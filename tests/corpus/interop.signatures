@@ -1,0 +1,37 @@
+# Signatures for the mixed-program corpus, in the declaration format
+# `zaqaru --signatures` reads.
+#
+# Milestone 2 of the interop plan supplies every boundary signature this way,
+# on purpose: it settles the marshalling before inference exists to feed it,
+# so that a later failure is a failure of inference rather than of the thunk
+# it fed. Milestones 3 and 4 delete these in two halves and require the same
+# corpus to keep passing.
+#
+# Pointers are `i32` because the target is wasm32, where an address really is
+# 32 bits wide.
+
+# --- the transpiled half, called from foreign wasm or from the test ---
+#
+# Inference recovers all of these from the machine code, so they are not
+# declared. The one exception below is not a shortcoming of the analysis but a
+# property of the convention: SysV fills the integer and floating-point
+# argument registers independently, so `f(i32, f64)` and `f(f64, i32)` produce
+# byte-identical assignments and nothing records which order the source used.
+# Inference refuses rather than guessing — a wrong signature at a boundary is
+# worse than none, because none keeps the uniform wrapper, which always works
+# — and a declaration is how the source gets to say what only it knew.
+#
+# It also keeps the override path exercised: declarations must beat inference,
+# and a test that never declares anything would not notice if they stopped.
+guest_uses_mixed(i32, f64, f32, i64) -> i32
+
+# --- the foreign half, reached through generated thunks ---
+#
+# Nothing is declared here either. The wasm object being linked against states
+# the type of every function it defines, and `--thunks` reads it: that is
+# knowledge rather than inference, and it is the only thing that can recover a
+# function whose arguments are all passed straight through, since a caller
+# that never touches an argument register leaves no trace of it.
+#
+# Call-site inference is the fallback for a foreign function no object
+# defines — a host import — and is graded on its own in tests/inference.rs.

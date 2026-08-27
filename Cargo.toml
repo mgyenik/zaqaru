@@ -1,0 +1,22 @@
+[package]
+name = "zaqaru"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.6", features = ["derive"] }
+iced-x86 = "1.21.0"
+object = "0.40.0"
+wasmprinter = "0.258.0"
+
+[dev-dependencies]
+criterion = "0.8.2"
+libloading = "0.9.0"
+rand = "0.10.2"
+wasmparser = "0.258.0"
+wasmtime = "48.0.1"
+
+[[bench]]
+name = "kernels"
+harness = false
