@@ -490,6 +490,40 @@ fn instruction_index(function: &LiftedFunction, offset: u64) -> Result<usize> {
         })
 }
 
+/// A branch target, with one overlapping-instruction case resolved.
+///
+/// glibc skips a `lock` prefix by branching *one byte into* the instruction
+/// that carries it: `je` past the `f0`, and the same `cmpxchg` runs
+/// unlocked when the process has no second thread. Two instruction streams
+/// share bytes, which no linear decode can represent — but here it does not
+/// have to, because the two streams differ only in a prefix this translation
+/// does not model. Nothing can run between the load and the store of a
+/// translated `cmpxchg` whether or not the guest asked for a lock, so both
+/// paths mean the same thing and the branch can name the whole instruction.
+///
+/// Narrow on purpose: only a single `lock` byte is stepped over. Every other
+/// prefix — operand size, address size, `rep`, a segment override, `REX` —
+/// changes what the instruction *does*, so a branch past one of those really
+/// is a second instruction stream and is refused as before.
+fn canonical_target(function: &LiftedFunction, offset: u64) -> u64 {
+    if function
+        .instructions
+        .iter()
+        .any(|lifted| lifted.offset == offset)
+    {
+        return offset;
+    }
+    function
+        .instructions
+        .iter()
+        .find(|lifted| {
+            lifted.offset + 1 == offset
+                && lifted.length() > 1
+                && lifted.instruction.has_lock_prefix()
+        })
+        .map_or(offset, |lifted| lifted.offset)
+}
+
 fn collect_leaders(function: &LiftedFunction, split_after_calls: bool) -> Result<BTreeSet<u64>> {
     let mut leaders = BTreeSet::new();
     leaders.insert(function.offset);
@@ -500,11 +534,16 @@ fn collect_leaders(function: &LiftedFunction, split_after_calls: bool) -> Result
 
         // A recovered `switch` reaches every one of its targets.
         if let Some(table) = function.jump_tables.get(&position) {
-            leaders.extend(table.targets.iter().copied());
+            leaders.extend(
+                table
+                    .targets
+                    .iter()
+                    .map(|target| canonical_target(function, *target)),
+            );
         }
 
         if branches && is_internal_branch(lifted, function) {
-            leaders.insert(instruction.near_branch64());
+            leaders.insert(canonical_target(function, instruction.near_branch64()));
         }
 
         let terminates = branches
@@ -556,7 +595,11 @@ fn classify_terminator(
         // any other indirect jump is an indirect tail call.
         return match function.jump_tables.get(&last) {
             Some(table) => Terminator::Switch {
-                targets: table.targets.clone(),
+                targets: table
+                    .targets
+                    .iter()
+                    .map(|target| canonical_target(function, *target))
+                    .collect(),
             },
             None => Terminator::Leaves,
         };
@@ -564,11 +607,11 @@ fn classify_terminator(
     if is_internal_branch(lifted, function) {
         return match instruction.flow_control() {
             FlowControl::ConditionalBranch => Terminator::Branch {
-                target: instruction.near_branch64(),
+                target: canonical_target(function, instruction.near_branch64()),
                 not_taken: block_end,
             },
             _ => Terminator::Jump {
-                target: instruction.near_branch64(),
+                target: canonical_target(function, instruction.near_branch64()),
             },
         };
     }

@@ -616,8 +616,7 @@ pub fn corpus_signatures(name: &str) -> zaqaru::abi::SignatureTable {
 /// execute — which makes it a stable stand-in for whatever the gap list
 /// holds this week. The sweep asks "is there anything in the corpus the
 /// transpiler refuses", and for these two the answer is yes on purpose.
-pub const DELIBERATELY_UNTRANSLATABLE: [&str; 2] =
-    ["untranslatable.s", "calls_untranslatable.s"];
+pub const DELIBERATELY_UNTRANSLATABLE: [&str; 2] = ["untranslatable.s", "calls_untranslatable.s"];
 
 pub fn corpus_sources() -> Vec<String> {
     let directory = Path::new(env!("CARGO_MANIFEST_DIR"))

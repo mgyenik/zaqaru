@@ -2665,3 +2665,60 @@ fn rotates_and_bit_tests_match_native() {
         }
     }
 }
+
+/// Branching past a `lock` prefix, which is two instruction streams sharing
+/// bytes.
+///
+/// glibc's allocator avoids a locked read-modify-write when the process has
+/// no second thread by jumping one byte into the instruction that carries
+/// the prefix. A linear decode has nothing at that byte, so the branch lands
+/// in the middle of an instruction — normally out of scope, and here not,
+/// because the two streams differ only in a prefix this translation does not
+/// model. Both paths have to compute the same thing, which is exactly what a
+/// differential can say.
+#[test]
+fn a_branch_past_a_lock_prefix_matches_native() {
+    let mut fixture = DifferentialFixture::build("lock-elision", &["lock_elision.s"]);
+
+    let mut inputs: Vec<(i64, i64, i64, i64)> = Vec::new();
+    const VALUES: [i64; 6] = [0, 1, -1, 0x7fff_ffff, i64::MIN, 0x0123_4567_89ab_cdef];
+    for &expected in &VALUES {
+        for &current in &VALUES {
+            for &replacement in &VALUES {
+                // Both ways through: locked and elided. The whole point is
+                // that they agree.
+                inputs.push((expected, current, replacement, 0));
+                inputs.push((expected, current, replacement, 1));
+            }
+        }
+    }
+    let mut generator = Pseudorandom::new(0x6c6f_636b_0000_0001);
+    for _ in 0..RANDOM_ITERATIONS {
+        inputs.push((
+            generator.next_i64(),
+            generator.next_i64(),
+            generator.next_i64(),
+            (generator.next_u64() & 1) as i64,
+        ));
+    }
+
+    for name in ["elided_compare_and_swap", "elided_exchange"] {
+        let native = unsafe {
+            native_function::<unsafe extern "C" fn(i64, i64, i64, i64) -> i64>(
+                &fixture.native,
+                name,
+            )
+        };
+        for &(first, second, third, path) in &inputs {
+            let expected = unsafe { native(first, second, third, path) };
+            for (variant, module) in &mut fixture.transpiled {
+                assert_eq!(
+                    module.call_guest(name, [first, second, third, path, 0, 0]),
+                    expected,
+                    "{name}({first}, {second}, {third}, path={path}) disagreed with \
+                     native in {variant}"
+                );
+            }
+        }
+    }
+}
