@@ -560,6 +560,20 @@ impl<'a> FunctionTranslator<'a> {
             // `endbr64` is a landing pad for control-flow enforcement, and
             // there is nothing in wasm for it to enforce.
             Mnemonic::Nop | Mnemonic::Endbr64 => Ok(()),
+            // A hint that this thread is spinning, so the processor may let
+            // a sibling have the pipeline. There is no sibling: the
+            // scheduler switches only at syscalls, so a spin loop holds the
+            // machine until it exits either way.
+            Mnemonic::Pause => Ok(()),
+            // Hints about what the cache should hold. Wasm has no cache to
+            // hint at, and every one of them is architecturally allowed to
+            // do nothing.
+            Mnemonic::Prefetcht0
+            | Mnemonic::Prefetcht1
+            | Mnemonic::Prefetcht2
+            | Mnemonic::Prefetchnta
+            | Mnemonic::Prefetchw
+            | Mnemonic::Prefetchwt1 => Ok(()),
             Mnemonic::Neg => self.translate_negate(body, lifted),
             Mnemonic::Not => self.translate_complement(body, lifted),
             Mnemonic::Inc => self.translate_step(body, lifted, FlagRule::Addition),
@@ -633,7 +647,11 @@ impl<'a> FunctionTranslator<'a> {
             // Halts the processor, and is privileged: reaching one from user
             // code faults. A translated guest has no processor to halt, and
             // a trap is what a fault is here.
-            Mnemonic::Hlt => {
+            // `hlt` halts the processor and is privileged, so reaching one
+            // from user code faults; the `ud` family raises an invalid-opcode
+            // exception on purpose. Compilers emit both where control
+            // provably does not reach. A trap is what a fault is here.
+            Mnemonic::Hlt | Mnemonic::Ud0 | Mnemonic::Ud1 | Mnemonic::Ud2 => {
                 body.unreachable();
                 Ok(())
             }
