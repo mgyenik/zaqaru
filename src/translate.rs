@@ -377,6 +377,23 @@ impl<'a> FunctionTranslator<'a> {
         lifted: &LiftedInstruction,
     ) -> Result<()> {
         self.temporaries.reset();
+        // Two of them test a register rather than a flag, so they have no
+        // condition code at all and cannot go through the table below.
+        match lifted.instruction.mnemonic() {
+            Mnemonic::Jrcxz => {
+                self.state
+                    .read_register(body, count_register(OperandWidth::QuadWord));
+                body.i64_eqz();
+                return Ok(());
+            }
+            Mnemonic::Jecxz => {
+                self.state
+                    .read_register(body, count_register(OperandWidth::DoubleWord));
+                body.i32_eqz();
+                return Ok(());
+            }
+            _ => {}
+        }
         if !is_conditional_jump(&lifted.instruction) {
             bail!(
                 "`{}` is not a conditional jump",
@@ -548,6 +565,15 @@ impl<'a> FunctionTranslator<'a> {
             Mnemonic::Bts => self.translate_bit_test(body, lifted, BitAction::Set),
             Mnemonic::Btr => self.translate_bit_test(body, lifted, BitAction::Clear),
             Mnemonic::Btc => self.translate_bit_test(body, lifted, BitAction::Complement),
+            Mnemonic::Shld => self.translate_double_shift(body, lifted, true),
+            Mnemonic::Shrd => self.translate_double_shift(body, lifted, false),
+            // Halts the processor, and is privileged: reaching one from user
+            // code faults. A translated guest has no processor to halt, and
+            // a trap is what a fault is here.
+            Mnemonic::Hlt => {
+                body.unreachable();
+                Ok(())
+            }
             Mnemonic::Shl | Mnemonic::Sal => self.translate_shift(body, lifted, ShiftKind::Left),
             Mnemonic::Shr => self.translate_shift(body, lifted, ShiftKind::RightLogical),
             Mnemonic::Sar => self.translate_shift(body, lifted, ShiftKind::RightArithmetic),
@@ -1601,6 +1627,147 @@ impl<'a> FunctionTranslator<'a> {
         self.emit_shift_flags(body, kind, width, value, count, result);
         body.end();
         Ok(())
+    }
+
+    /// `shld`/`shrd`: shift one operand, filling from another.
+    ///
+    /// The destination shifts as usual and the vacated bits come from the
+    /// *source* rather than from zero or the sign — which is how a
+    /// multi-word shift moves bits across a word boundary, and how a hash
+    /// mixes one register into another. The source itself is not written.
+    ///
+    /// A count of zero leaves everything alone, flags included, exactly as a
+    /// plain shift does.
+    fn translate_double_shift(
+        &mut self,
+        body: &mut FunctionBodyBuilder,
+        lifted: &LiftedInstruction,
+        left: bool,
+    ) -> Result<()> {
+        let width = self.destination_width(&lifted.instruction)?;
+        let value_type = width.value_type();
+        let bits = width.bits() as i32;
+
+        let value = self.temporaries.take(body, value_type);
+        let filler = self.temporaries.take(body, value_type);
+        let count = self.temporaries.take(body, ValueType::I32);
+        let result = self.temporaries.take(body, value_type);
+
+        self.read_operand(body, lifted, 0, width)?;
+        body.local_set(value);
+        self.read_operand(body, lifted, 1, width)?;
+        body.local_set(filler);
+        // Masked the same way a shift's count is. A count that exceeds the
+        // operand's width leaves the result architecturally undefined, so
+        // there is nothing to be faithful to beyond not trapping.
+        self.read_operand(body, lifted, 2, OperandWidth::Byte)?;
+        body.i32_const(if width == OperandWidth::QuadWord {
+            0x3f
+        } else {
+            0x1f
+        });
+        body.i32_and();
+        body.local_set(count);
+
+        body.local_get(value);
+        body.local_set(result);
+        body.local_get(count);
+        body.i32_eqz();
+        body.i32_eqz();
+        body.if_();
+        // The destination's own bits, moved; then the source's, moved the
+        // other way by the complement. Spelled with the zero count already
+        // excluded, because a shift by the operand's whole width is masked
+        // back to a shift by nothing and would leave the filler's bits
+        // where the destination's belong.
+        body.local_get(value);
+        emit_shift_count(body, width, count);
+        match (width.carrier(), left) {
+            (Carrier::I32, true) => body.i32_shl(),
+            (Carrier::I32, false) => body.i32_shr_unsigned(),
+            (Carrier::I64, true) => body.i64_shl(),
+            (Carrier::I64, false) => body.i64_shr_unsigned(),
+        }
+        body.local_get(filler);
+        body.i32_const(bits);
+        body.local_get(count);
+        body.i32_sub();
+        emit_shift_amount_to_carrier(body, width);
+        match (width.carrier(), left) {
+            (Carrier::I32, true) => body.i32_shr_unsigned(),
+            (Carrier::I32, false) => body.i32_shl(),
+            (Carrier::I64, true) => body.i64_shr_unsigned(),
+            (Carrier::I64, false) => body.i64_shl(),
+        }
+        match width.carrier() {
+            Carrier::I32 => body.i32_or(),
+            Carrier::I64 => body.i64_or(),
+        }
+        emit_mask_to_width(body, width);
+        body.local_set(result);
+
+        // The carry takes the last bit shifted out of the destination, and
+        // the rest follow the result the way a shift's do.
+        let carry = self.temporaries.take(body, ValueType::I32);
+        body.local_get(value);
+        if left {
+            body.i32_const(bits);
+            body.local_get(count);
+            body.i32_sub();
+        } else {
+            body.local_get(count);
+            body.i32_const(1);
+            body.i32_sub();
+        }
+        emit_shift_amount_to_carrier(body, width);
+        match width.carrier() {
+            Carrier::I32 => {
+                body.i32_shr_unsigned();
+                body.i32_const(1);
+                body.i32_and();
+            }
+            Carrier::I64 => {
+                body.i64_shr_unsigned();
+                body.i32_wrap_i64();
+                body.i32_const(1);
+                body.i32_and();
+            }
+        }
+        body.local_tee(carry);
+        self.state.write_flag(body, Flag::Carry);
+
+        // Overflow, and the two directions do not share a rule. Shifting
+        // left it is the bit that left against the sign that arrived;
+        // shifting right it is the result's top two bits, the same rule a
+        // right rotate uses. Architecturally it is defined for a count of
+        // one and undefined above, and hardware computes these whatever the
+        // count — which is what a differential against hardware can check,
+        // and the only reason the difference is known at all.
+        if left {
+            body.local_get(carry);
+            body.local_get(result);
+            emit_sign_bit(body, width);
+        } else {
+            body.local_get(result);
+            emit_sign_bit(body, width);
+            body.local_get(result);
+            emit_second_bit(body, width);
+        }
+        body.i32_xor();
+        self.state.write_flag(body, Flag::Overflow);
+
+        body.local_get(result);
+        emit_is_zero(body, width);
+        self.state.write_flag(body, Flag::Zero);
+        body.local_get(result);
+        emit_sign_bit(body, width);
+        self.state.write_flag(body, Flag::Sign);
+        body.local_get(result);
+        emit_parity(body, width);
+        self.state.write_flag(body, Flag::Parity);
+        body.end();
+
+        self.write_operand(body, lifted, 0, width, result)
     }
 
     /// `cld`/`std`: which way the string instructions walk.
@@ -3072,6 +3239,15 @@ fn is_string_move(instruction: &iced_x86::Instruction) -> bool {
 const COUNT_INDEX: usize = 1;
 const SOURCE_INDEX: usize = 6;
 const DESTINATION_INDEX: usize = 7;
+
+/// `%cl`/`%cx`/`%ecx`/`%rcx`, which `jrcxz` and `jecxz` test against zero.
+fn count_register(width: OperandWidth) -> RegisterSlice {
+    RegisterSlice {
+        number: COUNT_INDEX,
+        width,
+        high_byte: false,
+    }
+}
 
 /// A string instruction's pointer or counter, always at full width: the
 /// address-size prefix that would make them 32-bit is not something a

@@ -2854,3 +2854,126 @@ fn string_instructions_match_native() {
         }
     }
 }
+
+/// `jrcxz` and `jecxz` against native — conditional branches that test no
+/// flag.
+///
+/// Every other conditional jump asks about a flag and carries a condition
+/// code; these two ask whether the count register is zero and carry none, so
+/// they cannot go through the same table. glibc uses `jrcxz` to skip a `rep`
+/// whose count is zero, which is the shape the third function here has.
+#[test]
+fn count_register_branches_match_native() {
+    let mut fixture = DifferentialFixture::build("count-branch", &["count_branch.s"]);
+
+    let mut inputs: Vec<i64> = std::vec![0, 1, 2, 4, -1, i64::MIN, i64::MAX];
+    // A count whose low half is zero but whose whole register is not, which
+    // is the only case that tells `jrcxz` and `jecxz` apart.
+    inputs.push(0x1_0000_0000);
+    inputs.push(0x7_0000_0000);
+    let mut generator = Pseudorandom::new(0x6a72_6378_0000_0001);
+    for _ in 0..RANDOM_ITERATIONS / 8 {
+        inputs.push((generator.next_u64() % 5) as i64);
+        inputs.push(generator.next_i64());
+    }
+
+    for name in [
+        "branch_if_count_zero",
+        "branch_if_low_count_zero",
+        "guarded_fill",
+    ] {
+        let native =
+            unsafe { native_function::<unsafe extern "C" fn(i64) -> i64>(&fixture.native, name) };
+        for &count in &inputs {
+            // The guarded fill writes as many quadwords as it is asked for,
+            // so it is only given counts its buffer holds.
+            if name == "guarded_fill" && !(0..=4).contains(&count) {
+                continue;
+            }
+            let expected = unsafe { native(count) };
+            for (variant, module) in &mut fixture.transpiled {
+                assert_eq!(
+                    module.call_guest(name, [count, 0, 0, 0, 0, 0]),
+                    expected,
+                    "{name}({count:#x}) disagreed with native in {variant}"
+                );
+            }
+        }
+    }
+}
+
+/// `shld` and `shrd` against native — a shift whose vacated bits come from
+/// another register.
+///
+/// That is how a multi-word shift carries bits across a word boundary and
+/// how a hash mixes one register into another. Two cases separate a right
+/// implementation from a plausible one: a count of zero must leave
+/// everything alone including the flags, and a count equal to the operand's
+/// width is where a naive version puts the filler's bits where the
+/// destination's belong, because a shift by the whole width is masked back
+/// to a shift by nothing.
+#[test]
+fn double_shifts_match_native() {
+    let mut fixture = DifferentialFixture::build("double-shift", &["double_shift.s"]);
+
+    let mut inputs: Vec<(i64, i64, i64)> = Vec::new();
+    const VALUES: [i64; 6] = [0, 1, -1, i64::MIN, i64::MAX, 0x0123_4567_89ab_cdef];
+    for &value in &VALUES {
+        for &filler in &VALUES {
+            // Every count from none to past the widest operand, so the
+            // masking and the width-exact case are both reached.
+            for count in [0i64, 1, 15, 16, 17, 31, 32, 33, 63, 64, 65] {
+                inputs.push((value, filler, count));
+            }
+        }
+    }
+    let mut generator = Pseudorandom::new(0x7368_6c64_0000_0001);
+    for _ in 0..RANDOM_ITERATIONS / 2 {
+        inputs.push((
+            generator.next_i64(),
+            generator.next_i64(),
+            (generator.next_u64() % 66) as i64,
+        ));
+    }
+
+    for name in [
+        "shld_qword",
+        "shrd_qword",
+        "shld_dword",
+        "shrd_dword",
+        "shld_word",
+        "shrd_word",
+        "shld_leaves_source",
+        "shld_qword_flags",
+        "shrd_qword_flags",
+        "shld_qword_immediate",
+    ] {
+        let native = unsafe {
+            native_function::<unsafe extern "C" fn(i64, i64, i64) -> i64>(&fixture.native, name)
+        };
+        for &(value, filler, count) in &inputs {
+            // A count past the operand's own width leaves the result
+            // architecturally undefined, so only the defined range is
+            // compared for the narrow forms.
+            let width =
+                if name.contains("word") && !name.contains("qword") && !name.contains("dword") {
+                    16
+                } else if name.contains("dword") {
+                    32
+                } else {
+                    64
+                };
+            if count >= width {
+                continue;
+            }
+            let expected = unsafe { native(value, filler, count) };
+            for (variant, module) in &mut fixture.transpiled {
+                assert_eq!(
+                    module.call_guest(name, [value, filler, count, 0, 0, 0]),
+                    expected,
+                    "{name}({value:#x}, {filler:#x}, {count}) disagreed with native in {variant}"
+                );
+            }
+        }
+    }
+}
