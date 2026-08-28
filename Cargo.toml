@@ -1,5 +1,5 @@
 [workspace]
-members = ["baker", "kisal", "runner"]
+members = ["baker", "kisal", "runner", "x87"]
 
 [package]
 name = "zaqaru"

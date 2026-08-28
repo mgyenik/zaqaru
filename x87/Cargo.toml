@@ -1,0 +1,17 @@
+[package]
+name = "x87"
+version = "0.1.0"
+edition = "2024"
+description = "Soft emulation of the x87 FPU: extended-precision softfloat, the register stack, and the helper symbols translated code calls"
+
+[lib]
+# `staticlib` is what `wasm-ld` welds into the container module; `rlib` is
+# what the native unit tests and the host-FPU oracle link against. The
+# emulation is ordinary Rust either way — same arrangement as kisal.
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+# The pure-Rust musl math routines, for the f64-backed transcendental tier.
+# wasm32-unknown-unknown has no libm to link, so the algorithms come along
+# as Rust rather than as undefined symbols.
+libm = "0.2"

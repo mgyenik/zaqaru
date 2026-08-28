@@ -2151,6 +2151,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "x87"
+version = "0.1.0"
+dependencies = [
+ "libm",
+]
+
+[[package]]
 name = "zaqaru"
 version = "0.1.0"
 dependencies = [

@@ -1177,3 +1177,60 @@ What is left on the reachable path is about six pieces of work, not 138:
 `stosq` (6), and a short tail — `rdsspq`, `fld`, `stmxcsr`, two genuine
 `hlt` abort paths, and four calls to a suspicious `0x0` that have not
 been looked at.
+
+## 2026-08-28 — the x87 crate: softfloat with the hardware as oracle
+
+The `x87/` workspace crate exists and is green: the extended-precision
+softfloat core (add/sub/mul/div/sqrt/`fprem`/`fprem1`/`frndint`/
+`fscale`/`fxtract`, all conversions, both compare families), the
+register stack with TOP/tags/FCW/FSW and masked stack faults, the env
+and fnsave images, the RC-sensitive constants, the f64-backed
+transcendental four, and the `x87_*` FFI symbols over one static —
+`crate-type = ["staticlib", "rlib"]`, same arrangement as kisal, and
+the wasm32 staticlib builds. 47 unit tests plus a 14-test host-FPU
+oracle: ~1.3M random-operand comparisons against real hardware
+instructions demanding bit-identical results *and* flag words, across
+all four rounding modes and all three precision-control settings, in
+0.31s (volumes are sized by measurement, and say so in the file).
+
+The oracle earned its place in the first run. Seven of fourteen tests
+failed against the spec-from-memory implementation, and every failure
+was the hardware teaching something the manual does not say plainly:
+
+- **Denormal-flag suppression.** #D is *not* sticky-accumulated
+  alongside a higher-priority pre-operation exception: denormal ÷ 0
+  raises ZE alone, denormal vs SNaN raises IE alone — but
+  denormal + 0 and denormal + ∞ keep #D. Probed across the class
+  matrix; the rule (invalid or zero-divide suppresses denormal) is now
+  in the special-case arms, with the probe date cited.
+- **The store family raises no #D at all.** `fst`/`fstp`/`fist(p)` of
+  an extended subnormal: UE|PE only. #D belongs to loads and
+  arithmetic.
+- **`fscale` ignores precision control.** Full significand preserved
+  under PC = single; the exponent add is exact, only range effects
+  round.
+- **`fprem`'s partial step is 32 + (D mod 32) quotient bits**, leaving
+  a multiple of 32 for the next pass — measured by matching the
+  hardware's partial remainders for D = 64..133 and 6670 against the
+  shift-subtract loop, and squarely inside the manual's
+  "implementation-dependent number between 32 and 63".
+- **`fprem` canonicalizes a pseudo-denormal it returns unreduced**:
+  exp field 0 with the integer bit set comes back as the equivalent
+  exponent-1 normal.
+- **`f2xm1` outside [−1, 1]** returns the operand unchanged with PE —
+  "undefined" in the manual, definite on the die.
+
+The constants (`fldpi` and family) were measured before implementation:
+all four rounding modes on the host, which confirmed the internal
+values are wider than 64 bits and RC-sensitive, and cross-checked the
+embedded 128-bit significands. The f64-backed transcendentals measure
+their divergence rather than assume it: worst observed 4.5k ulps of
+extended (f2xm1), 4.2k (fpatan), 3.6k (fyl2x) — inside the ~2^11–2^12
+band a 53-bit core predicts, asserted under 2^14, printed on every run.
+
+Not yet built, in order: the translator lowering
+(`src/translate/x87.rs` + symbol plumbing beside `syscall_entry`), the
+corpus differentials (`long_double.c`, the `fprem` asm loop), and the
+build-plan appendix's later rows (`fsin` family, MMX, `fxsave`,
+unmasked delivery — the tier table in `x87/src/lib.rs` is the
+tracker).
