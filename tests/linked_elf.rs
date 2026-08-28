@@ -517,3 +517,54 @@ fn a_linked_module_can_be_entered_from_outside() {
     );
     support::validate_wasm(&std::fs::read(&module_path).expect("read"));
 }
+
+/// The loader and the translator read the same file, and have to agree.
+///
+/// They are separate readers by necessity — one is the transpiler's, on the
+/// `object` crate; the other is kisal's, which runs inside the module and
+/// parses the headers itself. A disagreement about where a segment goes
+/// would put the program's bytes somewhere its own operands do not point,
+/// and nothing downstream would say so.
+#[test]
+fn the_loader_and_the_translator_agree_about_the_program() {
+    let workspace = WorkingDirectory::new("linked-agree");
+    for name in ["arithmetic.c", "switch_dispatch.c"] {
+        let entry = if name == "arithmetic.c" {
+            "quad_mix"
+        } else {
+            "classify"
+        };
+        let path = support::link_corpus_executable(&workspace, name, entry, "-O1");
+        let bytes = std::fs::read(&path).expect("read");
+
+        let translator = ObjectFile::parse(&bytes).expect("the translator's reader");
+        let loader = kisal::exec::Program::parse(&bytes).expect("the loader's reader");
+
+        assert_eq!(loader.entry, translator.entry, "[{name}] a different entry");
+        assert_eq!(
+            loader.loads.len(),
+            translator.segments.len(),
+            "[{name}] a different number of segments"
+        );
+        for (placed, described) in loader.loads.iter().zip(&translator.segments) {
+            assert_eq!(placed.address, described.address, "[{name}] address");
+            assert_eq!(placed.file_size, described.file_size, "[{name}] file size");
+            assert_eq!(
+                placed.memory_size, described.memory_size,
+                "[{name}] memory size"
+            );
+            assert_eq!(
+                (placed.readable, placed.writable, placed.executable),
+                (described.readable, described.writable, described.executable),
+                "[{name}] permissions"
+            );
+        }
+
+        // And the entry point the loader will jump to is a function the
+        // translator actually translated.
+        assert!(
+            translator.function_at(loader.entry).is_some(),
+            "[{name}] the entry point is in no translated function"
+        );
+    }
+}

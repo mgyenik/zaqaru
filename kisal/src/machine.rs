@@ -16,6 +16,13 @@ pub trait Machine {
     fn segment_base(&self) -> i64;
     fn set_segment_base(&mut self, value: i64);
 
+    /// `%rsp`. Boot is what writes it: every other register a process starts
+    /// with is zero, and a wasm global starts at zero, so the stack pointer
+    /// is the only cell between a fresh instance and the state Linux hands
+    /// `_start`.
+    fn stack_pointer(&self) -> i64;
+    fn set_stack_pointer(&mut self, value: i64);
+
     /// One past the highest byte the guest can address. Every syscall that
     /// takes a pointer is bounded by this before it dereferences anything.
     fn memory_limit(&self) -> u64;
@@ -44,6 +51,10 @@ unsafe extern "C" {
     fn get_segment_base() -> i64;
     #[link_name = "x86_set_fs_base"]
     fn set_segment_base(value: i64);
+    #[link_name = "x86_get_rsp"]
+    fn get_stack_pointer() -> i64;
+    #[link_name = "x86_set_rsp"]
+    fn set_stack_pointer(value: i64);
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -54,6 +65,14 @@ impl Machine for GuestMachine {
 
     fn set_segment_base(&mut self, value: i64) {
         unsafe { set_segment_base(value) }
+    }
+
+    fn stack_pointer(&self) -> i64 {
+        unsafe { get_stack_pointer() }
+    }
+
+    fn set_stack_pointer(&mut self, value: i64) {
+        unsafe { set_stack_pointer(value) }
     }
 
     fn memory_limit(&self) -> u64 {
@@ -94,6 +113,14 @@ impl Machine for GuestMachine {
         unreachable!("the guest machine exists only inside the wasm module")
     }
 
+    fn stack_pointer(&self) -> i64 {
+        unreachable!("the guest machine exists only inside the wasm module")
+    }
+
+    fn set_stack_pointer(&mut self, _value: i64) {
+        unreachable!("the guest machine exists only inside the wasm module")
+    }
+
     fn memory_limit(&self) -> u64 {
         unreachable!("the guest machine exists only inside the wasm module")
     }
@@ -107,6 +134,7 @@ impl Machine for GuestMachine {
 /// shape a thread control block's saved register file will have.
 pub struct Registers {
     pub segment_base: i64,
+    pub stack_pointer: i64,
     /// The address space a native test is pretending to have. Unbounded by
     /// default, because a native test hands over real host pointers; a test
     /// that is *about* the bound sets one.
@@ -121,6 +149,7 @@ impl Default for Registers {
     fn default() -> Self {
         Self {
             segment_base: 0,
+            stack_pointer: 0,
             memory_limit: u64::MAX,
             ceiling: u64::MAX,
         }
@@ -134,6 +163,14 @@ impl Machine for Registers {
 
     fn set_segment_base(&mut self, value: i64) {
         self.segment_base = value;
+    }
+
+    fn stack_pointer(&self) -> i64 {
+        self.stack_pointer
+    }
+
+    fn set_stack_pointer(&mut self, value: i64) {
+        self.stack_pointer = value;
     }
 
     fn memory_limit(&self) -> u64 {

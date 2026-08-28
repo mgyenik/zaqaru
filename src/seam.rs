@@ -93,6 +93,17 @@ pub const LOAD_MACHINE: &str = "x86_load_machine";
 pub const GET_SEGMENT_BASE: &str = "x86_get_fs_base";
 pub const SET_SEGMENT_BASE: &str = "x86_set_fs_base";
 
+/// Reading and writing `%rsp` the same way, which boot is what needs.
+///
+/// Every other register a process starts with is zero, and a wasm global
+/// starts at zero, so the stack pointer is the only cell between a fresh
+/// instance and the state Linux hands `_start`. Writing it one cell at a
+/// time rather than through [`LOAD_MACHINE`] keeps the image's layout stated
+/// in one place — the seam — instead of in the kernel as well, where a
+/// disagreement would be silent rather than a link error.
+pub const GET_STACK_POINTER: &str = "x86_get_rsp";
+pub const SET_STACK_POINTER: &str = "x86_set_rsp";
+
 /// Alignment `wasm-ld` and clang's shadow stack both assume.
 const STACK_ALIGNMENT: i32 = 16;
 
@@ -341,6 +352,25 @@ pub fn build_seam_object() -> Result<Vec<u8>> {
     define(
         &mut wasm,
         SET_SEGMENT_BASE,
+        segment_write_type,
+        body.finish(),
+    );
+
+    let mut body = FunctionBodyBuilder::new(0);
+    body.global_get(machine.register(STACK_POINTER_REGISTER));
+    define(
+        &mut wasm,
+        GET_STACK_POINTER,
+        segment_read_type,
+        body.finish(),
+    );
+
+    let mut body = FunctionBodyBuilder::new(1);
+    body.local_get(0);
+    body.global_set(machine.register(STACK_POINTER_REGISTER));
+    define(
+        &mut wasm,
+        SET_STACK_POINTER,
         segment_write_type,
         body.finish(),
     );

@@ -22,6 +22,7 @@
 
 pub mod abi;
 pub mod errno;
+pub mod exec;
 pub mod fd;
 pub mod file;
 pub mod image;
