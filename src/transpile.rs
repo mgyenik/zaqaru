@@ -87,6 +87,9 @@ struct SymbolTable<'a> {
     exec_map: Option<FunctionReference>,
     /// Data symbols standing for recovered jump tables, by where they begin.
     jump_tables: HashMap<(usize, u64), u32>,
+    /// The imported [`UNTRANSLATED`], present only when the translation was
+    /// asked to trap rather than refuse.
+    untranslated: Option<FunctionReference>,
     /// The imported [`SYSCALL_ENTRY`], present when the object contains a
     /// `syscall` at all.
     syscall_entry: Option<FunctionReference>,
@@ -168,6 +171,13 @@ impl SymbolResolver for SymbolTable<'_> {
                  turn the address into a table slot"
             )
         })
+    }
+
+    fn function_at_address(&self, address: u64) -> Result<FunctionReference> {
+        let (section, offset) = self.object.section_at(address).ok_or_else(|| {
+            anyhow::anyhow!("a transfer to {address:#x}, which is in no loaded section")
+        })?;
+        self.function_at(section, offset)
     }
 
     fn section_address(&self, section: usize) -> u64 {
@@ -277,6 +287,7 @@ pub struct Transpiler<'a> {
     signatures: SignatureTable,
     promote: bool,
     resume: bool,
+    untranslatable: Untranslatable,
 }
 
 impl<'a> Transpiler<'a> {
@@ -287,7 +298,17 @@ impl<'a> Transpiler<'a> {
             signatures: SignatureTable::new(),
             promote: true,
             resume: false,
+            untranslatable: Untranslatable::Refuse,
         }
+    }
+
+    /// What to do with a function that cannot be translated. See
+    /// [`Untranslatable`]; the default refuses, which is right for anything
+    /// written to be translated and wrong for a binary that ships code for
+    /// processors this one is not.
+    pub fn with_untranslatable(mut self, untranslatable: Untranslatable) -> Self {
+        self.untranslatable = untranslatable;
+        self
     }
 
     /// Emits the checkpoint-resume machinery: call sites store resume IDs in
@@ -390,6 +411,7 @@ impl<'a> Transpiler<'a> {
             table_slots_by_location: HashMap::new(),
             table_slots_by_symbol: HashMap::new(),
             exec_map: None,
+            untranslated: None,
             jump_tables: HashMap::new(),
             syscall_entry: None,
             segment_of_section: HashMap::new(),
@@ -415,7 +437,17 @@ impl<'a> Transpiler<'a> {
         // Imports first: they occupy the low end of the function index space,
         // so every undefined callee has to be known before any definition
         // takes an index.
-        self.declare_imported_functions(&mut wasm, &mut symbols, guest_type, &references)?;
+        let report_type = wasm.intern_type(FunctionType {
+            parameters: vec![ValueType::I32, ValueType::I32],
+            results: vec![],
+        });
+        self.declare_imported_functions(
+            &mut wasm,
+            &mut symbols,
+            guest_type,
+            report_type,
+            &references,
+        )?;
         self.declare_data(&mut wasm, &mut symbols, &references)?;
         let (mut plans, driver, exec_map) = self.declare_functions(&mut wasm, &mut symbols)?;
         symbols.exec_map = exec_map;
@@ -453,6 +485,7 @@ impl<'a> Transpiler<'a> {
         // Bodies are built against the finished symbol table, then handed to
         // the object in the order the indices were reserved.
         let mut bodies: Vec<(u32, u32, FunctionBody)> = Vec::new();
+        let mut refused: Vec<Refusal> = Vec::new();
         for plan in &plans {
             let lifted = &lifted_functions[plan.input];
 
@@ -470,9 +503,26 @@ impl<'a> Transpiler<'a> {
                 _ => None,
             };
 
-            let body = self
+            let translated = self
                 .translate_guest_function(&symbols, &machine, lifted, guest_type, &resume_context)
-                .with_context(|| format!("translating function `{}`", lifted.name))?;
+                .with_context(|| format!("translating function `{}`", lifted.name));
+            let body = match translated {
+                Ok(body) => body,
+                Err(error) if self.untranslatable == Untranslatable::Trap => {
+                    refused.push(Refusal {
+                        name: lifted.name.clone(),
+                        reason: format!("{error:#}"),
+                    });
+                    build_refusal(
+                        &mut wasm,
+                        &lifted.name,
+                        symbols
+                            .untranslated
+                            .expect("the reporter is declared whenever trapping is asked for"),
+                    )
+                }
+                Err(error) => return Err(error),
+            };
             bodies.push((plan.guest.function_index, guest_type, body));
 
             if let (Some(resume), Some((graph, slot, entries))) = (plan.resume, &resume_context) {
@@ -534,6 +584,7 @@ impl<'a> Transpiler<'a> {
         Ok(Translation {
             module: wasm.serialize(),
             patches: self.image_patches(&references),
+            refused,
         })
     }
 
@@ -793,6 +844,7 @@ impl<'a> Transpiler<'a> {
         wasm: &mut WasmObject,
         symbols: &mut SymbolTable<'_>,
         guest_type: u32,
+        report_type: u32,
         references: &TextReferences,
     ) -> Result<()> {
         for (index, symbol) in self.object.symbols.iter().enumerate() {
@@ -818,6 +870,28 @@ impl<'a> Transpiler<'a> {
                     function_index,
                 },
             );
+        }
+
+        // Declared whether or not anything ends up refused: imports occupy
+        // the low end of the function index space, so one that appears
+        // partway through building bodies would shift every definition's
+        // index out from under the plans.
+        if self.untranslatable == Untranslatable::Trap {
+            let function_index = wasm.imported_functions.len() as u32;
+            wasm.imported_functions.push(ImportedFunction {
+                module: ENVIRONMENT_MODULE.to_string(),
+                field: UNTRANSLATED.to_string(),
+                type_index: report_type,
+            });
+            let symbol_index = wasm.add_symbol(Symbol {
+                name: UNTRANSLATED.to_string(),
+                target: SymbolTarget::Function(function_index),
+                flags: symbol_flags::UNDEFINED,
+            });
+            symbols.untranslated = Some(FunctionReference {
+                symbol_index,
+                function_index,
+            });
         }
 
         // The seam is an import like any other undefined callee, but it is
@@ -1572,6 +1646,36 @@ fn wrapper_symbol_flags(symbol: &crate::reader::Symbol) -> u32 {
     binding | symbol_flags::EXPORTED
 }
 
+/// What to do with a function the translator cannot translate.
+///
+/// A real binary contains code that never runs. glibc ships AVX-512 string
+/// routines beside SSE2 ones and picks between them at startup from CPUID —
+/// which the design curates to a baseline without AVX, precisely so the SSE2
+/// paths are the ones selected. The AVX bodies are still *there*, and a
+/// translator that must render every byte it finds would refuse a binary
+/// over code that cannot execute.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Untranslatable {
+    /// Fail the whole translation, naming the instruction. The default,
+    /// because for anything written to be translated a refusal is a gap in
+    /// the translator rather than a fact about the input.
+    Refuse,
+    /// Give the function a body that names itself and stops, and report it.
+    /// The refusal moves from bake time to the moment something actually
+    /// calls the thing — where it is still loud, and where it also says
+    /// that the curation was wrong.
+    Trap,
+}
+
+/// A function that got a trapping body instead of a translation.
+#[derive(Clone, Debug)]
+pub struct Refusal {
+    pub name: String,
+    /// The translator's own message, kept whole: it names the instruction,
+    /// which is what turns this list into a worklist.
+    pub reason: String,
+}
+
 /// A change the loader must make to the program image before it runs it.
 ///
 /// A jump table's entries are rewritten so that the address the dispatch
@@ -1588,11 +1692,15 @@ pub struct Patch {
     pub bytes: Vec<u8>,
 }
 
-/// A finished translation: the module, and whatever the image needs done to
-/// it before the module can run.
+/// A finished translation: the module, whatever the image needs done to it
+/// before the module can run, and whatever could not be translated.
 pub struct Translation {
     pub module: Vec<u8>,
     pub patches: Vec<Patch>,
+    /// Empty unless [`Untranslatable::Trap`] was asked for, and worth
+    /// printing when it is not: these are functions that will stop the
+    /// container if anything reaches them.
+    pub refused: Vec<Refusal>,
 }
 
 /// The name the exec map's lookup function is given, so a dump can point at
@@ -1600,6 +1708,13 @@ pub struct Translation {
 pub const EXEC_MAP_LOOKUP: &str = "x86_slot_of";
 /// The data segment holding the map itself.
 pub const EXEC_MAP_TABLE: &str = "x86_exec_map";
+
+/// What a function that could not be translated calls instead of running.
+///
+/// It takes the function's own name, so the failure says which one rather
+/// than leaving a bare trap in a backtrace — and the kernel is what turns it
+/// into a sentence, on the same path every other named fault takes.
+pub const UNTRANSLATED: &str = "kisal_untranslated";
 
 /// One entry: a virtual address and the table slot the function at it holds.
 /// Sixteen bytes so the address is eight-byte aligned, which is what a load
@@ -1678,6 +1793,43 @@ fn build_exec_map_table(wasm: &mut WasmObject, entries: &[(u64, TableReference)]
 /// pointer, a jump into data — and the useful thing is to stop where it
 /// happened. A sentinel slot would turn it into a call to whatever occupies
 /// that slot, which is the same bug arriving somewhere else.
+/// A body for a function that could not be translated: it names itself and
+/// does not return.
+///
+/// The `unreachable` after the call is not reached — the kernel's report
+/// ends the run — but a body has to end, and ending in a trap says that
+/// falling out of here was never a possibility.
+fn build_refusal(wasm: &mut WasmObject, name: &str, report: FunctionReference) -> FunctionBody {
+    let segment_index = wasm.data_segments.len() as u32;
+    let bytes = name.as_bytes().to_vec();
+    let size = bytes.len() as u32;
+    wasm.data_segments.push(DataSegment {
+        name: format!(".rodata.{UNTRANSLATED}.{name}"),
+        alignment_log2: 0,
+        bytes,
+        relocations: Vec::new(),
+    });
+    let text = DataReference {
+        symbol_index: wasm.add_symbol(Symbol {
+            name: format!("{UNTRANSLATED}.{name}"),
+            target: SymbolTarget::Data(Some(DataSymbolLocation {
+                segment_index,
+                offset: 0,
+                size,
+            })),
+            flags: symbol_flags::LOCAL,
+        }),
+        addend: 0,
+    };
+
+    let mut body = FunctionBodyBuilder::new(0);
+    body.i32_const_data_address(text);
+    body.i32_const(size as i32);
+    body.call(report);
+    body.unreachable();
+    body.finish()
+}
+
 fn build_exec_map_lookup(table: DataReference, count: u32) -> FunctionBody {
     let mut body = FunctionBodyBuilder::new(1);
     let low = body.declare_local(ValueType::I32);

@@ -271,3 +271,86 @@ fn a_container_with_no_program_refuses_to_boot() {
         "the kernel did not say what was missing; it logged: {log}"
     );
 }
+
+/// Reaching a function that was never translated says which one.
+///
+/// The trapping body exists for code a real binary carries and never runs.
+/// If something does run it, the container stops — and the whole value of
+/// stopping this way rather than trapping is that the message names the
+/// function, so the answer is "implement this instruction" rather than "a
+/// wasm trap happened somewhere".
+#[test]
+fn calling_an_untranslated_function_names_it() {
+    let workspace = WorkingDirectory::new("boot-untranslated");
+    let elf =
+        support::link_corpus_executable(&workspace, "calls_untranslatable.s", "_start", "-O1");
+    let bytes = std::fs::read(&elf).expect("read the program");
+    let object = zaqaru::reader::ObjectFile::parse(&bytes).expect("parse");
+    let top = object
+        .segments
+        .iter()
+        .map(|segment| segment.address + segment.memory_size)
+        .max()
+        .expect("segments");
+
+    let translation = zaqaru::transpile::Transpiler::new(&object)
+        .with_untranslatable(zaqaru::transpile::Untranslatable::Trap)
+        .translate()
+        .expect("translate");
+    assert_eq!(
+        translation.refused.len(),
+        1,
+        "the fixture no longer has exactly one untranslatable function"
+    );
+    let guest = workspace.write("halted.wasm.o", &translation.module);
+
+    let root = workspace.path().join("image");
+    std::fs::create_dir_all(&root).expect("create the image tree");
+    let mut placed = bytes.clone();
+    baker::program::apply(&mut placed, &translation.patches).expect("apply the patches");
+    std::fs::write(root.join(PROGRAM), &placed).expect("place the program");
+    let image = baker::object::emit(&baker::bake_directory(&root).expect("bake"))
+        .expect("emit the image object");
+
+    let module = support::link_container_for_program(
+        &workspace,
+        std::slice::from_ref(&guest),
+        &image,
+        "untranslated",
+        Some(top),
+    );
+    let mut container = runner::Container::instantiate(
+        &std::fs::read(&module).expect("read the container"),
+        support::mounts_seeded(&[0x22; 32]),
+    )
+    .expect("instantiate");
+
+    container
+        .boot()
+        .expect_err("a container calling an untranslated function finished");
+
+    // It got as far as the call, so what stopped it is the call and not
+    // something before it.
+    let output = container
+        .mounts()
+        .read(&path(&[b"iso", b"console", b"stdout"]))
+        .expect("the console mount failed")
+        .unwrap_or_default();
+    assert_eq!(
+        String::from_utf8_lossy(&output),
+        "running\n",
+        "the program did not reach the call"
+    );
+
+    let log = container
+        .mounts()
+        .read(&path(&[b"iso", b"log", b"error"]))
+        .expect("the log mount failed")
+        .unwrap_or_default();
+    let log = String::from_utf8_lossy(&log).into_owned();
+    assert!(
+        log.contains("halted"),
+        "the kernel did not name the function that was never translated; it \
+         logged: {log}"
+    );
+}

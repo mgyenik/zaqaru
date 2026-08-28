@@ -87,6 +87,16 @@ struct Arguments {
     #[arg(long)]
     no_promote: bool,
 
+    /// Give a function the translator cannot translate a body that names
+    /// itself and stops, instead of refusing the whole input.
+    ///
+    /// For real binaries, which carry code for processors this one is not:
+    /// glibc ships AVX-512 string routines beside SSE2 ones and chooses
+    /// between them from CPUID. Every such function is listed on stderr, and
+    /// reaching one at run time is a named failure rather than a trap.
+    #[arg(long)]
+    trap_untranslatable: bool,
+
     /// Emit checkpoint-resume machinery: call sites store resume IDs in
     /// their return-address slots, every function gets a resume body, and a
     /// weak `x86_resume` driver rebuilds the suspended frames of a restored
@@ -165,13 +175,32 @@ fn main() -> Result<()> {
         signatures
     };
 
-    let translated = transpile::Transpiler::new(&object)
+    let translation = transpile::Transpiler::new(&object)
         .with_mode(arguments.control_flow.into())
         .with_signatures(signatures)
         .with_promotion(!arguments.no_promote)
         .with_resume(arguments.resume)
-        .transpile()
+        .with_untranslatable(if arguments.trap_untranslatable {
+            transpile::Untranslatable::Trap
+        } else {
+            transpile::Untranslatable::Refuse
+        })
+        .translate()
         .with_context(|| format!("transpiling {}", input.display()))?;
+    let translated = translation.module;
+
+    // On stderr, because it is a worklist rather than output: every line is
+    // an instruction someone has to implement before that function can run.
+    if !translation.refused.is_empty() {
+        eprintln!(
+            "{} function(s) were not translated and will stop the container if \
+             called:",
+            translation.refused.len()
+        );
+        for refusal in &translation.refused {
+            eprintln!("  {}: {}", refusal.name, refusal.reason);
+        }
+    }
 
     if arguments.print {
         print!("{}", wasmprinter::print_bytes(&translated)?);

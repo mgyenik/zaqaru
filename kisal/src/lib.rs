@@ -274,3 +274,35 @@ fn push_status(into: &mut String, status: i32) {
         into.push(digits[index] as char);
     }
 }
+
+/// What a function the translator could not translate calls instead of
+/// running.
+///
+/// A real binary carries code for processors this one is not: glibc ships
+/// AVX-512 string routines beside SSE2 ones and chooses between them from
+/// CPUID, which the design curates to a baseline without AVX so that the
+/// SSE2 paths are the ones taken. The AVX bodies are still in the binary,
+/// and a translation that refused the whole program over them would refuse
+/// every real program.
+///
+/// So they get this instead. Reaching it means the curation was wrong, or
+/// that something needs an instruction nobody has written yet — and either
+/// way the answer is the function's name rather than a bare trap.
+///
+/// # Safety
+/// Called only from a generated body, with a pointer to that function's
+/// name in the module's own data.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kisal_untranslated(name: *const u8, length: usize) -> ! {
+    // SAFETY: the caller is generated code passing a static string the
+    // linker placed; the length is that segment's own size.
+    let name = unsafe { core::slice::from_raw_parts(name, length) };
+    let name = core::str::from_utf8(name).unwrap_or("<an unreadable name>");
+    let message = std::format!(
+        "kisal: `{name}` was never translated, and something called it — the \
+         instruction it needs is not implemented, or the CPUID this container \
+         reports let the guest choose a path that does not exist here"
+    );
+    with_kernel(|kernel| report(kernel, &message));
+    panic!("{message}");
+}

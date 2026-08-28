@@ -75,6 +75,12 @@ pub trait SymbolResolver {
         false
     }
 
+    /// The guest function beginning at a virtual address, for a linked
+    /// input where a call can cross from one placed section into another.
+    fn function_at_address(&self, _address: u64) -> Result<FunctionReference> {
+        bail!("this input has no addresses to resolve")
+    }
+
     /// The virtual address a section was placed at, or zero for a
     /// relocatable object where nothing has been placed.
     ///
@@ -1182,15 +1188,24 @@ impl<'a> FunctionTranslator<'a> {
         }
 
         if lifted.instruction.op_kind(0) == OpKind::NearBranch64 {
-            // A section offset in both shapes: the decoder runs with the
-            // instruction's offset within its section as the program
-            // counter, so a relative branch resolves to another offset in
-            // the same section — which is where the callee is, linked or
-            // not.
-            return Ok(CallTarget::Direct(
+            let target = lifted.instruction.near_branch64();
+            // The decoder runs with the instruction's offset within its
+            // section as the program counter, so a relative branch resolves
+            // to another offset in the same section.
+            //
+            // In a relocatable object that is the whole story — the
+            // assembler could only resolve a branch within the section it
+            // was assembling. A linked one has had everything placed, so a
+            // call crosses sections freely: `.text.unlikely` calls `.text`,
+            // and the offset is then relative to a section the callee is not
+            // in. Adding the section's own address makes it an address,
+            // which is a thing the whole program shares.
+            return Ok(CallTarget::Direct(if self.symbols.linked() {
                 self.symbols
-                    .function_at(self.section, lifted.instruction.near_branch64())?,
-            ));
+                    .function_at_address(self.symbols.section_address(self.section) + target)?
+            } else {
+                self.symbols.function_at(self.section, target)?
+            }));
         }
 
         // Anything else computes its target: a function pointer, which is a

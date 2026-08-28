@@ -714,3 +714,68 @@ fn a_linked_program_reaches_its_data_relative_to_the_program_counter() {
         .transpile()
         .expect("translating a program that reaches its own data");
 }
+
+/// A function nobody can translate does not take the program with it.
+///
+/// A real binary carries code for processors this one is not — glibc ships
+/// AVX-512 string routines beside SSE2 ones and picks between them from
+/// CPUID, which the design curates to a baseline without AVX so the SSE2
+/// paths are the ones taken. The AVX bodies are still there. Refusing a
+/// whole program over code that cannot execute would refuse every real
+/// program, so the refusal moves to the moment something calls the function.
+#[test]
+fn an_untranslatable_function_is_refused_by_default_and_trapped_on_request() {
+    let workspace = WorkingDirectory::new("linked-untranslatable");
+    let path = support::link_corpus_executable(&workspace, "untranslatable.s", "entry", "-O1");
+    let bytes = std::fs::read(&path).expect("read");
+    let object = ObjectFile::parse(&bytes).expect("parse");
+
+    // The default: a gap in the translator is a gap, and it says so.
+    let refused = zaqaru::transpile::Transpiler::new(&object)
+        .transpile()
+        .expect_err("an untranslatable instruction was translated");
+    let refused = format!("{refused:#}");
+    assert!(
+        refused.contains("unreachable_path") && refused.contains("hlt"),
+        "the refusal names neither the function nor the instruction: {refused}"
+    );
+
+    // Asked for, it becomes one function's problem instead of the program's.
+    let translation = zaqaru::transpile::Transpiler::new(&object)
+        .with_untranslatable(zaqaru::transpile::Untranslatable::Trap)
+        .translate()
+        .expect("translating around an untranslatable function");
+
+    let names: Vec<&str> = translation
+        .refused
+        .iter()
+        .map(|refusal| refusal.name.as_str())
+        .collect();
+    assert_eq!(
+        names,
+        ["unreachable_path"],
+        "the wrong functions were given up on"
+    );
+    assert!(
+        translation.refused[0].reason.contains("hlt"),
+        "the report does not name the instruction, so it is not a worklist: {}",
+        translation.refused[0].reason
+    );
+
+    // And the module is still a module: the other functions translated, and
+    // what stands in for the refused one links like anything else.
+    support::validate_wasm(&translation.module);
+    let object_path = workspace.write("untranslatable.wasm.o", &translation.module);
+    let seam = workspace.write("seam.wasm.o", support::seam_object());
+    let module_path = workspace.path().join("untranslatable.wasm");
+    let outcome = support::try_link_wasm(
+        &[object_path, seam],
+        &module_path,
+        &[
+            "--export-table",
+            "--growable-table",
+            "--unresolved-symbols=import-dynamic",
+        ],
+    );
+    assert!(outcome.succeeded, "did not link:\n{}", outcome.report());
+}
