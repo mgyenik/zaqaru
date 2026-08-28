@@ -974,3 +974,92 @@ hand in the meantime. The syscall grind (`uname`, `prlimit64`,
 `sched_getaffinity`, `getrandom`, `rseq`, the clock rows, `readv`/
 `writev`, the recorded signal rows) has not started, and neither has the
 strace-diff harness or the determinism check.
+
+## 2026-08-28 — what a real binary said, and the policy it forced
+
+No musl toolchain is installed, and a static *glibc* one builds and runs
+here, so it got used as a stand-in to see what a real binary demands.
+The plan targets musl deliberately; what follows is partly a measurement
+of why.
+
+### Two front-end defects, found in the first two seconds
+
+Neither was reachable from the corpus.
+
+**A function with no stated size.** `deregister_tm_clones` and its
+`crtbegin.o` neighbours carry neither a `.size` nor an unwind entry, and
+they are in every binary gcc links. The symbol table still says where
+the *next* thing starts, and a function cannot run past that — so that
+is the third witness, after the symbol's size and `.eh_frame`.
+
+**A program-counter-relative operand means different things in the two
+shapes.** In a relocatable object, one with no relocation could only
+have been resolved by the assembler against the section it was
+assembling, so it names a function in it. In a linked object *nothing*
+has a relocation, so the shape says nothing: the operand is an address,
+naming data as readily as code. The corpus hid this by linking its
+executables `-fno-pie`, which turns every global's address into an
+immediate; a distribution's `gcc -static` still compiles
+position-independently.
+
+**And one design error of mine, corrected.** I had reasoned that because
+the decoder runs with a section-relative program counter, a call's
+target is an offset in the caller's section — true of the *number*, and
+wrong about its *scope*. A relocatable object's assembler can only
+resolve within one section; a linked object has had everything placed,
+so `.text.unlikely` calls `.text` freely. The target is an address, and
+the section's own base is what turns the offset into one.
+
+### The policy: a function nobody can translate stops only itself
+
+glibc ships AVX-512 string routines beside SSE2 ones and chooses between
+them from CPUID, which the design curates to a baseline without AVX
+precisely so the SSE2 paths are taken. The AVX bodies are still in the
+binary. A translator that must render every byte it finds refuses every
+real program over code that cannot execute — which is not a loud error,
+it is a wrong one.
+
+So `--trap-untranslatable` gives such a function a body that names
+itself and stops, and lists every one on stderr. The default still
+refuses, because for anything written to be translated a refusal is a
+gap in the translator rather than a fact about the input. Reaching one
+at run time goes through the kernel's own log and names the function,
+so the answer is "implement this instruction" and not "a trap happened".
+
+### What the measurement actually said
+
+With both fixes and the policy, a static glibc `hello` translates in
+56 ms — 1054 functions, 719 of them refused. The shape of the 719 is the
+interesting part, because most of it is not an instruction list:
+
+| count | cause |
+| --- | --- |
+| 338 | a branch into the middle of another function |
+| 131 | a call to a `.plt` stub, which has no function symbol |
+| 66 | `cmpxchg` |
+| ~90 | AVX/AVX-512 (`vpxor`, `vmovd`, `vpbroadcastb`, `vmovdqu64`, …) |
+| 18 | `xchg` |
+| 16 | `pmovmskb` |
+| rest | `ror`, `punpcklbw`, `bt`, `stosq`, `cpuid`, `rdsspq`, … |
+
+The top two are worth naming precisely, because they are not gaps in
+the translator:
+
+- **The branches are real.** `_dl_start` states a size of 13 bytes and
+  jumps 185 bytes past its own end, into `abort` at `+0xa7` of `0x1a3`.
+  That is a branch into the middle of another function, which the design
+  already calls out of scope — not an artifact of the extent inference
+  above, since the symbol states its size.
+- **The calls are static ifunc.** A static glibc still has a `.plt`,
+  used to resolve `IRELATIVE` relocations at startup, and its stubs
+  carry no function symbols. Discovering them is a separate piece of
+  work with a separate design (the exec map already handles the indirect
+  jump through the GOT; nothing yet makes a stub a function).
+
+Both are glibc-shaped. musl has neither the hot/cold split at this scale
+nor the ifunc fan-out, which is why the plan named musl as the interim
+breadth target — and this measurement is the evidence for that choice
+rather than a reason to argue with it. The instruction rows below the
+top two (`cmpxchg`, `xchg`, `pmovmskb`, `ror`, `bt`, `stosq`, `cpuid`)
+are real gaps that musl and CPython will want too, and they are the part
+of this list worth working from.
