@@ -509,6 +509,26 @@ impl<'a> FunctionTranslator<'a> {
             Mnemonic::Not => self.translate_complement(body, lifted),
             Mnemonic::Inc => self.translate_step(body, lifted, FlagRule::Addition),
             Mnemonic::Dec => self.translate_step(body, lifted, FlagRule::Subtraction),
+            // The direction the string instructions walk. Nothing else
+            // reads it, and a libc clears it again the moment it is done.
+            Mnemonic::Cld => self.translate_set_direction(body, false),
+            Mnemonic::Std => self.translate_set_direction(body, true),
+            Mnemonic::Stosb => self.translate_store_string(body, lifted, OperandWidth::Byte),
+            Mnemonic::Stosw => self.translate_store_string(body, lifted, OperandWidth::Word),
+            Mnemonic::Stosd => self.translate_store_string(body, lifted, OperandWidth::DoubleWord),
+            Mnemonic::Stosq => self.translate_store_string(body, lifted, OperandWidth::QuadWord),
+            Mnemonic::Movsb => self.translate_move_string(body, lifted, OperandWidth::Byte),
+            Mnemonic::Movsw => self.translate_move_string(body, lifted, OperandWidth::Word),
+            // `movsd` and `movsq` each name two unrelated instructions: the
+            // string move, whose operands are the implicit `%rdi` and
+            // `%rsi`, and an SSE move between registers. The operand kind is
+            // what tells them apart, since the mnemonic does not.
+            Mnemonic::Movsd if is_string_move(&lifted.instruction) => {
+                self.translate_move_string(body, lifted, OperandWidth::DoubleWord)
+            }
+            Mnemonic::Movsq if is_string_move(&lifted.instruction) => {
+                self.translate_move_string(body, lifted, OperandWidth::QuadWord)
+            }
             Mnemonic::Cpuid => self.translate_cpuid(body),
             Mnemonic::Xgetbv => self.translate_extended_control(body),
             Mnemonic::Bsf => self.translate_bit_scan(body, lifted, true),
@@ -1580,6 +1600,148 @@ impl<'a> FunctionTranslator<'a> {
         body.if_();
         self.emit_shift_flags(body, kind, width, value, count, result);
         body.end();
+        Ok(())
+    }
+
+    /// `cld`/`std`: which way the string instructions walk.
+    fn translate_set_direction(
+        &mut self,
+        body: &mut FunctionBodyBuilder,
+        backwards: bool,
+    ) -> Result<()> {
+        body.i32_const(i32::from(backwards));
+        self.state.write_flag(body, Flag::Direction);
+        Ok(())
+    }
+
+    /// `stos`: fill memory at `%rdi` with the accumulator.
+    ///
+    /// With a `rep` prefix it is `memset` — `%rcx` elements, and `%rcx` ends
+    /// at zero. Without one it stores exactly once. Either way `%rdi` walks
+    /// forward or backward by the element's size according to the direction
+    /// flag, and a repeat count of zero stores nothing at all and still
+    /// leaves `%rdi` where it was, which is why the count is tested before
+    /// the first store rather than after it.
+    fn translate_store_string(
+        &mut self,
+        body: &mut FunctionBodyBuilder,
+        lifted: &LiftedInstruction,
+        width: OperandWidth,
+    ) -> Result<()> {
+        let value = self.temporaries.take(body, width.value_type());
+        self.state.read_register(body, accumulator(width));
+        body.local_set(value);
+        let step = self.direction_step(body, width);
+        self.repeat(body, lifted, |translator, body| {
+            let destination = translator.temporaries.take(body, ValueType::I64);
+            translator
+                .state
+                .read_register(body, string_pointer(DESTINATION_INDEX));
+            body.local_set(destination);
+            body.local_get(destination);
+            body.i32_wrap_i64();
+            body.local_get(value);
+            emit_store(body, width);
+            translator.advance(body, DESTINATION_INDEX, destination, step);
+            Ok(())
+        })
+    }
+
+    /// `movs`: copy from `%rsi` to `%rdi`, both walking.
+    ///
+    /// With a `rep` prefix it is `memcpy`, and with the direction flag set
+    /// it is the backwards copy a `memmove` uses when its ranges overlap —
+    /// which is the only reason the flag is modelled at all.
+    fn translate_move_string(
+        &mut self,
+        body: &mut FunctionBodyBuilder,
+        lifted: &LiftedInstruction,
+        width: OperandWidth,
+    ) -> Result<()> {
+        let step = self.direction_step(body, width);
+        self.repeat(body, lifted, |translator, body| {
+            let source = translator.temporaries.take(body, ValueType::I64);
+            let destination = translator.temporaries.take(body, ValueType::I64);
+            translator
+                .state
+                .read_register(body, string_pointer(SOURCE_INDEX));
+            body.local_set(source);
+            translator
+                .state
+                .read_register(body, string_pointer(DESTINATION_INDEX));
+            body.local_set(destination);
+
+            body.local_get(destination);
+            body.i32_wrap_i64();
+            body.local_get(source);
+            body.i32_wrap_i64();
+            emit_load(body, width);
+            emit_store(body, width);
+
+            translator.advance(body, SOURCE_INDEX, source, step);
+            translator.advance(body, DESTINATION_INDEX, destination, step);
+            Ok(())
+        })
+    }
+
+    /// The signed amount a string pointer moves per element: the element's
+    /// size, negated when the direction flag says backwards.
+    fn direction_step(&mut self, body: &mut FunctionBodyBuilder, width: OperandWidth) -> u32 {
+        let step = self.temporaries.take(body, ValueType::I64);
+        self.state.read_flag(body, Flag::Direction);
+        body.if_();
+        body.i64_const(-(width.bytes() as i64));
+        body.local_set(step);
+        body.else_();
+        body.i64_const(width.bytes() as i64);
+        body.local_set(step);
+        body.end();
+        step
+    }
+
+    /// Moves a string pointer by one element.
+    fn advance(&mut self, body: &mut FunctionBodyBuilder, register: usize, held: u32, step: u32) {
+        body.local_get(held);
+        body.local_get(step);
+        body.i64_add();
+        self.state.write_register(body, string_pointer(register));
+    }
+
+    /// Runs `once` the number of times the instruction's prefix asks for.
+    ///
+    /// Without a `rep` it runs exactly once. With one it runs `%rcx` times
+    /// and leaves `%rcx` at zero — and a count that starts at zero does
+    /// nothing at all, which is why the test comes before the body rather
+    /// than after it.
+    fn repeat(
+        &mut self,
+        body: &mut FunctionBodyBuilder,
+        lifted: &LiftedInstruction,
+        once: impl Fn(&mut Self, &mut FunctionBodyBuilder) -> Result<()>,
+    ) -> Result<()> {
+        if !lifted.instruction.has_rep_prefix() {
+            return once(self, body);
+        }
+        let count = self.temporaries.take(body, ValueType::I64);
+        self.state.read_register(body, string_pointer(COUNT_INDEX));
+        body.local_set(count);
+
+        body.block();
+        body.loop_();
+        body.local_get(count);
+        body.i64_eqz();
+        body.branch_if(1);
+        once(self, body)?;
+        body.local_get(count);
+        body.i64_const(1);
+        body.i64_sub();
+        body.local_set(count);
+        body.branch(0);
+        body.end(); // loop
+        body.end(); // block
+
+        body.local_get(count);
+        self.state.write_register(body, string_pointer(COUNT_INDEX));
         Ok(())
     }
 
@@ -2896,6 +3058,32 @@ fn is_conditional_move(mnemonic: Mnemonic) -> bool {
 }
 
 /// `al`/`ax`/`eax`/`rax`, the register a division's quotient lands in.
+/// Whether a `movsd`/`movsq` is the string instruction rather than the SSE
+/// move that shares its mnemonic. The string form's destination is the
+/// implicit `%rdi`, which no other form uses.
+fn is_string_move(instruction: &iced_x86::Instruction) -> bool {
+    matches!(
+        instruction.op0_kind(),
+        OpKind::MemoryESDI | OpKind::MemoryESEDI | OpKind::MemoryESRDI
+    )
+}
+
+/// `%rcx`, `%rsi` and `%rdi`, which the string instructions walk.
+const COUNT_INDEX: usize = 1;
+const SOURCE_INDEX: usize = 6;
+const DESTINATION_INDEX: usize = 7;
+
+/// A string instruction's pointer or counter, always at full width: the
+/// address-size prefix that would make them 32-bit is not something a
+/// 64-bit program emits.
+fn string_pointer(number: usize) -> RegisterSlice {
+    RegisterSlice {
+        number,
+        width: OperandWidth::QuadWord,
+        high_byte: false,
+    }
+}
+
 const REGISTER_RAX: usize = 0;
 const REGISTER_RCX: usize = 1;
 const REGISTER_RDX: usize = 2;

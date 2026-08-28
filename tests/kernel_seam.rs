@@ -453,7 +453,7 @@ fn a_continuation_that_returns_reports_no_yield() {
 /// out of the same constants `build_machine_image` walks, so a cell moved to
 /// overlap another is reproduced identically on both sides and stays
 /// invisible. Seventeen eight-byte registers, thirty-two eight-byte XMM
-/// halves, five four-byte flags, each region starting where the previous one
+/// halves, six four-byte flags, each region starting where the previous one
 /// ends.
 #[test]
 fn the_machine_image_layout_is_what_the_model_says() {
@@ -462,8 +462,8 @@ fn the_machine_image_layout_is_what_the_model_says() {
     assert_eq!(machine_image::SEGMENT_BASE_OFFSET, 16 * 8);
     assert_eq!(machine_image::VECTOR_OFFSET, 17 * 8);
     assert_eq!(machine_image::FLAG_OFFSET, 17 * 8 + 32 * 8);
-    assert_eq!(machine_image::SIZE, 17 * 8 + 32 * 8 + 5 * 4);
-    assert_eq!(machine_image::SIZE, 412);
+    assert_eq!(machine_image::SIZE, 17 * 8 + 32 * 8 + 6 * 4);
+    assert_eq!(machine_image::SIZE, 416);
     assert_eq!(
         machine_image::SEGMENT_BASE_OFFSET % 8,
         0,
@@ -606,7 +606,7 @@ fn machine_pattern() -> Vec<u8> {
          round-trip anyway"
     );
     assert_eq!(zaqaru::machine::VECTOR_REGISTER_COUNT, 16);
-    assert_eq!(zaqaru::machine::Flag::ALL.len(), 5);
+    assert_eq!(zaqaru::machine::Flag::ALL.len(), 6);
     for number in 0..16usize {
         let value = 0x0101_0000_0000_0000u64 | (number as u64 + 1);
         let offset = machine_image::REGISTER_OFFSET as usize + number * 8;

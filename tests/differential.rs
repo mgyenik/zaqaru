@@ -2798,3 +2798,59 @@ fn bit_scans_and_byte_swaps_match_native() {
         }
     }
 }
+
+/// `rep stos` and `rep movs` against native — memset and memcpy as single
+/// instructions.
+///
+/// The count is what makes these subtly wrong if they are wrong at all: a
+/// `rep` with `%rcx` of zero stores nothing *and* leaves the pointers where
+/// they were, so the test has to come before the first element rather than
+/// after it. And the direction flag decides which way the pointers walk,
+/// which is the only reason that flag is modelled — a libc's `memmove` sets
+/// it to copy an overlapping range backwards and clears it again straight
+/// after.
+///
+/// Each function returns a checksum of its buffer plus where the pointers
+/// ended, so running one element too many or walking the wrong way is a
+/// different number rather than a plausible one.
+#[test]
+fn string_instructions_match_native() {
+    let mut fixture = DifferentialFixture::build("string-ops", &["string_ops.s"]);
+
+    let mut inputs: Vec<(i64, i64)> = Vec::new();
+    for value in [0i64, 1, -1, 0x0123_4567_89ab_cdef, i64::MIN] {
+        // Counts from none through the buffer's whole length: zero is the
+        // case that must store nothing at all.
+        for count in [0i64, 1, 2, 3, 4, 8] {
+            inputs.push((value, count));
+        }
+    }
+    let mut generator = Pseudorandom::new(0x7265_7000_0000_0001);
+    for _ in 0..RANDOM_ITERATIONS / 4 {
+        inputs.push((generator.next_i64(), (generator.next_u64() % 9) as i64));
+    }
+
+    for name in [
+        "stos_quad_forward",
+        "stos_quad_backward",
+        "stos_byte_forward",
+        "stos_quad_once",
+        "movs_quad_forward",
+        "movs_byte_forward",
+        "movs_byte_backward",
+    ] {
+        let native = unsafe {
+            native_function::<unsafe extern "C" fn(i64, i64) -> i64>(&fixture.native, name)
+        };
+        for &(value, count) in &inputs {
+            let expected = unsafe { native(value, count) };
+            for (variant, module) in &mut fixture.transpiled {
+                assert_eq!(
+                    module.call_guest(name, [value, count, 0, 0, 0, 0]),
+                    expected,
+                    "{name}({value:#x}, count={count}) disagreed with native in {variant}"
+                );
+            }
+        }
+    }
+}

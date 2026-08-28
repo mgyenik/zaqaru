@@ -87,19 +87,28 @@ pub enum Flag {
     Carry,
     Overflow,
     Parity,
+    /// Which way the string instructions walk. Unlike the other five it is
+    /// not a result of anything — it is *set* by `std` and cleared by `cld`,
+    /// read by `movs` and `stos`, and by nothing else. A libc's `memmove`
+    /// sets it to copy an overlapping range backwards and clears it again
+    /// immediately after, which is the only reason it has to be modelled at
+    /// all rather than assumed clear.
+    Direction,
 }
 
 impl Flag {
-    pub const ALL: [Flag; 5] = [
+    pub const ALL: [Flag; 6] = [
         Flag::Zero,
         Flag::Sign,
         Flag::Carry,
         Flag::Overflow,
         Flag::Parity,
+        Flag::Direction,
     ];
 
     pub fn name(self) -> &'static str {
         match self {
+            Flag::Direction => "x86_df",
             Flag::Zero => "x86_zf",
             Flag::Sign => "x86_sf",
             Flag::Carry => "x86_cf",
@@ -115,6 +124,7 @@ impl Flag {
             Flag::Carry => 2,
             Flag::Overflow => 3,
             Flag::Parity => 4,
+            Flag::Direction => 5,
         }
     }
 }
