@@ -600,6 +600,8 @@ impl<'a> FunctionTranslator<'a> {
                 self.state.write_flag(body, Flag::Zero);
                 Ok(())
             }
+            Mnemonic::Rdtsc => self.translate_timestamp(body, false),
+            Mnemonic::Rdtscp => self.translate_timestamp(body, true),
             Mnemonic::Cpuid => self.translate_cpuid(body),
             Mnemonic::Xgetbv => self.translate_extended_control(body),
             Mnemonic::Bsf => self.translate_bit_scan(body, lifted, true),
@@ -1983,6 +1985,44 @@ impl<'a> FunctionTranslator<'a> {
 
         body.local_get(count);
         self.state.write_register(body, string_pointer(COUNT_INDEX));
+        Ok(())
+    }
+
+    /// `rdtsc`/`rdtscp`: the timestamp counter, which counts reads.
+    ///
+    /// It advances by a fixed step and answers from state rather than from
+    /// the world — see [`crate::machine::TIMESTAMP_STEP`] for why, at
+    /// length. The counter is sixty-four bits and the instruction delivers
+    /// it as two halves, the high in `%edx` and the low in `%eax`, each a
+    /// thirty-two bit write that clears the register above it.
+    fn translate_timestamp(
+        &mut self,
+        body: &mut FunctionBodyBuilder,
+        with_processor: bool,
+    ) -> Result<()> {
+        let counter = self.temporaries.take(body, ValueType::I64);
+        body.global_get(self.state.timestamp());
+        body.i64_const(crate::machine::TIMESTAMP_STEP);
+        body.i64_add();
+        body.local_tee(counter);
+        body.global_set(self.state.timestamp());
+
+        body.local_get(counter);
+        body.i32_wrap_i64();
+        self.state
+            .write_register(body, cpuid::register(REGISTER_RAX));
+        body.local_get(counter);
+        body.i64_const(32);
+        body.i64_shr_unsigned();
+        body.i32_wrap_i64();
+        self.state
+            .write_register(body, cpuid::register(REGISTER_RDX));
+        if with_processor {
+            // `rdtscp` also reports which processor answered. There is one.
+            body.i32_const(0);
+            self.state
+                .write_register(body, cpuid::register(REGISTER_RCX));
+        }
         Ok(())
     }
 

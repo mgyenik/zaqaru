@@ -34,6 +34,46 @@ use crate::emitter::{
 /// calls, and never flushed.
 pub const SEGMENT_BASE_NAME: &str = "x86_fs_base";
 
+/// The name of the timestamp counter's cell. See [`TIMESTAMP_STEP`].
+pub const TIMESTAMP_NAME: &str = "x86_tsc";
+
+/// How far the timestamp counter advances on every `rdtsc`.
+///
+/// **This counter counts reads, not cycles, and it is not a clock.** It has
+/// no relationship to elapsed time, to `/iso/time`, or to anything a guest
+/// can observe another way, and nothing should calibrate against it.
+///
+/// It works that way because of two commitments the design already makes.
+/// Replay: two runs from one seed must produce identical output, and a host
+/// timestamp read straight through would differ every run. And time as a
+/// *resource*: clocks reach the guest through `/iso/time` as syscalls —
+/// which is why the auxiliary vector omits `AT_SYSINFO_EHDR`, so that libc
+/// has no user-space clock and must ask. `rdtsc` is an instruction and
+/// bypasses that whether or not we would like it to, so it answers from
+/// state rather than from the world.
+///
+/// The step is large because the alternative is worse. A guest that spins
+/// on a timestamp deadline — wait until the counter passes `now + n` —
+/// would otherwise burn millions of iterations reaching it, and there is
+/// nothing to spin *for*: the scheduler switches only at syscalls, so a
+/// spin loop cannot be waiting on another thread's progress. Advancing
+/// about a billion per read means any plausible deadline is crossed in one
+/// or two of them and the guest falls through to whatever it does when
+/// spinning fails, which is the path that actually works here.
+///
+/// The step is odd, which is not decoration: it makes the low `k` bits
+/// cycle with period `2^k` across successive reads. glibc's adaptive mutex
+/// takes exactly those bits — `tsc & (backoff - 1)` — as jitter for its
+/// exponential backoff, and an even step would hand it the same value every
+/// time.
+///
+/// A guest that computed the counter's frequency by timing it against
+/// `clock_gettime` would get nonsense. Nothing here does: modern glibc
+/// reads the vDSO clock, which this container does not supply, and CPython
+/// calls `clock_gettime` directly. That is the assumption this constant
+/// rests on, which is why it is written down rather than left implied.
+pub const TIMESTAMP_STEP: i64 = 1_000_000_007;
+
 /// The sixteen general-purpose registers, in x86 encoding order.
 pub const REGISTER_NAMES: [&str; 16] = [
     "x86_rax", "x86_rcx", "x86_rdx", "x86_rbx", "x86_rsp", "x86_rbp", "x86_rsi", "x86_rdi",
@@ -294,6 +334,7 @@ pub struct MachineState {
     vector_registers: [[GlobalReference; 2]; VECTOR_REGISTER_COUNT],
     flags: [GlobalReference; Flag::ALL.len()],
     segment_base: GlobalReference,
+    timestamp: GlobalReference,
     pub linker_stack_pointer: GlobalReference,
 }
 
@@ -356,12 +397,14 @@ impl MachineState {
         // was — the indices are what a reader of an emitted object matches
         // against the register names.
         let segment_base = define_state_global(object, SEGMENT_BASE_NAME, ValueType::I64);
+        let timestamp = define_state_global(object, TIMESTAMP_NAME, ValueType::I64);
 
         Self {
             registers,
             vector_registers,
             flags,
             segment_base,
+            timestamp,
             linker_stack_pointer,
         }
     }
@@ -381,6 +424,10 @@ impl MachineState {
 
     pub fn segment_base(&self) -> GlobalReference {
         self.segment_base
+    }
+
+    pub fn timestamp(&self) -> GlobalReference {
+        self.timestamp
     }
 }
 
@@ -442,6 +489,16 @@ impl<'a> FunctionState<'a> {
             machine,
             promotion: None,
         }
+    }
+
+    /// The timestamp counter's cell.
+    ///
+    /// Never promoted: `rdtsc` is rare, and a counter held in a local would
+    /// have to be flushed at every call and exit for a saved machine image
+    /// to be truthful. Reading its global directly costs one instruction on
+    /// a path nothing takes often.
+    pub fn timestamp(&self) -> GlobalReference {
+        self.machine.timestamp
     }
 
     fn register_storage(&self, number: usize) -> Storage {

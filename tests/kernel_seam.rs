@@ -452,20 +452,21 @@ fn a_continuation_that_returns_reports_no_yield() {
 /// The round-trip test below cannot do this job: it builds its expected image
 /// out of the same constants `build_machine_image` walks, so a cell moved to
 /// overlap another is reproduced identically on both sides and stays
-/// invisible. Seventeen eight-byte registers, thirty-two eight-byte XMM
-/// halves, six four-byte flags, each region starting where the previous one
-/// ends.
+/// invisible. Sixteen eight-byte registers, the segment base and the
+/// timestamp counter beside them, thirty-two eight-byte XMM halves, six
+/// four-byte flags, each region starting where the previous one ends.
 #[test]
 fn the_machine_image_layout_is_what_the_model_says() {
     use zaqaru::seam::machine_image;
     assert_eq!(machine_image::REGISTER_OFFSET, 0);
     assert_eq!(machine_image::SEGMENT_BASE_OFFSET, 16 * 8);
-    assert_eq!(machine_image::VECTOR_OFFSET, 17 * 8);
-    assert_eq!(machine_image::FLAG_OFFSET, 17 * 8 + 32 * 8);
-    assert_eq!(machine_image::SIZE, 17 * 8 + 32 * 8 + 6 * 4);
-    assert_eq!(machine_image::SIZE, 416);
+    assert_eq!(machine_image::TIMESTAMP_OFFSET, 17 * 8);
+    assert_eq!(machine_image::VECTOR_OFFSET, 18 * 8);
+    assert_eq!(machine_image::FLAG_OFFSET, 18 * 8 + 32 * 8);
+    assert_eq!(machine_image::SIZE, 18 * 8 + 32 * 8 + 6 * 4);
+    assert_eq!(machine_image::SIZE, 424);
     assert_eq!(
-        machine_image::SEGMENT_BASE_OFFSET % 8,
+        machine_image::TIMESTAMP_OFFSET % 8,
         0,
         "every eight-byte cell must be eight-byte aligned"
     );
@@ -612,9 +613,17 @@ fn machine_pattern() -> Vec<u8> {
         let offset = machine_image::REGISTER_OFFSET as usize + number * 8;
         image[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
     }
-    {
-        let offset = machine_image::SEGMENT_BASE_OFFSET as usize;
-        image[offset..offset + 8].copy_from_slice(&0x0404_0000_0000_0001u64.to_le_bytes());
+    for (offset, value) in [
+        (
+            machine_image::SEGMENT_BASE_OFFSET as usize,
+            0x0404_0000_0000_0001u64,
+        ),
+        (
+            machine_image::TIMESTAMP_OFFSET as usize,
+            0x0404_0000_0000_0002u64,
+        ),
+    ] {
+        image[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
     }
     for number in 0..16usize {
         for half in 0..2usize {
@@ -623,7 +632,7 @@ fn machine_pattern() -> Vec<u8> {
             image[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
         }
     }
-    for index in 0..5usize {
+    for index in 0..zaqaru::machine::Flag::ALL.len() {
         let value = 0x0300_0000u32 | (index as u32 + 1);
         let offset = machine_image::FLAG_OFFSET as usize + index * 4;
         image[offset..offset + 4].copy_from_slice(&value.to_le_bytes());

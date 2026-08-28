@@ -219,7 +219,12 @@ pub mod machine_image {
     /// The seventeenth register sits where a seventeenth register would,
     /// which also keeps every eight-byte cell eight-byte aligned.
     pub const SEGMENT_BASE_OFFSET: u32 = 16 * 8;
-    pub const VECTOR_OFFSET: u32 = SEGMENT_BASE_OFFSET + 8;
+    /// The timestamp counter, beside the segment base for the same reason:
+    /// it is machine state that has to survive a context switch and a
+    /// checkpoint, or a resumed run reads a different value than the one it
+    /// is replaying. See `crate::machine::TIMESTAMP_STEP`.
+    pub const TIMESTAMP_OFFSET: u32 = SEGMENT_BASE_OFFSET + 8;
+    pub const VECTOR_OFFSET: u32 = TIMESTAMP_OFFSET + 8;
     pub const FLAG_OFFSET: u32 = VECTOR_OFFSET + (VECTOR_REGISTER_COUNT as u32) * 16;
     pub const SIZE: u32 = FLAG_OFFSET + (Flag::ALL.len() as u32) * 4;
 }
@@ -670,11 +675,13 @@ fn build_machine_image(machine: &MachineState, direction: Direction) -> Function
             &move |body: &mut FunctionBodyBuilder| body.global_set(global),
         );
     }
-    {
-        let global = machine.segment_base();
+    for (offset, global) in [
+        (machine_image::SEGMENT_BASE_OFFSET, machine.segment_base()),
+        (machine_image::TIMESTAMP_OFFSET, machine.timestamp()),
+    ] {
         cell(
             &mut body,
-            machine_image::SEGMENT_BASE_OFFSET,
+            offset,
             quad,
             &move |body: &mut FunctionBodyBuilder| body.global_get(global),
             &move |body: &mut FunctionBodyBuilder| body.global_set(global),
