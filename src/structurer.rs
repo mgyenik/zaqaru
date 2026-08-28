@@ -304,6 +304,9 @@ fn emit_dispatcher(
                 transfer(body, not_taken, 0)?;
             }
             Terminator::Leaves => emit_leaving(body, translator, lifted, index, graph)?,
+            // The call the block ends with was already emitted as an
+            // ordinary instruction; this says that it does not come back.
+            Terminator::Unreachable => body.unreachable(),
         }
         body.end();
     }
@@ -460,6 +463,10 @@ impl StructuredEmitter<'_> {
                 self.emit_branch(body, translator, block, destination)
             }
             Terminator::Leaves => emit_leaving(body, translator, self.lifted, block, self.graph),
+            Terminator::Unreachable => {
+                body.unreachable();
+                Ok(())
+            }
         }
     }
 

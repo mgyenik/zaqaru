@@ -120,3 +120,68 @@ fn a_loop_is_recognised_as_one() {
         "`gcd` has an unreachable basic block"
     );
 }
+
+/// A call that never comes back ends the function, and control does not
+/// continue past it.
+///
+/// A compiler that knows a callee is `noreturn` emits nothing after the
+/// call — no `ret`, no jump. The function's last byte is the call's last
+/// byte. Reading that as a fall-through asks where control goes next and
+/// finds no block there, which refused the function; the answer is that
+/// there is nowhere, and saying so is what `Terminator::Unreachable` is.
+///
+/// This is not a corner. gcc splits every cold path into a fragment ending
+/// this way, and a static glibc `hello` had 332 functions refused for it —
+/// nearly a third of the binary.
+#[test]
+fn a_function_ending_in_a_call_that_never_returns_stops_there() {
+    use zaqaru::cfg::Terminator;
+
+    let workspace = WorkingDirectory::new("cfg-noreturn");
+    let object_path = compile_corpus_object(&workspace, "noreturn_call.c");
+    let bytes = std::fs::read(&object_path).expect("read compiled object");
+    let object = ObjectFile::parse(&bytes).expect("parse object");
+    let functions = lifter::lift_object(&object).expect("lift object");
+
+    let give_up = functions
+        .iter()
+        .find(|function| function.name == "give_up")
+        .expect("the fixture no longer defines `give_up`");
+    let graph = ControlFlowGraph::build(give_up).expect("build the graph");
+
+    // The premise: the function really does end with its call.
+    let last = give_up
+        .instructions
+        .last()
+        .expect("`give_up` has instructions");
+    assert_eq!(
+        last.instruction.flow_control(),
+        iced_x86::FlowControl::Call,
+        "`give_up` no longer ends in a call, so this proves nothing"
+    );
+
+    let end = graph.blocks.last().expect("a graph has blocks");
+    assert_eq!(
+        end.terminator,
+        Terminator::Unreachable,
+        "the block that runs off the end of the function is not marked as \
+         going nowhere"
+    );
+    // And the call itself is still translated: it is an ordinary instruction
+    // that happens to be last, not a terminator that gets special handling.
+    assert_eq!(
+        end.body_instructions().end,
+        end.instructions.end,
+        "the call was treated as a terminator and dropped from the body"
+    );
+    assert!(graph.successors(graph.blocks.len() - 1).is_empty());
+
+    // A function with one such path among others still translates whole.
+    assert!(
+        functions.iter().any(|function| function.name == "checked"),
+        "the fixture no longer defines `checked`"
+    );
+    zaqaru::transpile::Transpiler::new(&object)
+        .transpile()
+        .expect("translating a function whose last instruction never returns");
+}

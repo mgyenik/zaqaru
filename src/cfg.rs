@@ -35,6 +35,17 @@ pub enum Terminator {
     /// A `ret`, or a tail jump to another function — including an indirect
     /// one — which the translator turns into a call followed by a return.
     Leaves,
+    /// The block's last instruction runs, and control does not continue past
+    /// it.
+    ///
+    /// A function whose final instruction is a `call` with nothing after it
+    /// called something that does not return, and the compiler emitted
+    /// nothing for a path that cannot be taken — `abort`, `exit`,
+    /// `__stack_chk_fail`, `_Unwind_Resume`. Every `.cold` fragment gcc
+    /// splits out of a function ends this way, and so does every wrapper
+    /// around a `noreturn`. There is no fall-through successor because
+    /// there is no fall-through.
+    Unreachable,
 }
 
 #[derive(Clone, Debug)]
@@ -51,7 +62,10 @@ impl BasicBlock {
     /// terminating transfer, which belongs to the structurer.
     pub fn body_instructions(&self) -> std::ops::Range<usize> {
         match self.terminator {
-            Terminator::FallThrough { .. } => self.instructions.clone(),
+            // The call is an ordinary instruction in both: what follows it
+            // is the terminator, and for `Unreachable` what follows it is
+            // nothing.
+            Terminator::FallThrough { .. } | Terminator::Unreachable => self.instructions.clone(),
             _ => self.instructions.start..self.instructions.end - 1,
         }
     }
@@ -68,7 +82,7 @@ impl BasicBlock {
     /// a transfer of its own rather than by running into the next one.
     pub fn terminating_instruction(&self) -> Option<usize> {
         match &self.terminator {
-            Terminator::FallThrough { .. } => None,
+            Terminator::FallThrough { .. } | Terminator::Unreachable => None,
             _ => Some(self.instructions.end - 1),
         }
     }
@@ -113,6 +127,8 @@ impl ControlFlowGraph {
                 .copied()
                 .into_iter()
                 .collect(),
+            // Nothing follows it, which is the point.
+            Terminator::Unreachable => Vec::new(),
             Terminator::Branch { target, not_taken } => [target, not_taken]
                 .iter()
                 .filter_map(|offset| self.index_of_start.get(offset).copied())
@@ -180,6 +196,8 @@ impl ControlFlowGraph {
                     graph.block_at(*target)?;
                     graph.block_at(*not_taken)?;
                 }
+                // No internal transfer to check: control does not continue.
+                Terminator::Unreachable => {}
                 Terminator::Switch { targets } => {
                     for target in targets {
                         graph.block_at(*target)?;
@@ -520,6 +538,12 @@ fn classify_terminator(
         return Terminator::ConditionalLeave {
             not_taken: block_end,
         };
+    }
+    // Nothing follows, and the block runs off the end of the function. A
+    // compiler emits that only after a call that does not return, so the
+    // honest translation of the path past it is that there is not one.
+    if instruction.flow_control() == FlowControl::Call && !function.contains(block_end) {
+        return Terminator::Unreachable;
     }
     Terminator::FallThrough { next: block_end }
 }
