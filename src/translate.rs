@@ -140,6 +140,16 @@ struct OperationValues {
     result: u32,
 }
 
+/// What a bit-test instruction does to the bit it selected.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BitAction {
+    /// `bt`: reads it and writes nothing back.
+    Read,
+    Set,
+    Clear,
+    Complement,
+}
+
 /// Which flags an operation writes, and by what rule.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum FlagRule {
@@ -494,6 +504,12 @@ impl<'a> FunctionTranslator<'a> {
             Mnemonic::Not => self.translate_complement(body, lifted),
             Mnemonic::Inc => self.translate_step(body, lifted, FlagRule::Addition),
             Mnemonic::Dec => self.translate_step(body, lifted, FlagRule::Subtraction),
+            Mnemonic::Rol => self.translate_rotate(body, lifted, true),
+            Mnemonic::Ror => self.translate_rotate(body, lifted, false),
+            Mnemonic::Bt => self.translate_bit_test(body, lifted, BitAction::Read),
+            Mnemonic::Bts => self.translate_bit_test(body, lifted, BitAction::Set),
+            Mnemonic::Btr => self.translate_bit_test(body, lifted, BitAction::Clear),
+            Mnemonic::Btc => self.translate_bit_test(body, lifted, BitAction::Complement),
             Mnemonic::Shl | Mnemonic::Sal => self.translate_shift(body, lifted, ShiftKind::Left),
             Mnemonic::Shr => self.translate_shift(body, lifted, ShiftKind::RightLogical),
             Mnemonic::Sar => self.translate_shift(body, lifted, ShiftKind::RightArithmetic),
@@ -1526,6 +1542,249 @@ impl<'a> FunctionTranslator<'a> {
         Ok(())
     }
 
+    /// `rol`/`ror`: the bits that leave one end arrive at the other.
+    ///
+    /// Unlike a shift, a rotate writes only two flags. The sign, zero,
+    /// parity and adjust flags are *unaffected* — a rotate does not define
+    /// them, and writing them would diverge from hardware on the next
+    /// instruction that reads one.
+    fn translate_rotate(
+        &mut self,
+        body: &mut FunctionBodyBuilder,
+        lifted: &LiftedInstruction,
+        left: bool,
+    ) -> Result<()> {
+        let width = self.destination_width(&lifted.instruction)?;
+        let value_type = width.value_type();
+        let bits = width.bits() as i32;
+
+        let value = self.temporaries.take(body, value_type);
+        let count = self.temporaries.take(body, ValueType::I32);
+        let amount = self.temporaries.take(body, ValueType::I32);
+        let result = self.temporaries.take(body, value_type);
+
+        self.read_operand(body, lifted, 0, width)?;
+        body.local_set(value);
+
+        // Masked exactly as a shift's count is, five bits or six, *before*
+        // being reduced modulo the operand's own width. The two are
+        // different: a 16-bit rotate by 16 has a masked count of 16, which
+        // is not zero — so it writes flags — and a rotate amount of zero, so
+        // it moves nothing.
+        self.read_operand(body, lifted, 1, OperandWidth::Byte)?;
+        body.i32_const(if width == OperandWidth::QuadWord {
+            0x3f
+        } else {
+            0x1f
+        });
+        body.i32_and();
+        body.local_set(count);
+        body.local_get(count);
+        body.i32_const(bits);
+        body.i32_rem_unsigned();
+        body.local_set(amount);
+
+        match width {
+            // Wasm rotates the whole carrier, which is the operand exactly
+            // at these two widths.
+            OperandWidth::QuadWord => {
+                body.local_get(value);
+                body.local_get(amount);
+                body.i64_extend_i32_unsigned();
+                if left {
+                    body.i64_rotate_left();
+                } else {
+                    body.i64_rotate_right();
+                }
+                body.local_set(result);
+            }
+            OperandWidth::DoubleWord => {
+                body.local_get(value);
+                body.local_get(amount);
+                if left {
+                    body.i32_rotate_left();
+                } else {
+                    body.i32_rotate_right();
+                }
+                body.local_set(result);
+            }
+            // Narrower than the carrier, so the wasm rotate would carry bits
+            // in from the padding above the operand. Two shifts and an or,
+            // with the zero case taken out: shifting a carrier by its own
+            // width is masked back to a shift by zero, which would leave the
+            // value where a rotate by nothing has to leave it anyway — but
+            // by the wrong route, and the other half would then duplicate it.
+            _ => {
+                // Rotating by nothing is the identity, and it has to be
+                // spelled that way rather than fall out of the arithmetic:
+                // the other half would shift by the operand's whole width,
+                // which wasm masks back to a shift by zero and would
+                // duplicate the value instead of contributing nothing.
+                body.local_get(value);
+                body.local_set(result);
+                body.local_get(amount);
+                body.i32_eqz();
+                body.i32_eqz();
+                body.if_();
+                body.local_get(value);
+                body.local_get(amount);
+                if left {
+                    body.i32_shl();
+                } else {
+                    body.i32_shr_unsigned();
+                }
+                body.local_get(value);
+                body.i32_const(bits);
+                body.local_get(amount);
+                body.i32_sub();
+                if left {
+                    body.i32_shr_unsigned();
+                } else {
+                    body.i32_shl();
+                }
+                body.i32_or();
+                body.local_set(result);
+                body.end();
+            }
+        }
+        body.local_get(result);
+        emit_mask_to_width(body, width);
+        body.local_set(result);
+        self.write_operand(body, lifted, 0, width, result)?;
+
+        // A rotate by a masked count of zero writes no flag at all.
+        body.local_get(count);
+        body.i32_eqz();
+        body.i32_eqz();
+        body.if_();
+        // Carry takes the bit that came round: the lowest for a left
+        // rotate, the highest for a right one.
+        body.local_get(result);
+        if left {
+            emit_low_bit(body, width);
+        } else {
+            emit_sign_bit(body, width);
+        }
+        self.state.write_flag(body, Flag::Carry);
+        // Overflow is architecturally defined for a count of one only. The
+        // formula is emitted for every count because that is what hardware
+        // does, and because a value nobody may read is better matching than
+        // invented.
+        body.local_get(result);
+        emit_sign_bit(body, width);
+        body.local_get(result);
+        if left {
+            emit_low_bit(body, width);
+        } else {
+            emit_second_bit(body, width);
+        }
+        body.i32_xor();
+        self.state.write_flag(body, Flag::Overflow);
+        body.end();
+        Ok(())
+    }
+
+    /// `bt`, `bts`, `btr`, `btc`: the selected bit goes to the carry flag,
+    /// and three of the four then write it back changed.
+    ///
+    /// Only the register-destination form is here. With a memory
+    /// destination and a *register* offset, x86 reads a bit string — the
+    /// offset is signed and may reach far outside the operand named — which
+    /// is a different instruction wearing the same mnemonic, and guessing at
+    /// it would address the wrong byte silently.
+    fn translate_bit_test(
+        &mut self,
+        body: &mut FunctionBodyBuilder,
+        lifted: &LiftedInstruction,
+        action: BitAction,
+    ) -> Result<()> {
+        let instruction = &lifted.instruction;
+        if instruction.op_kind(0) != OpKind::Register && instruction.op_kind(1) == OpKind::Register
+        {
+            bail!(
+                "`{}` addresses a bit string in memory, whose offset is not \
+                 bounded by the operand; only the register form is translated",
+                render(instruction)
+            );
+        }
+        let width = self.destination_width(instruction)?;
+        let value_type = width.value_type();
+
+        let value = self.temporaries.take(body, value_type);
+        let offset = self.temporaries.take(body, ValueType::I32);
+        let selected = self.temporaries.take(body, value_type);
+
+        self.read_operand(body, lifted, 0, width)?;
+        body.local_set(value);
+        // At the destination's width, not a byte: a shift takes its count
+        // from `%cl` and this takes its offset from a full register, so
+        // asking for a byte gets the register as it is rather than narrowed.
+        // Then reduced modulo the operand's width, which is what makes this
+        // the bounded form.
+        self.read_operand(body, lifted, 1, width)?;
+        match width.carrier() {
+            Carrier::I32 => {
+                body.i32_const(width.bits() as i32 - 1);
+                body.i32_and();
+            }
+            Carrier::I64 => {
+                body.i64_const(width.bits() as i64 - 1);
+                body.i64_and();
+                body.i32_wrap_i64();
+            }
+        }
+        body.local_set(offset);
+
+        // A one in the selected position, as the operand's own type.
+        emit_constant(body, width, 1);
+        emit_shift_count(body, width, offset);
+        match width.carrier() {
+            Carrier::I32 => body.i32_shl(),
+            Carrier::I64 => body.i64_shl(),
+        }
+        body.local_set(selected);
+
+        // Carry takes the bit as it was, before anything writes it back.
+        body.local_get(value);
+        body.local_get(selected);
+        match width.carrier() {
+            Carrier::I32 => body.i32_and(),
+            Carrier::I64 => body.i64_and(),
+        }
+        emit_is_zero(body, width);
+        body.i32_eqz();
+        self.state.write_flag(body, Flag::Carry);
+
+        // Every other flag is architecturally undefined here, and hardware
+        // leaves them alone — so this does too.
+        if action == BitAction::Read {
+            return Ok(());
+        }
+        let result = self.temporaries.take(body, value_type);
+        body.local_get(value);
+        body.local_get(selected);
+        match (width.carrier(), action) {
+            (Carrier::I32, BitAction::Set) => body.i32_or(),
+            (Carrier::I64, BitAction::Set) => body.i64_or(),
+            (Carrier::I32, BitAction::Complement) => body.i32_xor(),
+            (Carrier::I64, BitAction::Complement) => body.i64_xor(),
+            (Carrier::I32, _) => {
+                // Clear: and with the complement of the selected bit.
+                body.i32_const(-1);
+                body.i32_xor();
+                body.i32_and();
+            }
+            (Carrier::I64, _) => {
+                body.i64_const(-1);
+                body.i64_xor();
+                body.i64_and();
+            }
+        }
+        emit_mask_to_width(body, width);
+        body.local_set(result);
+        self.write_operand(body, lifted, 0, width, result)
+    }
+
     fn emit_shift_flags(
         &mut self,
         body: &mut FunctionBodyBuilder,
@@ -2551,6 +2810,40 @@ fn emit_is_zero(body: &mut FunctionBodyBuilder, width: OperandWidth) {
     match width.carrier() {
         Carrier::I32 => body.i32_eqz(),
         Carrier::I64 => body.i64_eqz(),
+    }
+}
+
+/// Bit zero of the value on the stack, as an `i32` of `0` or `1`.
+fn emit_low_bit(body: &mut FunctionBodyBuilder, width: OperandWidth) {
+    match width.carrier() {
+        Carrier::I32 => {
+            body.i32_const(1);
+            body.i32_and();
+        }
+        Carrier::I64 => {
+            body.i32_wrap_i64();
+            body.i32_const(1);
+            body.i32_and();
+        }
+    }
+}
+
+/// The bit below the sign bit, which a right rotate's overflow rule needs.
+fn emit_second_bit(body: &mut FunctionBodyBuilder, width: OperandWidth) {
+    match width.carrier() {
+        Carrier::I32 => {
+            body.i32_const(width.bits() as i32 - 2);
+            body.i32_shr_unsigned();
+            body.i32_const(1);
+            body.i32_and();
+        }
+        Carrier::I64 => {
+            body.i64_const(width.bits() as i64 - 2);
+            body.i64_shr_unsigned();
+            body.i32_wrap_i64();
+            body.i32_const(1);
+            body.i32_and();
+        }
     }
 }
 

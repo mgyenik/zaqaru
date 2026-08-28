@@ -2580,3 +2580,88 @@ fn atomic_read_modify_write_matches_native() {
         }
     }
 }
+
+/// `rol`/`ror` and the `bt` family against native.
+///
+/// Bit motion that is not a shift, and the difficulty is entirely in the
+/// flags: a shift writes five, a rotate writes two and must leave the other
+/// four exactly as it found them, and `bt` writes only the carry. A flag
+/// written that should not have been diverges on the *next* instruction
+/// rather than this one, so several of these set the flags to a known state
+/// first and read back only the ones that are supposed to have survived.
+#[test]
+fn rotates_and_bit_tests_match_native() {
+    let mut fixture = DifferentialFixture::build("rotate-bits", &["rotate_bits.s"]);
+
+    let mut inputs: Vec<(i64, i64)> = Vec::new();
+    const VALUES: [i64; 10] = [
+        0,
+        1,
+        -1,
+        0x80,
+        0xff,
+        0x8000,
+        0x0123_4567_89ab_cdef,
+        i64::MIN,
+        i64::MAX,
+        0x5555_5555_5555_5555,
+    ];
+    for &value in &VALUES {
+        // Every count from none through past the widest operand, so the
+        // masking and the reduction modulo the operand's width are both
+        // exercised — including the counts that mask to a multiple of a
+        // narrow width, which rotate nothing and still write flags.
+        for count in 0..=72i64 {
+            inputs.push((value, count));
+        }
+    }
+    let mut generator = Pseudorandom::new(0x726f_7461_0000_0001);
+    for _ in 0..RANDOM_ITERATIONS {
+        inputs.push((generator.next_i64(), generator.next_i64() & 0x7f));
+    }
+
+    for name in [
+        "rol_qword",
+        "ror_qword",
+        "rol_dword",
+        "ror_dword",
+        "rol_word",
+        "ror_word",
+        "rol_byte",
+        "ror_byte",
+        "rol_qword_flags",
+        "ror_qword_flags",
+        "rol_word_flags",
+        "ror_word_flags",
+        "rol_byte_flags",
+        "rol_preserves_flags",
+        "ror_preserves_flags",
+        "ror_qword_immediate",
+        "rol_word_immediate",
+        "bt_qword",
+        "bt_dword",
+        "bt_qword_immediate",
+        "bt_preserves_flags",
+        "bts_qword",
+        "btr_qword",
+        "btc_qword",
+        "bts_qword_carry",
+        "btr_qword_carry",
+        "btc_qword_carry",
+        "bts_dword",
+    ] {
+        let native = unsafe {
+            native_function::<unsafe extern "C" fn(i64, i64) -> i64>(&fixture.native, name)
+        };
+        for &(value, count) in &inputs {
+            let expected = unsafe { native(value, count) };
+            for (variant, module) in &mut fixture.transpiled {
+                assert_eq!(
+                    module.call_guest(name, [value, count, 0, 0, 0, 0]),
+                    expected,
+                    "{name}({value:#x}, {count}) disagreed with native in {variant}"
+                );
+            }
+        }
+    }
+}
