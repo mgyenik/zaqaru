@@ -1063,3 +1063,44 @@ rather than a reason to argue with it. The instruction rows below the
 top two (`cmpxchg`, `xchg`, `pmovmskb`, `ror`, `bt`, `stosq`, `cpuid`)
 are real gaps that musl and CPython will want too, and they are the part
 of this list worth working from.
+
+### Correction: the 338 were not out of scope
+
+The table above says 338 refusals were "a branch into the middle of
+another function", and cites `_dl_start` jumping into `abort`. That is
+wrong, and the way it was got wrong is worth keeping.
+
+The reported offset is **section-relative**, because the lifter decodes
+each function with its offset within its section as the program counter.
+I read it as function-relative: added `0xb9` to `_dl_start`'s address
+instead of to `.text`'s, landed inside `abort` by coincidence, and
+generalised from that one sample to all 338 — then labelled the category
+out of scope on the strength of it.
+
+Measuring all 338 instead of one: **332 are a fall-through off the
+function's own end**, six are something else. `.text` is at `0x401180`,
+`_dl_start` is at section offset `0xac` with a stated size of 13, so it
+spans `[0xac, 0xb9)` — and `0xb9` is one past its own last byte, not a
+jump 185 bytes away.
+
+What they actually are: a function whose final instruction is a call to
+something that does not return. `__libc_message_impl.cold` is five bytes
+and is one `call abort`. `_nl_load_domain.cold` is the same five bytes.
+gcc emits nothing after such a call because control cannot continue, and
+the graph builder asked where control continues.
+
+`Terminator::Unreachable` is the answer, and it took the refusal count
+from 719 to 522 and the branch category from 338 to 20. The remaining
+worklist is mostly instructions after all — `cmpxchg` (93), `xchg` (32),
+`ror` (27), `pmovmskb` (16), `stosq` (10), `punpcklbw` (8), `bt` (8),
+`cpuid` (7) — plus the 180 static-ifunc PLT calls, which are real.
+
+Two lessons, both of which this project has recorded before:
+
+- **One sample is not a category.** Reading a single failure and
+  extending it to 338 produced a confident, wrong claim about a third of
+  a binary — and the claim conveniently made the work disappear.
+- **"Out of scope" needs the same evidence as any other assertion.**
+  Citing the design doc's out-of-scope clause for a category I had not
+  measured is exactly the deferral this worklog keeps recording. The
+  design's clause is real; it just did not apply to these.
