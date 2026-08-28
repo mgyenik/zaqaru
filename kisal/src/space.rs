@@ -197,6 +197,18 @@ pub struct Space {
     /// Ranges `munmap` gave back, for address reuse. Memory never shrinks,
     /// so this is the only way an address is ever used twice.
     free: Vec<(u64, u64)>,
+    /// One past the highest address the guest may be given.
+    ///
+    /// The guest's arenas are a *reserved block*, not whatever lies above
+    /// the module. They have to be, because the kernel's own allocator takes
+    /// its pages from the end of linear memory and so would the arenas —
+    /// two claimants on the same bytes, interleaving, with the guest's `brk`
+    /// memory and the kernel's heap silently the same. Reserving the block
+    /// once at boot puts the kernel's heap above it for good.
+    ///
+    /// So the guest's address space is bounded, and running out of it is an
+    /// ordinary `ENOMEM` rather than a collision nothing detects.
+    ceiling: u64,
 }
 
 impl Space {
@@ -205,8 +217,19 @@ impl Space {
     /// `start` is the top of memory at boot, which is above the linker's
     /// data, the shadow stack, and whatever the kernel's own allocator has
     /// taken. Everything the guest is given comes from here up.
+    /// Unbounded, for the native tests: off wasm there is no shared memory
+    /// to collide over, and a test that is not about exhaustion should not
+    /// have to say how much space it wants.
     pub fn new(start: u64) -> Self {
         Self::with_brk_ceiling(start, BRK_CEILING)
+    }
+
+    /// Bounded to a reserved block, which is what a container gets.
+    pub fn within(start: u64, ceiling: u64) -> Self {
+        Self {
+            ceiling,
+            ..Self::with_brk_ceiling(start, BRK_CEILING)
+        }
     }
 
     /// The same, with the `brk` arena sized explicitly.
@@ -229,6 +252,7 @@ impl Space {
             high_water: brk_start,
             vmas: Vec::new(),
             free: Vec::new(),
+            ceiling: u64::MAX,
         }
     }
 
@@ -333,7 +357,9 @@ impl Space {
                 return Err(Errno::Exists);
             }
             let end = start.checked_add(length).ok_or(Errno::NoMemory)?;
-            if !grow(end) {
+            // Past the reserved block is not the guest's to have: above it
+            // is where the kernel's own allocator lives.
+            if end > self.ceiling || !grow(end) {
                 return Err(Errno::NoMemory);
             }
             self.punch(start, length);
@@ -389,7 +415,7 @@ impl Space {
         }
         let start = self.top();
         let end = start.checked_add(length).ok_or(Errno::NoMemory)?;
-        if !grow(end) {
+        if end > self.ceiling || !grow(end) {
             return Err(Errno::NoMemory);
         }
         Ok(start)

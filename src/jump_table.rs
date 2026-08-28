@@ -167,6 +167,21 @@ struct Candidate {
 /// relative form entries are stored against their own table, so the targets
 /// come out wrong rather than surplus.
 pub fn recover_all(object: &ObjectFile, functions: &mut [LiftedFunction]) -> Result<()> {
+    // Every instruction boundary in every function, by section. A table's
+    // arms are blocks, and a block is not always in the function that
+    // dispatches to it: gcc moves cold blocks into a `.cold` fragment of
+    // their own, and the switch that reaches them still reaches them.
+    // Bounding the scan to one function reads a short table, and a valid
+    // index then dispatches past its end.
+    let mut boundaries: std::collections::HashMap<usize, std::collections::BTreeSet<u64>> =
+        std::collections::HashMap::new();
+    for function in functions.iter() {
+        let starts = boundaries.entry(function.section).or_default();
+        for lifted in &function.instructions {
+            starts.insert(lifted.offset);
+        }
+    }
+
     let mut candidates: Vec<(usize, Candidate)> = Vec::new();
     for (index, function) in functions.iter().enumerate() {
         for (position, lifted) in function.instructions.iter().enumerate() {
@@ -186,7 +201,13 @@ pub fn recover_all(object: &ObjectFile, functions: &mut [LiftedFunction]) -> Res
 
     for (function_index, candidate) in &candidates {
         let limit = table_limit(object, &starts, candidate);
-        let Some(table) = read_table(object, &functions[*function_index], candidate, limit) else {
+        let Some(table) = read_table(
+            object,
+            &functions[*function_index],
+            candidate,
+            limit,
+            &boundaries,
+        ) else {
             continue;
         };
         functions[*function_index]
@@ -336,6 +357,7 @@ fn read_table(
     function: &LiftedFunction,
     candidate: &Candidate,
     limit: u64,
+    boundaries: &std::collections::HashMap<usize, std::collections::BTreeSet<u64>>,
 ) -> Option<JumpTable> {
     if object.layout == Layout::Linked {
         // Nothing says which form the entries are in, so each is tried and
@@ -345,7 +367,9 @@ fn read_table(
         // first form listed is the one a non-PIE compiler used.
         return ENTRY_FORMS
             .iter()
-            .filter_map(|form| read_linked_table(object, function, candidate, limit, *form))
+            .filter_map(|form| {
+                read_linked_table(object, function, candidate, limit, *form, boundaries)
+            })
             .max_by_key(|table| table.targets.len());
     }
     let first = relocation_at(object, candidate.table_section, candidate.table_offset)?;
@@ -396,7 +420,9 @@ fn read_linked_table(
     candidate: &Candidate,
     limit: u64,
     form: EntryForm,
+    boundaries: &std::collections::HashMap<usize, std::collections::BTreeSet<u64>>,
 ) -> Option<JumpTable> {
+    let elsewhere = boundaries.get(&function.section);
     let mut targets = Vec::new();
     for index in 0.. {
         let entry_offset = candidate.table_offset + index * form.stride;
@@ -412,7 +438,14 @@ fn read_linked_table(
         ) else {
             break;
         };
-        if !begins_an_instruction(function, target) {
+        // An instruction boundary anywhere in this section, not only in the
+        // dispatching function: an arm may land in a `.cold` fragment that
+        // the symbol table calls a function of its own. What decides that
+        // this *is* a table — that its first entries are blocks inside the
+        // dispatching function and not its start — is asked separately, and
+        // stays strict.
+        let boundary = elsewhere.is_some_and(|starts| starts.contains(&target));
+        if !boundary {
             break;
         }
         targets.push(target);

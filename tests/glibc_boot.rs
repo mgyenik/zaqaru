@@ -14,15 +14,7 @@ fn path(segments: &[&[u8]]) -> Vec<Vec<u8>> {
     segments.iter().map(|segment| segment.to_vec()).collect()
 }
 
-/// Not yet passing, and kept as the standing measure of how far a real
-/// binary gets. What stops it today is a jump table whose arms leave the
-/// function: `read_encoded_value_with_base` switches on a DWARF encoding
-/// byte and some arms land in its `.cold` fragment, so the entry scan —
-/// which stops where targets stop being instruction boundaries *inside* the
-/// function — reads a table shorter than the real one, and a valid encoding
-/// dispatches past its end.
 #[test]
-#[ignore = "the boot reaches DWARF frame registration and stops at a truncated jump table"]
 fn a_static_glibc_hello_runs() {
     let workspace = WorkingDirectory::new("glibc-hello");
 

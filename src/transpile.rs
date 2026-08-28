@@ -1495,8 +1495,18 @@ fn resume_entries(lifted: &LiftedFunction, graph: &ControlFlowGraph) -> Result<H
     // no instruction occupies, which is what keeps the two kinds of key
     // apart.
     for block in &graph.blocks {
-        if let crate::cfg::Terminator::FallsOut { into } = block.terminator {
-            entries.insert(into, epilogue);
+        match &block.terminator {
+            crate::cfg::Terminator::FallsOut { into } => {
+                entries.insert(*into, epilogue);
+            }
+            // A `switch` arm that leaves the function is a tail call, and it
+            // reserves a slot the same way.
+            crate::cfg::Terminator::Switch { targets } => {
+                for target in targets.iter().filter(|target| !lifted.contains(**target)) {
+                    entries.insert(*target, epilogue);
+                }
+            }
+            _ => {}
         }
     }
     Ok(entries)

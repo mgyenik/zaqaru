@@ -161,18 +161,25 @@ fn a_failing_log_store_is_not_reported_through_itself() {
     assert!(kernel.store.contents(paths::LOG_ERROR).is_empty());
 }
 
+/// The named half of the loud-error policy.
+///
+/// This needs a syscall the table *names* and does not implement, so its
+/// choice has to move as the grind proceeds — `getpid` was it until `getpid`
+/// was implemented. `clone3` is the furthest out of the named ones, and the
+/// premise is asserted, so the day it gains a row this fails and says so
+/// rather than passing quietly.
 #[test]
 fn an_unimplemented_syscall_faults_and_names_itself() {
     let mut kernel = Kernel::new(Recording::default(), Registers::default(), empty_image());
-    let outcome = kernel.dispatch(number::GETPID, Arguments::new([0; 6]));
+    let outcome = kernel.dispatch(number::CLONE3, Arguments::new([0; 6]));
     let Outcome::Fault(fault) = outcome else {
         panic!("an unimplemented syscall produced {outcome:?} instead of a fault");
     };
     assert_eq!(
         fault,
         Fault {
-            number: number::GETPID,
-            name: Some("getpid"),
+            number: number::CLONE3,
+            name: Some("clone3"),
             arguments: [0; 6],
             detail: None,
         }
@@ -181,7 +188,7 @@ fn an_unimplemented_syscall_faults_and_names_itself() {
     fault.message(&mut message);
     assert_eq!(
         message,
-        "kisal: unimplemented syscall getpid (39) with (0, 0, 0, 0, 0, 0)"
+        "kisal: unimplemented syscall clone3 (435) with (0, 0, 0, 0, 0, 0)"
     );
 }
 

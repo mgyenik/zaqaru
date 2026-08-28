@@ -370,6 +370,16 @@ enum Direction {
 /// The container's only process, which is the first in its own namespace.
 pub const PROCESS_ID: i64 = 1;
 
+/// How much linear memory the guest's arenas are given.
+///
+/// Reserved in one block at boot rather than grown as needed, because the
+/// kernel's allocator grows from the end of memory too and the two would
+/// otherwise interleave — see [`crate::space::Space`]. Wasm memory never
+/// shrinks and untouched pages cost address space rather than anything
+/// else, so a generous block is close to free and a stingy one is an
+/// `ENOMEM` a guest did not deserve.
+pub const GUEST_ADDRESS_SPACE: u64 = 512 * 1024 * 1024;
+
 /// The size Linux requires of a `struct robust_list_head`, and refuses any
 /// other. A caller passing a different one was built against a different
 /// kernel.
@@ -418,8 +428,17 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
     /// which is what mounting means: `mount` on a missing mount point fails
     /// on Linux as well, and inventing the directory would be inventing a
     /// filesystem the image did not ask for.
-    pub fn new(store: S, machine: M, image: crate::image::Image<'a>) -> Self {
+    pub fn new(store: S, mut machine: M, image: crate::image::Image<'a>) -> Self {
+        // The guest's arenas are a block reserved once, here, and not
+        // whatever happens to lie above the module. They have to be: the
+        // kernel's own allocator takes its pages from the end of linear
+        // memory, and so would the arenas — two claimants on the same
+        // bytes, with the guest's `brk` memory and the kernel's heap
+        // silently the same. Growing to the ceiling now puts every later
+        // kernel allocation above it, permanently.
         let space_start = machine.memory_limit();
+        let space_ceiling = space_start.saturating_add(GUEST_ADDRESS_SPACE);
+        let reserved = machine.grow(space_ceiling);
         let mut kernel = Self {
             store,
             machine,
@@ -435,7 +454,17 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             // the linker's data, the shadow stack, and anything the
             // kernel's own allocator has taken. Everything the guest is
             // given comes from there up.
-            space: crate::space::Space::new(space_start),
+            space: if reserved {
+                crate::space::Space::within(space_start, space_ceiling)
+            } else {
+                // The reservation always succeeds inside a module, where
+                // memory grows on request. It fails only in a native test,
+                // whose address space is a buffer it allocated — and there
+                // the bound has nothing to do, because the thing it keeps
+                // the guest away from is a kernel allocator that native
+                // tests do not share memory with.
+                crate::space::Space::new(space_start)
+            },
         };
         kernel.seed_random();
         kernel.mount_synthetics();

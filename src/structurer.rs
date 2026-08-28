@@ -126,8 +126,17 @@ fn emit_switch(
     body.end();
 
     for (arm, target) in targets.iter().enumerate() {
-        // Inside arm `k` sit the arms after it plus the default block.
-        transfer(body, *target, (arms - arm) as u32)?;
+        if lifted.contains(*target) {
+            // Inside arm `k` sit the arms after it plus the default block.
+            transfer(body, *target, (arms - arm) as u32)?;
+        } else {
+            // An arm that leaves the function is a tail call, the same as a
+            // jump that leaves by any other route. gcc's cold-block
+            // splitting produces these: a `switch` whose unusual cases were
+            // moved into a fragment with a symbol of its own.
+            translator.emit_fall_out(body, *target)?;
+            body.return_();
+        }
         body.end();
     }
     body.unreachable();
@@ -428,10 +437,15 @@ impl StructuredEmitter<'_> {
                 self.emit_branch(body, translator, block, destination)
             }
             Terminator::Switch { targets } => {
-                // Every target is forced to be a merge point, so each has a
-                // `block` of its own to branch to and none needs inlining.
+                // Every target that stays inside is forced to be a merge
+                // point, so each has a `block` of its own to branch to and
+                // none needs inlining. An arm that leaves has no block at
+                // all — it is a tail call, and `emit_switch` emits it
+                // without asking for a depth, so this list skips it and the
+                // two stay in step by walking the arms in the same order.
                 let depths: Vec<u32> = targets
                     .iter()
+                    .filter(|target| self.lifted.contains(**target))
                     .map(|target| {
                         let destination = self.graph.block_at(*target)?;
                         self.branch_depth(destination)

@@ -131,6 +131,8 @@ impl ControlFlowGraph {
                 .copied()
                 .into_iter()
                 .collect(),
+            // An arm that leaves the function has no successor here, which
+            // is what makes it a tail call rather than a branch.
             Terminator::Switch { targets } => targets
                 .iter()
                 .filter_map(|offset| self.index_of_start.get(offset).copied())
@@ -222,7 +224,7 @@ impl ControlFlowGraph {
                 // the other leaves for the function below.
                 Terminator::Unreachable | Terminator::FallsOut { .. } => {}
                 Terminator::Switch { targets } => {
-                    for target in targets {
+                    for target in targets.iter().filter(|target| function.contains(**target)) {
                         graph.block_at(*target)?;
                     }
                 }
@@ -549,11 +551,15 @@ fn collect_leaders(function: &LiftedFunction, split_after_calls: bool) -> Result
 
         // A recovered `switch` reaches every one of its targets.
         if let Some(table) = function.jump_tables.get(&position) {
+            // Only the arms that stay inside. One that leaves is a tail
+            // call, and a tail call's destination is another function's
+            // entry rather than a block of this one.
             leaders.extend(
                 table
                     .targets
                     .iter()
-                    .map(|target| canonical_target(function, *target)),
+                    .map(|target| canonical_target(function, *target))
+                    .filter(|target| function.contains(*target)),
             );
         }
 
