@@ -1106,6 +1106,13 @@ pub fn link_container_for_program(
     let mut arguments = vec![
         "--fatal-warnings",
         "--export=cabi_realloc",
+        // How the host starts a container. Nothing inside the module calls
+        // it, so without this the linker would drop it as unreachable.
+        "--export=kisal_boot",
+        // The exec map and the seam's yield slot, so a test can ask the
+        // module where an address resolves to without running it.
+        "--export=x86_slot_of",
+        "--export=x86_yield_slot",
         "--export-table",
         "--growable-table",
     ];

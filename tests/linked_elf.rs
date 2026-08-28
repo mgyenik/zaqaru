@@ -581,3 +581,41 @@ fn the_loader_and_the_translator_agree_about_the_program() {
         );
     }
 }
+
+/// A whole program translates: entry, arguments, syscalls and all.
+///
+/// The corpus's other guests are functions a test calls. This one starts at
+/// `_start`, which is hand-written assembly with no compiler-emitted extent
+/// and a tail jump instead of a return — the two things about a real entry
+/// point that a function-shaped fixture never exercises.
+#[test]
+fn a_whole_program_translates() {
+    let workspace = WorkingDirectory::new("linked-process");
+    let path = support::link_corpus_executable(&workspace, "process.c", "_start", "-O1");
+    let bytes = std::fs::read(&path).expect("read");
+    let object = ObjectFile::parse(&bytes).expect("parse");
+
+    let start = object
+        .function_at(object.entry)
+        .and_then(|index| object.functions.get(index))
+        .expect("the entry point is in no function");
+    assert!(start.size > 0, "`_start` has no extent to translate");
+
+    let translated = zaqaru::transpile::Transpiler::new(&object)
+        .transpile()
+        .unwrap_or_else(|error| panic!("translating a whole program: {error:#}"));
+    let object_path = workspace.write("process.wasm.o", &translated);
+    let module_path = workspace.path().join("process.wasm");
+    let seam = workspace.write("seam.wasm.o", support::seam_object());
+    let outcome = support::try_link_wasm(
+        &[object_path, seam],
+        &module_path,
+        &[
+            "--export-table",
+            "--growable-table",
+            "--unresolved-symbols=import-dynamic",
+        ],
+    );
+    assert!(outcome.succeeded, "did not link:\n{}", outcome.report());
+    support::validate_wasm(&std::fs::read(&module_path).expect("read"));
+}

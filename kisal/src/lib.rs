@@ -209,7 +209,17 @@ pub unsafe extern "C" fn kisal_boot() -> i32 {
 
     // SAFETY: the address is a translated function's, because the loader
     // read it out of the same ELF the translator did.
-    let left = unsafe { run_thread(slot_of(entry as i64)) };
+    let slot = unsafe { slot_of(entry as i64) };
+    if slot < 0 {
+        // The seam's weak answer: this container carries no linked program,
+        // so there is nothing to enter. A container is built with a program
+        // or it is not, and booting one that was not is a bake that skipped
+        // the translator.
+        let message = "kisal: this container has no linked program to run";
+        with_kernel(|kernel| report(kernel, message));
+        panic!("{message}");
+    }
+    let left = unsafe { run_thread(slot) };
 
     with_kernel(|kernel| {
         let status = match (left, kernel.status) {

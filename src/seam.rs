@@ -116,6 +116,14 @@ pub const SET_SEGMENT_BASE: &str = "x86_set_fs_base";
 /// time rather than through [`LOAD_MACHINE`] keeps the image's layout stated
 /// in one place — the seam — instead of in the kernel as well, where a
 /// disagreement would be silent rather than a link error.
+/// What the weak exec map answers: there is no linked program in this
+/// container, so no address resolves to anything.
+///
+/// Negative because a slot never is, and a distinct value from the real
+/// map's refusal — which traps, because there *is* a program and the address
+/// given was not in it.
+pub const NO_EXEC_MAP: i32 = -1;
+
 pub const GET_STACK_POINTER: &str = "x86_get_rsp";
 pub const SET_STACK_POINTER: &str = "x86_set_rsp";
 
@@ -233,6 +241,10 @@ pub fn build_seam_object() -> Result<Vec<u8>> {
         parameters: vec![ValueType::I32],
         results: vec![],
     });
+    let exec_map_type = wasm.intern_type(FunctionType {
+        parameters: vec![ValueType::I64],
+        results: vec![ValueType::I32],
+    });
     let run_thread_type = wasm.intern_type(FunctionType {
         parameters: vec![ValueType::I32],
         results: vec![ValueType::I32],
@@ -319,19 +331,23 @@ pub fn build_seam_object() -> Result<Vec<u8>> {
         tag_index,
     };
 
+    let define_with =
+        |wasm: &mut WasmObject, name: &str, type_index: u32, body: FunctionBody, flags: u32| {
+            let function_index = wasm.next_defined_function_index();
+            wasm.defined_functions
+                .push(DefinedFunction { type_index, body });
+            let symbol_index = wasm.add_symbol(Symbol {
+                name: name.to_string(),
+                target: SymbolTarget::Function(function_index),
+                flags,
+            });
+            FunctionReference {
+                symbol_index,
+                function_index,
+            }
+        };
     let define = |wasm: &mut WasmObject, name: &str, type_index: u32, body: FunctionBody| {
-        let function_index = wasm.next_defined_function_index();
-        wasm.defined_functions
-            .push(DefinedFunction { type_index, body });
-        let symbol_index = wasm.add_symbol(Symbol {
-            name: name.to_string(),
-            target: SymbolTarget::Function(function_index),
-            flags: symbol_flags::EXPORTED,
-        });
-        FunctionReference {
-            symbol_index,
-            function_index,
-        }
+        define_with(wasm, name, type_index, body, symbol_flags::EXPORTED)
     };
 
     // The throw is defined before the entry that calls it, because a
@@ -390,6 +406,23 @@ pub fn build_seam_object() -> Result<Vec<u8>> {
         SET_STACK_POINTER,
         segment_write_type,
         body.finish(),
+    );
+
+    // The exec map, weakly, for a container that carries no linked program.
+    //
+    // The kernel's boot path names it unconditionally — it is Rust, compiled
+    // once, and cannot know at its own compile time whether the container it
+    // ends up in has a program to load. A linked guest defines the real one
+    // and the linker prefers it; without one this answers, and the answer
+    // says what is missing rather than trapping.
+    let mut body = FunctionBodyBuilder::new(1);
+    body.i32_const(NO_EXEC_MAP);
+    define_with(
+        &mut wasm,
+        crate::transpile::EXEC_MAP_LOOKUP,
+        exec_map_type,
+        body.finish(),
+        symbol_flags::WEAK,
     );
 
     define(

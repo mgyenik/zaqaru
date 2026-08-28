@@ -431,18 +431,15 @@ impl<'a> Transpiler<'a> {
                 parameters: vec![ValueType::I64],
                 results: vec![ValueType::I32],
             });
-            let mut entries: Vec<(u64, u32)> = symbols
+            let mut entries: Vec<(u64, TableReference)> = symbols
                 .table_slots_by_location
                 .iter()
                 .map(|((section, offset), slot)| {
-                    (
-                        self.object.sections[*section].address + offset,
-                        slot.table_index,
-                    )
+                    (self.object.sections[*section].address + offset, *slot)
                 })
                 .collect();
             // Sorted, because the lookup searches in halves.
-            entries.sort_unstable();
+            entries.sort_unstable_by_key(|(address, _)| *address);
             let table = build_exec_map_table(&mut wasm, &entries);
             (
                 lookup_type,
@@ -1618,11 +1615,30 @@ const EXEC_MAP_ENTRY: u64 = 16;
 /// functions and CPython has thousands. A binary search is fourteen
 /// comparisons for ten thousand functions, on a path the plan says is hot
 /// and M11 measures.
-fn build_exec_map_table(wasm: &mut WasmObject, entries: &[(u64, u32)]) -> DataReference {
+/// The map itself: address and slot, eight bytes each, sorted so the lookup
+/// can search it in halves.
+///
+/// The slot is a *relocation*, not the number this object happened to give
+/// it. Every object numbers its own table entries from
+/// [`FIRST_TABLE_INDEX`] and the linker renumbers them as it merges the
+/// tables — so a constant here is a slot belonging to whichever object won
+/// that number, which for a container is the seam. Writing the entry as a
+/// relocation is what makes the address the guest holds and the slot the
+/// module calls the same function.
+fn build_exec_map_table(wasm: &mut WasmObject, entries: &[(u64, TableReference)]) -> DataReference {
     let mut bytes = Vec::with_capacity(entries.len() * EXEC_MAP_ENTRY as usize);
+    let mut relocations = Vec::with_capacity(entries.len());
     for (address, slot) in entries {
         bytes.extend_from_slice(&address.to_le_bytes());
-        bytes.extend_from_slice(&slot.to_le_bytes());
+        relocations.push(WasmRelocation {
+            kind: WasmRelocationKind::TableIndexI32,
+            offset: bytes.len() as u32,
+            symbol_index: slot.symbol_index,
+            addend: 0,
+        });
+        // The placeholder the linker overwrites, which is this object's own
+        // numbering — right when nothing else contributes a table.
+        bytes.extend_from_slice(&slot.table_index.to_le_bytes());
         bytes.extend_from_slice(&[0; 4]);
     }
     let segment_index = wasm.data_segments.len() as u32;
@@ -1631,7 +1647,7 @@ fn build_exec_map_table(wasm: &mut WasmObject, entries: &[(u64, u32)]) -> DataRe
         name: format!(".rodata.{EXEC_MAP_TABLE}"),
         alignment_log2: 3,
         bytes,
-        relocations: Vec::new(),
+        relocations,
     });
     DataReference {
         symbol_index: wasm.add_symbol(Symbol {

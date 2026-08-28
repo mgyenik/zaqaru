@@ -26,6 +26,16 @@ const REALLOC_EXPORT: &str = "cabi_realloc";
 const MEMORY_EXPORT: &str = "memory";
 const TABLE_EXPORT: &str = "__indirect_function_table";
 
+/// The one thing the host calls to run a container.
+///
+/// Everything the run consists of is inside the module: the program's bytes
+/// come from the image the module carries, its segments are copied within
+/// linear memory, and the only things that cross this boundary are what the
+/// mount table exposes. The return value is the exit status, which also
+/// arrives through the store at `/iso/shutdown/complete` — here so that a
+/// host that mounts nothing can still tell how the run ended.
+pub const BOOT_EXPORT: &str = "kisal_boot";
+
 /// The canonical ABI's alignment for a `list`'s `(pointer, length)` pair.
 const LIST_ALIGNMENT: u32 = 4;
 
@@ -123,6 +133,14 @@ impl Container {
         function
             .call(&mut self.store, parameters)
             .with_context(|| format!("calling `{name}`"))
+    }
+
+    /// Runs the container to completion, and reports the exit status.
+    ///
+    /// One call, because a container is one program: the kernel loads it,
+    /// enters it, and catches the throw its `exit_group` becomes.
+    pub fn boot(&mut self) -> Result<i32> {
+        self.call::<(), i32>(BOOT_EXPORT, ())
     }
 
     /// The mount table. A host that cannot see what the guest wrote cannot

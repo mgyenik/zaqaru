@@ -21,6 +21,7 @@ pub mod json;
 pub mod layers;
 pub mod layout;
 pub mod object;
+pub mod program;
 pub mod tar;
 pub mod tree;
 pub mod xattr;
