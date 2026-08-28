@@ -296,7 +296,8 @@ impl ObjectFile {
                 }
             }
         }
-        let functions = collect_functions(&symbols, &sections, layout)?;
+        let mut functions = collect_functions(&symbols, &sections, layout)?;
+        split_at_interior_entries(&sections, &mut functions)?;
         let segments = read_segments(&file);
 
         Ok(Self {
@@ -751,6 +752,133 @@ fn next_boundary(
     let offsets = boundaries.get(&section)?;
     let index = offsets.partition_point(|candidate| *candidate <= offset);
     offsets.get(index).copied()
+}
+
+/// Splits any function something branches *into* at the point it is entered.
+///
+/// A function can have more than one entry. gcc's hot/cold splitting is the
+/// common source: it collects several of a function's cold exits into one
+/// `.cold` fragment, gives the whole fragment a single symbol, and has the
+/// hot code jump to each exit individually — so `execute_stack_op.cold` is
+/// ten bytes holding two independent `call abort` stubs, and the jump to the
+/// second one lands five bytes in. glibc's `memmove` variants do the same,
+/// sharing tails between implementations.
+///
+/// Splitting is sound here for a reason particular to this design: a
+/// function boundary carries no live register state. The machine file lives
+/// in globals and is promoted into locals inside a body with a flush at
+/// every call and exit, so entering a piece reloads and leaving flushes —
+/// which is what already happens at every boundary. The guest stack is
+/// ordinary memory and is shared either way.
+///
+/// Only instruction boundaries are cut at. A target *inside* an instruction
+/// is a second instruction stream, which is a different question — see
+/// `crate::cfg`'s handling of a branch past a `lock` prefix.
+fn split_at_interior_entries(sections: &[Section], functions: &mut Vec<Function>) -> Result<()> {
+    use std::collections::{BTreeSet, HashMap};
+
+    // Where each function's instructions begin, and everywhere anything
+    // branches to. One decode pass over the text answers both.
+    // Targets carry the function they came *from*: a function's own
+    // branches are ordinary control flow and say nothing about entries.
+    let mut starts: HashMap<usize, BTreeSet<u64>> = HashMap::new();
+    let mut targets: HashMap<usize, Vec<(u64, usize)>> = HashMap::new();
+    for (index, function) in functions.iter().enumerate() {
+        let section = &sections[function.section];
+        let from = function.offset as usize;
+        let to = from + function.size as usize;
+        if to > section.bytes.len() {
+            continue;
+        }
+        let mut decoder = iced_x86::Decoder::with_ip(
+            64,
+            &section.bytes[from..to],
+            function.offset,
+            iced_x86::DecoderOptions::NONE,
+        );
+        let mut boundaries = BTreeSet::new();
+        while decoder.can_decode() {
+            let instruction = decoder.decode();
+            boundaries.insert(instruction.ip());
+            if instruction.op0_kind() == iced_x86::OpKind::NearBranch64
+                && matches!(
+                    instruction.flow_control(),
+                    iced_x86::FlowControl::ConditionalBranch
+                        | iced_x86::FlowControl::UnconditionalBranch
+                )
+            {
+                targets
+                    .entry(function.section)
+                    .or_default()
+                    .push((instruction.near_branch64(), index));
+            }
+        }
+        starts.insert(index, boundaries);
+    }
+
+    // A target that lands inside a function but not at its start is an entry
+    // the symbol table did not describe.
+    let mut cuts: HashMap<usize, BTreeSet<u64>> = HashMap::new();
+    for (index, function) in functions.iter().enumerate() {
+        let (Some(section_targets), Some(boundaries)) =
+            (targets.get(&function.section), starts.get(&index))
+        else {
+            continue;
+        };
+        for (target, from) in section_targets {
+            // A branch that stays inside its own body is ordinary control
+            // flow. Compared by extent rather than by index, because one
+            // body often carries several symbols: `__memcpy_avx_unaligned`
+            // and `__memmove_avx_unaligned` are the same ten instructions
+            // under two names, and each one's loops would otherwise look
+            // like entries into the other.
+            let source = &functions[*from];
+            if (source.offset..source.offset + source.size).contains(target) {
+                continue;
+            }
+            let interior = (function.offset + 1..function.offset + function.size).contains(target);
+            if interior && boundaries.contains(target) {
+                cuts.entry(index).or_default().insert(*target);
+            }
+        }
+    }
+    if cuts.is_empty() {
+        return Ok(());
+    }
+
+    let mut split = Vec::with_capacity(functions.len());
+    for (index, function) in functions.iter().enumerate() {
+        let Some(points) = cuts.get(&index) else {
+            split.push(function.clone());
+            continue;
+        };
+        let mut start = function.offset;
+        let end = function.offset + function.size;
+        for point in points.iter().copied().chain(std::iter::once(end)) {
+            split.push(Function {
+                // The first piece keeps the symbol and the name; the rest
+                // are named after where they begin, because nothing named
+                // them.
+                name: if start == function.offset {
+                    function.name.clone()
+                } else {
+                    format!("{}+{:#x}", function.name, start - function.offset)
+                },
+                symbol: if start == function.offset {
+                    function.symbol
+                } else {
+                    None
+                },
+                section: function.section,
+                offset: start,
+                size: point - start,
+            });
+            start = point;
+        }
+    }
+    split.sort_by_key(|function| (function.section, function.offset));
+    *functions = split;
+    Ok(())
 }
 
 /// Which section holds a virtual address, and where in it.

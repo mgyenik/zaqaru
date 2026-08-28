@@ -35,6 +35,16 @@ pub enum Terminator {
     /// A `ret`, or a tail jump to another function — including an indirect
     /// one — which the translator turns into a call followed by a return.
     Leaves,
+    /// The block runs off the end of its function into the one that begins
+    /// there, which is a tail call.
+    ///
+    /// A function can have more than one entry — see
+    /// `crate::reader`'s splitting — and a piece cut in front of another
+    /// piece continues into it. Falling out of a function into the function
+    /// below is exactly a tail call: the machine state is in globals either
+    /// way, and the boundary is where it would be flushed and reloaded
+    /// regardless.
+    FallsOut { into: u64 },
     /// The block's last instruction runs, and control does not continue past
     /// it.
     ///
@@ -65,7 +75,9 @@ impl BasicBlock {
             // The call is an ordinary instruction in both: what follows it
             // is the terminator, and for `Unreachable` what follows it is
             // nothing.
-            Terminator::FallThrough { .. } | Terminator::Unreachable => self.instructions.clone(),
+            Terminator::FallThrough { .. }
+            | Terminator::Unreachable
+            | Terminator::FallsOut { .. } => self.instructions.clone(),
             _ => self.instructions.start..self.instructions.end - 1,
         }
     }
@@ -82,7 +94,9 @@ impl BasicBlock {
     /// a transfer of its own rather than by running into the next one.
     pub fn terminating_instruction(&self) -> Option<usize> {
         match &self.terminator {
-            Terminator::FallThrough { .. } | Terminator::Unreachable => None,
+            Terminator::FallThrough { .. }
+            | Terminator::Unreachable
+            | Terminator::FallsOut { .. } => None,
             _ => Some(self.instructions.end - 1),
         }
     }
@@ -127,8 +141,8 @@ impl ControlFlowGraph {
                 .copied()
                 .into_iter()
                 .collect(),
-            // Nothing follows it, which is the point.
-            Terminator::Unreachable => Vec::new(),
+            // Neither continues inside this function.
+            Terminator::Unreachable | Terminator::FallsOut { .. } => Vec::new(),
             Terminator::Branch { target, not_taken } => [target, not_taken]
                 .iter()
                 .filter_map(|offset| self.index_of_start.get(offset).copied())
@@ -204,8 +218,9 @@ impl ControlFlowGraph {
                     graph.block_at(*target)?;
                     graph.block_at(*not_taken)?;
                 }
-                // No internal transfer to check: control does not continue.
-                Terminator::Unreachable => {}
+                // Neither names a block in this function: one stops, and
+                // the other leaves for the function below.
+                Terminator::Unreachable | Terminator::FallsOut { .. } => {}
                 Terminator::Switch { targets } => {
                     for target in targets {
                         graph.block_at(*target)?;
@@ -650,11 +665,16 @@ fn classify_terminator(
     if never_continues(instruction) {
         return Terminator::Unreachable;
     }
-    // Nothing follows, and the block runs off the end of the function. A
-    // compiler emits that only after a call that does not return, so the
-    // honest translation of the path past it is that there is not one.
-    if instruction.flow_control() == FlowControl::Call && !function.contains(block_end) {
-        return Terminator::Unreachable;
+    if !function.contains(block_end) {
+        // Nothing follows, and the block runs off the end of the function.
+        // After a call, that means the callee did not return and the
+        // compiler emitted nothing for a path that cannot be taken.
+        if instruction.flow_control() == FlowControl::Call {
+            return Terminator::Unreachable;
+        }
+        // Otherwise control really does continue, into whatever begins
+        // where this function ends — which is a tail call to it.
+        return Terminator::FallsOut { into: block_end };
     }
     Terminator::FallThrough { next: block_end }
 }

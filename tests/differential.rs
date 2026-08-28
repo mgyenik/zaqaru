@@ -2988,3 +2988,47 @@ fn double_shifts_match_native() {
         }
     }
 }
+
+/// Two functions sharing a body, entered at different points.
+///
+/// glibc writes `mempcpy` this way: it differs from `memcpy` only in the
+/// return value, so it computes its own and jumps *into* `memcpy` past where
+/// `memcpy` computes a different one. One copy loop, two entries, and a
+/// symbol table that can describe only the first. gcc's hot/cold splitting
+/// produces the same shape from the other direction, collecting several cold
+/// exits under one `.cold` symbol that the hot code jumps into separately.
+///
+/// The answers have to match native from *both* entries, which is what says
+/// the split kept the pieces' meaning rather than merely making them
+/// translate.
+#[test]
+fn functions_entered_at_a_shared_body_match_native() {
+    let mut fixture = DifferentialFixture::build("shared-tail", &["shared_tail.s"]);
+
+    let mut inputs: Vec<(i64, i64)> = Vec::new();
+    for value in [0i64, 1, -1, 1000, i64::MIN, i64::MAX] {
+        for count in [0i64, 1, 2, 7, -3] {
+            inputs.push((value, count));
+        }
+    }
+    let mut generator = Pseudorandom::new(0x7461_696c_0000_0001);
+    for _ in 0..RANDOM_ITERATIONS / 4 {
+        inputs.push((generator.next_i64(), generator.next_i64()));
+    }
+
+    for name in ["offset_by_count", "scaled", "hot"] {
+        let native = unsafe {
+            native_function::<unsafe extern "C" fn(i64, i64) -> i64>(&fixture.native, name)
+        };
+        for &(value, count) in &inputs {
+            let expected = unsafe { native(value, count) };
+            for (variant, module) in &mut fixture.transpiled {
+                assert_eq!(
+                    module.call_guest(name, [value, count, 0, 0, 0, 0]),
+                    expected,
+                    "{name}({value}, {count}) disagreed with native in {variant}"
+                );
+            }
+        }
+    }
+}

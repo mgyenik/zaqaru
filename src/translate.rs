@@ -404,6 +404,22 @@ impl<'a> FunctionTranslator<'a> {
             .with_context(|| format!("translating `{}`", render(&lifted.instruction)))
     }
 
+    /// Running off the end of a function into the one below it: a tail call
+    /// to that function, and then this one's return.
+    pub fn emit_fall_out(&mut self, body: &mut FunctionBodyBuilder, into: u64) -> Result<()> {
+        self.temporaries.reset();
+        // The same flush a tail jump does, and for the same reason: the
+        // function below may branch on what this one compared.
+        self.state.flush_flags(body);
+        let target = self.symbols.function_at(self.section, into)?;
+        self.reserve_return_address_at(body, into)?;
+        self.state.flush_written(body);
+        body.call(target);
+        self.state.reload(body);
+        self.emit_return(body);
+        Ok(())
+    }
+
     /// A tail jump: call the target, then let the structurer return.
     pub fn emit_tail_call(
         &mut self,
@@ -1351,16 +1367,29 @@ impl<'a> FunctionTranslator<'a> {
         body: &mut FunctionBodyBuilder,
         lifted: &LiftedInstruction,
     ) -> Result<()> {
+        self.reserve_return_address_at(body, lifted.offset)
+    }
+
+    /// The same, for a transfer that no instruction stands for.
+    ///
+    /// A function that runs off its end into the one below makes a call the
+    /// instruction stream does not contain, so its resume site is keyed by
+    /// the boundary rather than by an instruction's offset — a place no
+    /// instruction occupies, which is what keeps the two kinds of key apart.
+    fn reserve_return_address_at(
+        &mut self,
+        body: &mut FunctionBodyBuilder,
+        site: u64,
+    ) -> Result<()> {
         self.adjust_stack_pointer(body, -8);
         self.push_stack_pointer_address(body);
         match &self.resume_sites {
             None => body.i64_const(crate::machine::RETURN_ADDRESS_SENTINEL),
             Some(resume) => {
-                let entry = *resume.entries.get(&lifted.offset).ok_or_else(|| {
+                let entry = *resume.entries.get(&site).ok_or_else(|| {
                     anyhow::anyhow!(
-                        "the transfer at {:#x} has no resume entry; the site map \
-                         and the translation disagree about what reserves a slot",
-                        lifted.offset
+                        "the transfer at {site:#x} has no resume entry; the site map \
+                         and the translation disagree about what reserves a slot"
                     )
                 })?;
                 body.i32_const_table_index(resume.table_slot);

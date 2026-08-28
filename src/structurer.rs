@@ -156,6 +156,19 @@ fn emit_leaving(
     Ok(())
 }
 
+/// Emits the tail call a function makes by running off its own end into the
+/// function below, and the return that follows it — the same shape
+/// [`emit_leaving`] has, for a transfer no instruction stands for.
+fn emit_falling_out(
+    body: &mut FunctionBodyBuilder,
+    translator: &mut FunctionTranslator<'_>,
+    into: u64,
+) -> Result<()> {
+    translator.emit_fall_out(body, into)?;
+    body.return_();
+    Ok(())
+}
+
 /// Emits a conditional tail call: the transfer happens only when the branch
 /// is taken, and control otherwise continues after it.
 fn emit_conditional_leave(
@@ -304,6 +317,7 @@ fn emit_dispatcher(
                 transfer(body, not_taken, 0)?;
             }
             Terminator::Leaves => emit_leaving(body, translator, lifted, index, graph)?,
+            Terminator::FallsOut { into } => emit_falling_out(body, translator, *into)?,
             // The call the block ends with was already emitted as an
             // ordinary instruction; this says that it does not come back.
             Terminator::Unreachable => body.unreachable(),
@@ -463,6 +477,7 @@ impl StructuredEmitter<'_> {
                 self.emit_branch(body, translator, block, destination)
             }
             Terminator::Leaves => emit_leaving(body, translator, self.lifted, block, self.graph),
+            Terminator::FallsOut { into } => emit_falling_out(body, translator, *into),
             Terminator::Unreachable => {
                 body.unreachable();
                 Ok(())

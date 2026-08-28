@@ -1456,6 +1456,15 @@ fn resume_entries(lifted: &LiftedFunction, graph: &ControlFlowGraph) -> Result<H
         };
         entries.insert(instruction.offset, entry);
     }
+    // A function that runs off its end into the one below makes a call no
+    // instruction stands for, so its site is keyed by the boundary — a place
+    // no instruction occupies, which is what keeps the two kinds of key
+    // apart.
+    for block in &graph.blocks {
+        if let crate::cfg::Terminator::FallsOut { into } = block.terminator {
+            entries.insert(into, epilogue);
+        }
+    }
     Ok(entries)
 }
 
