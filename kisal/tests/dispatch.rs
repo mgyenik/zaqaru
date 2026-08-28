@@ -130,9 +130,7 @@ fn a_negative_length_is_einval() {
 #[test]
 fn a_failing_store_becomes_an_errno() {
     let mut store = Recording::default();
-    store
-        .refuse
-        .push(Recording::key(paths::CONSOLE_STDOUT));
+    store.refuse.push(Recording::key(paths::CONSOLE_STDOUT));
     let mut kernel = Kernel::new(store, Registers::default(), empty_image());
     assert_eq!(
         kernel.dispatch(number::WRITE, write_of(1, b"lost")),
@@ -327,8 +325,7 @@ fn an_unknown_arch_prctl_request_is_einval() {
 fn a_real_but_unimplemented_arch_prctl_request_is_a_named_fault() {
     for (request, expected) in [(0x1011i64, "CPUID"), (0x1012, "CPUID")] {
         let mut kernel = Kernel::new(Recording::default(), Registers::default(), empty_image());
-        let outcome =
-            kernel.dispatch(number::ARCH_PRCTL, Arguments::new([request, 0, 0, 0, 0, 0]));
+        let outcome = kernel.dispatch(number::ARCH_PRCTL, Arguments::new([request, 0, 0, 0, 0, 0]));
         let Outcome::Fault(fault) = outcome else {
             panic!("request {request:#x} produced {outcome:?} instead of a fault");
         };
@@ -349,7 +346,11 @@ use kisal::memory::GuestMemory;
 fn a_range_inside_the_guest_is_accepted() {
     let memory = GuestMemory::with_limit(0x1_0000);
     assert_eq!(memory.check(0x100, 0x10), Ok(()));
-    assert_eq!(memory.check(0xfff0, 0x10), Ok(()), "ending exactly at the limit");
+    assert_eq!(
+        memory.check(0xfff0, 0x10),
+        Ok(()),
+        "ending exactly at the limit"
+    );
 }
 
 #[test]

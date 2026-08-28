@@ -16,6 +16,7 @@ use crate::abi::{
     ARGUMENT_REGISTERS, FLOAT_ARGUMENT_REGISTERS, FLOAT_RETURN_VALUE_REGISTER,
     RETURN_VALUE_REGISTER, Signature, SignatureTable, marshal,
 };
+use crate::cfg::ControlFlowGraph;
 use crate::emitter::code::{
     DataReference, FunctionBody, FunctionBodyBuilder, FunctionReference, TableReference,
 };
@@ -28,7 +29,6 @@ use crate::emitter::{
     DefinedFunction, ENVIRONMENT_MODULE, FIRST_TABLE_INDEX, FunctionType, ImportedFunction,
     ValueType, WasmObject,
 };
-use crate::cfg::ControlFlowGraph;
 use crate::lifter::{self, LiftedFunction};
 use crate::machine::{MachineState, RETURN_ADDRESS_SENTINEL, STACK_POINTER_REGISTER, VectorHalf};
 use crate::reader::{ObjectFile, SectionRole, SymbolBinding, SymbolRole};
@@ -356,7 +356,11 @@ impl<'a> Transpiler<'a> {
         self.object
             .functions
             .iter()
-            .filter(|function| self.object.symbols[function.symbol].binding != SymbolBinding::Local)
+            .filter(|function| {
+                function
+                    .symbol
+                    .is_some_and(|index| self.object.symbols[index].binding != SymbolBinding::Local)
+            })
             .map(|function| function.name.clone())
             .collect()
     }
@@ -440,7 +444,10 @@ impl<'a> Transpiler<'a> {
             // Sorted, because the lookup searches in halves.
             entries.sort_unstable();
             let table = build_exec_map_table(&mut wasm, &entries);
-            (lookup_type, build_exec_map_lookup(table, entries.len() as u32))
+            (
+                lookup_type,
+                build_exec_map_lookup(table, entries.len() as u32),
+            )
         });
         wasm.uses_function_table = references.calls_indirectly || !wasm.table_functions.is_empty();
         self.rewrite_jump_tables(&mut wasm, &mut symbols, &references)?;
@@ -473,7 +480,9 @@ impl<'a> Transpiler<'a> {
 
             if let (Some(resume), Some((graph, slot, entries))) = (plan.resume, &resume_context) {
                 let resume_body = self
-                    .translate_resume_body(&symbols, &machine, lifted, guest_type, graph, *slot, entries)
+                    .translate_resume_body(
+                        &symbols, &machine, lifted, guest_type, graph, *slot, entries,
+                    )
                     .with_context(|| format!("translating `{}`'s resume body", lifted.name))?;
                 bodies.push((
                     resume.function_index,
@@ -1094,12 +1103,16 @@ impl<'a> Transpiler<'a> {
         &self,
         wasm: &mut WasmObject,
         symbols: &mut SymbolTable<'_>,
-    ) -> Result<(Vec<FunctionPlan>, Option<FunctionReference>, Option<FunctionReference>)> {
+    ) -> Result<(
+        Vec<FunctionPlan>,
+        Option<FunctionReference>,
+        Option<FunctionReference>,
+    )> {
         let mut plans = Vec::new();
         let mut next_index = wasm.imported_functions.len() as u32;
 
         for (input, function) in self.object.functions.iter().enumerate() {
-            let elf_symbol = &self.object.symbols[function.symbol];
+            let elf_symbol = function.symbol.map(|index| &self.object.symbols[index]);
 
             let guest_index = next_index;
             next_index += 1;
@@ -1112,27 +1125,32 @@ impl<'a> Transpiler<'a> {
                 symbol_index: guest_symbol,
                 function_index: guest_index,
             };
-            symbols.functions.insert(function.symbol, guest);
+            if let Some(index) = function.symbol {
+                symbols.functions.insert(index, guest);
+            }
             symbols
                 .functions_by_location
                 .insert((function.section, function.offset), guest);
 
             // A function nothing outside the object can name needs no host
             // entry point.
-            let wrapper = if elf_symbol.binding == SymbolBinding::Local {
-                None
-            } else {
-                let wrapper_index = next_index;
-                next_index += 1;
-                let wrapper_symbol = wasm.add_symbol(Symbol {
-                    name: function.name.clone(),
-                    target: SymbolTarget::Function(wrapper_index),
-                    flags: wrapper_symbol_flags(elf_symbol),
-                });
-                Some(FunctionReference {
-                    symbol_index: wrapper_symbol,
-                    function_index: wrapper_index,
-                })
+            let wrapper = match elf_symbol {
+                Some(named) if named.binding != SymbolBinding::Local => {
+                    let wrapper_index = next_index;
+                    next_index += 1;
+                    let wrapper_symbol = wasm.add_symbol(Symbol {
+                        name: function.name.clone(),
+                        target: SymbolTarget::Function(wrapper_index),
+                        flags: wrapper_symbol_flags(named),
+                    });
+                    Some(FunctionReference {
+                        symbol_index: wrapper_symbol,
+                        function_index: wrapper_index,
+                    })
+                }
+                // Local, or named by nothing at all: either way no host
+                // entry point, because nothing outside could ask for one.
+                _ => None,
             };
 
             let resume = if self.resume {
@@ -1526,14 +1544,15 @@ fn data_symbol_flags(symbol: &crate::reader::Symbol) -> u32 {
     }
 }
 
-fn guest_symbol_flags(symbol: &crate::reader::Symbol) -> u32 {
+fn guest_symbol_flags(symbol: Option<&crate::reader::Symbol>) -> u32 {
     // The guest entry point keeps the input's binding so that duplicate
     // definitions resolve the way they would have natively, but it is never
-    // exported: the wrapper is the module's public face.
-    let binding = match symbol.binding {
-        SymbolBinding::Local => symbol_flags::LOCAL,
-        SymbolBinding::Weak => symbol_flags::WEAK,
-        SymbolBinding::Global => 0,
+    // exported: the wrapper is the module's public face. A function no
+    // symbol named binds locally, since there is no name to collide with.
+    let binding = match symbol.map(|symbol| symbol.binding) {
+        None | Some(SymbolBinding::Local) => symbol_flags::LOCAL,
+        Some(SymbolBinding::Weak) => symbol_flags::WEAK,
+        Some(SymbolBinding::Global) => 0,
     };
     binding | symbol_flags::HIDDEN
 }

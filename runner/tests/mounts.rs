@@ -46,8 +46,7 @@ fn the_longest_prefix_wins_regardless_of_order() {
     for reversed in [false, true] {
         let mut mounts = MountTable::new();
         let general: (&[&[u8]], Box<dyn Store>) = (&[b"iso"], Box::new(Sink::new()));
-        let specific: (&[&[u8]], Box<dyn Store>) =
-            (&[b"iso", b"console"], Box::new(Sink::new()));
+        let specific: (&[&[u8]], Box<dyn Store>) = (&[b"iso", b"console"], Box::new(Sink::new()));
         let (first, second) = if reversed {
             (specific, general)
         } else {

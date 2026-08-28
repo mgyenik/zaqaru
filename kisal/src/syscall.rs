@@ -539,9 +539,7 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
                     // An `O_PATH` descriptor is a reference to a file
                     // rather than a handle on it, and there is nothing to
                     // flush through one.
-                    Ok(file)
-                        if file.flags & crate::file::open_flags::PATH != 0 =>
-                    {
+                    Ok(file) if file.flags & crate::file::open_flags::PATH != 0 => {
                         Errno::BadFile.as_result()
                     }
                     Ok(_) => 0,
@@ -651,8 +649,13 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             }
             crate::fd::Backing::Image(vnode) => {
                 return Outcome::Done(
-                    match self.write_file(vnode, file.flags, file.offset, buffer as i64, count as u64)
-                    {
+                    match self.write_file(
+                        vnode,
+                        file.flags,
+                        file.offset,
+                        buffer as i64,
+                        count as u64,
+                    ) {
                         Ok(written) => {
                             // The description's own position advances, and
                             // `O_APPEND` means it lands at the end whatever

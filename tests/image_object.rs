@@ -116,9 +116,11 @@ fn the_linker_keeps_the_blob_page_aligned() {
 fn a_region_too_large_to_address_is_refused() {
     assert!(baker::object::refuse_unaddressable("__image_blob", 0).is_ok());
     assert!(baker::object::refuse_unaddressable("__image_blob", u32::MAX as usize).is_ok());
-    let refusal =
-        baker::object::refuse_unaddressable("__image_blob", u32::MAX as usize + 1)
-            .expect_err("four gigabytes and one byte does not fit a 32-bit size");
+    let refusal = baker::object::refuse_unaddressable("__image_blob", u32::MAX as usize + 1)
+        .expect_err("four gigabytes and one byte does not fit a 32-bit size");
     let text = format!("{refusal}");
-    assert!(text.contains("__image_blob") && text.contains("4294967296"), "{text}");
+    assert!(
+        text.contains("__image_blob") && text.contains("4294967296"),
+        "{text}"
+    );
 }

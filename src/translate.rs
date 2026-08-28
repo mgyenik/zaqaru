@@ -322,7 +322,10 @@ impl<'a> FunctionTranslator<'a> {
             // loader puts the segment holding it and linear memory is the
             // address space. So the subtraction is a constant rather than a
             // symbol the linker will fill in.
-            body.i32_const(self.symbols.jump_table_at(table.table_section, table.table_offset)? as i32);
+            body.i32_const(
+                self.symbols
+                    .jump_table_at(table.table_section, table.table_offset)? as i32,
+            );
         } else {
             let address = self
                 .symbols

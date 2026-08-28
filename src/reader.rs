@@ -207,8 +207,11 @@ pub struct Relocation {
 #[derive(Clone, Debug)]
 pub struct Function {
     pub name: String,
-    /// Index into [`ObjectFile::symbols`].
-    pub symbol: usize,
+    /// Index into [`ObjectFile::symbols`], where a symbol named this
+    /// function. A function the unwind table found and the symbol table did
+    /// not has none — nothing outside the object can name it, because there
+    /// is no name to use.
+    pub symbol: Option<usize>,
     /// Index into [`ObjectFile::sections`].
     pub section: usize,
     pub offset: u64,
@@ -293,7 +296,7 @@ impl ObjectFile {
                 }
             }
         }
-        let functions = collect_functions(&symbols, &sections)?;
+        let functions = collect_functions(&symbols, &sections, layout)?;
         let segments = read_segments(&file);
 
         Ok(Self {
@@ -319,16 +322,19 @@ impl ObjectFile {
         if self.layout != Layout::Linked {
             return None;
         }
-        self.sections.iter().enumerate().find_map(|(index, section)| {
-            let size = section.size.max(section.bytes.len() as u64);
-            // A section at address zero is one the loader does not place —
-            // debug info, symbol tables — and every address would fall in
-            // the first of them.
-            (section.address != 0
-                && address >= section.address
-                && address < section.address + size)
-                .then(|| (index, address - section.address))
-        })
+        self.sections
+            .iter()
+            .enumerate()
+            .find_map(|(index, section)| {
+                let size = section.size.max(section.bytes.len() as u64);
+                // A section at address zero is one the loader does not place —
+                // debug info, symbol tables — and every address would fall in
+                // the first of them.
+                (section.address != 0
+                    && address >= section.address
+                    && address < section.address + size)
+                    .then(|| (index, address - section.address))
+            })
     }
 
     /// The function whose extent contains a virtual address, if any.
@@ -528,7 +534,21 @@ fn read_segments(file: &object::read::File<'_>) -> Vec<Segment> {
         .collect()
 }
 
-fn collect_functions(symbols: &[Symbol], sections: &[Section]) -> Result<Vec<Function>> {
+fn collect_functions(
+    symbols: &[Symbol],
+    sections: &[Section],
+    layout: Layout,
+) -> Result<Vec<Function>> {
+    // A linked executable's symbol table is a weaker witness than a fresh
+    // object's, so its unwind tables are read as a second one: they say
+    // where each function begins and how long it is, which is the whole of
+    // what discovery needs. See `crate::eh_frame`.
+    let unwind = if layout == Layout::Linked {
+        unwind_extents(sections)?
+    } else {
+        std::collections::BTreeMap::new()
+    };
+
     let mut functions = Vec::new();
     for (index, symbol) in symbols.iter().enumerate() {
         if symbol.role != SymbolRole::Function || !symbol.defined {
@@ -540,14 +560,23 @@ fn collect_functions(symbols: &[Symbol], sections: &[Section]) -> Result<Vec<Fun
         if sections[section].role != SectionRole::Text {
             continue;
         }
-        if symbol.size == 0 {
-            bail!(
-                "function symbol `{}` has zero size; the transpiler needs \
-                 function extents (compile with a toolchain that emits them)",
-                symbol.name
-            );
-        }
-        let end = symbol.offset + symbol.size;
+        // Hand-written assembly routinely omits `.size`, and a symbol
+        // without one says only where a function starts. The unwind table
+        // knows how long it is.
+        let size = match symbol.size {
+            0 => *unwind
+                .get(&(sections[section].address + symbol.offset))
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "function symbol `{}` has zero size and no unwind entry; the \
+                         transpiler needs function extents (compile with a toolchain \
+                         that emits them)",
+                        symbol.name
+                    )
+                })?,
+            size => size,
+        };
+        let end = symbol.offset + size;
         if end > sections[section].bytes.len() as u64 {
             bail!(
                 "function `{}` extends past the end of {}",
@@ -557,12 +586,81 @@ fn collect_functions(symbols: &[Symbol], sections: &[Section]) -> Result<Vec<Fun
         }
         functions.push(Function {
             name: symbol.name.clone(),
-            symbol: index,
+            symbol: Some(index),
             section,
             offset: symbol.offset,
-            size: symbol.size,
+            size,
         });
     }
     functions.sort_by_key(|function| (function.section, function.offset));
+
+    // Whatever the symbols did not account for. A static function the
+    // compiler never named, or every function in a stripped binary, reaches
+    // the translator this way and no other.
+    let mut discovered = Vec::new();
+    for (&address, &length) in &unwind {
+        let Some((section, offset)) = section_holding(sections, address) else {
+            continue;
+        };
+        if sections[section].role != SectionRole::Text {
+            continue;
+        }
+        if offset + length > sections[section].bytes.len() as u64 {
+            bail!(
+                "an unwind entry at {address:#x} extends past {}",
+                sections[section].name
+            );
+        }
+        // A symbol that already covers this start is the better name for it,
+        // and one that covers part of the range means the symbols split what
+        // the unwind table describes as a whole — in which case they are the
+        // finer answer and this one is redundant.
+        let covered = functions.iter().any(|function| {
+            function.section == section
+                && function.offset < offset + length
+                && offset < function.offset + function.size
+        });
+        if covered {
+            continue;
+        }
+        discovered.push(Function {
+            // Named after where it is, since nothing named it.
+            name: format!("fn.{address:#x}"),
+            symbol: None,
+            section,
+            offset,
+            size: length,
+        });
+    }
+    functions.extend(discovered);
+    functions.sort_by_key(|function| (function.section, function.offset));
     Ok(functions)
+}
+
+/// Which section holds a virtual address, and where in it.
+fn section_holding(sections: &[Section], address: u64) -> Option<(usize, u64)> {
+    sections.iter().enumerate().find_map(|(index, section)| {
+        let size = section.size.max(section.bytes.len() as u64);
+        (section.address != 0 && address >= section.address && address < section.address + size)
+            .then(|| (index, address - section.address))
+    })
+}
+
+/// The function extents every `.eh_frame` section in the file describes,
+/// keyed by virtual address.
+fn unwind_extents(sections: &[Section]) -> Result<std::collections::BTreeMap<u64, u64>> {
+    let mut extents = std::collections::BTreeMap::new();
+    for section in sections {
+        if section.name != ".eh_frame" || section.bytes.is_empty() {
+            continue;
+        }
+        for frame in crate::eh_frame::frames(&section.bytes, section.address)? {
+            // Two entries for one address would mean the table disagrees
+            // with itself; the longer extent is the safe reading, since
+            // translating too little leaves a tail nothing reaches.
+            let extent = extents.entry(frame.address).or_insert(frame.length);
+            *extent = (*extent).max(frame.length);
+        }
+    }
+    Ok(extents)
 }

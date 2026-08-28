@@ -576,7 +576,9 @@ fn build_bodies(object: &ObjectFile, lifted: &[LiftedFunction]) -> Result<Vec<Bo
     let mut by_symbol: HashMap<usize, usize> = HashMap::new();
     for (index, function) in lifted.iter().enumerate() {
         by_location.insert((function.section, function.offset), index);
-        by_symbol.insert(object.functions[function.function].symbol, index);
+        if let Some(symbol) = object.functions[function.function].symbol {
+            by_symbol.insert(symbol, index);
+        }
     }
 
     let mut factory = iced_x86::InstructionInfoFactory::new();
@@ -596,10 +598,14 @@ fn build_bodies(object: &ObjectFile, lifted: &[LiftedFunction]) -> Result<Vec<Bo
             }
         }
 
-        let symbol = &object.symbols[object.functions[function.function].symbol];
+        let symbol = object.functions[function.function]
+            .symbol
+            .map(|index| &object.symbols[index]);
         bodies.push(Body {
             name: function.name.clone(),
-            is_global: symbol.binding != SymbolBinding::Local,
+            // A function nothing named is one nothing outside can call, so
+            // its signature is this object's business alone.
+            is_global: symbol.is_some_and(|symbol| symbol.binding != SymbolBinding::Local),
             graph,
             effects,
             calls,

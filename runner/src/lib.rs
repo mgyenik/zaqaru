@@ -62,10 +62,22 @@ impl Container {
     pub fn call_guest(&mut self, name: &str, integers: [i64; 6]) -> Result<i64> {
         let function = self
             .instance
-            .get_typed_func::<(i64, i64, i64, i64, i64, i64, f64, f64, f64, f64, f64, f64, f64, f64), (i64, f64)>(
-                &mut self.store,
-                name,
-            )
+            .get_typed_func::<(
+                i64,
+                i64,
+                i64,
+                i64,
+                i64,
+                i64,
+                f64,
+                f64,
+                f64,
+                f64,
+                f64,
+                f64,
+                f64,
+                f64,
+            ), (i64, f64)>(&mut self.store, name)
             .with_context(|| format!("the module has no usable export `{name}`"))?;
         let (result, _) = function
             .call(
@@ -95,7 +107,11 @@ impl Container {
     /// its own ([`Container::call_guest`]); everything else the seam
     /// exports — the register-file helpers, the scheduler's catch — is an
     /// ordinary typed function reached through here.
-    pub fn call<Parameters, Results>(&mut self, name: &str, parameters: Parameters) -> Result<Results>
+    pub fn call<Parameters, Results>(
+        &mut self,
+        name: &str,
+        parameters: Parameters,
+    ) -> Result<Results>
     where
         Parameters: wasmtime::WasmParams,
         Results: wasmtime::WasmResults,
@@ -177,20 +193,16 @@ impl Container {
         };
         let guest_type = wasmtime::FuncType::new(self.store.engine(), [], []);
         let function = wasmtime::Func::new(&mut self.store, guest_type, |_, _, _| Ok(()));
-        let slot = table.grow(
-            &mut self.store,
-            1,
-            wasmtime::Ref::Func(Some(function)),
-        )?;
+        let slot = table.grow(&mut self.store, 1, wasmtime::Ref::Func(Some(function)))?;
         Ok(slot as i32)
     }
 
     fn memory(&mut self) -> Result<wasmtime::Memory> {
         match self.instance.get_export(&mut self.store, MEMORY_EXPORT) {
             Some(wasmtime::Extern::Memory(memory)) => Ok(memory),
-            _ => bail!(
-                "the container module does not export its linear memory as `{MEMORY_EXPORT}`"
-            ),
+            _ => {
+                bail!("the container module does not export its linear memory as `{MEMORY_EXPORT}`")
+            }
         }
     }
 }

@@ -314,7 +314,10 @@ impl<'a> Mounts<'a> {
     /// happen by accident.
     pub fn replace(&mut self, at: Vnode, image: Image<'a>) -> Result<(), Errno> {
         if let Some(existing) = self.mounted_on(at)
-            && let Some(entry) = self.entries.get_mut(existing as usize).and_then(Option::as_mut)
+            && let Some(entry) = self
+                .entries
+                .get_mut(existing as usize)
+                .and_then(Option::as_mut)
         {
             entry.filesystem = Filesystem::Image(image);
             return Ok(());

@@ -250,7 +250,12 @@ impl FdTable {
 
     /// `dup2`/`dup3`: a second descriptor at a number the caller chose,
     /// silently closing whatever was there.
-    pub fn duplicate_to(&mut self, fd: i32, target: i32, close_on_exec: bool) -> Result<i32, Errno> {
+    pub fn duplicate_to(
+        &mut self,
+        fd: i32,
+        target: i32,
+        close_on_exec: bool,
+    ) -> Result<i32, Errno> {
         let description = self.descriptor(fd)?.description;
         let target_index = usize::try_from(target).map_err(|_| Errno::BadFile)?;
         if target_index >= MAX_DESCRIPTORS {
@@ -310,9 +315,10 @@ impl FdTable {
     /// table and the filesystem into a cycle in which neither owns the
     /// other.
     pub fn holds(&self, node: u32) -> bool {
-        self.descriptions.iter().flatten().any(|file| {
-            matches!(file.backing, Backing::Image(vnode) if vnode.inode == node)
-        })
+        self.descriptions
+            .iter()
+            .flatten()
+            .any(|file| matches!(file.backing, Backing::Image(vnode) if vnode.inode == node))
     }
 
     /// Whether a descriptor number is open at all.

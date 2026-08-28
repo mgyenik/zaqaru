@@ -18,8 +18,7 @@ use std::path::PathBuf;
 use support::{
     ALL_MODES, WorkingDirectory, compile_corpus_object, compile_foreign_wasm_object,
     link_container, link_container_with_image, m1_mounts, print_wasm, seam_object,
-    transpile_object,
-    transpile_object_resumable, try_link_wasm, validate_wasm,
+    transpile_object, transpile_object_resumable, try_link_wasm, validate_wasm,
 };
 
 /// The bytes `guest_write` sends, and how many of them.
@@ -37,11 +36,7 @@ fn variants() -> Vec<(String, bool, zaqaru::structurer::Mode)> {
     let mut variants = Vec::new();
     for mode in ALL_MODES {
         for resume in [false, true] {
-            variants.push((
-                format!("{mode:?}/resume={resume}"),
-                resume,
-                mode,
-            ));
+            variants.push((format!("{mode:?}/resume={resume}"), resume, mode));
         }
     }
     variants
@@ -120,7 +115,8 @@ fn write_reaches_the_console_through_every_seam() {
             "[{label}] the syscall returned {returned}, the kernel returns {native_returned}"
         );
         assert_eq!(
-            delivered, native_delivered,
+            delivered,
+            native_delivered,
             "[{label}] delivered {:?}, the kernel delivers {:?}",
             String::from_utf8_lossy(&delivered),
             String::from_utf8_lossy(&native_delivered)
@@ -267,7 +263,10 @@ fn all_six_syscall_arguments_reach_the_kernel_in_order() {
     );
     let mut container = instantiate(&module);
     let outcome = container.call_guest("guest_six_arguments", [0; 6]);
-    assert!(outcome.is_err(), "an unimplemented syscall must stop the run");
+    assert!(
+        outcome.is_err(),
+        "an unimplemented syscall must stop the run"
+    );
 
     let logged = container
         .mounts()
@@ -383,9 +382,13 @@ fn the_yield_tag_survives_the_link_and_the_engine() {
     // Put a value in every register, then run the throw under the catch. The
     // thrower is reached through the indirect table, so a frame with no
     // handler of its own sits between the throw and the catch.
-    let image = container.allocate_transfer(zaqaru::seam::machine_image::SIZE, 8).expect("allocate");
+    let image = container
+        .allocate_transfer(zaqaru::seam::machine_image::SIZE, 8)
+        .expect("allocate");
     let pattern = machine_pattern();
-    container.write_memory(image, &pattern).expect("write the image");
+    container
+        .write_memory(image, &pattern)
+        .expect("write the image");
     container
         .call::<u32, ()>("x86_load_machine", image)
         .expect("load the machine image");
@@ -396,7 +399,9 @@ fn the_yield_tag_survives_the_link_and_the_engine() {
         .expect("the throw escaped its catch");
     assert_eq!(outcome, 1, "`x86_run_thread` did not report a yield");
 
-    let after = container.allocate_transfer(zaqaru::seam::machine_image::SIZE, 8).expect("allocate");
+    let after = container
+        .allocate_transfer(zaqaru::seam::machine_image::SIZE, 8)
+        .expect("allocate");
     container
         .call::<u32, ()>("x86_save_machine", after)
         .expect("save the machine image");
@@ -479,8 +484,12 @@ fn the_machine_image_round_trips() {
     let mut container = instantiate(&module);
 
     let pattern = machine_pattern();
-    let source = container.allocate_transfer(pattern.len() as u32, 8).expect("allocate");
-    let sink = container.allocate_transfer(pattern.len() as u32, 8).expect("allocate");
+    let source = container
+        .allocate_transfer(pattern.len() as u32, 8)
+        .expect("allocate");
+    let sink = container
+        .allocate_transfer(pattern.len() as u32, 8)
+        .expect("allocate");
     container.write_memory(source, &pattern).expect("write");
     container
         .call::<u32, ()>("x86_load_machine", source)
@@ -512,7 +521,9 @@ fn a_saved_image_holds_what_the_guest_left_behind() {
         .call_guest("guest_write", [1, MESSAGE.len() as i64, 0, 0, 0, 0])
         .expect("the guest trapped");
 
-    let image = container.allocate_transfer(zaqaru::seam::machine_image::SIZE, 8).expect("allocate");
+    let image = container
+        .allocate_transfer(zaqaru::seam::machine_image::SIZE, 8)
+        .expect("allocate");
     container
         .call::<u32, ()>("x86_save_machine", image)
         .expect("save");
@@ -734,7 +745,9 @@ fn the_segment_base_matches_native_in_every_build() {
             };
             let label = options.label().replace('/', ".");
             let native_object = compile_corpus_object(&workspace, "segment_base.s");
-            let object = workspace.path().join(format!("segment_base.{label}.wasm.o"));
+            let object = workspace
+                .path()
+                .join(format!("segment_base.{label}.wasm.o"));
             support::transpile_object_configured(&native_object, &object, options);
             let module = link_container(&workspace, &[object], &label);
             let mut container = instantiate(&module);
@@ -786,7 +799,11 @@ fn a_gs_prefix_is_a_named_translation_error() {
                 &object.to_string_lossy(),
             ],
         );
-        assert!(outcome.succeeded, "assembling the {name} case: {}", outcome.report());
+        assert!(
+            outcome.succeeded,
+            "assembling the {name} case: {}",
+            outcome.report()
+        );
 
         let error = support::try_transpile_object(&object, zaqaru::structurer::Mode::Structured)
             .expect_err("a `%gs` operand must be refused, not approximated");
@@ -899,7 +916,9 @@ fn the_transfer_arena_lasts_one_syscall() {
     let mut container = instantiate(&module);
 
     let placed = container.allocate_transfer(16, 8).expect("allocate");
-    container.write_memory(placed, b"before-a-syscall").expect("write");
+    container
+        .write_memory(placed, b"before-a-syscall")
+        .expect("write");
     assert_eq!(
         container.read_memory(placed, 16).expect("read"),
         b"before-a-syscall",
@@ -977,28 +996,28 @@ fn standard_input_crosses_the_store_boundary() {
             support::CodeModel::PositionIndependent,
             "-O1",
         );
-        let guest = workspace.path().join(format!("console.{label}.wasm.o").replace('/', "."));
+        let guest = workspace
+            .path()
+            .join(format!("console.{label}.wasm.o").replace('/', "."));
         let options = support::TranspileOptions {
             mode,
             promote: true,
             resume,
         };
         support::transpile_object_configured(&native, &guest, options);
-        let module = link_container_with_image(
-            &workspace,
-            &[guest],
-            &image,
-            &label.replace('/', "."),
-        );
+        let module =
+            link_container_with_image(&workspace, &[guest], &image, &label.replace('/', "."));
         let bytes = std::fs::read(&module).expect("read the container");
         validate_wasm(&bytes);
 
         let mut mounts = m1_mounts();
         mounts
-            .write(&path(&[b"iso", b"console", b"stdin"]), b"typed by a human\n")
+            .write(
+                &path(&[b"iso", b"console", b"stdin"]),
+                b"typed by a human\n",
+            )
             .expect("seed standard input");
-        let mut container =
-            runner::Container::instantiate(&bytes, mounts).expect("instantiate");
+        let mut container = runner::Container::instantiate(&bytes, mounts).expect("instantiate");
         container
             .call_guest("guest_console", [1, 0, 0, 0, 0, 0])
             .unwrap_or_else(|error| panic!("[{label}] the guest trapped: {error:?}"));
@@ -1061,9 +1080,8 @@ fn an_absent_standard_input_is_end_of_input() {
         .expect("mount")
         .unwrap_or_default();
     assert_eq!(written.len(), 32, "only the report, and no input bytes");
-    let word = |index: usize| {
-        i64::from_le_bytes(written[index * 8..index * 8 + 8].try_into().expect("8"))
-    };
+    let word =
+        |index: usize| i64::from_le_bytes(written[index * 8..index * 8 + 8].try_into().expect("8"));
     assert_eq!([word(0), word(1), word(2)], [0, 0, 0]);
 }
 
@@ -1104,7 +1122,11 @@ long long kisal_syscall(long long n, long long a, long long b, long long c,\n\
             &linked,
             &["--fatal-warnings", "--export=x86_syscall"],
         );
-        assert!(outcome.succeeded, "[{label}] link failed:\n{}", outcome.report());
+        assert!(
+            outcome.succeeded,
+            "[{label}] link failed:\n{}",
+            outcome.report()
+        );
 
         // Instantiated directly rather than through `runner::Container`:
         // this module is the seam and a stand-in kernel, with none of the
@@ -1250,9 +1272,7 @@ fn the_synthetic_devices_work_inside_a_container() {
             .chunks_exact(32)
             .map(|chunk| {
                 let word = |index: usize| {
-                    i64::from_le_bytes(
-                        chunk[index * 8..index * 8 + 8].try_into().expect("eight"),
-                    )
+                    i64::from_le_bytes(chunk[index * 8..index * 8 + 8].try_into().expect("eight"))
                 };
                 [word(0), word(1), word(2), word(3)]
             })
@@ -1319,8 +1339,7 @@ fn the_synthetic_devices_work_inside_a_container() {
 
     // And a container the host gave no entropy has none: the read is
     // refused rather than answered with zeros.
-    let mut blind =
-        runner::Container::instantiate(&bytes, m1_mounts()).expect("instantiate");
+    let mut blind = runner::Container::instantiate(&bytes, m1_mounts()).expect("instantiate");
     blind
         .call_guest("guest_devices", [1, 0, 0, 0, 0, 0])
         .expect("the guest trapped");
@@ -1398,8 +1417,8 @@ fn a_guest_reads_proc_self_maps_inside_a_container() {
     let read = word(2);
     assert!(mapped > 0, "the guest's mmap failed with {mapped}");
     assert!(read > 0, "reading /proc/self/maps failed with {read}");
-    let text = String::from_utf8(report[32..32 + read as usize].to_vec())
-        .expect("the file is text");
+    let text =
+        String::from_utf8(report[32..32 + read as usize].to_vec()).expect("the file is text");
 
     // Every line is `start-end perms offset dev:dev inode path`, in address
     // order — the shape `pthread_getattr_np`'s parser expects.
@@ -1425,7 +1444,14 @@ fn a_guest_reads_proc_self_maps_inside_a_container() {
 
     let (start, end, perms) =
         covering.unwrap_or_else(|| panic!("no line covers {mapped:#x}:\n{text}"));
-    assert_eq!(start, mapped as u64, "the mapping starts where it was given");
-    assert_eq!(end - start, length as u64, "and is as long as it was asked for");
+    assert_eq!(
+        start, mapped as u64,
+        "the mapping starts where it was given"
+    );
+    assert_eq!(
+        end - start,
+        length as u64,
+        "and is as long as it was asked for"
+    );
     assert_eq!(perms, "rw-p", "with the protection it was asked for");
 }

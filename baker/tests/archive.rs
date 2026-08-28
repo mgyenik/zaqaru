@@ -126,9 +126,18 @@ fn a_later_layer_replaces_deletes_and_adds() {
     let archive = workspace.archive(&["layer0", "layer1"]);
     let tree = baker::layers::tree_from_archive(&archive).expect("flatten");
 
-    assert_eq!(contents(&tree, "etc/hosts").as_deref(), Some(&b"replaced hosts\n"[..]));
-    assert_eq!(contents(&tree, "data/keep").as_deref(), Some(&b"kept\n"[..]));
-    assert_eq!(contents(&tree, "data/added").as_deref(), Some(&b"added\n"[..]));
+    assert_eq!(
+        contents(&tree, "etc/hosts").as_deref(),
+        Some(&b"replaced hosts\n"[..])
+    );
+    assert_eq!(
+        contents(&tree, "data/keep").as_deref(),
+        Some(&b"kept\n"[..])
+    );
+    assert_eq!(
+        contents(&tree, "data/added").as_deref(),
+        Some(&b"added\n"[..])
+    );
     assert!(
         baker::layers::resolve(&tree, "data/doomed").is_none(),
         "the whiteout did not delete the file"
@@ -166,7 +175,10 @@ fn an_opaque_directory_hides_everything_beneath_it() {
     let tree = baker::layers::tree_from_archive(&workspace.archive(&["layer0", "layer1"]))
         .expect("flatten");
 
-    assert_eq!(contents(&tree, "site/fresh").as_deref(), Some(&b"fresh\n"[..]));
+    assert_eq!(
+        contents(&tree, "site/fresh").as_deref(),
+        Some(&b"fresh\n"[..])
+    );
     for gone in ["site/one", "site/two", "site/deep", "site/deep/three"] {
         assert!(
             baker::layers::resolve(&tree, gone).is_none(),
@@ -174,7 +186,10 @@ fn an_opaque_directory_hides_everything_beneath_it() {
         );
     }
     // Only that directory: an opaque marker is not a whiteout of the world.
-    assert_eq!(contents(&tree, "other/kept").as_deref(), Some(&b"kept\n"[..]));
+    assert_eq!(
+        contents(&tree, "other/kept").as_deref(),
+        Some(&b"kept\n"[..])
+    );
     assert!(baker::layers::resolve(&tree, "site/.wh..wh..opq").is_none());
 }
 
@@ -227,7 +242,10 @@ fn a_hardlink_record_names_one_file_twice() {
     let bin = image.lookup(&bin, b"bin").expect("lookup").expect("bin");
     let bin = image.inode(bin.inode).expect("inode");
     let tool = image.lookup(&bin, b"tool").expect("lookup").expect("tool");
-    let twin = image.lookup(&bin, b"tool2").expect("lookup").expect("tool2");
+    let twin = image
+        .lookup(&bin, b"tool2")
+        .expect("lookup")
+        .expect("tool2");
     assert_eq!(tool.inode, twin.inode);
     assert_eq!(image.inode(tool.inode).expect("inode").nlink, 2);
 }
@@ -239,8 +257,21 @@ fn tar_metadata_reaches_the_baked_index() {
     let workspace = workspace("metadata");
     let base = workspace.tree_directory("base");
     write(&base.join("bin/ping"), b"binary\n");
-    set_xattr(&base.join("bin/ping"), b"user.capability", &[0x01, 0x00, 0x00, 0x02]);
-    workspace.layer(&base, "layer0", &["--format=pax", "--xattrs", "--owner=root:0", "--group=wheel:0"]);
+    set_xattr(
+        &base.join("bin/ping"),
+        b"user.capability",
+        &[0x01, 0x00, 0x00, 0x02],
+    );
+    workspace.layer(
+        &base,
+        "layer0",
+        &[
+            "--format=pax",
+            "--xattrs",
+            "--owner=root:0",
+            "--group=wheel:0",
+        ],
+    );
 
     let tree = baker::layers::tree_from_archive(&workspace.archive(&["layer0"])).expect("flatten");
     let ping = baker::layers::resolve(&tree, "bin/ping").expect("bin/ping");
@@ -280,13 +311,15 @@ fn a_compressed_layer_is_decompressed() {
     let path = workspace.layer(&base, "layer0", &["--format=pax"]);
 
     let plain = std::fs::read(&path).expect("read");
-    let mut encoder =
-        flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
     encoder.write_all(&plain).expect("compress");
     std::fs::write(&path, encoder.finish().expect("finish")).expect("write");
 
     let tree = baker::layers::tree_from_archive(&workspace.archive(&["layer0"])).expect("flatten");
-    assert_eq!(contents(&tree, "etc/hosts").as_deref(), Some(&b"compressed\n"[..]));
+    assert_eq!(
+        contents(&tree, "etc/hosts").as_deref(),
+        Some(&b"compressed\n"[..])
+    );
 }
 
 /// An archive bakes end to end, and the image reads back through the parser
@@ -310,9 +343,15 @@ fn an_archive_bakes_into_an_image() {
     let root = image.inode(image.root()).expect("root");
     let etc = image.lookup(&root, b"etc").expect("lookup").expect("etc");
     let etc = image.inode(etc.inode).expect("inode");
-    let hosts = image.lookup(&etc, b"hosts").expect("lookup").expect("hosts");
+    let hosts = image
+        .lookup(&etc, b"hosts")
+        .expect("lookup")
+        .expect("hosts");
     let hosts = image.inode(hosts.inode).expect("inode");
-    assert_eq!(image.contents(&hosts).expect("contents"), b"127.0.0.1 localhost\n");
+    assert_eq!(
+        image.contents(&hosts).expect("contents"),
+        b"127.0.0.1 localhost\n"
+    );
     assert_eq!(hosts.mode & 0o170000, 0o100000);
 
     let link = image.lookup(&root, b"bin").expect("lookup").expect("bin");
@@ -349,7 +388,10 @@ fn a_malformed_archive_is_refused_by_name() {
     let without = std::fs::read(workspace.root.join("image.tar")).expect("read");
     let refusal =
         baker::layers::tree_from_archive(&without).expect_err("no manifest must be refused");
-    assert!(format!("{refusal:#}").contains("manifest.json"), "{refusal:#}");
+    assert!(
+        format!("{refusal:#}").contains("manifest.json"),
+        "{refusal:#}"
+    );
 }
 
 /// A layer entry naming a path outside the image is refused rather than
@@ -410,8 +452,8 @@ fn a_directory_and_an_archive_of_it_bake_alike() {
     set_xattr(&source.join("etc/hosts"), b"user.origin", b"the fixture");
 
     workspace.layer(&source, "layer0", &["--format=pax", "--xattrs"]);
-    let from_archive = baker::layers::tree_from_archive(&workspace.archive(&["layer0"]))
-        .expect("flatten");
+    let from_archive =
+        baker::layers::tree_from_archive(&workspace.archive(&["layer0"])).expect("flatten");
     let from_directory = Tree::from_directory(&source).expect("read the directory");
 
     let mut ours = std::collections::BTreeMap::new();

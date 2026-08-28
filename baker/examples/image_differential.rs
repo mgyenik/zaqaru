@@ -52,8 +52,12 @@ fn walk(tree: &Tree, id: usize, prefix: &str, into: &mut BTreeMap<String, String
 
 fn main() {
     let mut arguments = std::env::args().skip(1);
-    let saved = arguments.next().expect("usage: <docker-save.tar> <docker-export.tar>");
-    let exported = arguments.next().expect("usage: <docker-save.tar> <docker-export.tar>");
+    let saved = arguments
+        .next()
+        .expect("usage: <docker-save.tar> <docker-export.tar>");
+    let exported = arguments
+        .next()
+        .expect("usage: <docker-save.tar> <docker-export.tar>");
 
     let tree = baker::layers::tree_from_archive(&std::fs::read(&saved).expect("read the archive"))
         .expect("flatten the layer stack");
@@ -65,7 +69,10 @@ fn main() {
     let mut theirs: BTreeMap<String, String> = BTreeMap::new();
     for entry in &flat {
         let path = String::from_utf8_lossy(&entry.path);
-        let path = path.trim_start_matches("./").trim_end_matches('/').to_string();
+        let path = path
+            .trim_start_matches("./")
+            .trim_end_matches('/')
+            .to_string();
         if path.is_empty() {
             continue;
         }

@@ -43,8 +43,8 @@
 
 mod support;
 
-use std::sync::{Arc, Mutex};
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 use support::{
     ALL_COMPILERS, ALL_MODES, ALL_OPTIMISATION_LEVELS, CORPUS_COMPILE_FLAGS, CodeModel, Compiler,
@@ -310,9 +310,22 @@ fn run(
     // The uniform host-entry wrapper: six integer argument registers and
     // eight floating-point ones in, `rax` and `xmm0` out.
     let wrapper = instance
-        .get_typed_func::<(i64, i64, i64, i64, i64, i64, f64, f64, f64, f64, f64, f64, f64, f64), (i64, f64)>(
-            &mut store, entry,
-        )
+        .get_typed_func::<(
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            f64,
+            f64,
+            f64,
+            f64,
+            f64,
+            f64,
+            f64,
+            f64,
+        ), (i64, f64)>(&mut store, entry)
         .unwrap_or_else(|error| panic!("export `{entry}` not usable: {error}"));
     let (result, _) = wrapper
         .call(
@@ -362,7 +375,10 @@ fn attack(linked: &Path, entry: &str, variant: &str, negative_controls: bool) {
         SEED_POISON,
     );
 
-    assert_eq!(record.calls, 1, "{variant}: `g` never ran in the record run");
+    assert_eq!(
+        record.calls, 1,
+        "{variant}: `g` never ran in the record run"
+    );
     assert_eq!(plain.calls, 1, "{variant}: `g` never ran in the plain run");
     assert_eq!(
         restore.calls, 1,

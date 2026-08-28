@@ -607,9 +607,7 @@ impl Space {
 /// Rounds a length up to the page the guest believes in, refusing one that
 /// would overflow rather than wrapping it to something small.
 fn round_up(length: u64) -> Result<u64, Errno> {
-    length
-        .checked_next_multiple_of(PAGE)
-        .ok_or(Errno::NoMemory)
+    length.checked_next_multiple_of(PAGE).ok_or(Errno::NoMemory)
 }
 
 // ---- mremap and the rendering -----------------------------------------
@@ -680,7 +678,9 @@ impl Space {
         }
 
         let extra = new_length - old_length;
-        if !self.overlaps(start + old_length, extra) && self.reserve_above(start + old_length, extra, grow) {
+        if !self.overlaps(start + old_length, extra)
+            && self.reserve_above(start + old_length, extra, grow)
+        {
             let fill = self.claim(start + old_length, extra);
             self.vmas[index].length = new_length;
             return Ok(Move {
@@ -711,26 +711,29 @@ impl Space {
             // new range needs them.
             fill: Fill {
                 start: fill.start.max(destination + old_length),
-                length: fill
-                    .length
-                    .saturating_sub(destination + old_length - fill.start.min(destination + old_length)),
+                length: fill.length.saturating_sub(
+                    destination + old_length - fill.start.min(destination + old_length),
+                ),
             },
         })
     }
 
     /// Whether a range immediately above a mapping can be taken: it must be
     /// free of other mappings, not inside the `brk` arena, and reachable.
-    fn reserve_above(&mut self, start: u64, length: u64, grow: &mut impl FnMut(u64) -> bool) -> bool {
+    fn reserve_above(
+        &mut self,
+        start: u64,
+        length: u64,
+        grow: &mut impl FnMut(u64) -> bool,
+    ) -> bool {
         if start < self.brk_ceiling {
             return false;
         }
         // If the pool holds it, take it out; otherwise it has to be fresh
         // space above everything.
-        if let Some(index) = self
-            .free
-            .iter()
-            .position(|(free_start, free_length)| *free_start <= start && free_start + free_length >= start + length)
-        {
+        if let Some(index) = self.free.iter().position(|(free_start, free_length)| {
+            *free_start <= start && free_start + free_length >= start + length
+        }) {
             let (free_start, free_length) = self.free[index];
             self.free.remove(index);
             if free_start < start {
@@ -749,5 +752,4 @@ impl Space {
         }
         grow(start + length)
     }
-
 }

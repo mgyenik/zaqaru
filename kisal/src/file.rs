@@ -14,9 +14,9 @@ use crate::errno::Errno;
 use crate::fd::{Backing, Console, MAX_DESCRIPTORS};
 use crate::image::{Inode, file_type};
 use crate::machine::Machine;
+use crate::mount::Vnode;
 use crate::paths;
 use crate::syscall::{Arguments, Fault, Kernel, Outcome, number};
-use crate::mount::Vnode;
 use crate::vfs::Lookup;
 
 /// `open(2)` flags, in the x86-64 numbering.
@@ -116,10 +116,7 @@ pub const PATH_MAX: usize = 4096;
 /// the guest hands to a lookup, and what comes back out of the index.
 pub const MAX_NAME: usize = 255;
 fn is_device_node(inode: &Inode) -> bool {
-    matches!(
-        inode.file_type(),
-        file_type::CHARACTER | file_type::BLOCK
-    )
+    matches!(inode.file_type(), file_type::CHARACTER | file_type::BLOCK)
 }
 
 /// How much of a generated stream is produced at a time. A guest asking for
@@ -335,8 +332,7 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
             // on Linux, checked against one. Opening `/dev/null` for writing
             // is among the first things a daemonising process does.
             let is_device = is_device_node(&resolved);
-            let wants_change = access != open_flags::READ_ONLY
-                || flags & open_flags::TRUNCATE != 0;
+            let wants_change = access != open_flags::READ_ONLY || flags & open_flags::TRUNCATE != 0;
             if !is_device && wants_change && !self.is_writable(inode) {
                 return Outcome::Done(Errno::ReadOnlyFs.as_result());
             }
@@ -348,8 +344,7 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
         // This is also where overlayfs copies up, and for the same reason.
         let mut inode = inode;
         if !path_only && !resolved.is_directory() && !is_device_node(&resolved) {
-            let wants_change =
-                access != open_flags::READ_ONLY || flags & open_flags::TRUNCATE != 0;
+            let wants_change = access != open_flags::READ_ONLY || flags & open_flags::TRUNCATE != 0;
             if wants_change {
                 // Following a trailing symlink, unless `O_NOFOLLOW` said
                 // not to — in which case resolution already refused it.
@@ -535,7 +530,10 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
             // call, so it is refused by name instead.
             return Err(Errno::NoDevice);
         }
-        let contents = self.vfs.filesystem_of(vnode)?.contents(&inode, vnode.inode)?;
+        let contents = self
+            .vfs
+            .filesystem_of(vnode)?
+            .contents(&inode, vnode.inode)?;
         // At full width. `usize` is 32 bits inside the module, so casting the
         // guest's offset and count first lets `offset = 1 << 32` read the
         // head of the file and report success, and lets a large count wrap
@@ -836,9 +834,7 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
         if path.is_empty() && flags & at::EMPTY_PATH != 0 {
             return match self.empty_path_target(arguments.get(0)) {
                 Ok(Backing::Image(inode)) => self.write_stat(inode, arguments.get(2)),
-                Ok(Backing::Console(stream)) => {
-                    self.write_console_stat(stream, arguments.get(2))
-                }
+                Ok(Backing::Console(stream)) => self.write_console_stat(stream, arguments.get(2)),
                 Err(errno) => Outcome::Done(errno.as_result()),
             };
         }
@@ -888,8 +884,7 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
                     let mut buffer = [0u8; STATX_SIZE];
                     encode_console_statx(&mut buffer, stream);
                     // SAFETY: bounds-checked against guest memory.
-                    return match unsafe { self.memory().write(arguments.get(4) as u64, &buffer) }
-                    {
+                    return match unsafe { self.memory().write(arguments.get(4) as u64, &buffer) } {
                         Ok(()) => Outcome::Done(0),
                         Err(errno) => Outcome::Done(errno.as_result()),
                     };
@@ -1024,7 +1019,11 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
         let mut memory_error = None;
         loop {
             let (name, child, entry_type): (&[u8], u32, u8) = if position == 0 {
-                (b".", vnode.inode, crate::image::directory_entry_type::DIRECTORY)
+                (
+                    b".",
+                    vnode.inode,
+                    crate::image::directory_entry_type::DIRECTORY,
+                )
             } else if position == 1 {
                 (
                     b"..",
@@ -1040,8 +1039,7 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
                 // A merged listing does not carry the type — reading it
                 // costs an inode lookup, and a walk that only needs names
                 // should not pay for one per step.
-                let entry_type = if entry.entry_type
-                    == crate::image::directory_entry_type::UNKNOWN
+                let entry_type = if entry.entry_type == crate::image::directory_entry_type::UNKNOWN
                 {
                     let child = Vnode::new(vnode.mount, entry.inode);
                     match self.vfs.inode(child) {
@@ -1219,7 +1217,12 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
     /// non-zero. Verified against this machine's kernel — `syscall(269, …,
     /// 0xdeadbeef)` answers exactly what `syscall(269, …, 0)` answers.
     pub(crate) fn faccessat(&mut self, arguments: Arguments) -> Outcome {
-        self.access_at(arguments.get(0), arguments.get(1), arguments.get(2) as i32, 0)
+        self.access_at(
+            arguments.get(0),
+            arguments.get(1),
+            arguments.get(2) as i32,
+            0,
+        )
     }
 
     fn access_at(&mut self, dirfd: i64, path: i64, mode: i32, flags: i32) -> Outcome {
@@ -1336,9 +1339,9 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
                     Backing::Console(_) => Ok(None),
                 }
             }
-            number::LGETXATTR | number::LLISTXATTR => {
-                self.resolve_at(at::FDCWD, first, Lookup::NO_FOLLOW).map(Some)
-            }
+            number::LGETXATTR | number::LLISTXATTR => self
+                .resolve_at(at::FDCWD, first, Lookup::NO_FOLLOW)
+                .map(Some),
             _ => self.resolve_at(at::FDCWD, first, Lookup::FOLLOW).map(Some),
         }
     }
@@ -1529,8 +1532,7 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
             fcntl_command::SETFL => {
                 const CHANGEABLE: i32 = open_flags::APPEND | open_flags::NONBLOCK;
                 self.files.description_mut(fd).map(|file| {
-                    file.flags =
-                        (file.flags & !CHANGEABLE) | (argument as i32 & CHANGEABLE);
+                    file.flags = (file.flags & !CHANGEABLE) | (argument as i32 & CHANGEABLE);
                     0
                 })
             }
@@ -1568,10 +1570,12 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
     }
 
     pub(crate) fn dup(&mut self, arguments: Arguments) -> Outcome {
-        Outcome::Done(match self.files.duplicate(arguments.get(0) as i32, 0, false) {
-            Ok(fd) => fd as i64,
-            Err(errno) => errno.as_result(),
-        })
+        Outcome::Done(
+            match self.files.duplicate(arguments.get(0) as i32, 0, false) {
+                Ok(fd) => fd as i64,
+                Err(errno) => errno.as_result(),
+            },
+        )
     }
 
     pub(crate) fn dup2(&mut self, arguments: Arguments) -> Outcome {
@@ -1694,10 +1698,7 @@ fn visible_inode(number: u32) -> u64 {
 }
 
 fn encode_stat(into: &mut [u8; STAT_SIZE], device: u64, number: u32, inode: &Inode) {
-    let rdev = if matches!(
-        inode.file_type(),
-        file_type::CHARACTER | file_type::BLOCK
-    ) {
+    let rdev = if matches!(inode.file_type(), file_type::CHARACTER | file_type::BLOCK) {
         inode.payload
     } else {
         0

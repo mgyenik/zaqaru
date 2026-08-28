@@ -24,7 +24,11 @@ pub fn read(path: &Path) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
     let mut names = vec![0u8; 1024];
     let length = loop {
         let length = unsafe {
-            libc::llistxattr(c_path.as_ptr(), names.as_mut_ptr() as *mut libc::c_char, names.len())
+            libc::llistxattr(
+                c_path.as_ptr(),
+                names.as_mut_ptr() as *mut libc::c_char,
+                names.len(),
+            )
         };
         if length >= 0 {
             break length as usize;

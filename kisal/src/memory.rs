@@ -68,9 +68,7 @@ impl GuestMemory {
         if length == 0 {
             return Ok(&[]);
         }
-        Ok(unsafe {
-            core::slice::from_raw_parts(address as usize as *const u8, length as usize)
-        })
+        Ok(unsafe { core::slice::from_raw_parts(address as usize as *const u8, length as usize) })
     }
 
     /// A NUL-terminated string at a guest address — a path, an attribute

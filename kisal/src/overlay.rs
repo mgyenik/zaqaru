@@ -246,7 +246,9 @@ impl<'a> Overlay<'a> {
         if !is_upper(number) {
             return Err(Errno::Invalid);
         }
-        self.upper.get_mut(upper_index(number)).ok_or(Errno::NoEntry)
+        self.upper
+            .get_mut(upper_index(number))
+            .ok_or(Errno::NoEntry)
     }
 
     // ---- the read interface, which is the image's ----------------------
@@ -273,7 +275,12 @@ impl<'a> Overlay<'a> {
     }
 
     /// The name of an entry, and what it points at.
-    pub fn lookup(&self, directory: &Inode, number: u32, name: &[u8]) -> Result<Option<u32>, Errno> {
+    pub fn lookup(
+        &self,
+        directory: &Inode,
+        number: u32,
+        name: &[u8],
+    ) -> Result<Option<u32>, Errno> {
         if is_upper(number) {
             let Body::Directory { entries, lower } = &self.node(number)?.body else {
                 return Err(Errno::NotDir);
@@ -375,7 +382,12 @@ impl<'a> Overlay<'a> {
         self.lower.xattr_count(inode).map_err(|_| Errno::Io)
     }
 
-    pub fn xattr(&self, inode: &Inode, number: u32, position: u32) -> Result<(&[u8], &[u8]), Errno> {
+    pub fn xattr(
+        &self,
+        inode: &Inode,
+        number: u32,
+        position: u32,
+    ) -> Result<(&[u8], &[u8]), Errno> {
         if is_upper(number) {
             return Err(Errno::NoData);
         }
@@ -627,12 +639,9 @@ impl Overlay<'_> {
                 entries: BTreeMap::new(),
                 lower: Some(number),
             },
-            file_type::REGULAR => Body::Regular(
-                self.lower
-                    .contents(&inode)
-                    .map_err(|_| Errno::Io)?
-                    .to_vec(),
-            ),
+            file_type::REGULAR => {
+                Body::Regular(self.lower.contents(&inode).map_err(|_| Errno::Io)?.to_vec())
+            }
             file_type::SYMLINK => Body::Symlink(
                 self.lower
                     .symlink_target(&inode)
@@ -692,12 +701,9 @@ impl Overlay<'_> {
         // them. The parent's own entry map is what finds this copy, and it
         // finds it under one name only.
         let body = match inode.file_type() {
-            file_type::REGULAR => Body::Regular(
-                self.lower
-                    .contents(&inode)
-                    .map_err(|_| Errno::Io)?
-                    .to_vec(),
-            ),
+            file_type::REGULAR => {
+                Body::Regular(self.lower.contents(&inode).map_err(|_| Errno::Io)?.to_vec())
+            }
             file_type::SYMLINK => Body::Symlink(
                 self.lower
                     .symlink_target(&inode)
@@ -781,8 +787,7 @@ impl Overlay<'_> {
         after: Option<bool>,
     ) -> Result<(), Errno> {
         let entries = i64::from(after.is_some()) - i64::from(before.is_some());
-        let subdirectories =
-            i64::from(after == Some(true)) - i64::from(before == Some(true));
+        let subdirectories = i64::from(after == Some(true)) - i64::from(before == Some(true));
         let node = self.node_mut(directory)?;
         let count = ((node.inode.size as i64 - 4) / 12 + entries).max(0) as u64;
         node.inode.size = 4 + 12 * count;
@@ -963,7 +968,9 @@ impl Overlay<'_> {
         if !is_upper(node) {
             return false;
         }
-        self.node(node).map(|node| node.inode.nlink == 0).unwrap_or(false)
+        self.node(node)
+            .map(|node| node.inode.nlink == 0)
+            .unwrap_or(false)
     }
 
     /// Whether an upper directory reads through to one below it.

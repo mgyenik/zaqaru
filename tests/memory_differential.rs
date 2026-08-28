@@ -30,9 +30,8 @@ use std::os::unix::io::AsRawFd;
 use std::path::Path;
 
 use support::{
-    ALL_MODES, CodeModel, Compiler, TranspileOptions, WorkingDirectory,
-    compile_corpus_object_with, link_container_with_image, m1_mounts, transpile_object_configured,
-    validate_wasm,
+    ALL_MODES, CodeModel, Compiler, TranspileOptions, WorkingDirectory, compile_corpus_object_with,
+    link_container_with_image, m1_mounts, transpile_object_configured, validate_wasm,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -65,7 +64,9 @@ const PATTERNED: usize = 4 * 4096 + 1000;
 
 fn build_tree(root: &Path) {
     std::fs::create_dir_all(root).expect("mkdir");
-    let patterned: Vec<u8> = (0..PATTERNED as u32).map(|index| (index % 251) as u8).collect();
+    let patterned: Vec<u8> = (0..PATTERNED as u32)
+        .map(|index| (index % 251) as u8)
+        .collect();
     let mut file = std::fs::File::create(root.join("patterned")).expect("create");
     file.write_all(&patterned).expect("write");
 }

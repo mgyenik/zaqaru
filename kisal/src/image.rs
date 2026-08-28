@@ -364,8 +364,8 @@ impl<'a> Image<'a> {
             return Err(ImageError::WrongKind);
         }
         let region = self.region(self.header.dirent_offset, self.header.dirent_size);
-        let payload = u32::try_from(directory.payload)
-            .map_err(|_| ImageError::OutOfRange("directory"))?;
+        let payload =
+            u32::try_from(directory.payload).map_err(|_| ImageError::OutOfRange("directory"))?;
         let count = word(span(region, payload, 4, "directory")?, 0);
         // The whole array has to be present before any entry is read, so that
         // `entry` needs no check of its own beyond its position.
@@ -451,8 +451,8 @@ impl<'a> Image<'a> {
         if !inode.is_symlink() {
             return Err(ImageError::WrongKind);
         }
-        let reference = u32::try_from(inode.payload)
-            .map_err(|_| ImageError::OutOfRange("symlink target"))?;
+        let reference =
+            u32::try_from(inode.payload).map_err(|_| ImageError::OutOfRange("symlink target"))?;
         self.string(reference)
     }
 
@@ -481,10 +481,7 @@ impl<'a> Image<'a> {
             .and_then(|start| u32::try_from(start).ok())
             .ok_or(ImageError::Malformed("xattr block overruns"))?;
         let record = span(region, start, 8, "xattr block overruns")?;
-        Ok((
-            self.string(word(record, 0))?,
-            self.string(word(record, 4))?,
-        ))
+        Ok((self.string(word(record, 0))?, self.string(word(record, 4))?))
     }
 
     fn region(&self, offset: u32, size: u32) -> &'a [u8] {
@@ -505,7 +502,9 @@ fn span<'a>(
     what: &'static str,
 ) -> Result<&'a [u8], ImageError> {
     let start = offset as u64;
-    let end = start.checked_add(length).ok_or(ImageError::OutOfRange(what))?;
+    let end = start
+        .checked_add(length)
+        .ok_or(ImageError::OutOfRange(what))?;
     if end > region.len() as u64 {
         return Err(ImageError::OutOfRange(what));
     }

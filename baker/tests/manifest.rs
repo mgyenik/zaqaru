@@ -18,14 +18,23 @@ fn a_real_manifest_reads_back_as_itself() {
     let document = parse(REAL.as_bytes()).expect("parse");
     let images = document.as_array().expect("an array");
     assert_eq!(images.len(), 1);
-    let layers = images[0].get("Layers").expect("Layers").as_array().expect("an array");
+    let layers = images[0]
+        .get("Layers")
+        .expect("Layers")
+        .as_array()
+        .expect("an array");
     assert_eq!(layers.len(), 1);
     assert_eq!(
         layers[0].as_str(),
         Some("blobs/sha256/25f1d6b1951ac8eb3740558fe94cb83d377bdadf95fd9f98b50d2e1b96130471")
     );
     assert_eq!(
-        images[0].get("RepoTags").expect("RepoTags").as_array().expect("array")[0].as_str(),
+        images[0]
+            .get("RepoTags")
+            .expect("RepoTags")
+            .as_array()
+            .expect("array")[0]
+            .as_str(),
         Some("alpine:3.20")
     );
     assert!(images[0].get("Nothing").is_none());
@@ -42,7 +51,11 @@ fn a_string_that_looks_like_the_key_is_not_the_key() {
     )
     .expect("parse");
     let images = document.as_array().expect("array");
-    let layers = images[0].get("Layers").expect("Layers").as_array().expect("array");
+    let layers = images[0]
+        .get("Layers")
+        .expect("Layers")
+        .as_array()
+        .expect("array");
     assert_eq!(layers.len(), 1);
     assert_eq!(layers[0].as_str(), Some("blobs/sha256/right"));
 }
@@ -81,7 +94,10 @@ fn the_values_json_has_all_read_back() {
     assert_eq!(document.get("empty"), Some(&Value::Object(Vec::new())));
     assert_eq!(document.get("list"), Some(&Value::Array(Vec::new())));
     assert_eq!(
-        document.get("nested").and_then(Value::as_array).map(<[Value]>::len),
+        document
+            .get("nested")
+            .and_then(Value::as_array)
+            .map(<[Value]>::len),
         Some(1)
     );
 }

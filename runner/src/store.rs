@@ -93,7 +93,9 @@ impl MountTable {
     /// Whether anything is mounted that would serve this path — the
     /// question a boot-time capability check asks.
     pub fn resolves(&self, path: &[Vec<u8>]) -> bool {
-        self.mounts.iter().any(|(prefix, _)| path.starts_with(prefix))
+        self.mounts
+            .iter()
+            .any(|(prefix, _)| path.starts_with(prefix))
     }
 
     pub fn read(&mut self, path: &[Vec<u8>]) -> Result<Option<Vec<u8>>, String> {
@@ -109,7 +111,6 @@ impl MountTable {
             None => Err(format!("nothing is mounted at {}", render(path))),
         }
     }
-
 }
 
 /// A path as a diagnostic string. Segments are bytes, so anything that is

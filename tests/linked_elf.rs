@@ -44,7 +44,10 @@ fn a_linked_executable_is_read_as_one() {
 
     // Functions, discovered from the symbol table, with extents.
     assert!(
-        object.functions.iter().any(|function| function.name == "quad_mix"),
+        object
+            .functions
+            .iter()
+            .any(|function| function.name == "quad_mix"),
         "the function under test was not discovered: {:?}",
         object
             .functions
@@ -57,7 +60,10 @@ fn a_linked_executable_is_read_as_one() {
         let address = object.address_of(function);
         assert_eq!(
             object.function_at(address),
-            object.functions.iter().position(|other| other.name == function.name),
+            object
+                .functions
+                .iter()
+                .position(|other| other.name == function.name),
             "{} does not contain its own first byte",
             function.name
         );
@@ -148,8 +154,10 @@ fn the_load_segments_describe_what_a_loader_places() {
             continue;
         }
         assert!(
-            loadable.iter().any(|segment| section.address >= segment.address
-                && section.address + section.size <= segment.address + segment.memory_size),
+            loadable
+                .iter()
+                .any(|segment| section.address >= segment.address
+                    && section.address + section.size <= segment.address + segment.memory_size),
             "{} is not inside any load segment",
             section.name
         );
@@ -195,7 +203,8 @@ fn a_linked_input_translates_to_the_same_shape_as_a_relocatable_one() {
             function.name
         );
         let from = linked.address_of(twin) - linked.sections[twin.section].address;
-        let linked_bytes = &linked.sections[twin.section].bytes[from as usize..][..twin.size as usize];
+        let linked_bytes =
+            &linked.sections[twin.section].bytes[from as usize..][..twin.size as usize];
         let object_bytes = &relocatable.sections[function.section].bytes
             [function.offset as usize..][..function.size as usize];
         // The bytes differ only where the linker filled in a relocation, so
@@ -256,7 +265,8 @@ fn a_linked_executable_translates_to_a_valid_module() {
 fn a_switch_is_recovered_from_a_linked_table() {
     for optimisation in ["-O1", "-O2"] {
         let workspace = WorkingDirectory::new(&format!("linked-switch{optimisation}"));
-        let path = link_corpus_executable(&workspace, "switch_dispatch.c", "classify", optimisation);
+        let path =
+            link_corpus_executable(&workspace, "switch_dispatch.c", "classify", optimisation);
         let bytes = std::fs::read(&path).expect("read");
         let object = ObjectFile::parse(&bytes).expect("parse");
 
@@ -277,7 +287,10 @@ fn a_switch_is_recovered_from_a_linked_table() {
         // inference rests on, checked rather than assumed.
         for function in &lifted {
             for table in function.jump_tables.values() {
-                assert!(table.targets.len() >= 2, "[{optimisation}] a one-entry table");
+                assert!(
+                    table.targets.len() >= 2,
+                    "[{optimisation}] a one-entry table"
+                );
                 for target in &table.targets {
                     assert!(
                         function.contains(*target),
@@ -318,7 +331,8 @@ fn a_switch_is_recovered_from_a_linked_table() {
 fn a_linked_switch_is_rewritten_through_image_patches() {
     for optimisation in ["-O1", "-O2"] {
         let workspace = WorkingDirectory::new(&format!("linked-patch{optimisation}"));
-        let path = link_corpus_executable(&workspace, "switch_dispatch.c", "classify", optimisation);
+        let path =
+            link_corpus_executable(&workspace, "switch_dispatch.c", "classify", optimisation);
         let bytes = std::fs::read(&path).expect("read");
         let object = ObjectFile::parse(&bytes).expect("parse");
 
@@ -377,7 +391,8 @@ fn a_linked_switch_is_rewritten_through_image_patches() {
             support::CodeModel::Absolute,
             optimisation,
         );
-        let relocatable = ObjectFile::parse(&std::fs::read(&relocatable).expect("read")).expect("parse");
+        let relocatable =
+            ObjectFile::parse(&std::fs::read(&relocatable).expect("read")).expect("parse");
         assert!(
             zaqaru::transpile::Transpiler::new(&relocatable)
                 .translate()
@@ -387,4 +402,70 @@ fn a_linked_switch_is_rewritten_through_image_patches() {
             "[{optimisation}] a relocatable object asked the loader to patch something"
         );
     }
+}
+
+/// Where the functions are, when the symbol table has been taken away.
+///
+/// This is not a hypothetical: a shipped static binary is usually stripped,
+/// and then `.eh_frame` is the only thing left that says where one function
+/// ends and the next begins. The check is that stripping changes nothing —
+/// the same extents come back, from the other witness.
+#[test]
+fn a_stripped_executable_still_has_functions() {
+    let workspace = WorkingDirectory::new("linked-stripped");
+    let named = support::link_corpus_executable_with(
+        &workspace,
+        "switch_dispatch.c",
+        "classify",
+        "-O1",
+        support::Unwind::Present,
+    );
+    let stripped = support::strip(&workspace, &named);
+
+    let named = ObjectFile::parse(&std::fs::read(&named).expect("read")).expect("parse");
+    let unnamed = ObjectFile::parse(&std::fs::read(&stripped).expect("read")).expect("parse");
+
+    // The premise: stripping really did take the names away.
+    assert!(
+        unnamed
+            .functions
+            .iter()
+            .all(|function| function.name.starts_with("fn.")),
+        "the stripped executable still has named functions, so this proves nothing"
+    );
+    assert!(!named.functions.is_empty());
+
+    let extents = |object: &ObjectFile| -> Vec<(u64, u64)> {
+        let mut extents: Vec<_> = object
+            .functions
+            .iter()
+            .map(|function| {
+                (
+                    object.sections[function.section].address + function.offset,
+                    function.size,
+                )
+            })
+            .collect();
+        extents.sort();
+        extents
+    };
+    assert_eq!(
+        extents(&named),
+        extents(&unnamed),
+        "the unwind table and the symbol table disagree about where the functions are"
+    );
+
+    // And the nameless one translates, which is the point of finding them.
+    let translated = zaqaru::transpile::Transpiler::new(&unnamed)
+        .transpile()
+        .unwrap_or_else(|error| panic!("translating a stripped executable: {error:#}"));
+    let object_path = workspace.write("stripped.wasm.o", &translated);
+    let module_path = workspace.path().join("stripped.wasm");
+    let outcome = support::try_link_wasm(
+        &[object_path],
+        &module_path,
+        &["--fatal-warnings", "--export-table", "--growable-table"],
+    );
+    assert!(outcome.succeeded, "did not link:\n{}", outcome.report());
+    support::validate_wasm(&std::fs::read(&module_path).expect("read"));
 }

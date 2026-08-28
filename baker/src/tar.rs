@@ -281,9 +281,7 @@ fn parse_pax(contents: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let space = contents[at..]
             .iter()
             .position(|byte| *byte == b' ')
-            .ok_or_else(|| {
-                anyhow::anyhow!("a PAX record at offset {at} has no length prefix")
-            })?;
+            .ok_or_else(|| anyhow::anyhow!("a PAX record at offset {at} has no length prefix"))?;
         let length: usize = std::str::from_utf8(&contents[at..at + space])
             .ok()
             .and_then(|text| text.parse().ok())
@@ -384,8 +382,8 @@ fn pax_number(key: &[u8], value: &[u8]) -> Result<i64> {
 /// the reason it exists: tar's own field is whole seconds, and CPython
 /// compares source timestamps to decide whether a `.pyc` is stale.
 fn pax_time(value: &[u8]) -> Result<(i64, u32)> {
-    let text = std::str::from_utf8(value)
-        .map_err(|_| anyhow::anyhow!("a PAX `mtime` is not text"))?;
+    let text =
+        std::str::from_utf8(value).map_err(|_| anyhow::anyhow!("a PAX `mtime` is not text"))?;
     let (whole, fraction) = match text.split_once('.') {
         Some((whole, fraction)) => (whole, fraction),
         None => (text, ""),
@@ -410,7 +408,10 @@ fn pax_time(value: &[u8]) -> Result<(i64, u32)> {
 }
 
 fn trim_nul(field: &[u8]) -> &[u8] {
-    let end = field.iter().position(|byte| *byte == 0).unwrap_or(field.len());
+    let end = field
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(field.len());
     &field[..end]
 }
 

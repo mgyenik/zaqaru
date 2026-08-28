@@ -11,12 +11,12 @@
 //! answered by asking the mount table whether the filesystem has a writable
 //! layer. A synthetic `/proc` says no; the root says yes.
 
+use crate::abi::Store;
 use crate::errno::Errno;
 use crate::file::{at, open_flags};
 use crate::image::{Inode, file_type};
 use crate::machine::Machine;
 use crate::mount::Vnode;
-use crate::abi::Store;
 use crate::syscall::{Arguments, Fault, Kernel, Outcome, number};
 use crate::vfs::Lookup;
 
@@ -106,7 +106,12 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
     /// Copies whatever a path names into the writable layer, and returns it
     /// there. The path is what makes it possible — see
     /// [`crate::overlay::Overlay::copy_up_child`].
-    pub(crate) fn copy_up_path(&mut self, dirfd: i64, path: i64, follow: bool) -> Result<Vnode, Errno> {
+    pub(crate) fn copy_up_path(
+        &mut self,
+        dirfd: i64,
+        path: i64,
+        follow: bool,
+    ) -> Result<Vnode, Errno> {
         let (directory, name) = self.writable_parent(dirfd, path, follow)?;
         let overlay = self.overlay_of(directory)?;
         let number = overlay.copy_up_child(directory.inode, &name)?;
@@ -159,12 +164,7 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
     // ---- creating and removing names -----------------------------------
 
     /// Creates a file for `open(…, O_CREAT)`.
-    pub(crate) fn create_file(
-        &mut self,
-        dirfd: i64,
-        path: i64,
-        mode: u32,
-    ) -> Result<Vnode, Errno> {
+    pub(crate) fn create_file(&mut self, dirfd: i64, path: i64, mode: u32) -> Result<Vnode, Errno> {
         // Creating: the name is the thing, and it does not exist yet.
         let (directory, name) = self.writable_parent(dirfd, path, false)?;
         let inode = self.new_inode(file_type::REGULAR, mode);
@@ -545,10 +545,12 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
         if offset < 0 {
             return Outcome::Done(Errno::Invalid.as_result());
         }
-        Outcome::Done(match self.write_positioned(fd, arguments.get(1), count, offset) {
-            Ok(written) => written as i64,
-            Err(errno) => errno.as_result(),
-        })
+        Outcome::Done(
+            match self.write_positioned(fd, arguments.get(1), count, offset) {
+                Ok(written) => written as i64,
+                Err(errno) => errno.as_result(),
+            },
+        )
     }
 
     fn write_positioned(
@@ -674,13 +676,7 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
         self.finish_change(arguments, result)
     }
 
-    fn set_times(
-        &mut self,
-        dirfd: i64,
-        path: i64,
-        times: i64,
-        flags: i32,
-    ) -> Result<(), Errno> {
+    fn set_times(&mut self, dirfd: i64, path: i64, times: i64, flags: i32) -> Result<(), Errno> {
         let vnode = if path == 0 {
             // A null path means the descriptor itself, which is how
             // `futimens` is spelled. There is no final component to decline
@@ -713,9 +709,8 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
         } else {
             // SAFETY: bounds-checked against the guest's memory.
             let bytes = unsafe { self.memory().slice(times as u64, 32)? };
-            let word = |at: usize| {
-                i64::from_le_bytes(bytes[at..at + 8].try_into().expect("eight bytes"))
-            };
+            let word =
+                |at: usize| i64::from_le_bytes(bytes[at..at + 8].try_into().expect("eight bytes"));
             let (access_nanoseconds, seconds, nanoseconds) = (word(8), word(16), word(24));
             for nanoseconds in [access_nanoseconds, nanoseconds] {
                 if nanoseconds != utime::NOW
@@ -742,7 +737,8 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
                 _ => (seconds, nanoseconds as u32),
             }
         };
-        let upper = self.copy_up_for_change(dirfd, path, vnode, flags & at::SYMLINK_NOFOLLOW == 0)?;
+        let upper =
+            self.copy_up_for_change(dirfd, path, vnode, flags & at::SYMLINK_NOFOLLOW == 0)?;
         let overlay = self.overlay_of(upper)?;
         overlay.set_times(upper.inode, seconds, nanoseconds)
     }
@@ -860,7 +856,13 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
         }
     }
 
-    fn change_mode_at(&mut self, dirfd: i64, path: i64, vnode: Vnode, mode: u32) -> Result<(), Errno> {
+    fn change_mode_at(
+        &mut self,
+        dirfd: i64,
+        path: i64,
+        vnode: Vnode,
+        mode: u32,
+    ) -> Result<(), Errno> {
         let upper = self.copy_up_for_change(dirfd, path, vnode, true)?;
         let overlay = self.overlay_of(upper)?;
         overlay.set_mode(upper.inode, mode)
@@ -916,7 +918,13 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
         )
     }
 
-    fn move_name(&mut self, from_dirfd: i64, from: i64, to_dirfd: i64, to: i64) -> Result<(), Errno> {
+    fn move_name(
+        &mut self,
+        from_dirfd: i64,
+        from: i64,
+        to_dirfd: i64,
+        to: i64,
+    ) -> Result<(), Errno> {
         // Renaming moves the *name*, symlink included, which is why neither
         // side follows a trailing link.
         let (from_directory, from_name) = self.parent_of(from_dirfd, from, false)?;

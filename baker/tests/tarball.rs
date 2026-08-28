@@ -45,8 +45,11 @@ fn build_tree(root: &Path) {
     write(&root.join("etc/hosts"), b"127.0.0.1 localhost\n");
     // Explicitly, rather than whatever the umask gives: the mode is what is
     // being compared.
-    std::fs::set_permissions(root.join("etc/hosts"), std::fs::Permissions::from_mode(0o644))
-        .expect("chmod");
+    std::fs::set_permissions(
+        root.join("etc/hosts"),
+        std::fs::Permissions::from_mode(0o644),
+    )
+    .expect("chmod");
     write(&root.join("usr/bin/tool"), b"#!/bin/sh\nexit 0\n");
     std::fs::set_permissions(
         root.join("usr/bin/tool"),
@@ -194,8 +197,14 @@ fn a_fractional_timestamp_survives_pax() {
     let file = tree.join("stamped");
     write(&file, b"x");
     let times = [
-        libc::timespec { tv_sec: 1_700_000_000, tv_nsec: 123_456_789 },
-        libc::timespec { tv_sec: 1_700_000_000, tv_nsec: 123_456_789 },
+        libc::timespec {
+            tv_sec: 1_700_000_000,
+            tv_nsec: 123_456_789,
+        },
+        libc::timespec {
+            tv_sec: 1_700_000_000,
+            tv_nsec: 123_456_789,
+        },
     ];
     let path = std::ffi::CString::new(file.as_os_str().as_bytes()).expect("path");
     assert_eq!(

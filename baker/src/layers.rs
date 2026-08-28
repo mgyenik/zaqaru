@@ -48,15 +48,12 @@ pub fn tree_from_archive(archive: &[u8]) -> Result<Tree> {
         // written by `tar` directly, are not. Both are read, decided by what
         // the bytes say rather than by what the name suggests.
         let layer = if layer.contents.starts_with(&[0x1f, 0x8b]) {
-            inflate(&layer.contents)
-                .with_context(|| format!("decompressing the layer `{name}`"))?
+            inflate(&layer.contents).with_context(|| format!("decompressing the layer `{name}`"))?
         } else {
             layer.contents.clone()
         };
-        let entries =
-            tar::read(&layer).with_context(|| format!("reading the layer `{name}`"))?;
-        apply(&mut tree, &entries)
-            .with_context(|| format!("applying the layer `{name}`"))?;
+        let entries = tar::read(&layer).with_context(|| format!("reading the layer `{name}`"))?;
+        apply(&mut tree, &entries).with_context(|| format!("applying the layer `{name}`"))?;
     }
     Ok(tree)
 }
@@ -164,9 +161,7 @@ fn apply(tree: &mut Tree, entries: &[Entry]) -> Result<()> {
             }
             Kind::Regular => tree.add(meta_of(entry), Body::Regular(entry.contents.clone())),
             Kind::Symlink => tree.add(meta_of(entry), Body::Symlink(entry.link.clone())),
-            Kind::Character | Kind::Block | Kind::Fifo => {
-                tree.add(meta_of(entry), Body::Special)
-            }
+            Kind::Character | Kind::Block | Kind::Fifo => tree.add(meta_of(entry), Body::Special),
         };
         tree.link(directory, &name, node)
             .with_context(|| format!("placing `{}`", String::from_utf8_lossy(&path)))?;

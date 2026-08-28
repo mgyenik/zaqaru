@@ -295,7 +295,8 @@ pub fn build_seam_object() -> Result<Vec<u8>> {
 
     let define = |wasm: &mut WasmObject, name: &str, type_index: u32, body: FunctionBody| {
         let function_index = wasm.next_defined_function_index();
-        wasm.defined_functions.push(DefinedFunction { type_index, body });
+        wasm.defined_functions
+            .push(DefinedFunction { type_index, body });
         let symbol_index = wasm.add_symbol(Symbol {
             name: name.to_string(),
             target: SymbolTarget::Function(function_index),
@@ -327,12 +328,22 @@ pub fn build_seam_object() -> Result<Vec<u8>> {
     );
     let mut body = FunctionBodyBuilder::new(0);
     body.global_get(machine.segment_base());
-    define(&mut wasm, GET_SEGMENT_BASE, segment_read_type, body.finish());
+    define(
+        &mut wasm,
+        GET_SEGMENT_BASE,
+        segment_read_type,
+        body.finish(),
+    );
 
     let mut body = FunctionBodyBuilder::new(1);
     body.local_get(0);
     body.global_set(machine.segment_base());
-    define(&mut wasm, SET_SEGMENT_BASE, segment_write_type, body.finish());
+    define(
+        &mut wasm,
+        SET_SEGMENT_BASE,
+        segment_write_type,
+        body.finish(),
+    );
 
     define(
         &mut wasm,
@@ -513,10 +524,10 @@ fn build_machine_image(machine: &MachineState, direction: Direction) -> Function
     let word = OperandWidth::DoubleWord.alignment_log2();
 
     let cell = |body: &mut FunctionBodyBuilder,
-                    offset: u32,
-                    alignment: u32,
-                    get: &dyn Fn(&mut FunctionBodyBuilder),
-                    set: &dyn Fn(&mut FunctionBodyBuilder)| {
+                offset: u32,
+                alignment: u32,
+                get: &dyn Fn(&mut FunctionBodyBuilder),
+                set: &dyn Fn(&mut FunctionBodyBuilder)| {
         match direction {
             Direction::Save => {
                 body.local_get(0);

@@ -20,13 +20,12 @@ use std::path::{Path, PathBuf};
 use kisal::abi::{Store, StoreOutcome};
 use kisal::errno::Errno;
 use kisal::file::{
-    O_LARGEFILE, PATH_MAX, STAT_SIZE, STATX_SIZE, access_mode, at, fcntl_command, open_flags,
-    seek, FD_CLOEXEC,
+    FD_CLOEXEC, O_LARGEFILE, PATH_MAX, STAT_SIZE, STATX_SIZE, access_mode, at, fcntl_command,
+    open_flags, seek,
 };
 use kisal::machine::Registers;
 use kisal::syscall::{Arguments, Kernel, Outcome, number};
 use kisal::vfs::Lookup;
-
 
 // ---- fixtures --------------------------------------------------------------
 
@@ -85,8 +84,7 @@ fn tree(label: &str) -> Tree {
     // able from one that read the image.
     std::fs::create_dir_all(root.join("etc/conf.d")).expect("mkdir");
     std::os::unix::fs::symlink("hosts", root.join("etc/hosts-alias")).expect("symlink");
-    let fifo = std::ffi::CString::new(root.join("etc/pipe").as_os_str().as_bytes())
-        .expect("path");
+    let fifo = std::ffi::CString::new(root.join("etc/pipe").as_os_str().as_bytes()).expect("path");
     assert_eq!(
         unsafe { libc::mkfifo(fifo.as_ptr(), 0o644) },
         0,
@@ -349,7 +347,11 @@ impl Fixture {
         if result < 0 {
             return Err(result);
         }
-        Ok(self.arena.read(buffer, STAT_SIZE).try_into().expect("144 bytes"))
+        Ok(self
+            .arena
+            .read(buffer, STAT_SIZE)
+            .try_into()
+            .expect("144 bytes"))
     }
 }
 
@@ -371,7 +373,10 @@ fn a_file_opens_reads_and_closes() {
     // they are for any process a Unix starts. "Lowest free" is still the
     // rule — an empty table would hand this file descriptor 0 and every libc
     // would treat it as stdin.
-    assert_eq!(fd, 3, "the lowest free descriptor above the standard streams");
+    assert_eq!(
+        fd, 3,
+        "the lowest free descriptor above the standard streams"
+    );
 
     let buffer = fixture.arena.buffer(64);
     let read = fixture.call(number::READ, [fd, buffer, 64, 0, 0, 0]);
@@ -457,7 +462,10 @@ fn a_read_only_mount_is_erofs_and_the_overlay_is_not() {
         "a directory refuses a write before the filesystem gets a say"
     );
     assert_eq!(
-        fixture.open("/proc/self/new", open_flags::WRITE_ONLY | open_flags::CREATE),
+        fixture.open(
+            "/proc/self/new",
+            open_flags::WRITE_ONLY | open_flags::CREATE
+        ),
         Errno::ReadOnlyFs.as_result()
     );
     let in_proc = fixture.arena.path("/proc/made");
@@ -507,15 +515,27 @@ fn lseek_moves_the_offset_and_reports_where_it_landed() {
     let mut fixture = fixture("lseek");
     let fd = fixture.opened("/etc/hosts");
 
-    assert_eq!(fixture.call(number::LSEEK, [fd, 10, seek::SET as i64, 0, 0, 0]), 10);
+    assert_eq!(
+        fixture.call(number::LSEEK, [fd, 10, seek::SET as i64, 0, 0, 0]),
+        10
+    );
     let buffer = fixture.arena.buffer(64);
     assert_eq!(fixture.call(number::READ, [fd, buffer, 64, 0, 0, 0]), 10);
     assert_eq!(fixture.arena.read(buffer, 10), b"localhost\n");
 
-    assert_eq!(fixture.call(number::LSEEK, [fd, 0, seek::END as i64, 0, 0, 0]), 20);
-    assert_eq!(fixture.call(number::LSEEK, [fd, -5, seek::CURRENT as i64, 0, 0, 0]), 15);
+    assert_eq!(
+        fixture.call(number::LSEEK, [fd, 0, seek::END as i64, 0, 0, 0]),
+        20
+    );
+    assert_eq!(
+        fixture.call(number::LSEEK, [fd, -5, seek::CURRENT as i64, 0, 0, 0]),
+        15
+    );
     // Past the end is legal — that is how a sparse file gets written.
-    assert_eq!(fixture.call(number::LSEEK, [fd, 100, seek::SET as i64, 0, 0, 0]), 100);
+    assert_eq!(
+        fixture.call(number::LSEEK, [fd, 100, seek::SET as i64, 0, 0, 0]),
+        100
+    );
     assert_eq!(fixture.call(number::READ, [fd, buffer, 64, 0, 0, 0]), 0);
     // Before it is not.
     assert_eq!(
@@ -554,7 +574,10 @@ fn a_duplicated_descriptor_shares_the_offset() {
     let copy = fixture.call(number::DUP, [fd, 0, 0, 0, 0, 0]);
     assert!(copy > fd);
 
-    assert_eq!(fixture.call(number::LSEEK, [fd, 10, seek::SET as i64, 0, 0, 0]), 10);
+    assert_eq!(
+        fixture.call(number::LSEEK, [fd, 10, seek::SET as i64, 0, 0, 0]),
+        10
+    );
     assert_eq!(
         fixture.call(number::LSEEK, [copy, 0, seek::CURRENT as i64, 0, 0, 0]),
         10,
@@ -574,8 +597,14 @@ fn dup2_and_dup3_place_a_descriptor_where_asked() {
     let fd = fixture.opened("/etc/hosts");
 
     assert_eq!(fixture.call(number::DUP2, [fd, 7, 0, 0, 0, 0]), 7);
-    assert_eq!(fixture.call(number::LSEEK, [fd, 5, seek::SET as i64, 0, 0, 0]), 5);
-    assert_eq!(fixture.call(number::LSEEK, [7, 0, seek::CURRENT as i64, 0, 0, 0]), 5);
+    assert_eq!(
+        fixture.call(number::LSEEK, [fd, 5, seek::SET as i64, 0, 0, 0]),
+        5
+    );
+    assert_eq!(
+        fixture.call(number::LSEEK, [7, 0, seek::CURRENT as i64, 0, 0, 0]),
+        5
+    );
 
     // `dup2` onto itself validates and does nothing; `dup3` refuses, because
     // the no-op would discard the `O_CLOEXEC` the caller asked for.
@@ -657,7 +686,10 @@ fn fcntl_reads_and_writes_the_flags_it_owns() {
     );
 
     // `F_DUPFD` takes a floor.
-    let copy = fixture.call(number::FCNTL, [fd, fcntl_command::DUPFD as i64, 20, 0, 0, 0]);
+    let copy = fixture.call(
+        number::FCNTL,
+        [fd, fcntl_command::DUPFD as i64, 20, 0, 0, 0],
+    );
     assert_eq!(copy, 20);
     let cloexec = fixture.call(
         number::FCNTL,
@@ -699,11 +731,23 @@ fn stat_follows_a_symlink_and_lstat_does_not() {
     let followed = fixture.stat(number::STAT, "/hosts-link").expect("stat");
     let link = fixture.stat(number::LSTAT, "/hosts-link").expect("lstat");
 
-    assert_eq!(field_u32(&followed, 24) & 0o170000, 0o100000, "a regular file");
+    assert_eq!(
+        field_u32(&followed, 24) & 0o170000,
+        0o100000,
+        "a regular file"
+    );
     assert_eq!(field_u32(&link, 24) & 0o170000, 0o120000, "a symlink");
     assert_eq!(field_u64(&followed, 48), 20, "the target's size");
-    assert_eq!(field_u64(&link, 48), 9, "the link's own size is its target's length");
-    assert_ne!(field_u64(&followed, 8), field_u64(&link, 8), "different inodes");
+    assert_eq!(
+        field_u64(&link, 48),
+        9,
+        "the link's own size is its target's length"
+    );
+    assert_ne!(
+        field_u64(&followed, 8),
+        field_u64(&link, 8),
+        "different inodes"
+    );
 
     // Both name the same file as the target does.
     let direct = fixture.stat(number::STAT, "/etc/hosts").expect("stat");
@@ -816,7 +860,10 @@ fn getdents64_reports_entries_in_order_with_their_type() {
 
     // A second call is past the end and reports nothing, which is how a
     // reader stops.
-    assert_eq!(fixture.call(number::GETDENTS64, [fd, buffer, 1024, 0, 0, 0]), 0);
+    assert_eq!(
+        fixture.call(number::GETDENTS64, [fd, buffer, 1024, 0, 0, 0]),
+        0
+    );
 }
 
 /// A buffer too small for even one entry is `EINVAL`, not a short read — the
@@ -923,11 +970,17 @@ fn a_symlink_is_followed_through_and_resolved_against_its_own_directory() {
 
     // An absolute target ignores where the link lives.
     let absolute = fixture.opened("/absolute-link");
-    assert_eq!(fixture.call(number::READ, [absolute, buffer, 64, 0, 0, 0]), 10);
+    assert_eq!(
+        fixture.call(number::READ, [absolute, buffer, 64, 0, 0, 0]),
+        10
+    );
 
     // And a link to a directory can be walked through.
     let library = fixture.opened("/lib/libthing.so");
-    assert_eq!(fixture.call(number::READ, [library, buffer, 64, 0, 0, 0]), 12);
+    assert_eq!(
+        fixture.call(number::READ, [library, buffer, 64, 0, 0, 0]),
+        12
+    );
 }
 
 #[test]
@@ -969,7 +1022,9 @@ fn dot_and_dot_dot_walk_the_tree() {
 
     // The root is its own parent, so no path escapes upward.
     let root = fixture.stat(number::STAT, "/").expect("stat /");
-    let above = fixture.stat(number::STAT, "/../../..").expect("stat /../..");
+    let above = fixture
+        .stat(number::STAT, "/../../..")
+        .expect("stat /../..");
     assert_eq!(field_u64(&root, 8), field_u64(&above, 8));
 }
 
@@ -1068,19 +1123,31 @@ fn access_answers_existence_and_executability() {
     let missing = fixture.arena.path("/nothing");
 
     assert_eq!(
-        fixture.call(number::ACCESS, [script, access_mode::EXISTS as i64, 0, 0, 0, 0]),
+        fixture.call(
+            number::ACCESS,
+            [script, access_mode::EXISTS as i64, 0, 0, 0, 0]
+        ),
         0
     );
     assert_eq!(
-        fixture.call(number::ACCESS, [missing, access_mode::EXISTS as i64, 0, 0, 0, 0]),
+        fixture.call(
+            number::ACCESS,
+            [missing, access_mode::EXISTS as i64, 0, 0, 0, 0]
+        ),
         Errno::NoEntry.as_result()
     );
     assert_eq!(
-        fixture.call(number::ACCESS, [script, access_mode::EXECUTE as i64, 0, 0, 0, 0]),
+        fixture.call(
+            number::ACCESS,
+            [script, access_mode::EXECUTE as i64, 0, 0, 0, 0]
+        ),
         0
     );
     assert_eq!(
-        fixture.call(number::ACCESS, [hosts, access_mode::EXECUTE as i64, 0, 0, 0, 0]),
+        fixture.call(
+            number::ACCESS,
+            [hosts, access_mode::EXECUTE as i64, 0, 0, 0, 0]
+        ),
         Errno::Access.as_result()
     );
     // The root has a writable layer, so a write probe succeeds. On a mount
@@ -1089,12 +1156,18 @@ fn access_answers_existence_and_executability() {
     // writable, rather than `EACCES`, which would send them looking for a
     // permission problem that does not exist.
     assert_eq!(
-        fixture.call(number::ACCESS, [hosts, access_mode::WRITE as i64, 0, 0, 0, 0]),
+        fixture.call(
+            number::ACCESS,
+            [hosts, access_mode::WRITE as i64, 0, 0, 0, 0]
+        ),
         0
     );
     let in_proc = fixture.arena.path("/proc/self");
     assert_eq!(
-        fixture.call(number::ACCESS, [in_proc, access_mode::WRITE as i64, 0, 0, 0, 0]),
+        fixture.call(
+            number::ACCESS,
+            [in_proc, access_mode::WRITE as i64, 0, 0, 0, 0]
+        ),
         Errno::ReadOnlyFs.as_result()
     );
     // A mode with bits outside R/W/X is `EINVAL`, not a cheerful yes.
@@ -1214,7 +1287,10 @@ fn write_follows_the_descriptor_rather_than_its_number() {
     let mut fixture = fixture("write-routing");
     let message = fixture.arena.place(b"to stdout");
     assert_eq!(fixture.call(number::WRITE, [1, message, 9, 0, 0, 0]), 9);
-    assert_eq!(fixture.kernel.store.contents(kisal::paths::CONSOLE_STDOUT), b"to stdout");
+    assert_eq!(
+        fixture.kernel.store.contents(kisal::paths::CONSOLE_STDOUT),
+        b"to stdout"
+    );
 
     // Move a read-only image file onto descriptor 1. Writing there is now
     // `EBADF` — the descriptor's access mode forbids it — and emphatically
@@ -1346,12 +1422,16 @@ fn enotdir_beats_enametoolong() {
     let mut fixture = fixture("precedence");
     let long = "x".repeat(300);
     assert_eq!(
-        fixture.stat(number::STAT, &format!("/etc/hosts/{long}")).unwrap_err(),
+        fixture
+            .stat(number::STAT, &format!("/etc/hosts/{long}"))
+            .unwrap_err(),
         Errno::NotDir.as_result()
     );
     // With a real directory as the parent, the name's length is what fails.
     assert_eq!(
-        fixture.stat(number::STAT, &format!("/etc/{long}")).unwrap_err(),
+        fixture
+            .stat(number::STAT, &format!("/etc/{long}"))
+            .unwrap_err(),
         Errno::NameTooLong.as_result()
     );
 }
@@ -1376,7 +1456,10 @@ fn o_path_opens_a_reference_rather_than_a_file() {
 
     // `O_PATH|O_NOFOLLOW` is the documented way to hold a symlink itself.
     let link = fixture.open("/hosts-link", open_flags::PATH | open_flags::NOFOLLOW);
-    assert!(link >= 0, "O_PATH|O_NOFOLLOW on a symlink failed with {link}");
+    assert!(
+        link >= 0,
+        "O_PATH|O_NOFOLLOW on a symlink failed with {link}"
+    );
     let stat = fixture.arena.buffer(STAT_SIZE);
     assert_eq!(fixture.call(number::FSTAT, [link, stat, 0, 0, 0, 0]), 0);
     assert_eq!(
@@ -1394,9 +1477,18 @@ fn o_path_opens_a_reference_rather_than_a_file() {
 fn seek_data_and_seek_hole_describe_a_file_with_no_holes() {
     let mut fixture = fixture("seek-data");
     let fd = fixture.opened("/etc/hosts");
-    assert_eq!(fixture.call(number::LSEEK, [fd, 0, seek::DATA as i64, 0, 0, 0]), 0);
-    assert_eq!(fixture.call(number::LSEEK, [fd, 5, seek::DATA as i64, 0, 0, 0]), 5);
-    assert_eq!(fixture.call(number::LSEEK, [fd, 0, seek::HOLE as i64, 0, 0, 0]), 20);
+    assert_eq!(
+        fixture.call(number::LSEEK, [fd, 0, seek::DATA as i64, 0, 0, 0]),
+        0
+    );
+    assert_eq!(
+        fixture.call(number::LSEEK, [fd, 5, seek::DATA as i64, 0, 0, 0]),
+        5
+    );
+    assert_eq!(
+        fixture.call(number::LSEEK, [fd, 0, seek::HOLE as i64, 0, 0, 0]),
+        20
+    );
     // Past the end there is no data to find.
     assert_eq!(
         fixture.call(number::LSEEK, [fd, 20, seek::DATA as i64, 0, 0, 0]),
@@ -1411,11 +1503,17 @@ fn fcntl_refuses_an_impossible_floor_and_names_what_it_cannot_do() {
     // A floor outside the descriptor space is EINVAL, not EMFILE: Linux
     // rejects the argument before it looks for room.
     assert_eq!(
-        fixture.call(number::FCNTL, [fd, fcntl_command::DUPFD as i64, 1 << 20, 0, 0, 0]),
+        fixture.call(
+            number::FCNTL,
+            [fd, fcntl_command::DUPFD as i64, 1 << 20, 0, 0, 0]
+        ),
         Errno::Invalid.as_result()
     );
     assert_eq!(
-        fixture.call(number::FCNTL, [fd, fcntl_command::DUPFD as i64, -1, 0, 0, 0]),
+        fixture.call(
+            number::FCNTL,
+            [fd, fcntl_command::DUPFD as i64, -1, 0, 0, 0]
+        ),
         Errno::Invalid.as_result()
     );
     // A command Linux implements and this does not is a named fault, never a
@@ -1442,7 +1540,10 @@ fn the_stat_family_validates_its_flags() {
         Errno::Invalid.as_result()
     );
     assert_eq!(
-        fixture.call(number::STATX, [at::FDCWD, path, 0x0f00_0000, 0x7ff, buffer, 0]),
+        fixture.call(
+            number::STATX,
+            [at::FDCWD, path, 0x0f00_0000, 0x7ff, buffer, 0]
+        ),
         Errno::Invalid.as_result()
     );
     assert_eq!(
@@ -1524,7 +1625,10 @@ fn extended_attributes_come_back_out_of_the_image() {
         8,
         "the length of \"the bake\""
     );
-    assert_eq!(fixture.call(number::GETXATTR, [path, name, value, 64, 0, 0]), 8);
+    assert_eq!(
+        fixture.call(number::GETXATTR, [path, name, value, 64, 0, 0]),
+        8
+    );
     assert_eq!(fixture.arena.read(value, 8), b"the bake");
     // Too small is `ERANGE`, and nothing is written.
     assert_eq!(
@@ -1534,7 +1638,10 @@ fn extended_attributes_come_back_out_of_the_image() {
     // An attribute with an empty value exists and has length zero, which is
     // a different answer from not existing.
     let empty = fixture.arena.place(b"user.empty\0");
-    assert_eq!(fixture.call(number::GETXATTR, [path, empty, value, 64, 0, 0]), 0);
+    assert_eq!(
+        fixture.call(number::GETXATTR, [path, empty, value, 64, 0, 0]),
+        0
+    );
     let missing = fixture.arena.place(b"user.missing\0");
     assert_eq!(
         fixture.call(number::GETXATTR, [path, missing, value, 64, 0, 0]),
@@ -1561,19 +1668,28 @@ fn the_attribute_list_is_names_one_after_another() {
     let list = fixture.arena.buffer(128);
     // "user.empty\0user.origin\0" — sorted, because the baker sorts them.
     let total = 11 + 12;
-    assert_eq!(fixture.call(number::LISTXATTR, [path, 0, 0, 0, 0, 0]), total);
+    assert_eq!(
+        fixture.call(number::LISTXATTR, [path, 0, 0, 0, 0, 0]),
+        total
+    );
     assert_eq!(
         fixture.call(number::LISTXATTR, [path, list, total - 1, 0, 0, 0]),
         Errno::Range.as_result()
     );
-    assert_eq!(fixture.call(number::LISTXATTR, [path, list, 128, 0, 0, 0]), total);
+    assert_eq!(
+        fixture.call(number::LISTXATTR, [path, list, 128, 0, 0, 0]),
+        total
+    );
     assert_eq!(
         fixture.arena.read(list, total as usize),
         b"user.empty\0user.origin\0"
     );
     // A file with no attributes lists nothing and does not fail.
     let bare = fixture.arena.path("/etc/hostname");
-    assert_eq!(fixture.call(number::LISTXATTR, [bare, list, 128, 0, 0, 0]), 0);
+    assert_eq!(
+        fixture.call(number::LISTXATTR, [bare, list, 128, 0, 0, 0]),
+        0
+    );
 }
 
 /// The `f` forms take a descriptor and the `l` forms do not follow a final
@@ -1584,18 +1700,30 @@ fn the_descriptor_and_no_follow_forms_name_what_they_say() {
     let name = fixture.arena.place(b"user.origin\0");
     let value = fixture.arena.buffer(64);
     let fd = fixture.opened("/etc/hosts");
-    assert_eq!(fixture.call(number::FGETXATTR, [fd, name, value, 64, 0, 0]), 8);
-    assert_eq!(fixture.call(number::FLISTXATTR, [fd, value, 64, 0, 0, 0]), 23);
+    assert_eq!(
+        fixture.call(number::FGETXATTR, [fd, name, value, 64, 0, 0]),
+        8
+    );
+    assert_eq!(
+        fixture.call(number::FLISTXATTR, [fd, value, 64, 0, 0, 0]),
+        23
+    );
 
     // `/hosts-link` points at `/etc/hosts`. Following finds the attribute;
     // not following lands on the link, which has none.
     let link = fixture.arena.path("/hosts-link");
-    assert_eq!(fixture.call(number::GETXATTR, [link, name, value, 64, 0, 0]), 8);
+    assert_eq!(
+        fixture.call(number::GETXATTR, [link, name, value, 64, 0, 0]),
+        8
+    );
     assert_eq!(
         fixture.call(number::LGETXATTR, [link, name, value, 64, 0, 0]),
         Errno::NoData.as_result()
     );
-    assert_eq!(fixture.call(number::LLISTXATTR, [link, value, 64, 0, 0, 0]), 0);
+    assert_eq!(
+        fixture.call(number::LLISTXATTR, [link, value, 64, 0, 0, 0]),
+        0
+    );
 }
 
 /// A console stream answers the way a real character device does. Verified
@@ -1692,7 +1820,14 @@ fn faccessat2_probes_a_descriptor_through_an_empty_path() {
     assert_eq!(
         fixture.call(
             number::FACCESSAT2,
-            [fd, empty, access_mode::EXECUTE as i64, at::EMPTY_PATH as i64, 0, 0]
+            [
+                fd,
+                empty,
+                access_mode::EXECUTE as i64,
+                at::EMPTY_PATH as i64,
+                0,
+                0
+            ]
         ),
         0,
         "/script is 0755"
@@ -1701,7 +1836,14 @@ fn faccessat2_probes_a_descriptor_through_an_empty_path() {
     assert_eq!(
         fixture.call(
             number::FACCESSAT2,
-            [plain, empty, access_mode::EXECUTE as i64, at::EMPTY_PATH as i64, 0, 0]
+            [
+                plain,
+                empty,
+                access_mode::EXECUTE as i64,
+                at::EMPTY_PATH as i64,
+                0,
+                0
+            ]
         ),
         Errno::Access.as_result()
     );
@@ -1715,9 +1857,15 @@ fn faccessat2_probes_a_descriptor_through_an_empty_path() {
         )
     };
     assert_eq!(probe(&mut fixture, 0, access_mode::READ), 0);
-    assert_eq!(probe(&mut fixture, 0, access_mode::WRITE), Errno::Access.as_result());
+    assert_eq!(
+        probe(&mut fixture, 0, access_mode::WRITE),
+        Errno::Access.as_result()
+    );
     assert_eq!(probe(&mut fixture, 1, access_mode::WRITE), 0);
-    assert_eq!(probe(&mut fixture, 1, access_mode::READ), Errno::Access.as_result());
+    assert_eq!(
+        probe(&mut fixture, 1, access_mode::READ),
+        Errno::Access.as_result()
+    );
     assert_eq!(probe(&mut fixture, 1, 0), 0, "it exists");
 }
 
@@ -1740,7 +1888,10 @@ fn a_directory_offset_past_every_cookie_is_the_end() {
         "past every cookie the listing is over"
     );
     // And a cookie inside the range still resumes where it should.
-    assert_eq!(fixture.call(number::LSEEK, [fd, 2, seek::SET as i64, 0, 0, 0]), 2);
+    assert_eq!(
+        fixture.call(number::LSEEK, [fd, 2, seek::SET as i64, 0, 0, 0]),
+        2
+    );
     assert!(fixture.call(number::GETDENTS64, [fd, buffer, 1024, 0, 0, 0]) > 0);
 }
 
@@ -1912,7 +2063,11 @@ fn the_mount_table_refuses_what_it_cannot_represent() {
     while attached < kisal::mount::MAX_MOUNTS {
         // Mount each new filesystem on the previous one's root, which is not
         // stacking: the covered directory is a different vnode each time.
-        at = kernel.vfs.mounts().root_of(attached as u8 - 1).expect("root");
+        at = kernel
+            .vfs
+            .mounts()
+            .root_of(attached as u8 - 1)
+            .expect("root");
         kernel
             .vfs
             .mounts_mut()
@@ -2041,14 +2196,20 @@ fn the_syscall_path_allocates_nothing() {
                 fixture.call(number::STAT, [miss, stat, 0, 0, 0, 0]),
                 Errno::NoEntry.as_result()
             );
-            assert_eq!(fixture.call(number::STAT, [through_link, stat, 0, 0, 0, 0]), 0);
+            assert_eq!(
+                fixture.call(number::STAT, [through_link, stat, 0, 0, 0, 0]),
+                0
+            );
             assert_eq!(fixture.call(number::STAT, [up, stat, 0, 0, 0, 0]), 0);
             assert_eq!(fixture.call(number::LSTAT, [link, stat, 0, 0, 0, 0]), 0);
             assert_eq!(
                 fixture.call(number::STATX, [at::FDCWD, hit, 0, 0x7ff, statx, 0]),
                 0
             );
-            assert_eq!(fixture.call(number::READLINK, [link, scratch, 64, 0, 0, 0]), 9);
+            assert_eq!(
+                fixture.call(number::READLINK, [link, scratch, 64, 0, 0, 0]),
+                9
+            );
 
             let fd = fixture.call(number::OPEN, [hit, 0, 0, 0, 0, 0]);
             assert!(fd >= 0);
@@ -2114,7 +2275,10 @@ fn pread_refuses_what_it_cannot_mean() {
     );
     // Past the end is zero, not an error — and the description's own offset
     // is untouched, which is the whole difference from `read`.
-    assert_eq!(fixture.call(number::PREAD64, [fd, buffer, 8, 1000, 0, 0]), 0);
+    assert_eq!(
+        fixture.call(number::PREAD64, [fd, buffer, 8, 1000, 0, 0]),
+        0
+    );
     assert_eq!(fixture.call(number::PREAD64, [fd, buffer, 8, 16, 0, 0]), 4);
     assert_eq!(
         fixture.call(number::LSEEK, [fd, 0, seek::CURRENT as i64, 0, 0, 0]),
@@ -2150,7 +2314,10 @@ fn lseek_refuses_an_offset_that_cannot_exist() {
     // own is not refused: filesystems differ about their maximum — ext4
     // refuses this one and tmpfs accepts it — and a directory's `d_off`
     // cookies are not byte positions at all.
-    assert_eq!(fixture.call(number::LSEEK, [fd, i64::MAX, seek::SET as i64, 0, 0, 0]), i64::MAX);
+    assert_eq!(
+        fixture.call(number::LSEEK, [fd, i64::MAX, seek::SET as i64, 0, 0, 0]),
+        i64::MAX
+    );
     assert_eq!(
         fixture.call(number::LSEEK, [fd, i64::MAX, seek::CURRENT as i64, 0, 0, 0]),
         Errno::Invalid.as_result()
@@ -2161,7 +2328,10 @@ fn lseek_refuses_an_offset_that_cannot_exist() {
         "an unknown `whence`"
     );
     // Seeking past the end is legal and reading there is end of file.
-    assert_eq!(fixture.call(number::LSEEK, [fd, 100, seek::SET as i64, 0, 0, 0]), 100);
+    assert_eq!(
+        fixture.call(number::LSEEK, [fd, 100, seek::SET as i64, 0, 0, 0]),
+        100
+    );
     let buffer = fixture.arena.buffer(8);
     assert_eq!(fixture.call(number::READ, [fd, buffer, 8, 0, 0, 0]), 0);
 }
@@ -2401,11 +2571,7 @@ fn a_character_device_in_the_image_reports_as_one() {
         let written = fixture.call(number::GETDENTS64, [directory, listing, 1024, 0, 0, 0]);
         assert!(written > 0);
         let entries = fixture.arena.read(listing, written as usize).to_vec();
-        assert_eq!(
-            entry_type_of(&entries, b"pipe"),
-            Some(2),
-            "DT_CHR"
-        );
+        assert_eq!(entry_type_of(&entries, b"pipe"), Some(2), "DT_CHR");
 
         // And reading it is refused by name: there is no driver behind a
         // node in an image, and `EINVAL` would be a plausible answer to a
@@ -2458,9 +2624,8 @@ fn patch_inode_to_device(baked: &mut baker::Image, name: &str, major: u32, minor
     inode.mode = 0o020644;
     // Linux's `dev_t`: minor's low eight bits, major's twelve above them,
     // and minor's remaining twelve above that.
-    inode.payload = ((major as u64 & 0xfff) << 8)
-        | (minor as u64 & 0xff)
-        | ((minor as u64 & 0xfff00) << 12);
+    inode.payload =
+        ((major as u64 & 0xfff) << 8) | (minor as u64 & 0xff) | ((minor as u64 & 0xfff00) << 12);
     let mut record = [0u8; kisal::image::INODE_SIZE];
     inode.write(&mut record);
     baked.index[at..at + kisal::image::INODE_SIZE].copy_from_slice(&record);
@@ -2478,12 +2643,16 @@ fn patch_inode_to_device(baked: &mut baker::Image, name: &str, major: u32, minor
 fn entry_type_of(entries: &[u8], name: &[u8]) -> Option<u8> {
     let mut at = 0;
     while at + 19 <= entries.len() {
-        let length = u16::from_le_bytes(entries[at + 16..at + 18].try_into().expect("two")) as usize;
+        let length =
+            u16::from_le_bytes(entries[at + 16..at + 18].try_into().expect("two")) as usize;
         if length == 0 {
             return None;
         }
         let bytes = &entries[at + 19..at + length];
-        let end = bytes.iter().position(|byte| *byte == 0).unwrap_or(bytes.len());
+        let end = bytes
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(bytes.len());
         if &bytes[..end] == name {
             return Some(entries[at + 18]);
         }
@@ -2573,7 +2742,11 @@ fn dev_is_mounted_over_the_directory_the_image_provides() {
         let stat = fixture
             .stat(number::STAT, &format!("/dev/{name}"))
             .unwrap_or_else(|errno| panic!("/dev/{name} is missing: {errno}"));
-        assert_eq!(field_u32(&stat, 24) & 0o170000, 0o020000, "{name} is a chardev");
+        assert_eq!(
+            field_u32(&stat, 24) & 0o170000,
+            0o020000,
+            "{name} is a chardev"
+        );
         assert_eq!(field_u32(&stat, 24) & 0o777, 0o666, "{name} is 0666");
         assert_eq!(
             field_u64(&stat, 40),
@@ -2612,7 +2785,10 @@ fn the_devices_read_and_write_as_they_do_on_linux() {
 
     // `/dev/null`: reads nothing, accepts everything.
     let null = fixture.open("/dev/null", open_flags::READ_WRITE);
-    assert!(null >= 0, "/dev/null must open for writing on a read-only image");
+    assert!(
+        null >= 0,
+        "/dev/null must open for writing on a read-only image"
+    );
     let buffer = fixture.arena.buffer(64);
     assert_eq!(fixture.call(number::READ, [null, buffer, 16, 0, 0, 0]), 0);
     assert_eq!(fixture.call(number::WRITE, [null, buffer, 16, 0, 0, 0]), 16);
@@ -2622,7 +2798,10 @@ fn the_devices_read_and_write_as_they_do_on_linux() {
     let zero = fixture.open("/dev/zero", open_flags::READ_WRITE);
     assert_eq!(fixture.call(number::READ, [zero, planted, 64, 0, 0, 0]), 64);
     assert_eq!(fixture.arena.read(planted, 64), &[0u8; 64]);
-    assert_eq!(fixture.call(number::WRITE, [zero, planted, 16, 0, 0, 0]), 16);
+    assert_eq!(
+        fixture.call(number::WRITE, [zero, planted, 16, 0, 0, 0]),
+        16
+    );
 
     // `/dev/full`: reads zeros and refuses every write, which is what it is
     // for — programs test their error handling against it.
@@ -2634,10 +2813,19 @@ fn the_devices_read_and_write_as_they_do_on_linux() {
     );
 
     // A device has no position: every seek answers zero and moves nothing.
-    assert_eq!(fixture.call(number::LSEEK, [zero, 100, seek::SET as i64, 0, 0, 0]), 0);
-    assert_eq!(fixture.call(number::LSEEK, [zero, 0, seek::END as i64, 0, 0, 0]), 0);
+    assert_eq!(
+        fixture.call(number::LSEEK, [zero, 100, seek::SET as i64, 0, 0, 0]),
+        0
+    );
+    assert_eq!(
+        fixture.call(number::LSEEK, [zero, 0, seek::END as i64, 0, 0, 0]),
+        0
+    );
     let after = fixture.call(number::READ, [zero, buffer, 8, 0, 0, 0]);
-    assert_eq!(after, 8, "the seek did not move the device past its own end");
+    assert_eq!(
+        after, 8,
+        "the seek did not move the device past its own end"
+    );
 
     // Opening one read-only still works, and writing to that descriptor is
     // `EBADF` — the access mode, not the filesystem, is what refuses.
@@ -2655,7 +2843,10 @@ fn urandom_replays_from_the_seed_and_diverges_without_it() {
     let read = |fixture: &mut Fixture, path: &str, count: i64| -> Vec<u8> {
         let fd = fixture.opened(path);
         let buffer = fixture.arena.buffer(count as usize);
-        assert_eq!(fixture.call(number::READ, [fd, buffer, count, 0, 0, 0]), count);
+        assert_eq!(
+            fixture.call(number::READ, [fd, buffer, count, 0, 0, 0]),
+            count
+        );
         fixture.arena.read(buffer, count as usize).to_vec()
     };
 
@@ -2687,7 +2878,11 @@ fn urandom_replays_from_the_seed_and_diverges_without_it() {
         blind.call(number::READ, [fd, buffer, 16, 0, 0, 0]),
         Errno::NoDevice.as_result()
     );
-    assert_eq!(blind.arena.read(buffer, 16), &[0u8; 16], "and wrote nothing");
+    assert_eq!(
+        blind.arena.read(buffer, 16),
+        &[0u8; 16],
+        "and wrote nothing"
+    );
 }
 
 /// A large read is served without the kernel asking its allocator for a
@@ -2699,12 +2894,14 @@ fn a_large_device_read_is_chunked_rather_than_allocated() {
     // Bigger than the kernel's chunk, and not a multiple of it.
     let length = 4096 * 3 + 17;
     let buffer = fixture.arena.place(&vec![0xff; length]);
-    let (read, allocations) = allocations_during(|| {
-        fixture.call(number::READ, [zero, buffer, length as i64, 0, 0, 0])
-    });
+    let (read, allocations) =
+        allocations_during(|| fixture.call(number::READ, [zero, buffer, length as i64, 0, 0, 0]));
     assert_eq!(read, length as i64);
     assert_eq!(fixture.arena.read(buffer, length), vec![0u8; length]);
-    assert_eq!(allocations, 0, "a device read allocated {allocations} times");
+    assert_eq!(
+        allocations, 0,
+        "a device read allocated {allocations} times"
+    );
 }
 
 /// `/proc/self/exe` is a symlink, and what it points at is a fact about the
@@ -2712,7 +2909,9 @@ fn a_large_device_read_is_chunked_rather_than_allocated() {
 #[test]
 fn proc_self_exe_is_a_symlink_whose_target_arrives_with_exec() {
     let mut fixture = fixture("proc");
-    let stat = fixture.stat(number::LSTAT, "/proc/self/exe").expect("lstat");
+    let stat = fixture
+        .stat(number::LSTAT, "/proc/self/exe")
+        .expect("lstat");
     assert_eq!(field_u32(&stat, 24) & 0o170000, 0o120000, "a symlink");
 
     // Reading it before anything has set the path is a named fault, not an
@@ -2737,7 +2936,9 @@ fn proc_self_exe_is_a_symlink_whose_target_arrives_with_exec() {
     assert_eq!(read, 20);
     assert_eq!(fixture.arena.read(buffer, 20), b"/usr/lib/libthing.so");
     let followed = fixture.stat(number::STAT, "/proc/self/exe").expect("stat");
-    let direct = fixture.stat(number::STAT, "/usr/lib/libthing.so").expect("stat");
+    let direct = fixture
+        .stat(number::STAT, "/usr/lib/libthing.so")
+        .expect("stat");
     assert_eq!(field_u64(&followed, 48), field_u64(&direct, 48));
 
     // `/proc/self` is a directory whose `..` is `/proc`.
@@ -2772,7 +2973,9 @@ fn the_terminal_ioctls_answer_enotty() {
         );
     }
     let file = fixture.opened("/etc/hosts");
-    for request in [0x5401i64, 0x5402, 0x5403, 0x5404, 0x540f, 0x5410, 0x5413, 0x5414] {
+    for request in [
+        0x5401i64, 0x5402, 0x5403, 0x5404, 0x540f, 0x5410, 0x5413, 0x5414,
+    ] {
         assert_eq!(
             fixture.call(number::IOCTL, [file, request, buffer, 0, 0, 0]),
             Errno::NoTty.as_result(),
@@ -2787,9 +2990,10 @@ fn the_terminal_ioctls_answer_enotty() {
     // A request with no driver is a named fault: `ioctl` is a thousand
     // unrelated calls behind one number, and `EINVAL` would be a lie about
     // this one.
-    let outcome = fixture
-        .kernel
-        .dispatch(number::IOCTL, Arguments::new([file, 0x1234, buffer, 0, 0, 0]));
+    let outcome = fixture.kernel.dispatch(
+        number::IOCTL,
+        Arguments::new([file, 0x1234, buffer, 0, 0, 0]),
+    );
     let Outcome::Fault(fault) = outcome else {
         panic!("an unimplemented ioctl produced {outcome:?}");
     };
@@ -2816,7 +3020,10 @@ fn a_created_file_reads_back_what_was_written() {
     );
     let buffer = fixture.arena.buffer(64);
     assert_eq!(fixture.call(number::READ, [fd, buffer, 64, 0, 0, 0]), 29);
-    assert_eq!(fixture.arena.read(buffer, 29), b"written into the upper layer\n");
+    assert_eq!(
+        fixture.arena.read(buffer, 29),
+        b"written into the upper layer\n"
+    );
 
     // And through a fresh path resolution, which is what says it is in the
     // filesystem rather than in the descriptor.
@@ -2855,7 +3062,10 @@ fn writing_to_an_image_file_copies_it_up() {
     // offset zero replaces the first bytes and leaves the rest.
     let reader = fixture.opened("/etc/hosts");
     let buffer = fixture.arena.buffer(64);
-    assert_eq!(fixture.call(number::READ, [reader, buffer, 64, 0, 0, 0]), 20);
+    assert_eq!(
+        fixture.call(number::READ, [reader, buffer, 64, 0, 0, 0]),
+        20
+    );
     assert_eq!(
         fixture.arena.read(buffer, 20),
         b"CHANGED.1 localhost\n",
@@ -2865,11 +3075,20 @@ fn writing_to_an_image_file_copies_it_up() {
     // The lower layer is untouched: a second overlay over the same image
     // sees the original, which is what makes the image shareable between
     // instances at all.
-    let image = *fixture.kernel.vfs.mounts().filesystem(0).expect("root").lower();
+    let image = *fixture
+        .kernel
+        .vfs
+        .mounts()
+        .filesystem(0)
+        .expect("root")
+        .lower();
     let root = image.inode(image.root()).expect("root");
     let etc = image.lookup(&root, b"etc").expect("lookup").expect("etc");
     let etc = image.inode(etc.inode).expect("inode");
-    let hosts = image.lookup(&etc, b"hosts").expect("lookup").expect("hosts");
+    let hosts = image
+        .lookup(&etc, b"hosts")
+        .expect("lookup")
+        .expect("hosts");
     let hosts = image.inode(hosts.inode).expect("inode");
     assert_eq!(
         image.contents(&hosts).expect("contents"),
@@ -2893,7 +3112,10 @@ fn o_append_writes_at_the_end_every_time() {
     let appender = fixture.open("/log", open_flags::WRITE_ONLY | open_flags::APPEND);
     assert!(appender >= 0);
     let second = fixture.arena.place(b"two\n");
-    assert_eq!(fixture.call(number::WRITE, [appender, second, 4, 0, 0, 0]), 4);
+    assert_eq!(
+        fixture.call(number::WRITE, [appender, second, 4, 0, 0, 0]),
+        4
+    );
 
     let reader = fixture.opened("/log");
     let buffer = fixture.arena.buffer(32);
@@ -2907,9 +3129,15 @@ fn o_append_writes_at_the_end_every_time() {
         0
     );
     let third = fixture.arena.place(b"three\n");
-    assert_eq!(fixture.call(number::WRITE, [appender, third, 6, 0, 0, 0]), 6);
+    assert_eq!(
+        fixture.call(number::WRITE, [appender, third, 6, 0, 0, 0]),
+        6
+    );
     let reader = fixture.opened("/log");
-    assert_eq!(fixture.call(number::READ, [reader, buffer, 32, 0, 0, 0]), 14);
+    assert_eq!(
+        fixture.call(number::READ, [reader, buffer, 32, 0, 0, 0]),
+        14
+    );
     assert_eq!(fixture.arena.read(buffer, 14), b"one\ntwo\nthree\n");
 }
 
@@ -2979,7 +3207,11 @@ fn deleting_an_image_file_whites_it_out() {
     let written = fixture.call(number::GETDENTS64, [directory, listing, 2048, 0, 0, 0]);
     let entries = fixture.arena.read(listing, written as usize).to_vec();
     assert_eq!(entry_type_of(&entries, b"hosts"), None);
-    assert_eq!(entry_type_of(&entries, b"hostname"), Some(8), "and the rest remain");
+    assert_eq!(
+        entry_type_of(&entries, b"hostname"),
+        Some(8),
+        "and the rest remain"
+    );
 
     // A name created over the whiteout is a new file, not the old one.
     let fd = fixture.open("/etc/hosts", open_flags::READ_WRITE | open_flags::CREATE);
@@ -3049,9 +3281,18 @@ fn a_recreated_directory_is_opaque() {
     assert!(fixture.stat(number::STAT, "/etc/hosts").is_ok());
 
     // Empty it, remove it, and make it again.
-    for name in ["/etc/hosts", "/etc/hostname", "/etc/hosts-alias", "/etc/pipe"] {
+    for name in [
+        "/etc/hosts",
+        "/etc/hostname",
+        "/etc/hosts-alias",
+        "/etc/pipe",
+    ] {
         let path = fixture.arena.path(name);
-        assert_eq!(fixture.call(number::UNLINK, [path, 0, 0, 0, 0, 0]), 0, "{name}");
+        assert_eq!(
+            fixture.call(number::UNLINK, [path, 0, 0, 0, 0, 0]),
+            0,
+            "{name}"
+        );
     }
     let conf = fixture.arena.path("/etc/conf.d");
     assert_eq!(fixture.call(number::RMDIR, [conf, 0, 0, 0, 0, 0]), 0);
@@ -3087,7 +3328,10 @@ fn a_symlink_can_be_created_and_followed() {
     assert_eq!(field_u64(&followed, 48), 20);
 
     let buffer = fixture.arena.buffer(32);
-    assert_eq!(fixture.call(number::READLINK, [path, buffer, 32, 0, 0, 0]), 10);
+    assert_eq!(
+        fixture.call(number::READLINK, [path, buffer, 32, 0, 0, 0]),
+        10
+    );
     assert_eq!(fixture.arena.read(buffer, 10), b"/etc/hosts");
 
     assert_eq!(
@@ -3111,7 +3355,10 @@ fn renaming_moves_a_name_and_refuses_what_it_cannot_do() {
         Errno::NoEntry.as_result()
     );
     assert_eq!(
-        field_u64(&fixture.stat(number::STAT, "/destination").expect("stat"), 48),
+        field_u64(
+            &fixture.stat(number::STAT, "/destination").expect("stat"),
+            48
+        ),
         8
     );
 
@@ -3120,7 +3367,10 @@ fn renaming_moves_a_name_and_refuses_what_it_cannot_do() {
     let three = fixture.arena.place(b"abc");
     fixture.call(number::WRITE, [other, three, 3, 0, 0, 0]);
     let other_path = fixture.arena.path("/other");
-    assert_eq!(fixture.call(number::RENAME, [to, other_path, 0, 0, 0, 0]), 0);
+    assert_eq!(
+        fixture.call(number::RENAME, [to, other_path, 0, 0, 0, 0]),
+        0
+    );
     assert_eq!(
         field_u64(&fixture.stat(number::STAT, "/other").expect("stat"), 48),
         8,
@@ -3166,7 +3416,10 @@ fn renaming_moves_a_name_and_refuses_what_it_cannot_do() {
         Errno::NoEntry.as_result()
     );
     assert_eq!(
-        field_u64(&fixture.stat(number::STAT, "/hosts-moved").expect("stat"), 48),
+        field_u64(
+            &fixture.stat(number::STAT, "/hosts-moved").expect("stat"),
+            48
+        ),
         20,
         "with its contents"
     );
@@ -3275,7 +3528,11 @@ fn utimensat_sets_the_time_a_pyc_is_compared_against() {
 fn flock_is_held_by_the_description() {
     let mut fixture = fixture("flock");
     let fd = fixture.opened("/etc/hosts");
-    assert_eq!(fixture.call(number::FLOCK, [fd, 2, 0, 0, 0, 0]), 0, "LOCK_EX");
+    assert_eq!(
+        fixture.call(number::FLOCK, [fd, 2, 0, 0, 0, 0]),
+        0,
+        "LOCK_EX"
+    );
     assert_eq!(fixture.kernel.files.lock(fd as i32).expect("lock"), 2);
 
     // A `dup` shares the description, so it shares the lock.
@@ -3284,11 +3541,19 @@ fn flock_is_held_by_the_description() {
     assert_eq!(fixture.kernel.files.lock(copy as i32).expect("lock"), 2);
 
     // A second request replaces the first rather than stacking.
-    assert_eq!(fixture.call(number::FLOCK, [fd, 1, 0, 0, 0, 0]), 0, "LOCK_SH");
+    assert_eq!(
+        fixture.call(number::FLOCK, [fd, 1, 0, 0, 0, 0]),
+        0,
+        "LOCK_SH"
+    );
     assert_eq!(fixture.kernel.files.lock(copy as i32).expect("lock"), 1);
 
     // Unlocking releases it.
-    assert_eq!(fixture.call(number::FLOCK, [fd, 8, 0, 0, 0, 0]), 0, "LOCK_UN");
+    assert_eq!(
+        fixture.call(number::FLOCK, [fd, 8, 0, 0, 0, 0]),
+        0,
+        "LOCK_UN"
+    );
     assert_eq!(fixture.kernel.files.lock(fd as i32).expect("lock"), 0);
 
     // A separate open is a separate description with its own lock.
@@ -3330,7 +3595,10 @@ fn a_change_through_a_symlink_reaches_the_file_it_names() {
     assert_eq!(field_u64(&target, 48), 20, "the target still has its bytes");
     let reader = fixture.opened("/etc/hosts");
     let buffer = fixture.arena.buffer(32);
-    assert_eq!(fixture.call(number::READ, [reader, buffer, 32, 0, 0, 0]), 20);
+    assert_eq!(
+        fixture.call(number::READ, [reader, buffer, 32, 0, 0, 0]),
+        20
+    );
     assert_eq!(fixture.arena.read(buffer, 7), b"CHANGED");
     // And the link is still a link.
     let itself = fixture.stat(number::LSTAT, "/hosts-link").expect("lstat");
@@ -3359,7 +3627,10 @@ fn a_change_through_a_symlink_reaches_the_file_it_names() {
         0o700
     );
     assert_eq!(
-        field_u32(&fixture.stat(number::LSTAT, "/hosts-link").expect("lstat"), 24) & 0o777,
+        field_u32(
+            &fixture.stat(number::LSTAT, "/hosts-link").expect("lstat"),
+            24
+        ) & 0o777,
         0o777,
         "the link's own mode is untouched"
     );
@@ -3476,7 +3747,10 @@ fn a_merged_directory_cannot_be_renamed_even_once_written_to() {
     // A directory created here, which reads through to nothing, still moves.
     let fresh = fixture.arena.path("/fresh-dir");
     assert_eq!(fixture.call(number::MKDIR, [fresh, 0o755, 0, 0, 0, 0]), 0);
-    assert_eq!(fixture.call(number::RENAME, [fresh, elsewhere, 0, 0, 0, 0]), 0);
+    assert_eq!(
+        fixture.call(number::RENAME, [fresh, elsewhere, 0, 0, 0, 0]),
+        0
+    );
 }
 
 /// A change that is going to fail must not copy anything up on the way.
@@ -3538,10 +3812,16 @@ fn a_refused_change_leaves_the_tree_alone() {
 fn a_directory_scan_survives_a_change_underneath_it() {
     let mut fixture = fixture("scan");
     let directory = fixture.arena.path("/scanned");
-    assert_eq!(fixture.call(number::MKDIR, [directory, 0o755, 0, 0, 0, 0]), 0);
+    assert_eq!(
+        fixture.call(number::MKDIR, [directory, 0o755, 0, 0, 0, 0]),
+        0
+    );
     let names = ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot"];
     for name in names {
-        let fd = fixture.open(&format!("/scanned/{name}"), open_flags::WRITE_ONLY | open_flags::CREATE);
+        let fd = fixture.open(
+            &format!("/scanned/{name}"),
+            open_flags::WRITE_ONLY | open_flags::CREATE,
+        );
         assert!(fd >= 0);
         fixture.call(number::CLOSE, [fd, 0, 0, 0, 0, 0]);
     }
@@ -3569,7 +3849,10 @@ fn a_directory_scan_survives_a_change_underneath_it() {
             let length =
                 u16::from_le_bytes(bytes[at + 16..at + 18].try_into().expect("two")) as usize;
             let name = &bytes[at + 19..at + length];
-            let end = name.iter().position(|byte| *byte == 0).unwrap_or(name.len());
+            let end = name
+                .iter()
+                .position(|byte| *byte == 0)
+                .unwrap_or(name.len());
             seen.push(String::from_utf8_lossy(&name[..end]).into_owned());
             at += length;
         }
@@ -3589,9 +3872,16 @@ fn a_directory_scan_survives_a_change_underneath_it() {
         .collect();
     survivors.sort();
     survivors.dedup();
-    let expected: Vec<&str> = names.iter().copied().filter(|name| *name != "charlie").collect();
+    let expected: Vec<&str> = names
+        .iter()
+        .copied()
+        .filter(|name| *name != "charlie")
+        .collect();
     assert_eq!(
-        survivors.iter().map(|name| name.as_str()).collect::<Vec<_>>(),
+        survivors
+            .iter()
+            .map(|name| name.as_str())
+            .collect::<Vec<_>>(),
         expected,
         "the scan skipped an entry the deletion moved: saw {seen:?}"
     );
@@ -3660,7 +3950,10 @@ fn a_device_node_is_writable_by_both_rows() {
     let mut fixture = fixture("device-access");
     let null = fixture.arena.path("/dev/null");
     assert_eq!(
-        fixture.call(number::ACCESS, [null, access_mode::WRITE as i64, 0, 0, 0, 0]),
+        fixture.call(
+            number::ACCESS,
+            [null, access_mode::WRITE as i64, 0, 0, 0, 0]
+        ),
         0,
         "access says the device is writable"
     );
@@ -3672,7 +3965,10 @@ fn a_device_node_is_writable_by_both_rows() {
     // both, which is the contrast that makes the pair meaningful.
     let in_proc = fixture.arena.path("/proc/self/maps");
     assert_eq!(
-        fixture.call(number::ACCESS, [in_proc, access_mode::WRITE as i64, 0, 0, 0, 0]),
+        fixture.call(
+            number::ACCESS,
+            [in_proc, access_mode::WRITE as i64, 0, 0, 0, 0]
+        ),
         Errno::ReadOnlyFs.as_result()
     );
     assert_eq!(
@@ -3711,7 +4007,13 @@ fn setting_the_executable_replaces_the_proc_mount() {
     let path = fixture.arena.path("/proc/self/exe");
     let buffer = fixture.arena.buffer(64);
 
-    for name in ["/first", "/second", "/usr/lib/libthing.so", "/fourth", "/fifth"] {
+    for name in [
+        "/first",
+        "/second",
+        "/usr/lib/libthing.so",
+        "/fourth",
+        "/fifth",
+    ] {
         fixture.kernel.set_executable(name);
         assert_eq!(
             fixture.kernel.vfs.mounts().count(),
@@ -3772,7 +4074,11 @@ fn a_write_past_what_can_be_stored_is_refused_rather_than_fatal() {
     );
     let buffer = fixture.arena.buffer(64);
     assert_eq!(fixture.call(number::PREAD64, [fd, buffer, 64, 0, 0, 0]), 64);
-    assert_eq!(fixture.arena.read(buffer, 64), &[0u8; 64], "the hole is zeros");
+    assert_eq!(
+        fixture.arena.read(buffer, 64),
+        &[0u8; 64],
+        "the hole is zeros"
+    );
 }
 
 /// Copying a file up breaks a hard link, and the link count says so.
@@ -3789,7 +4095,11 @@ fn copying_up_breaks_a_hard_link_and_says_so() {
     let before = fixture.stat(number::STAT, "/twin-a").expect("stat");
     assert_eq!(field_u32(&before, 16), 2, "two names, one file");
     let other = fixture.stat(number::STAT, "/twin-b").expect("stat");
-    assert_eq!(field_u64(&before, 8), field_u64(&other, 8), "the same inode");
+    assert_eq!(
+        field_u64(&before, 8),
+        field_u64(&other, 8),
+        "the same inode"
+    );
 
     let fd = fixture.open("/twin-a", open_flags::WRITE_ONLY);
     assert!(fd >= 0);
@@ -3885,10 +4195,16 @@ fn link_gives_a_file_a_second_name() {
     // point of a hard link.
     let writer = fixture.open("/second-name", open_flags::WRITE_ONLY);
     let changed = fixture.arena.place(b"CHANGED");
-    assert_eq!(fixture.call(number::WRITE, [writer, changed, 7, 0, 0, 0]), 7);
+    assert_eq!(
+        fixture.call(number::WRITE, [writer, changed, 7, 0, 0, 0]),
+        7
+    );
     let reader = fixture.opened("/original");
     let buffer = fixture.arena.buffer(32);
-    assert_eq!(fixture.call(number::READ, [reader, buffer, 32, 0, 0, 0]), 12);
+    assert_eq!(
+        fixture.call(number::READ, [reader, buffer, 32, 0, 0, 0]),
+        12
+    );
     assert_eq!(fixture.arena.read(buffer, 7), b"CHANGED");
 
     // Removing one name leaves the other, with the count back to one.
@@ -3897,7 +4213,10 @@ fn link_gives_a_file_a_second_name() {
     let survivor = fixture.stat(number::STAT, "/second-name").expect("stat");
     assert_eq!(field_u32(&survivor, 16), 1);
     let reader = fixture.opened("/second-name");
-    assert_eq!(fixture.call(number::READ, [reader, buffer, 32, 0, 0, 0]), 12);
+    assert_eq!(
+        fixture.call(number::READ, [reader, buffer, 32, 0, 0, 0]),
+        12
+    );
 }
 
 #[test]
@@ -3940,7 +4259,10 @@ fn link_refuses_what_it_cannot_do() {
     assert!(message.contains("AT_EMPTY_PATH"), "{message}");
     // An unknown flag is `EINVAL`.
     assert_eq!(
-        fixture.call(number::LINKAT, [at::FDCWD, file, at::FDCWD, fresh, 0x4000, 0]),
+        fixture.call(
+            number::LINKAT,
+            [at::FDCWD, file, at::FDCWD, fresh, 0x4000, 0]
+        ),
         Errno::Invalid.as_result()
     );
 }
@@ -3976,7 +4298,14 @@ fn linking_an_image_file_copies_it_up_first() {
     assert_eq!(
         fixture.call(
             number::LINKAT,
-            [at::FDCWD, link, at::FDCWD, followed, at::SYMLINK_FOLLOW as i64, 0]
+            [
+                at::FDCWD,
+                link,
+                at::FDCWD,
+                followed,
+                at::SYMLINK_FOLLOW as i64,
+                0
+            ]
         ),
         0
     );
@@ -4067,7 +4396,10 @@ fn repeated_churn_does_not_grow_the_writable_layer() {
         let fd = fixture.open("/scratch", open_flags::WRITE_ONLY | open_flags::CREATE);
         assert!(fd >= 0);
         for _ in 0..4 {
-            assert_eq!(fixture.call(number::WRITE, [fd, block, 4096, 0, 0, 0]), 4096);
+            assert_eq!(
+                fixture.call(number::WRITE, [fd, block, 4096, 0, 0, 0]),
+                4096
+            );
         }
         assert_eq!(fixture.call(number::CLOSE, [fd, 0, 0, 0, 0, 0]), 0);
         assert_eq!(fixture.call(number::UNLINK, [path, 0, 0, 0, 0, 0]), 0);

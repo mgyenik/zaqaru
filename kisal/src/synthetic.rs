@@ -22,8 +22,7 @@ use std::vec;
 use std::vec::Vec;
 
 use crate::image::{
-    HEADER_SIZE, INODE_SIZE, Image, ImageError, Inode, directory_entry_type, file_type,
-    inode_flags,
+    HEADER_SIZE, INODE_SIZE, Image, ImageError, Inode, directory_entry_type, file_type, inode_flags,
 };
 
 /// The device numbers Linux gives these, which is what a program that looks
@@ -144,7 +143,11 @@ pub fn proc(executable: &[u8]) -> Vec<u8> {
     let mut dirents = Vec::new();
     // The root's array, then `self`'s.
     let root_payload = dirents.len() as u64;
-    write_entries(&mut dirents, &mut strings, &[(b"self", 1, directory_entry_type::DIRECTORY)]);
+    write_entries(
+        &mut dirents,
+        &mut strings,
+        &[(b"self", 1, directory_entry_type::DIRECTORY)],
+    );
     let self_payload = dirents.len() as u64;
     write_entries(
         &mut dirents,
@@ -180,7 +183,11 @@ fn build(entries: &[Entry]) -> Vec<u8> {
             nlink: 1,
             ..blank()
         });
-        listing.push((entry.name, number, directory_entry_type::of_mode(entry.mode)));
+        listing.push((
+            entry.name,
+            number,
+            directory_entry_type::of_mode(entry.mode),
+        ));
     }
 
     let mut dirents = Vec::new();
@@ -193,11 +200,7 @@ fn build(entries: &[Entry]) -> Vec<u8> {
     index
 }
 
-fn write_entries(
-    dirents: &mut Vec<u8>,
-    strings: &mut Strings,
-    entries: &[(&[u8], u32, u8)],
-) {
+fn write_entries(dirents: &mut Vec<u8>, strings: &mut Strings, entries: &[(&[u8], u32, u8)]) {
     dirents.extend_from_slice(&(entries.len() as u32).to_le_bytes());
     // Interned first, so the references are known before any is written and
     // sorted, because lookup is a binary search.
@@ -210,10 +213,7 @@ fn write_entries(
         indices.sort_by_key(|index| entries[*index].0);
         indices
     };
-    sorted = order
-        .iter()
-        .map(|index| sorted[*index])
-        .collect();
+    sorted = order.iter().map(|index| sorted[*index]).collect();
     for (name, inode, kind) in sorted {
         dirents.extend_from_slice(&name.to_le_bytes());
         dirents.extend_from_slice(&inode.to_le_bytes());

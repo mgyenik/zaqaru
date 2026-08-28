@@ -33,9 +33,8 @@ use std::os::unix::io::AsRawFd;
 use std::path::Path;
 
 use support::{
-    ALL_MODES, CodeModel, Compiler, TranspileOptions, WorkingDirectory,
-    compile_corpus_object_with, link_container_with_image, m1_mounts, transpile_object_configured,
-    validate_wasm,
+    ALL_MODES, CodeModel, Compiler, TranspileOptions, WorkingDirectory, compile_corpus_object_with,
+    link_container_with_image, m1_mounts, transpile_object_configured, validate_wasm,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

@@ -158,10 +158,37 @@ pub fn link_corpus_executable(
     entry: &str,
     optimisation: &str,
 ) -> PathBuf {
+    link_corpus_executable_with(workspace, name, entry, optimisation, Unwind::Omitted)
+}
+
+/// Whether the linked executable carries `.eh_frame`.
+///
+/// The corpus is otherwise built without unwind tables, since a relocatable
+/// object's is a section the translator has no use for. A real static binary
+/// has one — C is compiled with asynchronous unwind tables by default — and
+/// it is the only witness to where the functions are once the symbol table
+/// has been stripped away.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Unwind {
+    Omitted,
+    Present,
+}
+
+pub fn link_corpus_executable_with(
+    workspace: &WorkingDirectory,
+    name: &str,
+    entry: &str,
+    optimisation: &str,
+    unwind: Unwind,
+) -> PathBuf {
     let source = corpus_source(name);
+    let suffix = match unwind {
+        Unwind::Omitted => "",
+        Unwind::Present => ".unwound",
+    };
     let output = workspace
         .path()
-        .join(format!("{name}{optimisation}.elf").replace('/', "."));
+        .join(format!("{name}{optimisation}{suffix}.elf").replace('/', "."));
     let source_text = source.to_string_lossy().into_owned();
     let output_text = output.to_string_lossy().into_owned();
     let entry_flag = format!("-Wl,-e,{entry}");
@@ -169,6 +196,10 @@ pub fn link_corpus_executable(
         Vec::new()
     } else {
         let mut flags = CORPUS_COMPILE_FLAGS.to_vec();
+        if unwind == Unwind::Present {
+            flags.retain(|flag| *flag != "-fno-asynchronous-unwind-tables");
+            flags.push("-fasynchronous-unwind-tables");
+        }
         flags.push(optimisation);
         flags.push(CodeModel::Absolute.flag());
         flags
@@ -178,6 +209,18 @@ pub fn link_corpus_executable(
     arguments.push("-o");
     arguments.push(&output_text);
     run_tool(Compiler::Gcc.program(), &arguments);
+    output
+}
+
+/// A copy of a linked executable with its symbol table removed, which is how
+/// most shipped binaries arrive.
+pub fn strip(workspace: &WorkingDirectory, path: &std::path::Path) -> PathBuf {
+    let output = workspace.path().join(format!(
+        "{}.stripped",
+        path.file_name().expect("a file name").to_string_lossy()
+    ));
+    std::fs::copy(path, &output).expect("copy before stripping");
+    run_tool("strip", &["--strip-all", &output.to_string_lossy()]);
     output
 }
 
@@ -473,7 +516,11 @@ pub fn transpile_object_configured(input: &Path, output: &Path, options: Transpi
         .with_resume(options.resume)
         .transpile()
         .unwrap_or_else(|error| {
-            panic!("transpiling {} ({}): {error:?}", input.display(), options.label())
+            panic!(
+                "transpiling {} ({}): {error:?}",
+                input.display(),
+                options.label()
+            )
         });
     validate_wasm(&wasm);
     std::fs::write(output, &wasm).expect("write transpiled object");
@@ -1056,10 +1103,7 @@ pub fn link_container_with_image(
 /// both sinks a test can read back.
 pub fn m1_mounts() -> runner::store::MountTable {
     let mut mounts = runner::store::MountTable::new();
-    mounts.mount(
-        &[b"iso", b"console"],
-        Box::new(runner::store::Sink::new()),
-    );
+    mounts.mount(&[b"iso", b"console"], Box::new(runner::store::Sink::new()));
     mounts.mount(&[b"iso", b"log"], Box::new(runner::store::Sink::new()));
     mounts
 }
@@ -1075,7 +1119,12 @@ pub fn mounts_seeded(seed: &[u8]) -> runner::store::MountTable {
     mounts.mount(&[b"iso", b"random"], Box::new(runner::store::Sink::new()));
     mounts
         .write(
-            &[b"iso".to_vec(), b"random".to_vec(), b"bytes".to_vec(), b"32".to_vec()],
+            &[
+                b"iso".to_vec(),
+                b"random".to_vec(),
+                b"bytes".to_vec(),
+                b"32".to_vec(),
+            ],
             seed,
         )
         .expect("seed the container");

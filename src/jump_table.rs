@@ -266,7 +266,10 @@ fn absolute_operands(instruction: &iced_x86::Instruction) -> impl Iterator<Item 
 /// The data location a virtual address names, if it is in a data section.
 fn data_at(object: &ObjectFile, address: u64) -> Option<(usize, u64)> {
     let (section, offset) = object.section_at(address)?;
-    object.sections[section].role.is_data().then_some((section, offset))
+    object.sections[section]
+        .role
+        .is_data()
+        .then_some((section, offset))
 }
 
 /// Whether a data location begins a run of references to blocks *inside* this

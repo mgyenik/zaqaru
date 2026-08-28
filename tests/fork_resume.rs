@@ -287,9 +287,22 @@ fn full_run(
 ) -> (i64, u32) {
     let (mut store, instance) = instantiate(engine, module, state, snapshot, global_names);
     let wrapper = instance
-        .get_typed_func::<(i64, i64, i64, i64, i64, i64, f64, f64, f64, f64, f64, f64, f64, f64), (i64, f64)>(
-            &mut store, entry,
-        )
+        .get_typed_func::<(
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            f64,
+            f64,
+            f64,
+            f64,
+            f64,
+            f64,
+            f64,
+            f64,
+        ), (i64, f64)>(&mut store, entry)
         .unwrap_or_else(|error| panic!("export `{entry}` not usable: {error}"));
     let (result, _) = wrapper
         .call(
@@ -314,8 +327,7 @@ fn fork_run(
         snapshot_on: None,
         child_from: Some(1),
     };
-    let (mut store, instance) =
-        instantiate(engine, module, state, snapshot.clone(), global_names);
+    let (mut store, instance) = instantiate(engine, module, state, snapshot.clone(), global_names);
 
     {
         let recorded = snapshot.lock().unwrap();

@@ -100,7 +100,9 @@ fn fixture(label: &str) -> Fixture {
     std::fs::write(root.join("etc/hosts"), b"127.0.0.1 localhost\n").expect("write");
     // A file long enough to span pages, with a pattern that says which byte
     // of it any given byte is.
-    let patterned: Vec<u8> = (0..PATTERNED as u32).map(|index| (index % 251) as u8).collect();
+    let patterned: Vec<u8> = (0..PATTERNED as u32)
+        .map(|index| (index % 251) as u8)
+        .collect();
     std::fs::write(root.join("etc/patterned"), &patterned).expect("write");
     let tree = Tree { root };
 
@@ -168,7 +170,10 @@ impl Fixture {
     }
 
     fn map(&mut self, hint: i64, length: i64, prot: i32, flags: i32) -> i64 {
-        self.call(number::MMAP, [hint, length, prot as i64, flags as i64, -1, 0])
+        self.call(
+            number::MMAP,
+            [hint, length, prot as i64, flags as i64, -1, 0],
+        )
     }
 
     fn anonymous(&mut self, length: i64) -> u64 {
@@ -216,7 +221,10 @@ fn anonymous_memory_reads_as_zeros_and_keeps_what_is_written() {
     let mut fixture = fixture("anonymous");
     let address = fixture.anonymous(3 * PAGE);
     assert_eq!(address % PAGE as u64, 0, "a mapping is page-aligned");
-    assert_eq!(fixture.bytes(address, 3 * PAGE as usize), vec![0u8; 3 * PAGE as usize]);
+    assert_eq!(
+        fixture.bytes(address, 3 * PAGE as usize),
+        vec![0u8; 3 * PAGE as usize]
+    );
 
     fixture.dirty(address, 3 * PAGE as usize, 0xa5);
     assert_eq!(fixture.bytes(address + 8, 4), &[0xa5; 4]);
@@ -227,7 +235,10 @@ fn anonymous_memory_reads_as_zeros_and_keeps_what_is_written() {
         second >= address + 3 * PAGE as u64 || second + PAGE as u64 <= address,
         "the two mappings overlap: {address:#x} and {second:#x}"
     );
-    assert_eq!(fixture.bytes(second, PAGE as usize), vec![0u8; PAGE as usize]);
+    assert_eq!(
+        fixture.bytes(second, PAGE as usize),
+        vec![0u8; PAGE as usize]
+    );
 }
 
 /// A length that is not a whole number of pages is rounded up, so the tail
@@ -258,9 +269,17 @@ fn mmap_refuses_what_it_cannot_mean() {
     // `0x80000000` here and answers `EINVAL` to the same bit in
     // `mprotect`. The asymmetry is real and the rows differ accordingly.
     let ignored = fixture.map(0, PAGE, 0x40, map::PRIVATE | map::ANONYMOUS);
-    assert!(ignored > 0, "mmap refused an unknown protection bit: {ignored}");
+    assert!(
+        ignored > 0,
+        "mmap refused an unknown protection bit: {ignored}"
+    );
     assert_eq!(
-        fixture.kernel.space.find(ignored as u64).expect("mapped").prot,
+        fixture
+            .kernel
+            .space
+            .find(ignored as u64)
+            .expect("mapped")
+            .prot,
         prot::NONE,
         "and nothing it did not understand was recorded"
     );
@@ -382,10 +401,7 @@ fn a_partial_unmap_splits_the_mapping() {
 
     // Punch the middle page out.
     assert_eq!(
-        fixture.call(
-            number::MUNMAP,
-            [base as i64 + 2 * PAGE, PAGE, 0, 0, 0, 0]
-        ),
+        fixture.call(number::MUNMAP, [base as i64 + 2 * PAGE, PAGE, 0, 0, 0, 0]),
         0
     );
     let pieces: Vec<_> = fixture
@@ -411,7 +427,10 @@ fn a_partial_unmap_splits_the_mapping() {
         map::PRIVATE | map::ANONYMOUS,
     );
     assert_eq!(reused, base as i64 + 2 * PAGE, "the hole was reused");
-    assert_eq!(fixture.bytes(reused as u64, PAGE as usize), vec![0u8; PAGE as usize]);
+    assert_eq!(
+        fixture.bytes(reused as u64, PAGE as usize),
+        vec![0u8; PAGE as usize]
+    );
     // And the pages around it still hold what was written.
     assert_eq!(fixture.bytes(base, 8), &[0x77; 8]);
     assert_eq!(fixture.bytes(base + 3 * PAGE as u64, 8), &[0x77; 8]);
@@ -532,7 +551,14 @@ fn madv_dontneed_zeroes_the_range() {
     assert_eq!(
         fixture.call(
             number::MADVISE,
-            [base as i64 + PAGE, 2 * PAGE, advice::DONTNEED as i64, 0, 0, 0]
+            [
+                base as i64 + PAGE,
+                2 * PAGE,
+                advice::DONTNEED as i64,
+                0,
+                0,
+                0
+            ]
         ),
         0
     );
@@ -730,7 +756,9 @@ fn a_file_mapping_holds_the_files_bytes() {
     );
     assert!(mapped > 0, "mmap failed with {mapped}");
 
-    let expected: Vec<u8> = (0..PATTERNED as u32).map(|index| (index % 251) as u8).collect();
+    let expected: Vec<u8> = (0..PATTERNED as u32)
+        .map(|index| (index % 251) as u8)
+        .collect();
     assert_eq!(
         fixture.bytes(mapped as u64, 3 * PAGE as usize),
         &expected[..3 * PAGE as usize]
@@ -775,7 +803,9 @@ fn a_mapping_past_the_end_of_a_file_is_zeros() {
 fn the_loader_carving_sequence_lands_the_right_bytes() {
     let mut fixture = fixture("carving");
     let fd = fixture.open("/etc/patterned");
-    let expected: Vec<u8> = (0..PATTERNED as u32).map(|index| (index % 251) as u8).collect();
+    let expected: Vec<u8> = (0..PATTERNED as u32)
+        .map(|index| (index % 251) as u8)
+        .collect();
 
     // The extent: the whole file, read-only, wherever the kernel likes.
     let extent = fixture.call(
@@ -871,7 +901,14 @@ fn a_file_mapping_refuses_what_cannot_be_mapped() {
     let directory = fixture.path("/etc");
     let fd = fixture.call(
         number::OPEN,
-        [directory, kisal::file::open_flags::DIRECTORY as i64, 0, 0, 0, 0],
+        [
+            directory,
+            kisal::file::open_flags::DIRECTORY as i64,
+            0,
+            0,
+            0,
+            0,
+        ],
     );
     assert!(fd >= 0);
     assert_eq!(
@@ -934,10 +971,7 @@ fn mremap_grows_in_place_shrinks_and_moves() {
     fixture.dirty(base, 2 * PAGE as usize, 0x21);
 
     // Growing into free space stays put, and the new part is zeros.
-    let grown = fixture.call(
-        number::MREMAP,
-        [base as i64, 2 * PAGE, 4 * PAGE, 0, 0, 0],
-    );
+    let grown = fixture.call(number::MREMAP, [base as i64, 2 * PAGE, 4 * PAGE, 0, 0, 0]);
     assert_eq!(grown, base as i64, "there was room above");
     assert_eq!(fixture.bytes(base, 8), &[0x21; 8], "the old bytes survived");
     assert_eq!(
@@ -947,13 +981,15 @@ fn mremap_grows_in_place_shrinks_and_moves() {
     );
 
     // Shrinking truncates, and the tail becomes available again.
-    let shrunk = fixture.call(
-        number::MREMAP,
-        [base as i64, 4 * PAGE, PAGE, 0, 0, 0],
-    );
+    let shrunk = fixture.call(number::MREMAP, [base as i64, 4 * PAGE, PAGE, 0, 0, 0]);
     assert_eq!(shrunk, base as i64);
     assert_eq!(
-        fixture.kernel.space.find(base).expect("still mapped").length,
+        fixture
+            .kernel
+            .space
+            .find(base)
+            .expect("still mapped")
+            .length,
         PAGE as u64
     );
     assert!(fixture.kernel.space.find(base + PAGE as u64).is_none());
@@ -970,16 +1006,30 @@ fn mremap_grows_in_place_shrinks_and_moves() {
     fixture.dirty(base, 8, 0x64);
     let moved = fixture.call(
         number::MREMAP,
-        [base as i64, PAGE, 2 * PAGE, kisal::space::remap::MAYMOVE as i64, 0, 0],
+        [
+            base as i64,
+            PAGE,
+            2 * PAGE,
+            kisal::space::remap::MAYMOVE as i64,
+            0,
+            0,
+        ],
     );
     assert!(moved > 0 && moved != base as i64, "it had to move");
-    assert_eq!(fixture.bytes(moved as u64, 8), &[0x64; 8], "the bytes came along");
+    assert_eq!(
+        fixture.bytes(moved as u64, 8),
+        &[0x64; 8],
+        "the bytes came along"
+    );
     assert_eq!(
         fixture.bytes(moved as u64 + PAGE as u64, PAGE as usize),
         vec![0u8; PAGE as usize],
         "and the new part is zeros"
     );
-    assert!(fixture.kernel.space.find(base).is_none(), "the old range is gone");
+    assert!(
+        fixture.kernel.space.find(base).is_none(),
+        "the old range is gone"
+    );
 
     // Without `MREMAP_MAYMOVE` and with nowhere to grow, `ENOMEM`.
     let pinned = fixture.anonymous(PAGE);
@@ -1001,7 +1051,10 @@ fn mremap_refuses_what_it_cannot_mean() {
     let base = fixture.anonymous(2 * PAGE);
     // An address that is not a mapping's start.
     assert_eq!(
-        fixture.call(number::MREMAP, [base as i64 + PAGE, PAGE, 2 * PAGE, 0, 0, 0]),
+        fixture.call(
+            number::MREMAP,
+            [base as i64 + PAGE, PAGE, 2 * PAGE, 0, 0, 0]
+        ),
         Errno::Fault.as_result()
     );
     // A length that is not the mapping's.
@@ -1013,7 +1066,14 @@ fn mremap_refuses_what_it_cannot_mean() {
     assert_eq!(
         fixture.call(
             number::MREMAP,
-            [base as i64, 2 * PAGE, 4 * PAGE, kisal::space::remap::FIXED as i64, 0, 0]
+            [
+                base as i64,
+                2 * PAGE,
+                4 * PAGE,
+                kisal::space::remap::FIXED as i64,
+                0,
+                0
+            ]
         ),
         Errno::Invalid.as_result()
     );
@@ -1068,7 +1128,10 @@ fn proc_self_maps_renders_the_tree_as_it_stands() {
         anonymous_line.contains(&format!("{:x} rw-p ", anonymous + 2 * PAGE as u64)),
         "{anonymous_line}"
     );
-    assert!(anonymous_line.ends_with("00000000 00:00 0 "), "{anonymous_line}");
+    assert!(
+        anonymous_line.ends_with("00000000 00:00 0 "),
+        "{anonymous_line}"
+    );
 
     let file_line = lines
         .iter()

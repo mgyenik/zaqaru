@@ -269,7 +269,8 @@ impl Parser<'_> {
     }
 
     fn skip_whitespace(&mut self) {
-        while self.at < self.text.len() && matches!(self.text[self.at], b' ' | b'\t' | b'\n' | b'\r')
+        while self.at < self.text.len()
+            && matches!(self.text[self.at], b' ' | b'\t' | b'\n' | b'\r')
         {
             self.at += 1;
         }

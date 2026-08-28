@@ -23,9 +23,7 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
     pub(crate) fn brk(&mut self, arguments: Arguments) -> Outcome {
         let requested = arguments.get(0) as u64;
         let machine = &mut self.machine;
-        let (result, fill) = self
-            .space
-            .brk(requested, &mut |to| machine.grow(to));
+        let (result, fill) = self.space.brk(requested, &mut |to| machine.grow(to));
         if let Err(errno) = self.zero(fill) {
             return Outcome::Done(errno.as_result());
         }
@@ -79,10 +77,7 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
         // either dirty tracking or a flush at `msync`. Nothing in the
         // target workload creates one, and a mapping that silently dropped
         // the writes would be the worst of the three options.
-        if !anonymous
-            && flags & map::TYPE_MASK == map::SHARED
-            && prot_bits & prot::WRITE != 0
-        {
+        if !anonymous && flags & map::TYPE_MASK == map::SHARED && prot_bits & prot::WRITE != 0 {
             return Outcome::Fault(Fault::detailed(
                 number::MMAP,
                 arguments,
@@ -139,7 +134,12 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
     /// of writes unspecified for a private mapping, so a copy is conformant;
     /// the alternative — pointing the guest at the shared image blob — has
     /// no answer for a later `mprotect(PROT_WRITE)`, which Linux permits.
-    fn copy_file_backing(&mut self, address: u64, length: u64, backing: &Backing) -> Result<(), Errno> {
+    fn copy_file_backing(
+        &mut self,
+        address: u64,
+        length: u64,
+        backing: &Backing,
+    ) -> Result<(), Errno> {
         let Backing::File { vnode, offset, .. } = backing else {
             return Ok(());
         };
@@ -200,8 +200,9 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
         let machine = &mut self.machine;
         let moved = match self
             .space
-            .remap(start, old_length, new_length, flags, &mut |to| machine.grow(to))
-        {
+            .remap(start, old_length, new_length, flags, &mut |to| {
+                machine.grow(to)
+            }) {
             Ok(moved) => moved,
             Err(errno) => return Outcome::Done(errno.as_result()),
         };
@@ -270,7 +271,11 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
             hex(&mut rendered, vma.end());
             rendered.push(' ');
             rendered.push(if vma.prot & prot::READ != 0 { 'r' } else { '-' });
-            rendered.push(if vma.prot & prot::WRITE != 0 { 'w' } else { '-' });
+            rendered.push(if vma.prot & prot::WRITE != 0 {
+                'w'
+            } else {
+                '-'
+            });
             rendered.push(if vma.prot & prot::EXEC != 0 { 'x' } else { '-' });
             // Every mapping is private: nothing creates a writable shared
             // one, and a read-only shared mapping is indistinguishable from
@@ -401,4 +406,3 @@ fn decimal(into: &mut String, value: u64) {
         into.push(digits[index] as char);
     }
 }
-

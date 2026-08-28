@@ -95,15 +95,21 @@ fn fixture(label: &str) -> Fixture {
     std::fs::create_dir_all(root.join("etc")).expect("mkdir");
 
     write(&root.join("bin/tool"), b"the tool");
-    std::fs::set_permissions(root.join("bin/tool"), std::fs::Permissions::from_mode(0o4755))
-        .expect("chmod");
+    std::fs::set_permissions(
+        root.join("bin/tool"),
+        std::fs::Permissions::from_mode(0o4755),
+    )
+    .expect("chmod");
     // A second name for the same inode, which the index must record as one
     // record with `nlink` 2 rather than as two files.
     std::fs::hard_link(root.join("bin/tool"), root.join("bin/alias")).expect("link");
 
     write(&root.join("etc/conf"), b"key = value\n");
     // An ELF-shaped file, which the baker page-aligns in the blob.
-    write(&root.join("usr/lib/libthing.so"), b"\x7fELFand then some bytes");
+    write(
+        &root.join("usr/lib/libthing.so"),
+        b"\x7fELFand then some bytes",
+    );
     // Names chosen so that directory order is not insertion order.
     write(&root.join("etc/zulu"), b"z");
     write(&root.join("etc/alpha"), b"a");
@@ -115,7 +121,11 @@ fn fixture(label: &str) -> Fixture {
     // `security.capability` is a packed struct, and anything that treats a
     // value as text destroys it. That one cannot be set here without
     // `CAP_SETFCAP`, so its *shape* is what is exercised.
-    set_xattr(&root.join("bin/tool"), b"user.packed", &[0x01, 0x00, 0x00, 0x02, 0xff, 0x00]);
+    set_xattr(
+        &root.join("bin/tool"),
+        b"user.packed",
+        &[0x01, 0x00, 0x00, 0x02, 0xff, 0x00],
+    );
     set_xattr(&root.join("bin/tool"), b"user.aardvark", b"first by name");
     set_xattr(&root.join("etc/conf"), b"user.empty", b"");
 
@@ -275,7 +285,10 @@ fn entries_are_sorted_and_carry_their_type() {
         );
         names.push(image.string(entry.name_ref).expect("name").to_vec());
     }
-    assert_eq!(names, vec![b"alpha".to_vec(), b"conf".to_vec(), b"zulu".to_vec()]);
+    assert_eq!(
+        names,
+        vec![b"alpha".to_vec(), b"conf".to_vec(), b"zulu".to_vec()]
+    );
 
     // The type is precomputed from the target's mode, which is what lets an
     // importer skip a `stat` per entry.
@@ -303,7 +316,10 @@ fn a_hardlink_is_one_inode_with_two_names() {
 
     let bin = resolve(&image, "bin").expect("bin exists");
     let tool = image.lookup(&bin, b"tool").expect("lookup").expect("tool");
-    let alias = image.lookup(&bin, b"alias").expect("lookup").expect("alias");
+    let alias = image
+        .lookup(&bin, b"alias")
+        .expect("lookup")
+        .expect("alias");
     assert_eq!(tool.inode, alias.inode, "two names, one inode");
 
     let inode = image.inode(tool.inode).expect("inode");
@@ -356,7 +372,11 @@ fn metadata_survives_the_bake() {
 
     let inode = resolve(&image, "bin/tool").expect("bin/tool exists");
     assert_eq!(inode.mode, native.mode(), "mode, setuid bit included");
-    assert_eq!(inode.mode & 0o4000, 0o4000, "the setuid bit is really there");
+    assert_eq!(
+        inode.mode & 0o4000,
+        0o4000,
+        "the setuid bit is really there"
+    );
     assert_eq!(inode.uid, native.uid());
     assert_eq!(inode.gid, native.gid());
     assert_eq!(inode.mtime_sec, native.mtime());
@@ -406,7 +426,10 @@ fn extended_attributes_survive_byte_for_byte() {
         attributes,
         vec![
             (b"user.aardvark".to_vec(), b"first by name".to_vec()),
-            (b"user.packed".to_vec(), vec![0x01, 0x00, 0x00, 0x02, 0xff, 0x00]),
+            (
+                b"user.packed".to_vec(),
+                vec![0x01, 0x00, 0x00, 0x02, 0xff, 0x00]
+            ),
         ]
     );
 
@@ -579,7 +602,10 @@ fn an_empty_image_has_a_usable_root() {
     let baked = baker::bake_empty();
     let image = Image::parse(&baked.index, &baked.blob).expect("parse an empty image");
     let root = image.inode(image.root()).expect("root inode");
-    assert!(root.is_directory(), "the root of an empty image is a directory");
+    assert!(
+        root.is_directory(),
+        "the root of an empty image is a directory"
+    );
     assert_eq!(root.parent, image.root(), "and it is its own parent");
     assert_eq!(image.entry_count(&root).expect("count"), 0);
     assert!(image.lookup(&root, b"anything").expect("lookup").is_none());

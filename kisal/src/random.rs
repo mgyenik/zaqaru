@@ -203,9 +203,22 @@ mod tests {
         // Compared as the bytes a guest reads, not as words: a mistake in
         // the little-endian serialisation would be invisible otherwise.
         let expected: [u32; 16] = [
-            0xe4e7_f110, 0x1559_3bd1, 0x1fdd_0f50, 0xc471_20a3, 0xc7f4_d1c7, 0x0368_c033,
-            0x9aaa_2204, 0x4e6c_d4c3, 0x4664_82d2, 0x09aa_9f07, 0x05d7_c214, 0xa202_8bd9,
-            0xd19c_12b5, 0xb94e_16de, 0xe883_d0cb, 0x4e3c_50a2,
+            0xe4e7_f110,
+            0x1559_3bd1,
+            0x1fdd_0f50,
+            0xc471_20a3,
+            0xc7f4_d1c7,
+            0x0368_c033,
+            0x9aaa_2204,
+            0x4e6c_d4c3,
+            0x4664_82d2,
+            0x09aa_9f07,
+            0x05d7_c214,
+            0xa202_8bd9,
+            0xd19c_12b5,
+            0xb94e_16de,
+            0xe883_d0cb,
+            0x4e3c_50a2,
         ];
         let mut serialised = [0u8; 64];
         for (index, word) in expected.iter().enumerate() {

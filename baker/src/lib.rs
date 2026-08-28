@@ -30,9 +30,7 @@ use std::path::Path;
 
 use anyhow::{Result, bail};
 use kisal::file::MAX_NAME;
-use kisal::image::{
-    self, HEADER_SIZE, INODE_SIZE, Inode, directory_entry_type, inode_flags,
-};
+use kisal::image::{self, HEADER_SIZE, INODE_SIZE, Inode, directory_entry_type, inode_flags};
 
 /// Contents are packed at this alignment normally.
 const CONTENT_ALIGNMENT: usize = 16;
@@ -163,8 +161,9 @@ impl Builder {
                     // interned would have no place in the strings region to
                     // point at.
                     self.intern(name);
-                    let entry_type =
-                        directory_entry_type::of_mode(self.inodes[child_number as usize].inode.mode);
+                    let entry_type = directory_entry_type::of_mode(
+                        self.inodes[child_number as usize].inode.mode,
+                    );
                     match &mut self.inodes[number as usize].contents {
                         Contents::Directory(entries) => {
                             entries.insert(name.clone(), (child_number, entry_type));

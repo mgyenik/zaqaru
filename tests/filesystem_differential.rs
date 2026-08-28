@@ -52,9 +52,8 @@ use std::os::unix::io::AsRawFd;
 use std::path::Path;
 
 use support::{
-    ALL_MODES, WorkingDirectory, compile_corpus_object_with, Compiler, CodeModel,
-    link_container_with_image, m1_mounts, validate_wasm, TranspileOptions,
-    transpile_object_configured,
+    ALL_MODES, CodeModel, Compiler, TranspileOptions, WorkingDirectory, compile_corpus_object_with,
+    link_container_with_image, m1_mounts, transpile_object_configured, validate_wasm,
 };
 
 /// One record the guest emits: a tag, a result, and five values.
@@ -156,8 +155,7 @@ fn build_tree(root: &Path) {
     // listed, so `getdents64` reports more than one `d_type` there too.
     std::fs::create_dir_all(root.join("etc/conf.d")).expect("mkdir");
     std::os::unix::fs::symlink("hosts", root.join("etc/hosts-alias")).expect("symlink");
-    let fifo = std::ffi::CString::new(root.join("etc/pipe").as_os_str().as_bytes())
-        .expect("path");
+    let fifo = std::ffi::CString::new(root.join("etc/pipe").as_os_str().as_bytes()).expect("path");
     assert_eq!(
         unsafe { libc::mkfifo(fifo.as_ptr(), 0o644) },
         0,
@@ -289,8 +287,8 @@ fn the_comparison_notices_a_divergent_image() {
     let divergent = workspace.path().join("divergent");
     build_tree(&divergent);
     write(&divergent.join("etc/hosts"), b"127.0.0.1 elsewhere!\n");
-    let image = baker::object::emit(&baker::bake_directory(&divergent).expect("bake"))
-        .expect("emit");
+    let image =
+        baker::object::emit(&baker::bake_directory(&divergent).expect("bake")).expect("emit");
 
     let native_object = compile_corpus_object_with(
         &workspace,
