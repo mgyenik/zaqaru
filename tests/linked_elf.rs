@@ -469,3 +469,51 @@ fn a_stripped_executable_still_has_functions() {
     assert!(outcome.succeeded, "did not link:\n{}", outcome.report());
     support::validate_wasm(&std::fs::read(&module_path).expect("read"));
 }
+
+/// The boot path's way in.
+///
+/// Every function in a linked program is local — nothing outside can name
+/// one — so the module has to define exactly one thing a caller can name,
+/// which takes the entry point's address and runs the program. Without it a
+/// linked module is a program nothing can start. The check is the real
+/// shape: a separate object with an undefined reference to it, linked.
+#[test]
+fn a_linked_module_can_be_entered_from_outside() {
+    let workspace = WorkingDirectory::new("linked-entry");
+    let object = read(&workspace, "arithmetic.c", "quad_mix");
+    let translated = zaqaru::transpile::Transpiler::new(&object)
+        .transpile()
+        .expect("translate");
+    let object_path = workspace.write("entry.wasm.o", &translated);
+
+    // The address the boot path would hand over is a real function's.
+    assert!(
+        object.function_at(object.entry).is_some(),
+        "the entry point is in no function, so there is nothing to enter"
+    );
+
+    let caller = support::compile_foreign_wasm_object(
+        &workspace,
+        "boot",
+        &format!(
+            "void {entry}(long long address);\n\
+             __attribute__((export_name(\"start\")))\n\
+             void start(long long address) {{ {entry}(address); }}\n",
+            entry = zaqaru::transpile::GUEST_ENTRY
+        ),
+    );
+
+    let module_path = workspace.path().join("entry.wasm");
+    let outcome = support::try_link_wasm(
+        &[object_path, caller],
+        &module_path,
+        &["--fatal-warnings", "--export-table", "--growable-table"],
+    );
+    assert!(
+        outcome.succeeded,
+        "a caller of `{}` did not link:\n{}",
+        zaqaru::transpile::GUEST_ENTRY,
+        outcome.report()
+    );
+    support::validate_wasm(&std::fs::read(&module_path).expect("read"));
+}

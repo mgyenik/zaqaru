@@ -70,6 +70,16 @@ pub const SYSCALL_ENTRY: &str = "x86_syscall";
 const UNIFORM_WRAPPER_ARGUMENTS: usize = ARGUMENT_REGISTERS.len();
 const UNIFORM_WRAPPER_FLOAT_ARGUMENTS: usize = FLOAT_ARGUMENT_REGISTERS.len();
 
+/// The two functions a linked module needs that a relocatable one does not.
+#[derive(Clone, Copy)]
+struct LinkedHelpers {
+    /// [`EXEC_MAP_LOOKUP`]: a virtual address in, a table slot out.
+    lookup: FunctionReference,
+    /// [`GUEST_ENTRY`]: the address of the program's entry point in, and the
+    /// program runs.
+    enter: FunctionReference,
+}
+
 /// Maps input-object symbols onto the wasm symbols that stand for them.
 struct SymbolTable<'a> {
     object: &'a ObjectFile,
@@ -417,8 +427,8 @@ impl<'a> Transpiler<'a> {
         // takes an index.
         self.declare_imported_functions(&mut wasm, &mut symbols, guest_type, &references)?;
         self.declare_data(&mut wasm, &mut symbols, &references)?;
-        let (mut plans, driver, exec_map) = self.declare_functions(&mut wasm, &mut symbols)?;
-        symbols.exec_map = exec_map;
+        let (mut plans, driver, helpers) = self.declare_functions(&mut wasm, &mut symbols)?;
+        symbols.exec_map = helpers.map(|helpers| helpers.lookup);
 
         // Table slots have to exist before anything can refer to one, and
         // they are only known once every function has a symbol.
@@ -426,7 +436,7 @@ impl<'a> Transpiler<'a> {
         // The static exec map, which only a linked input needs: a function
         // pointer there is a virtual address, and this is what turns one
         // into a slot.
-        let exec_map_body = exec_map.map(|_| {
+        let exec_map_body = helpers.map(|_| {
             let lookup_type = wasm.intern_type(FunctionType {
                 parameters: vec![ValueType::I64],
                 results: vec![ValueType::I32],
@@ -449,6 +459,11 @@ impl<'a> Transpiler<'a> {
                 build_exec_map_lookup(table, entries.len() as u32),
             )
         });
+        // The trampoline is a `call_indirect`, so the module needs a table
+        // whether or not the program itself ever calls through one.
+        if helpers.is_some() {
+            wasm.uses_function_table = true;
+        }
         wasm.uses_function_table = references.calls_indirectly || !wasm.table_functions.is_empty();
         self.rewrite_jump_tables(&mut wasm, &mut symbols, &references)?;
         self.translate_data_relocations(&mut wasm, &symbols, &references)?;
@@ -523,8 +538,17 @@ impl<'a> Transpiler<'a> {
             ));
         }
 
-        if let (Some(reference), Some((lookup_type, body))) = (exec_map, exec_map_body) {
-            bodies.push((reference.function_index, lookup_type, body));
+        if let (Some(helpers), Some((lookup_type, body))) = (helpers, exec_map_body) {
+            bodies.push((helpers.lookup.function_index, lookup_type, body));
+            let enter_type = wasm.intern_type(FunctionType {
+                parameters: vec![ValueType::I64],
+                results: vec![],
+            });
+            bodies.push((
+                helpers.enter.function_index,
+                enter_type,
+                build_guest_entry(helpers.lookup, guest_type),
+            ));
         }
 
         bodies.sort_by_key(|(index, _, _)| *index);
@@ -1106,7 +1130,7 @@ impl<'a> Transpiler<'a> {
     ) -> Result<(
         Vec<FunctionPlan>,
         Option<FunctionReference>,
-        Option<FunctionReference>,
+        Option<LinkedHelpers>,
     )> {
         let mut plans = Vec::new();
         let mut next_index = wasm.imported_functions.len() as u32;
@@ -1203,18 +1227,31 @@ impl<'a> Transpiler<'a> {
         // definition's index is reserved in one place and the bodies can be
         // pushed in the order they were claimed.
         let exec_map = (self.object.layout == crate::reader::Layout::Linked).then(|| {
-            let index = next_index;
-            let symbol = wasm.add_symbol(Symbol {
+            let lookup_index = next_index;
+            let lookup_symbol = wasm.add_symbol(Symbol {
                 name: EXEC_MAP_LOOKUP.to_string(),
-                target: SymbolTarget::Function(index),
+                target: SymbolTarget::Function(lookup_index),
                 flags: symbol_flags::LOCAL,
             });
-            FunctionReference {
-                symbol_index: symbol,
-                function_index: index,
+            // The trampoline, unlike the lookup, is the one thing in a
+            // linked module something outside it has to be able to name.
+            let enter_index = lookup_index + 1;
+            let enter_symbol = wasm.add_symbol(Symbol {
+                name: GUEST_ENTRY.to_string(),
+                target: SymbolTarget::Function(enter_index),
+                flags: 0,
+            });
+            LinkedHelpers {
+                lookup: FunctionReference {
+                    symbol_index: lookup_symbol,
+                    function_index: lookup_index,
+                },
+                enter: FunctionReference {
+                    symbol_index: enter_symbol,
+                    function_index: enter_index,
+                },
             }
         });
-
         Ok((plans, driver, exec_map))
     }
 
@@ -1594,6 +1631,15 @@ pub const EXEC_MAP_LOOKUP: &str = "x86_slot_of";
 /// The data segment holding the map itself.
 pub const EXEC_MAP_TABLE: &str = "x86_exec_map";
 
+/// The name of the trampoline the boot path enters the program through.
+///
+/// A linked program's entry point is one of its own functions, and in linked
+/// mode almost every function is local — there is no exported name to call.
+/// What there is, is the address the ELF header states. So the boot path
+/// hands over an address and this turns it into the call, through the same
+/// exec map an indirect call in translated code goes through.
+pub const GUEST_ENTRY: &str = "x86_enter";
+
 /// One entry: a virtual address and the table slot the function at it holds.
 /// Sixteen bytes so the address is eight-byte aligned, which is what a load
 /// wants and what makes the search's arithmetic a shift.
@@ -1652,6 +1698,20 @@ fn build_exec_map_table(wasm: &mut WasmObject, entries: &[(u64, u32)]) -> DataRe
 /// pointer, a jump into data — and the useful thing is to stop where it
 /// happened. A sentinel slot would turn it into a call to whatever occupies
 /// that slot, which is the same bug arriving somewhere else.
+/// The trampoline: an address in, the program running.
+///
+/// It returns if the entry point returns, which a real one never does — a
+/// program leaves through `exit_group`. The boot path treats a return as the
+/// fault it is rather than trapping here, because a named fault says more
+/// than an unreachable does.
+fn build_guest_entry(lookup: FunctionReference, guest_type: u32) -> FunctionBody {
+    let mut body = FunctionBodyBuilder::new(1);
+    body.local_get(0);
+    body.call(lookup);
+    body.call_indirect(guest_type);
+    body.finish()
+}
+
 fn build_exec_map_lookup(table: DataReference, count: u32) -> FunctionBody {
     let mut body = FunctionBodyBuilder::new(1);
     let low = body.declare_local(ValueType::I32);
