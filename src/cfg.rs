@@ -600,7 +600,18 @@ fn is_branch(lifted: &LiftedInstruction) -> bool {
     matches!(
         lifted.instruction.flow_control(),
         FlowControl::ConditionalBranch | FlowControl::UnconditionalBranch
-    )
+    ) || is_transaction_start(&lifted.instruction)
+}
+
+/// `xbegin`, which branches to the address it names when its transaction
+/// aborts.
+///
+/// The decoder gives it a flow control of its own rather than calling it a
+/// branch, because architecturally it is one only on the abort path. Here it
+/// is a branch outright: a transaction that always aborts always takes it.
+fn is_transaction_start(instruction: &iced_x86::Instruction) -> bool {
+    instruction.mnemonic() == iced_x86::Mnemonic::Xbegin
+        && instruction.op0_kind() == iced_x86::OpKind::NearBranch64
 }
 
 /// A branch is *internal* when it lands inside this function. A jump naming a
@@ -637,6 +648,14 @@ fn classify_terminator(
         };
     }
     if is_internal_branch(lifted, function) {
+        // `xbegin` reaches both: the fallback it names when the transaction
+        // aborts, and the transaction body when it does not.
+        if is_transaction_start(instruction) {
+            return Terminator::Branch {
+                target: canonical_target(function, instruction.near_branch64()),
+                not_taken: block_end,
+            };
+        }
         return match instruction.flow_control() {
             FlowControl::ConditionalBranch => Terminator::Branch {
                 target: canonical_target(function, instruction.near_branch64()),

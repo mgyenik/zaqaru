@@ -377,9 +377,31 @@ impl<'a> FunctionTranslator<'a> {
         lifted: &LiftedInstruction,
     ) -> Result<()> {
         self.temporaries.reset();
-        // Two of them test a register rather than a flag, so they have no
-        // condition code at all and cannot go through the table below.
+        // Three of them test no flag, so they have no condition code at all
+        // and cannot go through the table below.
         match lifted.instruction.mnemonic() {
+            // A hardware transaction that always aborts, which is what this
+            // has: there is no transactional memory here, and there is no
+            // concurrency to elide either, since the scheduler switches only
+            // at syscalls.
+            //
+            // Always-aborting is not a shortcut but the architecture's own
+            // contract — a transaction may abort spuriously for no reason,
+            // and software must never rely on one committing, which is why
+            // every user of `xbegin` has a fallback path. Taking it always
+            // is taking a path the program is already required to have.
+            //
+            // The status matters: bit one says "this may succeed if you try
+            // again", and setting it would spin a retry loop forever. Zero
+            // says aborted and do not retry, so a lock elision falls through
+            // to taking the lock.
+            Mnemonic::Xbegin => {
+                body.i32_const(0);
+                self.state
+                    .write_register(body, transaction_status(OperandWidth::DoubleWord));
+                body.i32_const(1);
+                return Ok(());
+            }
             Mnemonic::Jrcxz => {
                 self.state
                     .read_register(body, count_register(OperandWidth::QuadWord));
@@ -561,6 +583,22 @@ impl<'a> FunctionTranslator<'a> {
             }
             Mnemonic::Movsq if is_string_move(&lifted.instruction) => {
                 self.translate_move_string(body, lifted, OperandWidth::QuadWord)
+            }
+            // Committing a transaction that was never begun, which raises a
+            // general protection fault on real hardware. Every caller
+            // reaches this only after `xbegin` reported success, and here it
+            // never does — so the guard above it is what makes the program
+            // correct, and a trap is what a fault is.
+            Mnemonic::Xend | Mnemonic::Xabort => {
+                body.unreachable();
+                Ok(())
+            }
+            // "Are we in a transaction?" — never, and the zero flag is how
+            // the answer is given.
+            Mnemonic::Xtest => {
+                body.i32_const(1);
+                self.state.write_flag(body, Flag::Zero);
+                Ok(())
             }
             Mnemonic::Cpuid => self.translate_cpuid(body),
             Mnemonic::Xgetbv => self.translate_extended_control(body),
@@ -3275,6 +3313,15 @@ fn is_string_move(instruction: &iced_x86::Instruction) -> bool {
 const COUNT_INDEX: usize = 1;
 const SOURCE_INDEX: usize = 6;
 const DESTINATION_INDEX: usize = 7;
+
+/// `%eax`, which a transaction's abort status is delivered in.
+fn transaction_status(width: OperandWidth) -> RegisterSlice {
+    RegisterSlice {
+        number: REGISTER_RAX,
+        width,
+        high_byte: false,
+    }
+}
 
 /// `%cl`/`%cx`/`%ecx`/`%rcx`, which `jrcxz` and `jecxz` test against zero.
 fn count_register(width: OperandWidth) -> RegisterSlice {
