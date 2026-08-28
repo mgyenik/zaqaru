@@ -547,6 +547,7 @@ fn collect_leaders(function: &LiftedFunction, split_after_calls: bool) -> Result
         }
 
         let terminates = branches
+            || never_continues(instruction)
             || matches!(
                 instruction.flow_control(),
                 FlowControl::Return | FlowControl::IndirectBranch
@@ -562,6 +563,22 @@ fn collect_leaders(function: &LiftedFunction, split_after_calls: bool) -> Result
     }
 
     Ok(leaders)
+}
+
+/// Whether control simply stops at this instruction.
+///
+/// `hlt` halts the processor — privileged, so reaching one from user code
+/// faults — and the `ud` family raises an invalid-opcode exception on
+/// purpose. Compilers emit them where control provably does not reach, most
+/// often straight after a call that never returns.
+fn never_continues(instruction: &iced_x86::Instruction) -> bool {
+    matches!(
+        instruction.mnemonic(),
+        iced_x86::Mnemonic::Hlt
+            | iced_x86::Mnemonic::Ud0
+            | iced_x86::Mnemonic::Ud1
+            | iced_x86::Mnemonic::Ud2
+    )
 }
 
 fn is_branch(lifted: &LiftedInstruction) -> bool {
@@ -624,6 +641,14 @@ fn classify_terminator(
         return Terminator::ConditionalLeave {
             not_taken: block_end,
         };
+    }
+    // An instruction that does not continue ends its block wherever it
+    // stands. `hlt` halts the processor and `ud2` raises an exception, and
+    // both are how a compiler spells "control does not reach here" — `_start`
+    // itself ends in a `hlt`, after the call to `__libc_start_main` that
+    // never returns.
+    if never_continues(instruction) {
+        return Terminator::Unreachable;
     }
     // Nothing follows, and the block runs off the end of the function. A
     // compiler emits that only after a call that does not return, so the

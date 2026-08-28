@@ -185,3 +185,71 @@ fn a_function_ending_in_a_call_that_never_returns_stops_there() {
         .transpile()
         .expect("translating a function whose last instruction never returns");
 }
+
+/// `hlt` ends its block wherever it stands, not only at a function's end.
+///
+/// A compiler emits one where control provably does not reach — after a call
+/// that never returns — and six of the seven in a static glibc are
+/// *mid*-function, with more code after them. `abort`, `_Exit` and
+/// `__libc_check_standard_fds` all carry one. Reading it as a fall-through
+/// describes a path into the following block that cannot be taken, and at
+/// the end of a function it describes a path off the end entirely, which is
+/// what refused `_start`.
+#[test]
+fn an_instruction_that_never_continues_ends_its_block() {
+    use zaqaru::cfg::Terminator;
+
+    let workspace = WorkingDirectory::new("cfg-halting");
+    let object_path = compile_corpus_object(&workspace, "halting.s");
+    let bytes = std::fs::read(&object_path).expect("read compiled object");
+    let object = ObjectFile::parse(&bytes).expect("parse object");
+    let functions = lifter::lift_object(&object).expect("lift object");
+
+    for name in ["halts_at_the_end", "halts_in_the_middle"] {
+        let function = functions
+            .iter()
+            .find(|function| function.name == name)
+            .unwrap_or_else(|| panic!("the fixture no longer defines `{name}`"));
+        let graph = ControlFlowGraph::build(function).expect("build the graph");
+
+        let halting = graph
+            .blocks
+            .iter()
+            .enumerate()
+            .find(|(_, block)| {
+                function.instructions[block.instructions.end - 1]
+                    .instruction
+                    .mnemonic()
+                    == iced_x86::Mnemonic::Hlt
+            })
+            .map(|(index, block)| (index, block.terminator.clone()))
+            .unwrap_or_else(|| panic!("no block in `{name}` ends in `hlt`"));
+
+        assert_eq!(
+            halting.1,
+            Terminator::Unreachable,
+            "`{name}`'s halting block does not stop there"
+        );
+        assert!(
+            graph.successors(halting.0).is_empty(),
+            "`{name}` continues past a `hlt`"
+        );
+    }
+
+    // The mid-function case has reachable code after the halt, which must
+    // still be there — it is the branch's target, not the halt's successor.
+    let middle = functions
+        .iter()
+        .find(|function| function.name == "halts_in_the_middle")
+        .expect("the fixture");
+    let graph = ControlFlowGraph::build(middle).expect("build the graph");
+    assert!(
+        graph.blocks.len() >= 3,
+        "the block after the halt went missing: {} blocks",
+        graph.blocks.len()
+    );
+
+    zaqaru::transpile::Transpiler::new(&object)
+        .transpile()
+        .expect("translating functions that halt");
+}
