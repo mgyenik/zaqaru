@@ -504,6 +504,8 @@ impl<'a> FunctionTranslator<'a> {
             Mnemonic::Not => self.translate_complement(body, lifted),
             Mnemonic::Inc => self.translate_step(body, lifted, FlagRule::Addition),
             Mnemonic::Dec => self.translate_step(body, lifted, FlagRule::Subtraction),
+            Mnemonic::Cpuid => self.translate_cpuid(body),
+            Mnemonic::Xgetbv => self.translate_extended_control(body),
             Mnemonic::Bsf => self.translate_bit_scan(body, lifted, true),
             Mnemonic::Bsr => self.translate_bit_scan(body, lifted, false),
             Mnemonic::Bswap => self.translate_byte_swap(body, lifted),
@@ -1564,6 +1566,71 @@ impl<'a> FunctionTranslator<'a> {
         body.if_();
         self.emit_shift_flags(body, kind, width, value, count, result);
         body.end();
+        Ok(())
+    }
+
+    /// `cpuid`: what this machine says it is.
+    ///
+    /// The answer is *curated*, and that is the design rather than a
+    /// shortcut. A libc ships several implementations of `memcpy` and picks
+    /// between them from what `cpuid` reports; reporting a processor with
+    /// AVX-512 would have it select code paths written in instructions
+    /// nothing here translates, and reporting the host's own processor would
+    /// make a container's behaviour depend on the machine it happened to run
+    /// on — which is the opposite of what a container is for.
+    ///
+    /// So it reports one fixed processor: a baseline x86-64 with SSE2 and
+    /// nothing later. Every ifunc resolver then chooses the same
+    /// implementation on every host, deterministically, and that
+    /// implementation is one the translator covers.
+    ///
+    /// This is the reason a differential cannot check it. Native `cpuid`
+    /// answers for the host, and the whole point here is not to.
+    fn translate_cpuid(&mut self, body: &mut FunctionBodyBuilder) -> Result<()> {
+        // Read at the width `cpuid` uses, which is already the carrier the
+        // comparisons below want.
+        let leaf = self.temporaries.take(body, ValueType::I32);
+        self.state
+            .read_register(body, cpuid::register(REGISTER_RAX));
+        body.local_set(leaf);
+
+        // Everything unrecognised answers zero, which is what a processor
+        // does for a leaf it does not implement.
+        for register in cpuid::REGISTERS {
+            body.i32_const(0);
+            self.state.write_register(body, cpuid::register(register));
+        }
+
+        for (query, answer) in cpuid::ANSWERS {
+            body.local_get(leaf);
+            body.i32_const(*query as i32);
+            body.i32_eq();
+            body.if_();
+            for (register, value) in cpuid::REGISTERS.iter().zip(answer) {
+                if *value != 0 {
+                    body.i32_const(*value as i32);
+                    self.state.write_register(body, cpuid::register(*register));
+                }
+            }
+            body.end();
+        }
+        Ok(())
+    }
+
+    /// `xgetbv`: which extended processor states the operating system has
+    /// enabled.
+    ///
+    /// The same curation as `cpuid`, and it has to agree with it: a libc
+    /// that saw `OSXSAVE` would read this to find out whether the AVX state
+    /// is live before using an AVX path. This reports x87 and SSE enabled
+    /// and nothing else, which is what a machine without AVX has.
+    fn translate_extended_control(&mut self, body: &mut FunctionBodyBuilder) -> Result<()> {
+        body.i32_const(cpuid::EXTENDED_CONTROL as i32);
+        self.state
+            .write_register(body, cpuid::register(REGISTER_RAX));
+        body.i32_const(0);
+        self.state
+            .write_register(body, cpuid::register(REGISTER_RDX));
         Ok(())
     }
 
@@ -2806,6 +2873,86 @@ fn is_conditional_move(mnemonic: Mnemonic) -> bool {
 }
 
 /// `al`/`ax`/`eax`/`rax`, the register a division's quotient lands in.
+const REGISTER_RAX: usize = 0;
+const REGISTER_RCX: usize = 1;
+const REGISTER_RDX: usize = 2;
+const REGISTER_RBX: usize = 3;
+
+/// The processor this container reports itself to be.
+///
+/// One machine, the same on every host: a baseline x86-64 with SSE2 and
+/// nothing later. See [`Translator::translate_cpuid`] for why it is fixed
+/// rather than passed through.
+mod cpuid {
+    use super::{OperandWidth, REGISTER_RAX, REGISTER_RBX, REGISTER_RCX, REGISTER_RDX};
+    use crate::machine::RegisterSlice;
+
+    /// `cpuid` writes these four, in this order, and clears what it does
+    /// not fill.
+    pub const REGISTERS: [usize; 4] = [REGISTER_RAX, REGISTER_RBX, REGISTER_RCX, REGISTER_RDX];
+
+    pub fn register(number: usize) -> RegisterSlice {
+        RegisterSlice {
+            number,
+            // A 32-bit write, which clears the register's upper half — as
+            // `cpuid` does.
+            width: OperandWidth::DoubleWord,
+            high_byte: false,
+        }
+    }
+
+    /// x87 and SSE state enabled, and nothing else. Read by `xgetbv`.
+    pub const EXTENDED_CONTROL: u32 = 0x3;
+
+    /// Leaf, then `eax`, `ebx`, `ecx`, `edx`.
+    pub const ANSWERS: &[(u32, [u32; 4])] = &[
+        // Leaf 0: the highest leaf understood, and the vendor string in
+        // `ebx:edx:ecx`. Stopping at 1 is what keeps a libc from asking
+        // about AVX2 at all — leaf 7 is where that lives, and a processor
+        // that does not reach it does not have it.
+        (
+            0,
+            [
+                1,
+                u32::from_le_bytes(*b"Genu"),
+                u32::from_le_bytes(*b"ntel"),
+                u32::from_le_bytes(*b"ineI"),
+            ],
+        ),
+        // Leaf 1: signature and features.
+        //
+        // `eax` is family 6, model 15, stepping 11 — a Core 2, which is the
+        // oldest processor that runs everything this targets and the
+        // newest that has nothing after SSE3.
+        //
+        // `edx` carries the old feature word: FPU, TSC, CMOV, CLFSH, MMX,
+        // FXSR, SSE, SSE2. Deliberately absent from `ecx` are SSSE3, SSE4,
+        // POPCNT, XSAVE, OSXSAVE and AVX — every one of which selects a
+        // path this translation would have to grow instructions for.
+        (
+            1,
+            [
+                0x0000_06fb,
+                0x0000_0800,
+                0x0000_0001,
+                (1 << 0)   // FPU
+                    | (1 << 4)  // TSC
+                    | (1 << 8)  // CMPXCHG8B
+                    | (1 << 15) // CMOV
+                    | (1 << 19) // CLFSH
+                    | (1 << 23) // MMX
+                    | (1 << 24) // FXSR
+                    | (1 << 25) // SSE
+                    | (1 << 26), // SSE2
+            ],
+        ),
+        // The extended leaves: how many there are, then long mode and the
+        // no-execute bit, which every x86-64 has.
+        (0x8000_0000, [0x8000_0001, 0, 0, 0]),
+        (0x8000_0001, [0, 0, 0, (1 << 20) | (1 << 29)]),
+    ];
+}
+
 fn accumulator(width: OperandWidth) -> RegisterSlice {
     RegisterSlice {
         number: 0,
