@@ -20,6 +20,12 @@ Current documents:
   resolution model, and per-subsystem designs (threads on the resume
   machinery, futex, mmap, dynamic loading, sockets, signals, x87/MMX
   soft emulation).
+- [x87-plan.md](x87-plan.md) — the plan that finishes the x87: symbol
+  plumbing and the translator lowering (X1–X2), linking the staticlib
+  into every build (X3), corpus differentials (X4), the refusal-tail
+  gate (X5), kisal integration points (X6), and the full-coverage rows
+  through MMX and unmasked-exception delivery (X7) — written to be
+  executable without archaeology, with a pitfalls index.
 - [container-build-plan.md](container-build-plan.md) — the implementation
   plan for the above: milestones M0–M11 from toolchain gates through
   "Flask, served", with the two integration checkpoints (hello-write,
