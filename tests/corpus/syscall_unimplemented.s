@@ -1,18 +1,21 @@
-/* A syscall kisal has no row for. Natively it is an ordinary `getpid`; under
- * kisal it is the loud-error policy, which exists to be tested rather than
- * merely stated.
+/* A syscall number Linux does not define, and so one kisal can never have a
+ * row for. That is the point: this exercises the loud-error policy, which
+ * exists to be tested rather than merely stated, and a number that might one
+ * day be implemented would eventually stop testing it.
  *
- * long guest_getpid(void);
+ * It was `getpid` until `getpid` was implemented.
+ *
+ * long guest_unknown_syscall(void);
  */
 
 	.text
-	.globl	guest_getpid
-	.type	guest_getpid, @function
-guest_getpid:
-	movq	$39, %rax
+	.globl	guest_unknown_syscall
+	.type	guest_unknown_syscall, @function
+guest_unknown_syscall:
+	movq	$1000, %rax
 	syscall
 	ret
-	.size	guest_getpid, .-guest_getpid
+	.size	guest_unknown_syscall, .-guest_unknown_syscall
 
 /* Six distinct arguments through an unimplemented syscall, so that the
  * kernel's diagnostic reports what the seam actually marshalled.
@@ -29,7 +32,7 @@ guest_getpid:
 	.globl	guest_six_arguments
 	.type	guest_six_arguments, @function
 guest_six_arguments:
-	movq	$39, %rax
+	movq	$1000, %rax
 	movq	$11, %rdi
 	movq	$22, %rsi
 	movq	$33, %rdx

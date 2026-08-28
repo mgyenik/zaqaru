@@ -224,7 +224,7 @@ fn an_unimplemented_syscall_names_itself() {
         zaqaru::structurer::Mode::Structured,
     );
     let mut container = instantiate(&module);
-    let outcome = container.call_guest("guest_getpid", [0; 6]);
+    let outcome = container.call_guest("guest_unknown_syscall", [0; 6]);
     assert!(
         outcome.is_err(),
         "an unimplemented syscall returned {outcome:?} instead of stopping the run"
@@ -236,11 +236,15 @@ fn an_unimplemented_syscall_names_itself() {
         .expect("the log mount failed")
         .unwrap_or_default();
     let logged = String::from_utf8_lossy(&logged).into_owned();
-    // The exact message, not a substring: `"390".contains("39")` is true, so a
-    // substring check cannot tell a correct number from a wrong one.
+    // The exact message, not a substring: `"10000".contains("1000")` is
+    // true, so a substring check cannot tell a correct number from a wrong
+    // one. The number is one Linux does not define, which is what keeps it
+    // unimplemented — this fixture used `getpid` until `getpid` was
+    // implemented, and a stand-in that can stop standing in is one that
+    // breaks a test for no reason.
     assert_eq!(
         logged,
-        "kisal: unimplemented syscall getpid (39) with (0, 0, 0, 0, 0, 0)"
+        "kisal: unimplemented syscall 1000 with (0, 0, 0, 0, 0, 0)"
     );
 }
 
@@ -277,7 +281,7 @@ fn all_six_syscall_arguments_reach_the_kernel_in_order() {
     // fourth argument is the mistake this exists to catch.
     assert_eq!(
         String::from_utf8_lossy(&logged),
-        "kisal: unimplemented syscall getpid (39) with (11, 22, 33, 44, 55, 66)"
+        "kisal: unimplemented syscall 1000 with (11, 22, 33, 44, 55, 66)"
     );
 }
 

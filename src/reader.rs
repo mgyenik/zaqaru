@@ -775,6 +775,29 @@ fn next_boundary(
 /// is a second instruction stream, which is a different question — see
 /// `crate::cfg`'s handling of a branch past a `lock` prefix.
 fn split_at_interior_entries(sections: &[Section], functions: &mut Vec<Function>) -> Result<()> {
+    // To a fixpoint, because a cut makes boundaries that were not there
+    // before: a branch that stayed inside one function may cross two of its
+    // pieces, and that is a second entry the first pass could not see.
+    // glibc's `memmove` variants need three rounds — the entry cut exposes a
+    // branch into the tail, which exposes another.
+    const ROUNDS: usize = 16;
+    for round in 0..=ROUNDS {
+        if !split_once(sections, functions)? {
+            return Ok(());
+        }
+        if round == ROUNDS {
+            bail!(
+                "splitting functions at their entry points did not settle in \
+                 {ROUNDS} rounds, which means a cut is creating another"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// One pass of [`split_at_interior_entries`], reporting whether it cut
+/// anything.
+fn split_once(sections: &[Section], functions: &mut Vec<Function>) -> Result<bool> {
     use std::collections::{BTreeSet, HashMap};
 
     // Where each function's instructions begin, and everywhere anything
@@ -843,7 +866,7 @@ fn split_at_interior_entries(sections: &[Section], functions: &mut Vec<Function>
         }
     }
     if cuts.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
 
     let mut split = Vec::with_capacity(functions.len());
@@ -859,6 +882,9 @@ fn split_at_interior_entries(sections: &[Section], functions: &mut Vec<Function>
                 // The first piece keeps the symbol and the name; the rest
                 // are named after where they begin, because nothing named
                 // them.
+                // Named after where the piece begins within whatever it was
+                // cut from. A later round cuts a piece that already carries
+                // a suffix, so the offsets compose rather than nesting.
                 name: if start == function.offset {
                     function.name.clone()
                 } else {
@@ -878,7 +904,7 @@ fn split_at_interior_entries(sections: &[Section], functions: &mut Vec<Function>
     }
     split.sort_by_key(|function| (function.section, function.offset));
     *functions = split;
-    Ok(())
+    Ok(true)
 }
 
 /// Which section holds a virtual address, and where in it.

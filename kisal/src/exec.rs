@@ -737,6 +737,21 @@ pub fn check_region(program: &Program, data: u64) -> Result<(), Error> {
     Ok(())
 }
 
+/// A segment's protection, as the address space records it.
+fn prot_of(load: &Load) -> i32 {
+    let mut prot = crate::space::prot::NONE;
+    if load.readable {
+        prot |= crate::space::prot::READ;
+    }
+    if load.writable {
+        prot |= crate::space::prot::WRITE;
+    }
+    if load.executable {
+        prot |= crate::space::prot::EXEC;
+    }
+    prot
+}
+
 /// How much stack a process starts with, matching Linux's default
 /// `RLIMIT_STACK`. It is an ordinary mapping, so `/proc/self/maps` shows it
 /// and `pthread_getattr_np` can find its bounds like any other.
@@ -760,6 +775,35 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
         check_region(&program, module_data_base())?;
 
         for load in &program.loads {
+            // Recorded as a mapping before anything is written into it. The
+            // guest's own memory is not special to it: glibc applies
+            // read-only relocation protection with `mprotect` over its data
+            // segment moments after starting, and a region nothing has
+            // mapped has nothing to protect. `/proc/self/maps` renders the
+            // same tree, so this is also what makes a program visible to
+            // itself.
+            let start = load.address - load.address % crate::space::PAGE;
+            let end = (load.address + load.memory_size).next_multiple_of(crate::space::PAGE);
+            let machine = &mut self.machine;
+            let request = crate::space::Request {
+                hint: start,
+                length: end - start,
+                prot: prot_of(load),
+                // Fixed, because the address is the program's and not ours
+                // to choose; private and anonymous, because the bytes are
+                // copied in rather than shared with anything.
+                flags: crate::space::map::FIXED
+                    | crate::space::map::PRIVATE
+                    | crate::space::map::ANONYMOUS,
+                backing: crate::space::Backing::Anonymous,
+            };
+            self.space
+                .map(&request, &mut |to| machine.grow(to))
+                .map_err(|_| Error::RegionOccupied {
+                    top: program.top(),
+                    data: module_data_base(),
+                })?;
+
             let memory = self.memory();
             memory
                 .check(load.address, load.memory_size)

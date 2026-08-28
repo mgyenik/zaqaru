@@ -684,15 +684,15 @@ fn classify_terminator(
     if never_continues(instruction) {
         return Terminator::Unreachable;
     }
+    // The block runs off the end of the function, and there are two very
+    // different reasons for that. Either another function begins there and
+    // control continues into it — a tail call — or nothing does, and the
+    // compiler emitted no path past a call that never returns.
+    //
+    // Which one cannot be told apart here: this sees one function and the
+    // answer is about the others. So both become `FallsOut`, and the
+    // translator, which knows where every function begins, decides.
     if !function.contains(block_end) {
-        // Nothing follows, and the block runs off the end of the function.
-        // After a call, that means the callee did not return and the
-        // compiler emitted nothing for a path that cannot be taken.
-        if instruction.flow_control() == FlowControl::Call {
-            return Terminator::Unreachable;
-        }
-        // Otherwise control really does continue, into whatever begins
-        // where this function ends — which is a tail call to it.
         return Terminator::FallsOut { into: block_end };
     }
     Terminator::FallThrough { next: block_end }

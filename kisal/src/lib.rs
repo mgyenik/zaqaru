@@ -306,3 +306,48 @@ pub unsafe extern "C" fn kisal_untranslated(name: *const u8, length: usize) -> !
     with_kernel(|kernel| report(kernel, &message));
     panic!("{message}");
 }
+
+/// What the exec map calls when an address is not a function's.
+///
+/// A function pointer in a linked program is a virtual address, and the map
+/// turns one into the slot the indirect-call table is indexed by. Reaching
+/// here means the guest computed a pointer to something that is not the
+/// start of a translated function: a data address mistaken for code, a
+/// relocation the loader has not applied yet, or a function the translator
+/// never found.
+///
+/// The address is the whole of what is worth knowing, so it is reported
+/// rather than trapped on — a bare `unreachable` in the middle of a binary
+/// search says nothing at all.
+///
+/// # Safety
+/// Called only from the generated exec map, on the path where its search
+/// found nothing.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kisal_no_function_at(address: i64) -> ! {
+    let mut message = String::from("kisal: ");
+    push_hex(&mut message, address as u64);
+    message.push_str(
+        " is not the address of any translated function, and something \
+         called through it",
+    );
+    with_kernel(|kernel| report(kernel, &message));
+    panic!("{message}");
+}
+
+/// Hexadecimal, because an address is only legible that way.
+fn push_hex(into: &mut String, value: u64) {
+    into.push_str("0x");
+    let mut started = false;
+    for shift in (0..16).rev() {
+        let digit = ((value >> (shift * 4)) & 0xf) as u8;
+        if digit == 0 && !started && shift != 0 {
+            continue;
+        }
+        started = true;
+        into.push(char::from(match digit {
+            0..=9 => b'0' + digit,
+            _ => b'a' + digit - 10,
+        }));
+    }
+}

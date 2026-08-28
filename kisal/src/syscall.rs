@@ -38,6 +38,7 @@ pub mod number {
     pub const IOCTL: i64 = 16;
     pub const FCNTL: i64 = 72;
     pub const WRITEV: i64 = 20;
+    pub const READV: i64 = 19;
     pub const MADVISE: i64 = 28;
     pub const MREMAP: i64 = 25;
     pub const MSYNC: i64 = 26;
@@ -131,6 +132,7 @@ pub mod number {
             FCHDIR => "fchdir",
             READLINK => "readlink",
             READLINKAT => "readlinkat",
+            READV => "readv",
             FACCESSAT => "faccessat",
             FACCESSAT2 => "faccessat2",
             PWRITE64 => "pwrite64",
@@ -358,6 +360,13 @@ pub struct Kernel<'a, S: Store, M: Machine> {
     pub robust_list: u64,
 }
 
+/// Which way a vectored transfer moves.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Direction {
+    In,
+    Out,
+}
+
 /// The container's only process, which is the first in its own namespace.
 pub const PROCESS_ID: i64 = 1;
 
@@ -519,6 +528,8 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
     pub fn dispatch(&mut self, number: i64, arguments: Arguments) -> Outcome {
         match number {
             number::WRITE => self.write(arguments),
+            number::WRITEV => self.vectored(arguments, Direction::Out),
+            number::READV => self.vectored(arguments, Direction::In),
             number::ARCH_PRCTL => self.arch_prctl(arguments),
 
             // The read-only filesystem. Eighty per cent of a real
@@ -902,6 +913,84 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             }
             _ => Outcome::Done(count),
         }
+    }
+
+    /// `readv`/`writev`: one call, several buffers.
+    ///
+    /// Walked one vector at a time through the ordinary rows, which is
+    /// exactly what they mean — the gather and scatter are about saving
+    /// syscalls, not about doing anything a sequence of them could not.
+    /// Linux additionally makes the whole thing atomic against other writers
+    /// on the same description; with one thread there is no other writer,
+    /// and M7 is where that stops being true for free.
+    ///
+    /// The return value is the total moved. A vector that fails after
+    /// something has already moved reports what moved rather than the
+    /// error, because that is what a caller resumes from — the error comes
+    /// back on the next call, when nothing has moved yet.
+    fn vectored(&mut self, arguments: Arguments, direction: Direction) -> Outcome {
+        /// Bytes per `struct iovec`: a pointer and a length.
+        const VECTOR: u64 = 16;
+        /// `IOV_MAX`, which Linux refuses to exceed.
+        const MAX_VECTORS: i64 = 1024;
+
+        let descriptor = arguments.get(0);
+        let vectors = arguments.get(1) as u64;
+        let count = arguments.get(2);
+        if !(0..=MAX_VECTORS).contains(&count) {
+            return Outcome::Done(Errno::Invalid.as_result());
+        }
+        // SAFETY: the whole array is bounds-checked before any of it is
+        // read, so a count that runs off the end fails before anything
+        // moves rather than part-way through.
+        let array = match unsafe { self.memory().slice(vectors, count as u64 * VECTOR) } {
+            Ok(array) => array,
+            Err(errno) => return Outcome::Done(errno.as_result()),
+        };
+        let mut described = [(0u64, 0u64); MAX_VECTORS as usize];
+        for index in 0..count as usize {
+            let at = index * VECTOR as usize;
+            let mut base = [0u8; 8];
+            let mut length = [0u8; 8];
+            base.copy_from_slice(&array[at..at + 8]);
+            length.copy_from_slice(&array[at + 8..at + 16]);
+            described[index] = (u64::from_le_bytes(base), u64::from_le_bytes(length));
+        }
+
+        let mut total: i64 = 0;
+        for &(base, length) in &described[..count as usize] {
+            if length == 0 {
+                continue;
+            }
+            if i64::try_from(length).is_err() {
+                return Outcome::Done(Errno::Invalid.as_result());
+            }
+            let one = Arguments::new([descriptor, base as i64, length as i64, 0, 0, 0]);
+            let moved = match direction {
+                Direction::Out => self.write(one),
+                Direction::In => self.read(one),
+            };
+            match moved {
+                Outcome::Done(moved) if moved < 0 => {
+                    // Nothing has moved yet, so the error is the answer.
+                    return if total == 0 {
+                        Outcome::Done(moved)
+                    } else {
+                        Outcome::Done(total)
+                    };
+                }
+                Outcome::Done(moved) => {
+                    total += moved;
+                    // A short move ends the call: the next vector would
+                    // otherwise skip the bytes that did not go.
+                    if (moved as u64) < length {
+                        break;
+                    }
+                }
+                other => return other,
+            }
+        }
+        Outcome::Done(total)
     }
 
     /// `write` to a descriptor the filesystem backs.

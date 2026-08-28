@@ -90,6 +90,8 @@ struct SymbolTable<'a> {
     /// The imported [`UNTRANSLATED`], present only when the translation was
     /// asked to trap rather than refuse.
     untranslated: Option<FunctionReference>,
+    /// The imported [`NO_FUNCTION_AT`], present for a linked input.
+    no_function_at: Option<FunctionReference>,
     /// The imported [`SYSCALL_ENTRY`], present when the object contains a
     /// `syscall` at all.
     syscall_entry: Option<FunctionReference>,
@@ -412,6 +414,7 @@ impl<'a> Transpiler<'a> {
             table_slots_by_symbol: HashMap::new(),
             exec_map: None,
             untranslated: None,
+            no_function_at: None,
             jump_tables: HashMap::new(),
             syscall_entry: None,
             segment_of_section: HashMap::new(),
@@ -441,11 +444,16 @@ impl<'a> Transpiler<'a> {
             parameters: vec![ValueType::I32, ValueType::I32],
             results: vec![],
         });
+        let address_type = wasm.intern_type(FunctionType {
+            parameters: vec![ValueType::I64],
+            results: vec![],
+        });
         self.declare_imported_functions(
             &mut wasm,
             &mut symbols,
             guest_type,
             report_type,
+            address_type,
             &references,
         )?;
         self.declare_data(&mut wasm, &mut symbols, &references)?;
@@ -475,7 +483,13 @@ impl<'a> Transpiler<'a> {
             let table = build_exec_map_table(&mut wasm, &entries);
             (
                 lookup_type,
-                build_exec_map_lookup(table, entries.len() as u32),
+                build_exec_map_lookup(
+                    table,
+                    entries.len() as u32,
+                    symbols
+                        .no_function_at
+                        .expect("a linked input declares the reporter"),
+                ),
             )
         });
         wasm.uses_function_table = references.calls_indirectly || !wasm.table_functions.is_empty();
@@ -845,6 +859,7 @@ impl<'a> Transpiler<'a> {
         symbols: &mut SymbolTable<'_>,
         guest_type: u32,
         report_type: u32,
+        address_type: u32,
         references: &TextReferences,
     ) -> Result<()> {
         for (index, symbol) in self.object.symbols.iter().enumerate() {
@@ -889,6 +904,25 @@ impl<'a> Transpiler<'a> {
                 flags: symbol_flags::UNDEFINED,
             });
             symbols.untranslated = Some(FunctionReference {
+                symbol_index,
+                function_index,
+            });
+        }
+
+        // The exec map's own failure, which only a linked input can have.
+        if self.object.layout == crate::reader::Layout::Linked {
+            let function_index = wasm.imported_functions.len() as u32;
+            wasm.imported_functions.push(ImportedFunction {
+                module: ENVIRONMENT_MODULE.to_string(),
+                field: NO_FUNCTION_AT.to_string(),
+                type_index: address_type,
+            });
+            let symbol_index = wasm.add_symbol(Symbol {
+                name: NO_FUNCTION_AT.to_string(),
+                target: SymbolTarget::Function(function_index),
+                flags: symbol_flags::UNDEFINED,
+            });
+            symbols.no_function_at = Some(FunctionReference {
                 symbol_index,
                 function_index,
             });
@@ -1725,6 +1759,15 @@ pub const EXEC_MAP_TABLE: &str = "x86_exec_map";
 /// into a sentence, on the same path every other named fault takes.
 pub const UNTRANSLATED: &str = "kisal_untranslated";
 
+/// What the exec map calls when an address is not a function's.
+///
+/// A function pointer in a linked program is a virtual address, and the map
+/// turns one into the slot the indirect-call table is indexed by. An address
+/// with no entry means the guest computed a pointer to something that is not
+/// the start of a translated function — and the *address* is the whole of
+/// what is worth knowing, so it is reported rather than trapped on.
+pub const NO_FUNCTION_AT: &str = "kisal_no_function_at";
+
 /// One entry: a virtual address and the table slot the function at it holds.
 /// Sixteen bytes so the address is eight-byte aligned, which is what a load
 /// wants and what makes the search's arithmetic a shift.
@@ -1839,7 +1882,11 @@ fn build_refusal(wasm: &mut WasmObject, name: &str, report: FunctionReference) -
     body.finish()
 }
 
-fn build_exec_map_lookup(table: DataReference, count: u32) -> FunctionBody {
+fn build_exec_map_lookup(
+    table: DataReference,
+    count: u32,
+    report: FunctionReference,
+) -> FunctionBody {
     let mut body = FunctionBodyBuilder::new(1);
     let low = body.declare_local(ValueType::I32);
     let high = body.declare_local(ValueType::I32);
@@ -1915,7 +1962,10 @@ fn build_exec_map_lookup(table: DataReference, count: u32) -> FunctionBody {
     body.end(); // loop
     body.end(); // block
 
-    // Not a function.
+    // Not a function. The address is the whole of what is worth knowing,
+    // so it is named rather than trapped on anonymously.
+    body.local_get(0);
+    body.call(report);
     body.unreachable();
     body.finish()
 }

@@ -500,7 +500,9 @@ fn a_linked_module_can_be_entered_from_outside() {
         &format!(
             "int {slot_of}(long long address);\n\
              int x86_run_thread(int slot);\n\
-             /* The seam calls into the kernel; this stands in for one. */\n\
+             /* The kernel side, stood in for: the seam calls one and the\n\
+                exec map the other. */\n\
+             void kisal_no_function_at(long long address) {{ (void)address; }}\n\
              long long kisal_syscall(long long n, long long a, long long b,\n\
                                      long long c, long long d, long long e,\n\
                                      long long f) {{\n\
@@ -736,7 +738,7 @@ fn an_untranslatable_function_is_refused_by_default_and_trapped_on_request() {
         .expect_err("an untranslatable instruction was translated");
     let refused = format!("{refused:#}");
     assert!(
-        refused.contains("unreachable_path") && refused.contains("hlt"),
+        refused.contains("unreachable_path") && refused.contains("wrmsr"),
         "the refusal names neither the function nor the instruction: {refused}"
     );
 
@@ -757,7 +759,7 @@ fn an_untranslatable_function_is_refused_by_default_and_trapped_on_request() {
         "the wrong functions were given up on"
     );
     assert!(
-        translation.refused[0].reason.contains("hlt"),
+        translation.refused[0].reason.contains("wrmsr"),
         "the report does not name the instruction, so it is not a worklist: {}",
         translation.refused[0].reason
     );

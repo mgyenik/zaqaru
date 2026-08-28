@@ -121,14 +121,20 @@ fn a_loop_is_recognised_as_one() {
     );
 }
 
-/// A call that never comes back ends the function, and control does not
-/// continue past it.
+/// A call that never comes back ends the function, and the graph says so by
+/// handing the question on.
 ///
 /// A compiler that knows a callee is `noreturn` emits nothing after the
 /// call — no `ret`, no jump. The function's last byte is the call's last
 /// byte. Reading that as a fall-through asks where control goes next and
-/// finds no block there, which refused the function; the answer is that
-/// there is nowhere, and saying so is what `Terminator::Unreachable` is.
+/// finds no block there, which refused the function.
+///
+/// The answer is one of two things and the graph cannot tell which: either
+/// another function begins where this one ends and control continues into
+/// it, or nothing does and there is no path past the call. It sees one
+/// function and the question is about the others, so it reports
+/// `FallsOut` and the translator — which knows where every function begins
+/// — decides. Here nothing follows, so the translation is a trap.
 ///
 /// This is not a corner. gcc splits every cold path into a fragment ending
 /// this way, and a static glibc `hello` had 332 functions refused for it —
@@ -163,9 +169,10 @@ fn a_function_ending_in_a_call_that_never_returns_stops_there() {
     let end = graph.blocks.last().expect("a graph has blocks");
     assert_eq!(
         end.terminator,
-        Terminator::Unreachable,
-        "the block that runs off the end of the function is not marked as \
-         going nowhere"
+        Terminator::FallsOut {
+            into: give_up.offset + give_up.size
+        },
+        "the block that runs off the end of the function does not say so"
     );
     // And the call itself is still translated: it is an ordinary instruction
     // that happens to be last, not a terminator that gets special handling.

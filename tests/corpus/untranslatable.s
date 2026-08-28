@@ -1,11 +1,15 @@
 /* A program with one function nobody can translate.
  *
- * `hlt` halts the processor and is privileged; nothing a container runs will
- * ever legitimately execute one, which makes it a stable stand-in here for
- * whatever the gap list happens to hold this week. The point is not the
+ * `wrmsr` writes a model-specific register, which is a supervisor operation
+ * a container can never meaningfully perform. The point is not the
  * instruction — it is that one function is untranslatable and the rest of
  * the program is not, so what a translation does with the first can be
  * checked without the second going missing.
+ *
+ * This was `hlt` until `hlt` was implemented, which is the hazard with a
+ * stand-in: it stops standing in. The premise is asserted rather than
+ * assumed, so the day `wrmsr` gains a translation the test says so instead
+ * of passing quietly.
  */
 	.text
 	.globl entry
@@ -28,6 +32,6 @@ reachable:
 	.globl unreachable_path
 	.type unreachable_path,@function
 unreachable_path:
-	hlt
+	wrmsr
 	ret
 	.size unreachable_path, .-unreachable_path

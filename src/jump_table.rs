@@ -216,9 +216,12 @@ fn propose(object: &ObjectFile, function: &LiftedFunction, position: usize) -> O
         // one has the address in the instruction, because that is what the
         // linker put there.
         let locations: Vec<(usize, u64)> = if object.layout == Layout::Linked {
-            absolute_operands(&lifted.instruction)
-                .filter_map(|address| data_at(object, address))
-                .collect()
+            absolute_operands(
+                &lifted.instruction,
+                object.sections[function.section].address,
+            )
+            .filter_map(|address| data_at(object, address))
+            .collect()
         } else {
             [lifted.displacement, lifted.immediate]
                 .into_iter()
@@ -241,16 +244,27 @@ fn propose(object: &ObjectFile, function: &LiftedFunction, position: usize) -> O
 
 /// The absolute addresses an instruction mentions.
 ///
-/// A table's address reaches the dispatch as a displacement — `lea rax,
-/// [rip + table]` — or as an immediate in absolute code. Both are just
-/// numbers once the linker has been through, so both are offered and the
-/// entry scan decides which, if either, is a table.
-fn absolute_operands(instruction: &iced_x86::Instruction) -> impl Iterator<Item = u64> {
+/// A table's address reaches the dispatch as a displacement — `lea rcx,
+/// [rip + table]`, which is what a position-independent compilation emits —
+/// or as an immediate, which is what an absolute one does. Both are offered
+/// and the entry scan decides which, if either, is a table.
+///
+/// `section_base` is where the instruction's own section was placed, and it
+/// applies to the program-counter-relative form only. The decoder runs with
+/// a section-relative program counter, so such a displacement resolves to a
+/// section offset rather than an address; an absolute displacement is
+/// already the address and must not be moved.
+fn absolute_operands(
+    instruction: &iced_x86::Instruction,
+    section_base: u64,
+) -> impl Iterator<Item = u64> {
     let mut addresses = Vec::new();
-    if instruction.memory_base() == iced_x86::Register::RIP
-        || instruction.memory_base() == iced_x86::Register::None
-    {
-        addresses.push(instruction.memory_displacement64());
+    match instruction.memory_base() {
+        iced_x86::Register::RIP => {
+            addresses.push(section_base.wrapping_add(instruction.memory_displacement64()));
+        }
+        iced_x86::Register::None => addresses.push(instruction.memory_displacement64()),
+        _ => {}
     }
     for index in 0..instruction.op_count() {
         match instruction.op_kind(index) {
@@ -458,7 +472,10 @@ fn reject_unrecognised_dispatch(
         // recover, and translating it as an indirect call would branch
         // somewhere arbitrary.
         for lifted in &function.instructions[..=position] {
-            for address in absolute_operands(&lifted.instruction) {
+            for address in absolute_operands(
+                &lifted.instruction,
+                object.sections[function.section].address,
+            ) {
                 let Some((section, offset)) = data_at(object, address) else {
                     continue;
                 };

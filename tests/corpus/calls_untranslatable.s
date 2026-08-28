@@ -24,7 +24,7 @@ _start:
 	.globl halted
 	.type halted,@function
 halted:
-	hlt
+	wrmsr
 	ret
 	.size halted, .-halted
 

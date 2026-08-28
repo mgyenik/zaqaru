@@ -430,10 +430,18 @@ impl<'a> FunctionTranslator<'a> {
     /// to that function, and then this one's return.
     pub fn emit_fall_out(&mut self, body: &mut FunctionBodyBuilder, into: u64) -> Result<()> {
         self.temporaries.reset();
+        // Nothing begins where this function ends, so control does not
+        // continue: the compiler emitted no path past a call that never
+        // returns, which is what `abort` and `exit` leave behind. A function
+        // whose last instruction is a call and which is followed by another
+        // function is the other case, and it is the one below.
+        let Ok(target) = self.symbols.function_at(self.section, into) else {
+            body.unreachable();
+            return Ok(());
+        };
         // The same flush a tail jump does, and for the same reason: the
         // function below may branch on what this one compared.
         self.state.flush_flags(body);
-        let target = self.symbols.function_at(self.section, into)?;
         self.reserve_return_address_at(body, into)?;
         self.state.flush_written(body);
         body.call(target);
@@ -903,19 +911,52 @@ impl<'a> FunctionTranslator<'a> {
         let scale = instruction.memory_index_scale();
         let mut have_term = false;
 
+        // An address-size prefix computes the whole sum in thirty-two bits
+        // and truncates it. glibc reaches for it as arithmetic rather than
+        // as addressing — `lea edx, [ecx-1]` is a subtract that wraps at
+        // four gigabytes, which is a byte shorter than the subtract — and
+        // `__strrchr_sse2` is one of the functions that does.
+        let narrow = matches!(base.size(), 4) || (index != Register::None && index.size() == 4);
+        if narrow {
+            if base != Register::None && base.size() != 4 {
+                bail!(
+                    "an address mixing a {}-byte base with a four-byte index",
+                    base.size()
+                );
+            }
+            if index != Register::None && index.size() != 4 {
+                bail!(
+                    "an address mixing a four-byte base with an {}-byte index",
+                    index.size()
+                );
+            }
+        }
+
         if base != Register::None && base != Register::RIP {
-            if base.size() != 8 {
-                bail!("32-bit addressing (base {base:?}) is out of scope");
+            if base.size() != 8 && !narrow {
+                bail!(
+                    "addressing with a {}-byte base is out of scope",
+                    base.size()
+                );
             }
             self.state.read_register(body, RegisterSlice::of(base)?);
+            if narrow {
+                body.i64_extend_i32_unsigned();
+            }
             have_term = true;
         }
 
         if index != Register::None {
-            if index.size() != 8 {
-                bail!("32-bit addressing (index {index:?}) is out of scope");
+            if index.size() != 8 && !narrow {
+                bail!(
+                    "addressing with a {}-byte index is out of scope",
+                    index.size()
+                );
             }
             self.state.read_register(body, RegisterSlice::of(index)?);
+            if narrow {
+                body.i64_extend_i32_unsigned();
+            }
             if scale > 1 {
                 body.i64_const(scale.trailing_zeros() as i64);
                 body.i64_shl();
@@ -973,10 +1014,18 @@ impl<'a> FunctionTranslator<'a> {
                     if have_term {
                         body.i64_add();
                     }
+                    have_term = true;
                 }
             }
         }
 
+        // And the truncation, which is the whole of what the address-size
+        // prefix means. Applied to the sum rather than to each term,
+        // because that is where the wrap happens.
+        if narrow && have_term {
+            body.i64_const(0xffff_ffff);
+            body.i64_and();
+        }
         Ok(())
     }
 

@@ -131,9 +131,17 @@ pub fn location_of(register: Register) -> Option<Location> {
     let full = register.full_register();
     if full.is_gpr64() {
         Some(Location::Integer(full.number()))
-    } else if full.is_zmm() {
+    } else if full.is_zmm() && full.number() < crate::machine::VECTOR_REGISTER_COUNT {
         // XMM, YMM and ZMM all normalise to ZMM; the number is the same, and
         // only the low 128 bits are ever part of the SysV scalar convention.
+        //
+        // Bounded, because AVX-512 has thirty-two of them and the machine
+        // model has sixteen. glibc's AVX-512 string functions use the upper
+        // half — that is why they are written with those registers, since
+        // touching them needs no `vzeroupper` — and this pass runs over
+        // every function before anything decides which are translatable. An
+        // unbounded number here shifts past the end of the set, which panics
+        // in a debug build and silently wraps in a release one.
         Some(Location::Float(full.number()))
     } else {
         None

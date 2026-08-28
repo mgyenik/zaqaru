@@ -163,6 +163,17 @@ impl FunctionTranslator<'_> {
             Mnemonic::Movups | Mnemonic::Movupd | Mnemonic::Movdqu => {
                 self.translate_whole_move(body, lifted, UNALIGNED_ACCESS)?
             }
+            // The non-temporal stores, which differ from an ordinary one
+            // only in asking the processor not to keep the line in cache.
+            // There is no cache here to ask about, and the architecture
+            // makes the hint advisory — what is left is the store, at the
+            // alignment each form requires. glibc's `memcpy` uses them for
+            // copies large enough that keeping the source would evict
+            // everything else.
+            Mnemonic::Movntdq | Mnemonic::Movntps | Mnemonic::Movntpd => {
+                self.translate_whole_move(body, lifted, ALIGNED_ACCESS)?
+            }
+            Mnemonic::Movntdqa => self.translate_whole_move(body, lifted, ALIGNED_ACCESS)?,
             Mnemonic::Movlps | Mnemonic::Movlpd => {
                 self.translate_half_move(body, lifted, VectorHalf::Low)?
             }
