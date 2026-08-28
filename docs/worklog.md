@@ -1104,3 +1104,76 @@ Two lessons, both of which this project has recorded before:
   Citing the design doc's out-of-scope clause for a category I had not
   measured is exactly the deferral this worklog keeps recording. The
   design's clause is real; it just did not apply to these.
+
+### The atomic read-modify-write family, and what "atomic" means here
+
+`xchg`, `xadd` and `cmpxchg` were the largest instruction gap on the
+reachable path — 43 of the 380 functions a static glibc `hello` can
+reach, including `__pthread_mutex_lock`, `__pthread_rwlock_rdlock` and
+`__calloc`. They are one shape (read the destination, compute, write one
+or both operands back) and differ in which operand receives what and
+which flags survive:
+
+- **`xchg`** writes no flags at all. Both operands are read before either
+  is written, because they can name the same register and a swap that
+  read the second one afterwards would read what it had just written.
+- **`xadd`** writes an addition's flags, and gives the *source* the
+  destination's old value — the half that makes it an exchange rather
+  than an add.
+- **`cmpxchg`** compares the accumulator with the destination and writes
+  one of them: equal, and the source replaces the destination; unequal,
+  and the destination replaces the accumulator. The flags are the
+  comparison's either way, which is what makes `ZF` the answer to "did
+  it take".
+
+**They are not atomic, and that is a property of the scheduler rather
+than of the translation.** On x86 `xchg` against memory is atomic
+whether or not a `lock` prefix is present, and `xadd`/`cmpxchg` are when
+prefixed. What is emitted here is an ordinary sequence of loads and
+stores — no `i64.atomic.rmw.*`, no wasm atomics at all.
+
+That is sound *only* under the model the design already commits to: one
+instance per process, one linear memory, and threads that switch only at
+syscalls. Nothing can run between the load and the store, so nothing can
+observe the halves apart. Two things would break it, and neither is on
+this plan's path:
+
+- **Preemption at arbitrary points.** The designed poll insertion goes on
+  CFG back-edges and function entries, never inside one instruction's
+  translation, so that particular door stays closed — but a future that
+  polls anywhere would open it.
+- **Real shared-memory wasm threads.** Genuine parallelism over one
+  memory would need the atomic opcodes.
+
+The comment naming this lives on `translate_exchange`, so the search for
+"atomic" finds the place that has to change rather than a doc that
+mentions it. **M7 must not widen the switching model without revisiting
+these three.**
+
+Two simplifications, both invisible to a single-threaded guest:
+`cmpxchg`'s failure path does not write the destination back with its own
+value (architecturally a locked RMW dirties the line), and
+`cmpxchg8b`/`cmpxchg16b` are untouched and stay loud.
+
+### Where the numbers went
+
+Refusals on a static glibc `hello`, as each piece landed:
+
+| refused (total) | reachable from `_start` | after |
+| --- | --- | --- |
+| 719 | 165 | the trap policy and the linked-call fix |
+| 522 | 165 | `Terminator::Unreachable` |
+| 421 | 138 | the atomic family |
+
+"Reachable" counts only direct calls and jumps, so it is a lower bound.
+It is the number that matters: the unreachable remainder is dominated by
+AVX-512 string routines that curated CPUID means are never selected, and
+the reachable set contains **no AVX at all** — which is the evidence for
+that curation argument rather than an assumption of it.
+
+What is left on the reachable path is about six pieces of work, not 138:
+72 static-ifunc PLT stubs (one piece), `ror`/`rol` (13), `bt`/`bts`/`btr`
+(9), `cpuid` (7, which the design already says to implement and curate),
+`stosq` (6), and a short tail — `rdsspq`, `fld`, `stmxcsr`, two genuine
+`hlt` abort paths, and four calls to a suspicious `0x0` that have not
+been looked at.
