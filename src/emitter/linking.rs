@@ -33,6 +33,10 @@ pub enum RelocationKind {
     TypeIndexLeb = 6,
     /// Global index as a relocatable unsigned LEB (a `global.get`/`global.set`).
     GlobalIndexLeb = 7,
+    /// Tag index as a relocatable unsigned LEB — the immediate of `throw`
+    /// and of a `try_table` catch clause. Read off clang's own objects
+    /// rather than out of the spec text, in M0's gate 3.
+    TagIndexLeb = 10,
 }
 
 impl RelocationKind {
@@ -73,6 +77,8 @@ pub enum SymbolKind {
     Function = 0,
     Data = 1,
     Global = 2,
+    /// Kind 3 is `SYMTAB_SECTION`, which we never emit; a tag is 4.
+    Tag = 4,
 }
 
 /// Where a data symbol's bytes live: a span of one data segment.
@@ -91,6 +97,8 @@ pub enum SymbolTarget {
     Function(u32),
     /// Index into the global index space (imports first, then definitions).
     Global(u32),
+    /// Index into the tag index space.
+    Tag(u32),
     /// A span of a data segment; `None` for an undefined data symbol.
     Data(Option<DataSymbolLocation>),
 }
@@ -100,6 +108,7 @@ impl SymbolTarget {
         match self {
             SymbolTarget::Function(_) => SymbolKind::Function,
             SymbolTarget::Global(_) => SymbolKind::Global,
+            SymbolTarget::Tag(_) => SymbolKind::Tag,
             SymbolTarget::Data(_) => SymbolKind::Data,
         }
     }
@@ -154,10 +163,11 @@ fn write_symbol(output: &mut Vec<u8>, symbol: &Symbol) {
     write_unsigned_leb128(output, symbol.flags as u64);
 
     match symbol.target {
-        SymbolTarget::Function(index) | SymbolTarget::Global(index) => {
+        SymbolTarget::Function(index) | SymbolTarget::Global(index) | SymbolTarget::Tag(index) => {
             write_unsigned_leb128(output, index as u64);
-            // An undefined function or global takes its name from the import
-            // that stands in for it, unless EXPLICIT_NAME says otherwise.
+            // An undefined function, global or tag takes its name from the
+            // import that stands in for it, unless EXPLICIT_NAME says
+            // otherwise.
             let name_is_implicit =
                 symbol.is_undefined() && symbol.flags & symbol_flags::EXPLICIT_NAME == 0;
             if !name_is_implicit {

@@ -17,6 +17,23 @@ use crate::emitter::{
     DefinedGlobal, ENVIRONMENT_MODULE, ImportedGlobal, STACK_POINTER_IMPORT, ValueType, WasmObject,
 };
 
+/// The base of the `%fs` segment: the seventeenth register.
+///
+/// A register in every way that matters here — an `i64` global, promotion-
+/// eligible, saved and restored with the other sixteen — because that is
+/// what it is on x86-64. `%fs` has no selector semantics left in long mode;
+/// it is a base address that `arch_prctl` writes and that every glibc and
+/// musl access to the thread pointer, the stack canary and errno reads.
+/// Modelling it as a register rather than as a segmentation feature is what
+/// makes an `%fs`-prefixed operand cost one extra add and nothing else cost
+/// anything.
+///
+/// Guest code never writes it: the only writers are the kernel — through
+/// `arch_prctl`, a syscall, and through a new thread's control block — and
+/// `wrfsbase`, which is not translated. So it is loaded at entry and after
+/// calls, and never flushed.
+pub const SEGMENT_BASE_NAME: &str = "x86_fs_base";
+
 /// The sixteen general-purpose registers, in x86 encoding order.
 pub const REGISTER_NAMES: [&str; 16] = [
     "x86_rax", "x86_rcx", "x86_rdx", "x86_rbx", "x86_rsp", "x86_rbp", "x86_rsi", "x86_rdi",
@@ -266,6 +283,7 @@ pub struct MachineState {
     /// The low and high halves of each XMM register, in that order.
     vector_registers: [[GlobalReference; 2]; VECTOR_REGISTER_COUNT],
     flags: [GlobalReference; Flag::ALL.len()],
+    segment_base: GlobalReference,
     pub linker_stack_pointer: GlobalReference,
 }
 
@@ -324,11 +342,16 @@ impl MachineState {
         let flags = std::array::from_fn(|index| {
             define_state_global(object, Flag::ALL[index].name(), ValueType::I32)
         });
+        // Last, so that adding it leaves every other global's index where it
+        // was — the indices are what a reader of an emitted object matches
+        // against the register names.
+        let segment_base = define_state_global(object, SEGMENT_BASE_NAME, ValueType::I64);
 
         Self {
             registers,
             vector_registers,
             flags,
+            segment_base,
             linker_stack_pointer,
         }
     }
@@ -344,6 +367,10 @@ impl MachineState {
 
     pub fn flag(&self, flag: Flag) -> GlobalReference {
         self.flags[flag.index()]
+    }
+
+    pub fn segment_base(&self) -> GlobalReference {
+        self.segment_base
     }
 }
 
@@ -382,6 +409,9 @@ struct Promotion {
     vector_halves: [[Option<u32>; 2]; VECTOR_REGISTER_COUNT],
     /// Flags are always promoted, so their locals are unconditional.
     flags: [u32; Flag::ALL.len()],
+    /// Present when the function has an `%fs`-prefixed operand at all. Never
+    /// in the written set: guest code cannot write the segment base.
+    segment_base: Option<u32>,
     written: LocationSet,
 }
 
@@ -440,6 +470,7 @@ impl<'a> FunctionState<'a> {
         body: &mut FunctionBodyBuilder,
         touched: LocationSet,
         written: LocationSet,
+        segment_base: bool,
     ) {
         let mut registers = [None; 16];
         let mut vector_halves = [[None; 2]; VECTOR_REGISTER_COUNT];
@@ -467,10 +498,17 @@ impl<'a> FunctionState<'a> {
             body.local_set(local);
             local
         });
+        let segment_base = segment_base.then(|| {
+            let local = body.declare_local(ValueType::I64);
+            body.global_get(self.machine.segment_base);
+            body.local_set(local);
+            local
+        });
         self.promotion = Some(Promotion {
             registers,
             vector_halves,
             flags,
+            segment_base,
             written,
         });
     }
@@ -515,6 +553,13 @@ impl<'a> FunctionState<'a> {
         let Some(promotion) = &self.promotion else {
             return;
         };
+        // The segment base is reloaded for a reason the other cells do not
+        // have: `arch_prctl` is a syscall, and a syscall is a call, so the
+        // callee is exactly what changes it.
+        if let Some(local) = promotion.segment_base {
+            body.global_get(self.machine.segment_base);
+            body.local_set(local);
+        }
         for (number, local) in promotion.registers.iter().enumerate() {
             if let Some(local) = *local {
                 body.global_get(self.machine.registers[number]);
@@ -606,6 +651,15 @@ impl<'a> FunctionState<'a> {
     /// Stores the `i64` on top of the stack into one half of an XMM register.
     pub fn write_vector(&self, body: &mut FunctionBodyBuilder, number: usize, half: VectorHalf) {
         self.vector_storage(number, half).set(body);
+    }
+
+    /// Pushes the `%fs` base, which an `%fs`-prefixed operand adds into its
+    /// effective address.
+    pub fn read_segment_base(&self, body: &mut FunctionBodyBuilder) {
+        match self.promotion.as_ref().and_then(|p| p.segment_base) {
+            Some(local) => body.local_get(local),
+            None => body.global_get(self.machine.segment_base),
+        }
     }
 
     /// Pushes a flag as an `i32`, `1` or `0`.

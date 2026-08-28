@@ -61,7 +61,32 @@ pub trait SymbolResolver {
     /// same section itself, so taking its address leaves no relocation to
     /// read — only a displacement from the program counter.
     fn table_slot_at(&self, section: usize, offset: u64) -> Result<TableReference>;
+    /// The kernel-seam entry a `syscall` instruction calls.
+    ///
+    /// `syscall` names nothing — it has no operand at all — so there is no
+    /// symbol in the input to resolve. The transpiler declares the seam's
+    /// symbol itself when the object contains one, and this is how the
+    /// translation reaches it.
+    fn syscall_entry(&self) -> Result<FunctionReference>;
 }
+
+/// How far a translated `syscall` moves `%rsp`: the 128-byte red zone it must
+/// not touch, plus the eight-byte slot carrying the resume ID.
+///
+/// `136 % 16 == 8`, the same alignment parity a `call` leaves behind, so
+/// nothing downstream can tell the two apart by alignment.
+pub const SYSCALL_RESERVATION: i64 = 136;
+
+/// Marks a resume ID as naming a site that reserved [`SYSCALL_RESERVATION`]
+/// rather than a call site's eight bytes.
+///
+/// It rides in the entry-index half of the ID because that is the half with
+/// room, and the driver masks it off before using the index. Sites are what
+/// know their own frame size; the driver is generic and must be told.
+pub const RED_ZONE_RESERVED: i64 = 1 << 63;
+
+/// The entry index of a resume ID, once the frame-size marker is removed.
+pub const RESUME_ENTRY_MASK: i64 = 0x7fff_ffff;
 
 /// The three values a flag rule reads: an operation's two inputs and its
 /// result, each parked in a local by the time flags are computed.
@@ -94,6 +119,28 @@ pub struct FunctionTranslator<'a> {
     /// that normally makes indirect calls difficult never arises.
     guest_type: u32,
     temporaries: Temporaries,
+    /// When present, every call site stores a resume ID in its
+    /// return-address slot instead of the sentinel; see [`ResumeSites`].
+    resume_sites: Option<ResumeSites>,
+    /// Set when translating a resume body: `ret` loads the ID it is popping
+    /// and returns it, so the resume driver can re-enter the frame above.
+    yield_on_return: bool,
+}
+
+/// The resume IDs of one function's call sites.
+///
+/// A resume ID is what a return-address slot holds when checkpointing is on:
+/// the table slot of the enclosing function's resume body in the low 32 bits,
+/// and the resume body's entry index — the post-call block, or the epilogue
+/// arm for a tail-call site — in the high 32. The chain of these slots on the
+/// guest stack is a serialization of the frames above any call, which is what
+/// lets a restored snapshot be walked back to life without re-execution.
+pub struct ResumeSites {
+    /// Table slot of the enclosing function's resume body.
+    pub table_slot: TableReference,
+    /// Resume-body entry index for each transfer instruction, keyed by the
+    /// instruction's section offset.
+    pub entries: std::collections::HashMap<u64, u32>,
 }
 
 /// A reusable pool of scratch locals. Instructions are translated one at a
@@ -151,7 +198,20 @@ impl<'a> FunctionTranslator<'a> {
             section,
             guest_type,
             temporaries: Temporaries::default(),
+            resume_sites: None,
+            yield_on_return: false,
         }
+    }
+
+    /// Makes every call site store its resume ID instead of the sentinel.
+    pub fn enable_resume(&mut self, sites: ResumeSites) {
+        self.resume_sites = Some(sites);
+    }
+
+    /// Makes `ret` return the ID it pops — the shape a resume body has, so
+    /// the driver learns where the frame above continues.
+    pub fn yield_next_site_on_return(&mut self) {
+        self.yield_on_return = true;
     }
 
     /// Builds the promotion plan for the function being translated and emits
@@ -162,18 +222,45 @@ impl<'a> FunctionTranslator<'a> {
     /// instruction's registers are known even where its translation is not.
     /// A cell the scan misses stays in its global, which is slower, never
     /// wrong: every access to a cell resolves the same way for the whole
-    /// function.
+    /// function. That holds for cells only the *guest* writes. The stack
+    /// pointer is not one of them — see below.
     pub fn begin_function(&mut self, body: &mut FunctionBodyBuilder, lifted: &LiftedFunction) {
+        use crate::abi::effects::Location;
         let mut factory = iced_x86::InstructionInfoFactory::new();
         let mut touched = LocationSet::new();
         let mut written = LocationSet::new();
+        // The stack pointer is written by the *translation*, not only by the
+        // guest's instructions, and the scan cannot see that. A call site
+        // reserves a return-address slot and a `syscall` reserves the red
+        // zone as well; neither is an instruction `iced` reports as touching
+        // `%rsp` — it reports `syscall` as writing `rcx` and `r11` and
+        // nothing else. A function that reads `%rsp` without ever writing it
+        // through a `push`, `pop`, `call` or `ret` — a leaf that exits by
+        // tail jump — would therefore promote `%rsp` to a local, have the
+        // reservation update that local, and never publish it, leaving the
+        // guest's stack pointer shifted by the reservation for the rest of
+        // its life with nothing to say so.
+        //
+        // Unconditional rather than derived from which transfers the
+        // function contains, because "which instructions make the translator
+        // move `%rsp`" is a second rule that can drift from the first.
+        touched.insert(Location::Integer(STACK_POINTER_REGISTER));
+        written.insert(Location::Integer(STACK_POINTER_REGISTER));
+
+        // The segment base is not in the location sets, and deliberately so:
+        // those describe where an *argument* can travel, which is what
+        // signature inference reads them for, and `%fs` never carries one.
+        // Its promotion is decided the same way, by a scan of the function,
+        // and recorded separately.
+        let mut segment_base = false;
         for instruction in &lifted.instructions {
             let effects = effects_of(&instruction.instruction, &mut factory);
             touched.union_with(effects.reads);
             touched.union_with(effects.writes);
             written.union_with(effects.writes);
+            segment_base |= instruction.instruction.segment_prefix() == Register::FS;
         }
-        self.state.promote(body, touched, written);
+        self.state.promote(body, touched, written, segment_base);
     }
 
     /// Pushes the arm a recovered `switch` selects.
@@ -262,7 +349,7 @@ impl<'a> FunctionTranslator<'a> {
     ) -> Result<()> {
         match self.call_target(lifted)? {
             CallTarget::Direct(target) => {
-                self.reserve_return_address(body);
+                self.reserve_return_address(body, lifted)?;
                 self.state.flush_written(body);
                 body.call(target);
                 self.state.reload(body);
@@ -274,7 +361,7 @@ impl<'a> FunctionTranslator<'a> {
                 let slot = self.temporaries.take(body, ValueType::I64);
                 self.read_operand(body, lifted, 0, OperandWidth::QuadWord)?;
                 body.local_set(slot);
-                self.reserve_return_address(body);
+                self.reserve_return_address(body, lifted)?;
                 self.state.flush_written(body);
                 body.local_get(slot);
                 body.i32_wrap_i64();
@@ -289,9 +376,23 @@ impl<'a> FunctionTranslator<'a> {
     /// return-address slot, and leaving gives it back — followed by the
     /// flush, because leaving is where the caller starts reading the
     /// globals.
+    ///
+    /// In a resume body the popped slot is also the answer: it holds the
+    /// resume ID of the frame above, which the driver needs next, so it is
+    /// read before the pop and left on the stack for the `return`.
     pub fn emit_return(&mut self, body: &mut FunctionBodyBuilder) {
-        self.adjust_stack_pointer(body, 8);
-        self.state.flush_written(body);
+        if self.yield_on_return {
+            let next = self.temporaries.take(body, ValueType::I64);
+            self.push_stack_pointer_address(body);
+            body.i64_load(OperandWidth::QuadWord.alignment_log2(), 0);
+            body.local_set(next);
+            self.adjust_stack_pointer(body, 8);
+            self.state.flush_written(body);
+            body.local_get(next);
+        } else {
+            self.adjust_stack_pointer(body, 8);
+            self.state.flush_written(body);
+        }
     }
 
     fn translate_dispatch(
@@ -364,6 +465,7 @@ impl<'a> FunctionTranslator<'a> {
             Mnemonic::Xor => self.translate_arithmetic(body, lifted, FlagRule::Logical, true),
             Mnemonic::Test => self.translate_arithmetic(body, lifted, FlagRule::Logical, false),
             Mnemonic::Call => self.translate_call(body, lifted),
+            Mnemonic::Syscall => self.translate_syscall(body, lifted),
             // `leave` is `mov rsp, rbp` followed by `pop rbp`, which is how
             // an unoptimised frame is torn down.
             Mnemonic::Leave => {
@@ -425,6 +527,10 @@ impl<'a> FunctionTranslator<'a> {
                 if let Some(reference) = lifted.displacement
                     && reference.via_global_offset_table
                 {
+                    // This path returns the symbol's address without ever
+                    // building an effective address, so it is the one place a
+                    // segment prefix could slip through unexamined.
+                    Self::check_segment_prefix(&lifted.instruction)?;
                     if width != OperandWidth::QuadWord {
                         bail!(
                             "a global offset table slot is eight bytes wide, \
@@ -519,19 +625,51 @@ impl<'a> FunctionTranslator<'a> {
     }
 
     /// Pushes the address a memory operand computes, as a full `i64`.
+    ///
+    /// An `%fs`-prefixed operand adds the segment base into the effective
+    /// address, and that is the entire cost of thread-local storage: one
+    /// extra add on the instructions that carry the prefix, and nothing
+    /// anywhere else. `%gs` stays a loud error until something real needs
+    /// it — no libc on this path uses it, and guessing at a second segment
+    /// nobody exercises is how a silent divergence gets built.
     fn emit_address_arithmetic(
         &mut self,
         body: &mut FunctionBodyBuilder,
         lifted: &LiftedInstruction,
     ) -> Result<()> {
-        let instruction = &lifted.instruction;
-        if instruction.segment_prefix() != Register::None {
-            bail!(
-                "segment-prefixed memory operand ({:?}) is out of scope",
-                instruction.segment_prefix()
-            );
+        let segment = Self::check_segment_prefix(&lifted.instruction)?;
+        self.emit_unsegmented_address(body, lifted)?;
+        if segment == Register::FS {
+            self.state.read_segment_base(body);
+            body.i64_add();
         }
+        Ok(())
+    }
 
+    /// The segment a memory operand is prefixed with, refusing any this
+    /// translation cannot honour.
+    ///
+    /// `%gs` is deliberately loud rather than approximated: nothing on this
+    /// path uses it, and a libc that reached for it would be a libc nothing
+    /// here has been tested against.
+    fn check_segment_prefix(instruction: &Instruction) -> Result<Register> {
+        match instruction.segment_prefix() {
+            segment @ (Register::None | Register::FS) => Ok(segment),
+            other => bail!(
+                "segment-prefixed memory operand ({other:?}) is out of scope; \
+                 only `%fs` is translated"
+            ),
+        }
+    }
+
+    /// The address a memory operand computes before any segment base is
+    /// added: base, index, scale and displacement.
+    fn emit_unsegmented_address(
+        &mut self,
+        body: &mut FunctionBodyBuilder,
+        lifted: &LiftedInstruction,
+    ) -> Result<()> {
+        let instruction = &lifted.instruction;
         let base = instruction.memory_base();
         let index = instruction.memory_index();
         let scale = instruction.memory_index_scale();
@@ -660,8 +798,12 @@ impl<'a> FunctionTranslator<'a> {
         let instruction = &lifted.instruction;
         let width = self.destination_width(instruction)?;
         // `lea` is pure arithmetic: no memory access, no flags, and no
-        // narrowing to the linear-memory address space.
-        self.emit_address_arithmetic(body, lifted)?;
+        // narrowing to the linear-memory address space. It also ignores a
+        // segment override — there is no access for a segment to apply to,
+        // and gas says as much ("segment override on `lea' is ineffectual")
+        // while still emitting the prefix byte. Honouring it here would add
+        // the thread pointer to an address the hardware computes without it.
+        self.emit_unsegmented_address(body, lifted)?;
         match width {
             OperandWidth::QuadWord => {}
             OperandWidth::DoubleWord => body.i32_wrap_i64(),
@@ -864,6 +1006,90 @@ impl<'a> FunctionTranslator<'a> {
         self.emit_transfer(body, lifted)
     }
 
+    /// `syscall`, translated as what it is here: a direct call to the kernel
+    /// seam, over a stack reservation that skips the guest's red zone.
+    ///
+    /// It is emitted through the same machinery as a `call` — reserve the
+    /// return-address slot, flush, call, reload — rather than as a special
+    /// case, and everything that buys follows from that one decision. The
+    /// flush discipline puts the whole machine state in the globals before
+    /// the kernel sees it, which is the invariant the scheduler rests on;
+    /// the reserved slot means that under `--resume` every syscall site is a
+    /// resume site with nothing extra built, since `syscall` classifies as a
+    /// call and therefore already has a site-map entry.
+    ///
+    /// The hardware's `rcx`/`r11` clobber needs no code: `iced` reports both
+    /// as written, so the promotion scan has them in the written set, they
+    /// are flushed here like any other written register, and the seam's own
+    /// thunk is what puts a value in them.
+    ///
+    /// What a `syscall` may *not* borrow from a `call` is the stack. A callee
+    /// is allowed to destroy the 128 bytes below `%rsp`; the kernel is not,
+    /// and compilers depend on the difference — gcc at `-O2` keeps a leaf
+    /// function's locals in the red zone across an inline `syscall` without
+    /// moving `%rsp` at all. So the slot goes *below* the red zone rather
+    /// than on top of it. The reservation is the same size for every build,
+    /// because one seam serves guests translated with and without resume, and
+    /// it moves `%rsp` by a multiple of sixteen plus eight — the same
+    /// alignment parity a `call` produces.
+    fn translate_syscall(
+        &mut self,
+        body: &mut FunctionBodyBuilder,
+        lifted: &LiftedInstruction,
+    ) -> Result<()> {
+        let target = self.symbols.syscall_entry()?;
+        self.reserve_syscall_frame(body, lifted)?;
+        self.state.flush_written(body);
+        // Flags are exempt from the flush at an ordinary call on the ABI's
+        // authority: they are call-clobbered, so nothing conforming reads one
+        // it did not set since. A `syscall` has no such authority — Linux
+        // restores `RFLAGS` from `r11`, so a guest may legitimately branch on
+        // a flag it set before one. More decisively, the kernel *snapshots*
+        // this state: a thread that blocks here has its register file saved
+        // from the globals, and flags left in locals would be saved stale and
+        // restored wrong on the far side of a context switch. No reload
+        // afterwards, because the kernel does not change the guest's flags —
+        // when signal delivery starts editing a `ucontext`, that is what has
+        // to change.
+        self.state.flush_flags(body);
+        body.call(target);
+        self.state.reload(body);
+        Ok(())
+    }
+
+    /// The syscall's stack frame: the red zone stepped over, then the slot
+    /// that carries the resume ID, at the stack pointer where the driver
+    /// expects to find it.
+    fn reserve_syscall_frame(
+        &mut self,
+        body: &mut FunctionBodyBuilder,
+        lifted: &LiftedInstruction,
+    ) -> Result<()> {
+        self.adjust_stack_pointer(body, -SYSCALL_RESERVATION);
+        self.push_stack_pointer_address(body);
+        match &self.resume_sites {
+            None => body.i64_const(crate::machine::RETURN_ADDRESS_SENTINEL),
+            Some(resume) => {
+                let entry = *resume.entries.get(&lifted.offset).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "the syscall at {:#x} has no resume entry; the site map \
+                         and the translation disagree about what reserves a slot",
+                        lifted.offset
+                    )
+                })?;
+                body.i32_const_table_index(resume.table_slot);
+                body.i64_extend_i32_unsigned();
+                // The driver has to give back the whole reservation, not the
+                // eight bytes a call site takes, and the only thing it has to
+                // decide that from is the ID it just popped.
+                body.i64_const(((entry as i64) << 32) | RED_ZONE_RESERVED);
+                body.i64_or();
+            }
+        }
+        body.i64_store(OperandWidth::QuadWord.alignment_log2(), 0);
+        Ok(())
+    }
+
     /// Where a direct call or tail jump goes.
     fn call_target(&self, lifted: &LiftedInstruction) -> Result<CallTarget> {
         // A call through a global offset table slot names its callee
@@ -895,11 +1121,50 @@ impl<'a> FunctionTranslator<'a> {
     }
 
     /// Reserves the return-address slot the callee's `ret` will pop.
-    fn reserve_return_address(&mut self, body: &mut FunctionBodyBuilder) {
+    ///
+    /// The slot's value is never consulted by translated code — guest frames
+    /// and wasm frames stay aligned, so the pop is pure bookkeeping — which
+    /// is why it can hold the sentinel.
+    ///
+    /// A **tail jump** reserves one too, because it is translated as a call
+    /// followed by a return. That makes a tail-called function see `%rsp`
+    /// eight bytes lower than it would natively, where a `jmp` reuses the
+    /// caller's slot. The offset is self-consistent — the target's own `ret`
+    /// gives back exactly what was reserved, and every address the target
+    /// computes is relative to the `%rsp` it was entered with — so nothing
+    /// observes it except a guest that compares a stack address against one
+    /// taken before the jump. `tests/corpus/syscall_leaf.s` records the
+    /// property by storing `%rsp` on both sides of a tail jump; a guest that
+    /// depended on the native value would be depending on the depth of its
+    /// own call chain, which no compiler emits. With resume on, it holds the call
+    /// site's resume ID instead: still never consulted in ordinary running,
+    /// but a restored snapshot's driver reads the chain of them to rebuild
+    /// the frames above the checkpoint.
+    fn reserve_return_address(
+        &mut self,
+        body: &mut FunctionBodyBuilder,
+        lifted: &LiftedInstruction,
+    ) -> Result<()> {
         self.adjust_stack_pointer(body, -8);
         self.push_stack_pointer_address(body);
-        body.i64_const(crate::machine::RETURN_ADDRESS_SENTINEL);
+        match &self.resume_sites {
+            None => body.i64_const(crate::machine::RETURN_ADDRESS_SENTINEL),
+            Some(resume) => {
+                let entry = *resume.entries.get(&lifted.offset).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "the transfer at {:#x} has no resume entry; the site map \
+                         and the translation disagree about what reserves a slot",
+                        lifted.offset
+                    )
+                })?;
+                body.i32_const_table_index(resume.table_slot);
+                body.i64_extend_i32_unsigned();
+                body.i64_const((entry as i64) << 32);
+                body.i64_or();
+            }
+        }
         body.i64_store(OperandWidth::QuadWord.alignment_log2(), 0);
+        Ok(())
     }
 
     /// Pushes `1` or `0` according to a condition code, read from the

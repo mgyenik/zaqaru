@@ -1,0 +1,19 @@
+[package]
+name = "kisal"
+version = "0.1.0"
+edition = "2024"
+description = "The in-guest Linux-personality kernel: syscalls handled inside the wasm module"
+
+[lib]
+# `staticlib` is what `wasm-ld` welds into the container module; `rlib` is
+# what the native unit tests link against. The kernel's logic is ordinary
+# Rust either way — that is the point of the whole arrangement.
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+
+[dev-dependencies]
+# A cycle Cargo allows, and the honest one: the kernel's tests drive real
+# baked images rather than a hand-written stand-in for one.
+baker = { path = "../baker" }
+libc = "0.2"

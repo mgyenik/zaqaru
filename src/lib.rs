@@ -19,6 +19,7 @@ pub mod jump_table;
 pub mod lifter;
 pub mod machine;
 pub mod reader;
+pub mod seam;
 pub mod structurer;
 pub mod thunks;
 pub mod translate;

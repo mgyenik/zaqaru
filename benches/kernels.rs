@@ -122,6 +122,7 @@ fn transpiled_build(
     workspace: &WorkingDirectory,
     compiler: Compiler,
     label: &'static str,
+    mode: zaqaru::structurer::Mode,
 ) -> Build {
     let object = compile_corpus_object_with(
         workspace,
@@ -131,7 +132,7 @@ fn transpiled_build(
         "-O2",
     );
     let wasm_object = workspace.path().join(format!("{label}.wasm.o"));
-    transpile_object(&object, &wasm_object, zaqaru::structurer::Mode::Structured);
+    transpile_object(&object, &wasm_object, mode);
     let linked = workspace.path().join(format!("{label}.wasm"));
     link_wasm(&[wasm_object], &linked, &[]);
     report_module(label, &linked);
@@ -190,15 +191,40 @@ fn report_module(label: &str, linked: &PathBuf) {
 fn main() {
     let workspace = WorkingDirectory::new("bench-kernels");
     let mut builds = vec![
-        transpiled_build(&workspace, Compiler::Gcc, "transpiled-gcc"),
-        transpiled_build(&workspace, Compiler::Clang, "transpiled-clang"),
+        transpiled_build(
+            &workspace,
+            Compiler::Gcc,
+            "transpiled-gcc",
+            zaqaru::structurer::Mode::Structured,
+        ),
+        transpiled_build(
+            &workspace,
+            Compiler::Clang,
+            "transpiled-clang",
+            zaqaru::structurer::Mode::Structured,
+        ),
+        // The dispatcher is what a resumed frame's remainder runs in, so its
+        // distance from the structured translation is the cost of having
+        // been suspended — a number the scheduler design needs.
+        transpiled_build(
+            &workspace,
+            Compiler::Gcc,
+            "transpiled-gcc-dispatcher",
+            zaqaru::structurer::Mode::Dispatcher,
+        ),
+        transpiled_build(
+            &workspace,
+            Compiler::Clang,
+            "transpiled-clang-dispatcher",
+            zaqaru::structurer::Mode::Dispatcher,
+        ),
         wasm_native_build(&workspace),
     ];
 
     // Correctness gate: every build must agree with the wasm-native build on
     // every kernel before any of them is worth timing.
     for kernel in KERNELS {
-        let (transpiled, native) = builds.split_at_mut(2);
+        let (transpiled, native) = builds.split_at_mut(4);
         let expected = native[0].run(kernel);
         for build in transpiled {
             let actual = build.run(kernel);

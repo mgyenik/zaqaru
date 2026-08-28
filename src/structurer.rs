@@ -207,24 +207,64 @@ fn translate_with_dispatcher(
     lifted: &LiftedFunction,
     graph: &ControlFlowGraph,
 ) -> Result<()> {
-    let block_count = graph.blocks.len();
-    let state = body.declare_local(ValueType::I32);
-
     // The entry block is the one at the lowest offset, which is index 0, and
     // a fresh local already holds 0.
+    let state = body.declare_local(ValueType::I32);
+    emit_dispatcher(body, translator, lifted, graph, state, false)
+}
+
+/// Translates a function's *resume body*: the dispatcher over the call-split
+/// graph, entered wherever the parameter says instead of at the top.
+///
+/// The graph must be the one [`ControlFlowGraph::build_resumable`] builds, so
+/// that every post-call instruction heads a block the entry parameter can
+/// name. One synthetic arm sits past the real blocks: entry `block_count` is
+/// the *epilogue* — the resume point of a tail-call site, where the frame's
+/// only remaining work is its own return. The translator must have
+/// [`yield_next_site_on_return`](FunctionTranslator::yield_next_site_on_return)
+/// set, which is what gives every path out of the body its `i64` result: the
+/// resume ID of the frame above.
+pub fn translate_resume_function(
+    body: &mut FunctionBodyBuilder,
+    translator: &mut FunctionTranslator<'_>,
+    lifted: &LiftedFunction,
+    graph: &ControlFlowGraph,
+    entry_parameter: u32,
+) -> Result<()> {
+    emit_dispatcher(body, translator, lifted, graph, entry_parameter, true)?;
+    // Control only ever leaves the dispatcher through a `return`; the body's
+    // own end is unreachable, and with an `i64` result that has to be said.
+    body.unreachable();
+    Ok(())
+}
+
+fn emit_dispatcher(
+    body: &mut FunctionBodyBuilder,
+    translator: &mut FunctionTranslator<'_>,
+    lifted: &LiftedFunction,
+    graph: &ControlFlowGraph,
+    state: u32,
+    epilogue: bool,
+) -> Result<()> {
+    let block_count = graph.blocks.len();
+    // The epilogue arm, when present, is one more landing block wrapped
+    // around the real ones, and everything the real arms count is one
+    // deeper.
+    let arm_count = block_count + usize::from(epilogue);
+
     body.loop_();
-    for _ in 0..=block_count {
+    for _ in 0..=arm_count {
         body.block();
     }
     body.local_get(state);
-    let table: Vec<u32> = (0..block_count as u32).collect();
-    body.branch_table(&table, block_count as u32);
+    let table: Vec<u32> = (0..arm_count as u32).collect();
+    body.branch_table(&table, arm_count as u32);
     body.end();
 
     for index in 0..block_count {
         // A block body sits inside the blocks that follow it, plus the
         // default block, plus the loop.
-        let loop_depth = (block_count - index) as u32;
+        let loop_depth = (arm_count - index) as u32;
         let transfer =
             |body: &mut FunctionBodyBuilder, target: u64, extra_depth: u32| -> Result<()> {
                 let destination = graph.block_at(target)?;
@@ -265,6 +305,14 @@ fn translate_with_dispatcher(
             }
             Terminator::Leaves => emit_leaving(body, translator, lifted, index, graph)?,
         }
+        body.end();
+    }
+
+    if epilogue {
+        // The synthetic arm: a frame suspended at a tail-call site resumes
+        // with nothing left to run but its own return.
+        translator.emit_return(body);
+        body.return_();
         body.end();
     }
 

@@ -1,1 +1,8 @@
 /target
+
+# Local Claude Code configuration: personal to one machine, and the hook it
+# registers. Committing either would hand every contributor a ban that is not
+# theirs — and committing the settings without the script would leave a hook
+# pointing at a file that is not in the clone.
+.claude/settings.local.json
+.claude/hooks/

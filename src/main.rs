@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 
-use zaqaru::{abi, dump, lifter, reader, structurer, thunks, transpile, wasm_reader};
+use zaqaru::{abi, dump, lifter, reader, seam, structurer, thunks, transpile, wasm_reader};
 
 /// Which control-flow translation to use. Both must produce the same
 /// results; the dispatcher is also what the structured mode falls back to for
@@ -35,7 +35,7 @@ struct Arguments {
     /// Transpiling takes exactly one. `--thunks` takes the whole set that
     /// will be linked together, because what counts as a foreign function is
     /// a property of the set, not of any one object.
-    #[arg(required = true)]
+    #[arg(required = false)]
     inputs: Vec<PathBuf>,
 
     /// Output relocatable wasm object, ready for `wasm-ld`.
@@ -51,6 +51,15 @@ struct Arguments {
     /// a foreign signature is *known* rather than inferred.
     #[arg(long)]
     thunks: bool,
+
+    /// Emit the kernel seam object instead of transpiling: `x86_syscall`,
+    /// which turns a translated `syscall` into a typed call to the kernel's
+    /// `kisal_syscall`, plus the scheduler's throw/catch pair and the
+    /// register-file save and restore helpers.
+    ///
+    /// Takes no inputs — the seam depends on nothing but the machine model.
+    #[arg(long)]
+    seam: bool,
 
     /// Signature declarations, one per line: `name(i32, f64) -> i32`.
     ///
@@ -78,6 +87,13 @@ struct Arguments {
     #[arg(long)]
     no_promote: bool,
 
+    /// Emit checkpoint-resume machinery: call sites store resume IDs in
+    /// their return-address slots, every function gets a resume body, and a
+    /// weak `x86_resume` driver rebuilds the suspended frames of a restored
+    /// snapshot without re-executing anything.
+    #[arg(long)]
+    resume: bool,
+
     /// Print what the reader and lifter see, then stop.
     #[arg(long)]
     dump: bool,
@@ -102,6 +118,10 @@ fn main() -> Result<()> {
         Some(path) => abi::SignatureTable::read(path)?,
         None => abi::SignatureTable::new(),
     };
+
+    if arguments.seam {
+        return emit_seam(&arguments);
+    }
 
     if arguments.thunks {
         return emit_thunks(&arguments, signatures);
@@ -149,6 +169,7 @@ fn main() -> Result<()> {
         .with_mode(arguments.control_flow.into())
         .with_signatures(signatures)
         .with_promotion(!arguments.no_promote)
+        .with_resume(arguments.resume)
         .transpile()
         .with_context(|| format!("transpiling {}", input.display()))?;
 
@@ -161,6 +182,22 @@ fn main() -> Result<()> {
         path.set_extension("wasm.o");
         path
     });
+    std::fs::write(&output, &translated)
+        .with_context(|| format!("writing {}", output.display()))?;
+    Ok(())
+}
+
+fn emit_seam(arguments: &Arguments) -> Result<()> {
+    if !arguments.inputs.is_empty() {
+        bail!("`--seam` takes no inputs: the seam is generated, not translated");
+    }
+    let translated = seam::build_seam_object()?;
+    if arguments.print {
+        print!("{}", wasmprinter::print_bytes(&translated)?);
+    }
+    let Some(output) = arguments.output.clone() else {
+        bail!("`--seam` needs an explicit `-o`");
+    };
     std::fs::write(&output, &translated)
         .with_context(|| format!("writing {}", output.display()))?;
     Ok(())

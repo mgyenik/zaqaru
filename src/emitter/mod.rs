@@ -85,6 +85,18 @@ pub struct DefinedFunction {
     pub body: FunctionBody,
 }
 
+/// A tag this object defines: an exception the module can throw and catch,
+/// named by the type of the values it carries.
+///
+/// The attribute byte is fixed at zero — "exception" — because that is the
+/// only attribute the proposal defines. Every tag we emit is defined here
+/// and weakly bound, so separately emitted objects collapse onto one tag
+/// exactly as they collapse onto one register file.
+#[derive(Clone, Debug)]
+pub struct DefinedTag {
+    pub type_index: u32,
+}
+
 /// A complete relocatable object, ready to serialize.
 #[derive(Default)]
 pub struct WasmObject {
@@ -93,6 +105,7 @@ pub struct WasmObject {
     pub imported_globals: Vec<ImportedGlobal>,
     pub defined_functions: Vec<DefinedFunction>,
     pub defined_globals: Vec<DefinedGlobal>,
+    pub defined_tags: Vec<DefinedTag>,
     pub data_segments: Vec<DataSegment>,
     pub symbols: Vec<Symbol>,
     /// Functions whose address is taken, in the order they occupy slots of
@@ -131,6 +144,12 @@ impl WasmObject {
     /// Index in the global index space of the next defined global.
     pub fn next_defined_global_index(&self) -> u32 {
         (self.imported_globals.len() + self.defined_globals.len()) as u32
+    }
+
+    /// Index in the tag index space of the next defined tag. Nothing imports
+    /// a tag here, so the space begins with our definitions.
+    pub fn next_defined_tag_index(&self) -> u32 {
+        self.defined_tags.len() as u32
     }
 
     pub fn add_symbol(&mut self, symbol: Symbol) -> u32 {
@@ -205,6 +224,19 @@ impl WasmObject {
         }
         write_section(&mut output, binary::SECTION_FUNCTION, &payload);
         section_ordinal += 1;
+
+        // The binary format places the tag section between the memory and
+        // global sections, despite its later section id.
+        if !self.defined_tags.is_empty() {
+            payload.clear();
+            write_unsigned_leb128(&mut payload, self.defined_tags.len() as u64);
+            for tag in &self.defined_tags {
+                payload.push(0x00); // attribute: exception
+                write_unsigned_leb128(&mut payload, tag.type_index as u64);
+            }
+            write_section(&mut output, binary::SECTION_TAG, &payload);
+            section_ordinal += 1;
+        }
 
         if !self.defined_globals.is_empty() {
             payload.clear();
@@ -328,6 +360,9 @@ impl WasmObject {
         if self.uses_v128() {
             features.push("simd128");
         }
+        if self.uses_exceptions() {
+            features.push("exception-handling");
+        }
         write_target_features(&mut payload, &features);
         write_custom_section(&mut output, "target_features", &payload);
         let _ = section_ordinal;
@@ -355,6 +390,18 @@ impl WasmObject {
                 .defined_functions
                 .iter()
                 .any(|function| function.body.uses_simd)
+    }
+
+    /// Whether anything in the object involves exception handling — a tag it
+    /// defines, or `throw`/`try_table` in a body — which decides whether it
+    /// declares the `exception-handling` target feature, exactly as clang's
+    /// objects do.
+    fn uses_exceptions(&self) -> bool {
+        !self.defined_tags.is_empty()
+            || self
+                .defined_functions
+                .iter()
+                .any(|function| function.body.uses_exceptions)
     }
 
     fn minimum_memory_pages(&self) -> usize {

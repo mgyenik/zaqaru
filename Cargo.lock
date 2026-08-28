@@ -127,6 +127,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
+name = "baker"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "flate2",
+ "kisal",
+ "libc",
+ "zaqaru",
+]
+
+[[package]]
 name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -910,6 +921,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "kisal"
+version = "0.1.0"
+dependencies = [
+ "baker",
+ "libc",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1255,6 +1274,13 @@ name = "regex-syntax"
 version = "0.8.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
+
+[[package]]
+name = "runner"
+version = "0.1.0"
+dependencies = [
+ "wasmtime",
+]
 
 [[package]]
 name = "rustc-demangle"
@@ -2129,12 +2155,16 @@ name = "zaqaru"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "baker",
  "clap",
  "criterion",
  "iced-x86",
+ "kisal",
+ "libc",
  "libloading",
  "object 0.40.0",
  "rand",
+ "runner",
  "wasmparser 0.258.0",
  "wasmprinter 0.258.0",
  "wasmtime",

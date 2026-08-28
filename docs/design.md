@@ -626,6 +626,14 @@ pair), `neg`, `not`, `and`, `or`, `xor`, shifts (`shl`/`shr`/`sar`), `cmp`,
 `test`, `jcc`, `jmp`, `call`, `ret`, `push`, `pop`, `setcc`, `cmov`,
 `cdq`/`cqo`, `idiv`/`div`, `endbr64` (as nop), `nop` family.
 
+`syscall` is in the set too, and it is translated as what it is here: a
+direct call to `x86_syscall`, the generated kernel seam. It goes through
+the same machinery as a `call` — reserve the return-address slot, flush,
+call, reload — rather than as a special case, which is what makes the
+whole machine state present in the globals when the kernel sees it, and
+what makes every syscall site a resume site under `--resume` with nothing
+extra built. See [container-plan.md](container-plan.md).
+
 The SSE set is what the corpus turned out to demand across two compilers and
 five optimisation levels — the move family and its write masks, the bitwise
 and lane-rearranging families, scalar arithmetic, compares and conversions,
@@ -885,6 +893,56 @@ of it makes the differential suite fail, and the one deliberate narrowing
 — flags do not cross calls — is invisible to every behavioural test and
 worth up to 62% on flag-heavy loops.
 
+Checkpoint-resume is built, opt-in (`--resume`), and tested end to end. The
+flush discipline already means that at any call boundary the whole machine
+state is in the globals and linear memory — `tests/call_boundary_state.rs`
+attacks that claim directly with a state swap at an injected external call,
+with negative controls proving the instrument can detect a single withheld
+register or memory word. On top of it, `--resume` makes the guest stack a
+serialization of the suspended frames: each call site's return-address slot
+holds a *resume ID* (the enclosing function's resume body's table slot low,
+its re-entry block high) instead of the sentinel, every function gets a
+second body — the dispatcher over the call-split graph, entered at whichever
+post-call block the ID names, yielding the next frame's ID at its `ret`,
+with one synthetic epilogue arm for frames suspended at tail-call sites —
+and a weak `x86_resume` driver walks the chain until the wrapper's sentinel.
+`tests/fork_resume.rs` runs fork itself on it: snapshot a parent at a call,
+copy memory and globals into a fresh instance, set `rax` to the child's
+reply, resume — the child must match a full-run oracle exactly, make only
+its own fresh calls (the prefix provably never re-runs), and the resume-off
+build must compute exactly what the resume-on parent did. Covered shapes:
+straight-line frames, a frame suspended at a sibling call (the epilogue
+arm), and a mid-loop resume at a `call_indirect` site whose child makes five
+fresh calls. Ordinary output is byte-identical with the flag off.
+
+The kernel seam is built, and with it the first two milestones of the
+container work ([container-build-plan.md](container-build-plan.md)) —
+including a round of adversarial review that found the first version of
+M1 had shipped two silent memory-corruption defects and a set of tests
+that passed with the feature broken; both milestones' sections record
+what was found and what changed. A
+translated `syscall` is a direct call to a generated `x86_syscall`, which
+marshals the Linux ABI out of the register globals into a typed
+`kisal_syscall` — so a disagreement about the kernel's shape is a link
+error, and the flush the call performs is what puts the whole machine
+state where the kernel can see it. Behind it, `kisal/` is a real kernel
+crate (Rust to `wasm32-unknown-unknown`, welded in by `wasm-ld`) whose
+only host interface is a two-function `ll-store` pair, and `runner/` is a
+wasmtime host that supplies exactly those two imports over a mount table.
+`tests/kernel_seam.rs` runs a hand-written `write(2)` guest through every
+layer of that and compares it against the same `.s` executed by the real
+kernel, across both control-flow modes and with `--resume` on and off.
+
+The emitter also learned exception handling for it: a tag section, tag
+symbols, `R_WASM_TAG_INDEX_LEB`, and the standardized `throw`/`try_table`
+pair (the legacy form clang still emits is what wasmtime rejects). The
+seam carries the scheduler's throw and catch and a register-file
+save/restore, none of which is used yet — they are linked and exercised
+now because their risk is toolchain risk: the tag survives the link with
+its relocations, and the engine accepts the standardized form unflagged.
+Unwinding a real chain of transpiled frames waits for the milestone that
+produces one.
+
 What follows is what a real binary would hit next. It is written down
 because "anything not implemented is a hard translation error naming the
 instruction" makes the gaps discoverable but not *visible*: nothing tells
@@ -927,6 +985,29 @@ needs them: MXCSR (`ldmxcsr`/`stmxcsr`), x87, and the adjust flag.
   parameters, and results whose width only the caller knows.
 - **Host-to-guest callbacks**: a function pointer handed *in* needs an
   adapter that speaks the emulated convention.
+- **Thread-local storage in the relocatable pipeline.** A `gcc -c` object
+  containing `__thread` carries `R_X86_64_TPOFF32` relocations, and those
+  are a named error: "unsupported relocation type 23". Local exec is what
+  every compiler emits for an executable, so this is a real gap rather
+  than an exotic one. What makes it more than a missing case is that a
+  faithful translation needs the *end* of the TLS block — x86 puts
+  `__thread` variables at negative offsets from a thread pointer that
+  sits above them — and there is no symbol-difference relocation in the
+  wasm linking format to compute it with. `wasm-ld`'s own TLS support does
+  not supply it either: in the non-shared, non-threads link this pipeline
+  uses, LLD *relaxes* a thread-local access to an ordinary absolute load
+  and emits no `__tls_base` at all — the access works, and `__tls_size`
+  resolves to zero, so there is still nothing to compute the block's end
+  from. (Under `-matomics` without `--shared-memory` the same source does
+  read back zero, which is the threads TLS model half-configured and not
+  this pipeline's configuration; an earlier version of this paragraph
+  reported that as the behaviour of a plain link, which it is not.) So the
+  block must be laid out by a generated object built from the whole link
+  set, exactly as the interop thunks are, which defines the end symbol as
+  a side effect. Reinterpreting
+  the offsets to avoid needing it — treating `%fs` as a bias instead of a
+  thread pointer — was tried and rejected: it silently corrupts any
+  program whose libc installs a real thread pointer.
 - **Division** still traps on a genuinely 128-bit dividend, where hardware
   would divide.
 

@@ -28,15 +28,34 @@ use crate::emitter::{
     DefinedFunction, ENVIRONMENT_MODULE, FIRST_TABLE_INDEX, FunctionType, ImportedFunction,
     ValueType, WasmObject,
 };
+use crate::cfg::ControlFlowGraph;
 use crate::lifter::{self, LiftedFunction};
 use crate::machine::{MachineState, RETURN_ADDRESS_SENTINEL, STACK_POINTER_REGISTER, VectorHalf};
 use crate::reader::{ObjectFile, SectionRole, SymbolBinding, SymbolRole};
 use crate::structurer;
-use crate::translate::{FunctionTranslator, SymbolResolver, SymbolValue};
+use crate::translate::{
+    FunctionTranslator, RED_ZONE_RESERVED, RESUME_ENTRY_MASK, ResumeSites, SYSCALL_RESERVATION,
+    SymbolResolver, SymbolValue,
+};
 
 /// Suffix distinguishing a translated function, which runs on the emulated
 /// register convention, from the host-entry wrapper that carries its name.
 pub const GUEST_SUFFIX: &str = "_guest";
+
+/// The checkpoint-resume driver: walks the chain of resume IDs on a restored
+/// guest stack, re-entering each suspended frame's resume body in turn until
+/// it pops the sentinel the entry wrapper planted at the bottom. Defined
+/// weakly, so that objects transpiled separately link into one module with
+/// one driver.
+pub const RESUME_DRIVER: &str = "x86_resume";
+
+/// The kernel seam: what a translated `syscall` calls.
+///
+/// Defined in the guest convention by the generated seam object, which reads
+/// the Linux syscall ABI out of the register globals and makes it an
+/// ordinary typed call into the kernel. Named rather than inferred, because
+/// `syscall` carries no operand for a relocation to describe.
+pub const SYSCALL_ENTRY: &str = "x86_syscall";
 
 /// How many arguments of each kind a host-entry wrapper accepts when nothing
 /// is known about the function's real signature.
@@ -65,6 +84,9 @@ struct SymbolTable<'a> {
     table_slots_by_symbol: HashMap<usize, TableReference>,
     /// Data symbols standing for recovered jump tables, by where they begin.
     jump_tables: HashMap<(usize, u64), u32>,
+    /// The imported [`SYSCALL_ENTRY`], present when the object contains a
+    /// `syscall` at all.
+    syscall_entry: Option<FunctionReference>,
     /// Which data segment each input section became.
     segment_of_section: HashMap<usize, u32>,
     data: HashMap<usize, u32>,
@@ -126,6 +148,16 @@ impl SymbolResolver for SymbolTable<'_> {
                     self.object.sections[section].name
                 )
             })
+    }
+
+    fn syscall_entry(&self) -> Result<FunctionReference> {
+        self.syscall_entry.ok_or_else(|| {
+            anyhow::anyhow!(
+                "a `syscall` was translated but `{SYSCALL_ENTRY}` was never \
+                 declared; the instruction scan and the import declaration \
+                 disagree about what this object contains"
+            )
+        })
     }
 
     fn value(&self, elf_symbol: usize, addend: i64) -> Result<SymbolValue> {
@@ -208,6 +240,11 @@ struct FunctionPlan {
     /// Present when the function is visible outside the object and therefore
     /// gets a host-entry wrapper carrying its clean name.
     wrapper: Option<FunctionReference>,
+    /// The function's resume body and its table slot, when checkpoint-resume
+    /// is on: the dispatcher over the call-split graph, entered at whichever
+    /// post-call point a resume ID names.
+    resume: Option<FunctionReference>,
+    resume_slot: Option<TableReference>,
 }
 
 pub struct Transpiler<'a> {
@@ -215,6 +252,7 @@ pub struct Transpiler<'a> {
     mode: structurer::Mode,
     signatures: SignatureTable,
     promote: bool,
+    resume: bool,
 }
 
 impl<'a> Transpiler<'a> {
@@ -224,7 +262,18 @@ impl<'a> Transpiler<'a> {
             mode: structurer::Mode::default(),
             signatures: SignatureTable::new(),
             promote: true,
+            resume: false,
         }
+    }
+
+    /// Emits the checkpoint-resume machinery: call sites store resume IDs in
+    /// their return-address slots, every function gets a resume body, and a
+    /// weak [`RESUME_DRIVER`] rebuilds the suspended frames of a restored
+    /// snapshot. Off by default — ordinary output is byte-identical without
+    /// it.
+    pub fn with_resume(mut self, resume: bool) -> Self {
+        self.resume = resume;
+        self
     }
 
     /// Chooses the control-flow translation. Every mode must produce the same
@@ -308,6 +357,7 @@ impl<'a> Transpiler<'a> {
             table_slots_by_location: HashMap::new(),
             table_slots_by_symbol: HashMap::new(),
             jump_tables: HashMap::new(),
+            syscall_entry: None,
             segment_of_section: HashMap::new(),
             data: HashMap::new(),
             names: HashMap::new(),
@@ -318,16 +368,26 @@ impl<'a> Transpiler<'a> {
             }
         }
 
+        // The resume bodies' shared type: the entry index in, the resume ID
+        // of the frame above out. Interned only when the machinery is on, so
+        // ordinary output is byte-identical without it.
+        let resume_type = self.resume.then(|| {
+            wasm.intern_type(FunctionType {
+                parameters: vec![ValueType::I32],
+                results: vec![ValueType::I64],
+            })
+        });
+
         // Imports first: they occupy the low end of the function index space,
         // so every undefined callee has to be known before any definition
         // takes an index.
         self.declare_imported_functions(&mut wasm, &mut symbols, guest_type, &references)?;
         self.declare_data(&mut wasm, &mut symbols, &references)?;
-        let plans = self.declare_functions(&mut wasm, &mut symbols)?;
+        let (mut plans, driver) = self.declare_functions(&mut wasm, &mut symbols)?;
 
         // Table slots have to exist before anything can refer to one, and
         // they are only known once every function has a symbol.
-        self.assign_table_slots(&mut wasm, &mut symbols, &references);
+        self.assign_table_slots(&mut wasm, &mut symbols, &references, &mut plans);
         wasm.uses_function_table = references.calls_indirectly || !wasm.table_functions.is_empty();
         self.rewrite_jump_tables(&mut wasm, &mut symbols, &references)?;
         self.translate_data_relocations(&mut wasm, &symbols, &references)?;
@@ -337,10 +397,36 @@ impl<'a> Transpiler<'a> {
         let mut bodies: Vec<(u32, u32, FunctionBody)> = Vec::new();
         for plan in &plans {
             let lifted = &lifted_functions[plan.input];
+
+            // With resume on, both of the function's bodies are built against
+            // the same call-split graph and site map: the ordinary body
+            // stores the IDs, the resume body is what they name.
+            let resume_context = match (plan.resume, plan.resume_slot) {
+                (Some(_), Some(slot)) => {
+                    let graph = ControlFlowGraph::build_resumable(lifted)
+                        .with_context(|| format!("splitting `{}` at its calls", lifted.name))?;
+                    let entries = resume_entries(lifted, &graph)
+                        .with_context(|| format!("mapping `{}`'s resume points", lifted.name))?;
+                    Some((graph, slot, entries))
+                }
+                _ => None,
+            };
+
             let body = self
-                .translate_guest_function(&symbols, &machine, lifted, guest_type)
+                .translate_guest_function(&symbols, &machine, lifted, guest_type, &resume_context)
                 .with_context(|| format!("translating function `{}`", lifted.name))?;
             bodies.push((plan.guest.function_index, guest_type, body));
+
+            if let (Some(resume), Some((graph, slot, entries))) = (plan.resume, &resume_context) {
+                let resume_body = self
+                    .translate_resume_body(&symbols, &machine, lifted, guest_type, graph, *slot, entries)
+                    .with_context(|| format!("translating `{}`'s resume body", lifted.name))?;
+                bodies.push((
+                    resume.function_index,
+                    resume_type.expect("resume bodies exist only when the type does"),
+                    resume_body,
+                ));
+            }
 
             if let Some(wrapper) = plan.wrapper {
                 let name = &self.object.functions[plan.input].name;
@@ -361,6 +447,17 @@ impl<'a> Transpiler<'a> {
                 };
                 bodies.push((wrapper.function_index, type_index, body));
             }
+        }
+
+        if let Some(driver) = driver {
+            bodies.push((
+                driver.function_index,
+                guest_type,
+                build_resume_driver(
+                    &machine,
+                    resume_type.expect("the driver exists only when the type does"),
+                ),
+            ));
         }
 
         bodies.sort_by_key(|(index, _, _)| *index);
@@ -415,6 +512,10 @@ impl<'a> Transpiler<'a> {
                 // The address computation of a recovered dispatch names the
                 // table, which is data; nothing else about it survives.
                 if function.jump_tables.contains_key(&position) {
+                    continue;
+                }
+                if lifted.instruction.mnemonic() == iced_x86::Mnemonic::Syscall {
+                    references.issues_syscalls = true;
                     continue;
                 }
                 if matches!(
@@ -527,6 +628,7 @@ impl<'a> Transpiler<'a> {
         wasm: &mut WasmObject,
         symbols: &mut SymbolTable<'_>,
         references: &TextReferences,
+        plans: &mut [FunctionPlan],
     ) {
         let mut next_slot = FIRST_TABLE_INDEX;
         let mut claim = |function: FunctionReference| {
@@ -553,6 +655,14 @@ impl<'a> Transpiler<'a> {
             let slot = claim(function);
             symbols.table_slots_by_symbol.insert(*symbol, slot);
             wasm.table_functions.push(function.function_index);
+        }
+
+        // Resume bodies are reached through the table too: a resume ID's low
+        // half is the slot claimed here.
+        for plan in plans {
+            let Some(resume) = plan.resume else { continue };
+            plan.resume_slot = Some(claim(resume));
+            wasm.table_functions.push(resume.function_index);
         }
     }
 
@@ -589,6 +699,26 @@ impl<'a> Transpiler<'a> {
                     function_index,
                 },
             );
+        }
+
+        // The seam is an import like any other undefined callee, but it is
+        // named by us rather than by a relocation: `syscall` has no operand.
+        if references.issues_syscalls {
+            let function_index = wasm.imported_functions.len() as u32;
+            wasm.imported_functions.push(ImportedFunction {
+                module: ENVIRONMENT_MODULE.to_string(),
+                field: SYSCALL_ENTRY.to_string(),
+                type_index: guest_type,
+            });
+            let symbol_index = wasm.add_symbol(Symbol {
+                name: SYSCALL_ENTRY.to_string(),
+                target: SymbolTarget::Function(function_index),
+                flags: symbol_flags::UNDEFINED,
+            });
+            symbols.syscall_entry = Some(FunctionReference {
+                symbol_index,
+                function_index,
+            });
         }
         Ok(())
     }
@@ -839,7 +969,7 @@ impl<'a> Transpiler<'a> {
         &self,
         wasm: &mut WasmObject,
         symbols: &mut SymbolTable<'_>,
-    ) -> Result<Vec<FunctionPlan>> {
+    ) -> Result<(Vec<FunctionPlan>, Option<FunctionReference>)> {
         let mut plans = Vec::new();
         let mut next_index = wasm.imported_functions.len() as u32;
 
@@ -880,14 +1010,50 @@ impl<'a> Transpiler<'a> {
                 })
             };
 
+            let resume = if self.resume {
+                let resume_index = next_index;
+                next_index += 1;
+                let resume_symbol = wasm.add_symbol(Symbol {
+                    name: format!("{}{GUEST_SUFFIX}.resume", function.name),
+                    target: SymbolTarget::Function(resume_index),
+                    // Resume bodies are reached through the function table by
+                    // resume IDs this same object wrote; no other object ever
+                    // names one.
+                    flags: symbol_flags::LOCAL,
+                });
+                Some(FunctionReference {
+                    symbol_index: resume_symbol,
+                    function_index: resume_index,
+                })
+            } else {
+                None
+            };
+
             plans.push(FunctionPlan {
                 input,
                 guest,
                 wrapper,
+                resume,
+                resume_slot: None,
             });
         }
 
-        Ok(plans)
+        let driver = if self.resume {
+            let driver_index = next_index;
+            let driver_symbol = wasm.add_symbol(Symbol {
+                name: RESUME_DRIVER.to_string(),
+                target: SymbolTarget::Function(driver_index),
+                flags: symbol_flags::WEAK,
+            });
+            Some(FunctionReference {
+                symbol_index: driver_symbol,
+                function_index: driver_index,
+            })
+        } else {
+            None
+        };
+
+        Ok((plans, driver))
     }
 
     fn translate_guest_function(
@@ -896,13 +1062,52 @@ impl<'a> Transpiler<'a> {
         machine: &MachineState,
         lifted: &LiftedFunction,
         guest_type: u32,
+        resume: &Option<(ControlFlowGraph, TableReference, HashMap<u64, u32>)>,
     ) -> Result<FunctionBody> {
         let mut body = FunctionBodyBuilder::new(0);
         let mut translator = FunctionTranslator::new(symbols, machine, lifted.section, guest_type);
+        if let Some((_, slot, entries)) = resume {
+            translator.enable_resume(ResumeSites {
+                table_slot: *slot,
+                entries: entries.clone(),
+            });
+        }
         if self.promote {
             translator.begin_function(&mut body, lifted);
         }
         structurer::translate_function(&mut body, &mut translator, lifted, self.mode)?;
+        Ok(body.finish())
+    }
+
+    /// The function's second body: entered by the resume driver at whichever
+    /// post-call point the popped resume ID names, running the frame to its
+    /// return and yielding the next frame's ID. Always the dispatcher shape —
+    /// the entry parameter is a block index, which structured control flow
+    /// has no way to jump to.
+    #[allow(clippy::too_many_arguments)]
+    fn translate_resume_body(
+        &self,
+        symbols: &SymbolTable<'_>,
+        machine: &MachineState,
+        lifted: &LiftedFunction,
+        guest_type: u32,
+        graph: &ControlFlowGraph,
+        slot: TableReference,
+        entries: &HashMap<u64, u32>,
+    ) -> Result<FunctionBody> {
+        let mut body = FunctionBodyBuilder::new(1);
+        let mut translator = FunctionTranslator::new(symbols, machine, lifted.section, guest_type);
+        // Fresh calls made by a resumed frame reserve slots like any others,
+        // so a checkpoint taken under a resumed frame resumes too.
+        translator.enable_resume(ResumeSites {
+            table_slot: slot,
+            entries: entries.clone(),
+        });
+        translator.yield_next_site_on_return();
+        if self.promote {
+            translator.begin_function(&mut body, lifted);
+        }
+        structurer::translate_resume_function(&mut body, &mut translator, lifted, graph, 0)?;
         Ok(body.finish())
     }
 
@@ -979,6 +1184,99 @@ impl<'a> Transpiler<'a> {
     }
 }
 
+/// The resume entry for every slot-reserving transfer in a function, keyed
+/// by the instruction's offset.
+///
+/// A call's entry is the block its next instruction heads in the call-split
+/// graph — where execution stands when the callee returns. A tail jump's
+/// entry is the epilogue arm past the real blocks: the frame it suspends has
+/// nothing left to run but its own return. A call with no next instruction
+/// is a call to a function that never returns; its slot's ID is never
+/// consumed, and the epilogue arm is as good a value as any.
+fn resume_entries(lifted: &LiftedFunction, graph: &ControlFlowGraph) -> Result<HashMap<u64, u32>> {
+    use iced_x86::FlowControl;
+    let epilogue = graph.blocks.len() as u32;
+    let mut entries = HashMap::new();
+    for (position, instruction) in lifted.instructions.iter().enumerate() {
+        let entry = match instruction.instruction.flow_control() {
+            FlowControl::Call | FlowControl::IndirectCall => {
+                match lifted.instructions.get(position + 1) {
+                    Some(next) => u32::try_from(graph.block_at(next.offset)?)
+                        .expect("a function has fewer than 2^32 blocks"),
+                    None => epilogue,
+                }
+            }
+            FlowControl::UnconditionalBranch
+            | FlowControl::ConditionalBranch
+            | FlowControl::IndirectBranch => epilogue,
+            _ => continue,
+        };
+        entries.insert(instruction.offset, entry);
+    }
+    Ok(entries)
+}
+
+/// The driver that brings a restored checkpoint back to life.
+///
+/// The restored guest stack's top slot holds the resume ID of the innermost
+/// suspended frame — the caller of whatever the checkpoint was taken inside.
+/// Pop it (the pop that suspended callee's return owes), then walk: each
+/// resume body runs its frame to completion and yields the ID above it,
+/// until the sentinel the entry wrapper planted says the chain is done. The
+/// program's result is where it always is, in the register globals.
+fn build_resume_driver(machine: &MachineState, resume_type: u32) -> FunctionBody {
+    let mut body = FunctionBodyBuilder::new(0);
+    let id = body.declare_local(ValueType::I64);
+
+    body.global_get(machine.register(STACK_POINTER_REGISTER));
+    body.i32_wrap_i64();
+    body.i64_load(3, 0);
+    body.local_set(id);
+
+    // Give back what the suspended site reserved. A call site takes eight
+    // bytes; a syscall site takes the red zone as well, because the kernel is
+    // not allowed to spend it. Only this first pop can be either — every
+    // later slot in the chain is popped by a resume body's own `ret`, and
+    // what a `ret` gives back is always its caller's call slot.
+    body.global_get(machine.register(STACK_POINTER_REGISTER));
+    body.i64_const(8);
+    body.i64_const(SYSCALL_RESERVATION);
+    body.local_get(id);
+    body.i64_const(RED_ZONE_RESERVED);
+    body.i64_and();
+    body.i64_eqz();
+    body.select();
+    body.i64_add();
+    body.global_set(machine.register(STACK_POINTER_REGISTER));
+
+    body.block();
+    body.loop_();
+    body.local_get(id);
+    body.i64_const(RETURN_ADDRESS_SENTINEL);
+    body.i64_eq();
+    body.if_();
+    body.branch(2);
+    body.end();
+
+    // A resume ID: entry index in the high half, table slot in the low, and
+    // the frame-size marker riding above the index.
+    body.local_get(id);
+    body.i64_const(32);
+    body.i64_shr_unsigned();
+    body.i64_const(RESUME_ENTRY_MASK);
+    body.i64_and();
+    body.i32_wrap_i64();
+    body.local_get(id);
+    body.i32_wrap_i64();
+    body.call_indirect(resume_type);
+    body.local_set(id);
+    body.branch(0);
+    body.end();
+    body.end();
+
+    body.finish()
+}
+
 /// Starts the guest stack from the linker's stack pointer.
 ///
 /// SysV asks for `rsp % 16 == 8` at entry, as if a return address had just
@@ -1051,6 +1349,10 @@ struct TextReferences {
     /// that only receives function pointers needs the table without putting
     /// anything in it.
     calls_indirectly: bool,
+    /// Whether the object contains a `syscall`, which is what obliges it to
+    /// import the kernel seam. There is no relocation to notice, so the
+    /// instruction scan is the only evidence.
+    issues_syscalls: bool,
 }
 
 impl TextReferences {

@@ -1,3 +1,6 @@
+[workspace]
+members = ["baker", "kisal", "runner"]
+
 [package]
 name = "zaqaru"
 version = "0.1.0"
@@ -11,7 +14,11 @@ object = "0.40.0"
 wasmprinter = "0.258.0"
 
 [dev-dependencies]
+baker = { path = "baker" }
+kisal = { path = "kisal" }
+runner = { path = "runner" }
 criterion = "0.8.2"
+libc = "0.2"
 libloading = "0.9.0"
 rand = "0.10.2"
 wasmparser = "0.258.0"

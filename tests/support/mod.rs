@@ -395,6 +395,67 @@ pub fn try_transpile_object_with_signatures(
     Ok(wasm)
 }
 
+/// How an object under test is transpiled. Every combination is meant to
+/// compute the same thing, which is what makes running a corpus through all
+/// of them a test rather than a survey.
+#[derive(Clone, Copy, Debug)]
+pub struct TranspileOptions {
+    pub mode: zaqaru::structurer::Mode,
+    /// Promotion off leaves every machine-state access on the globals. A
+    /// miscompile that disappears with it off is a promotion bug, located —
+    /// which is why a new cell in the machine model is run both ways.
+    pub promote: bool,
+    pub resume: bool,
+}
+
+impl TranspileOptions {
+    pub fn new(mode: zaqaru::structurer::Mode) -> Self {
+        Self {
+            mode,
+            promote: true,
+            resume: false,
+        }
+    }
+
+    pub fn label(&self) -> String {
+        format!(
+            "{:?}/promote={}/resume={}",
+            self.mode, self.promote, self.resume
+        )
+    }
+}
+
+pub fn transpile_object_configured(input: &Path, output: &Path, options: TranspileOptions) {
+    let bytes = std::fs::read(input).expect("read native object");
+    let object = zaqaru::reader::ObjectFile::parse(&bytes)
+        .unwrap_or_else(|error| panic!("parsing {}: {error:?}", input.display()));
+    let wasm = zaqaru::transpile::Transpiler::new(&object)
+        .with_mode(options.mode)
+        .with_promotion(options.promote)
+        .with_resume(options.resume)
+        .transpile()
+        .unwrap_or_else(|error| {
+            panic!("transpiling {} ({}): {error:?}", input.display(), options.label())
+        });
+    validate_wasm(&wasm);
+    std::fs::write(output, &wasm).expect("write transpiled object");
+}
+
+/// Transpiles with the checkpoint-resume machinery on: resume IDs at call
+/// sites, a resume body per function, and the weak `x86_resume` driver.
+pub fn transpile_object_resumable(input: &Path, output: &Path, mode: zaqaru::structurer::Mode) {
+    let bytes = std::fs::read(input).expect("read native object");
+    let object = zaqaru::reader::ObjectFile::parse(&bytes)
+        .unwrap_or_else(|error| panic!("parsing {}: {error:?}", input.display()));
+    let wasm = zaqaru::transpile::Transpiler::new(&object)
+        .with_mode(mode)
+        .with_resume(true)
+        .transpile()
+        .unwrap_or_else(|error| panic!("transpiling {} ({mode:?}): {error:?}", input.display()));
+    validate_wasm(&wasm);
+    std::fs::write(output, &wasm).expect("write transpiled object");
+}
+
 /// Transpiles with signatures recovered from the machine code, plus whatever
 /// was declared. Declarations win: inference fills in what was not declared
 /// rather than competing with it.
@@ -855,4 +916,130 @@ pub unsafe fn native_function<'library, Signature: Copy>(
 ) -> libloading::Symbol<'library, Signature> {
     unsafe { library.get(name.as_bytes()) }
         .unwrap_or_else(|error| panic!("native symbol `{name}`: {error}"))
+}
+
+// ---- the container pipeline ------------------------------------------------
+//
+// Everything below builds the M1 artefact: a transpiled guest, the generated
+// kernel seam, and kisal compiled to wasm, linked into one module the runner
+// can instantiate. It lives in the shared support so that every milestone
+// after this one inherits it rather than re-deriving it.
+
+/// The kisal staticlib, built for `wasm32-unknown-unknown` once per test
+/// binary and cached.
+///
+/// Built into a target directory of its own: cargo takes a lock per
+/// directory, and sharing the host build's would deadlock a test that is
+/// itself running under cargo.
+pub fn kisal_staticlib() -> PathBuf {
+    static BUILT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    BUILT
+        .get_or_init(|| {
+            let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+            let target = root.join("target").join("wasm-kisal");
+            let output = Command::new(env!("CARGO"))
+                .current_dir(root)
+                .env("CARGO_TARGET_DIR", &target)
+                .args([
+                    "build",
+                    "-p",
+                    "kisal",
+                    "--target",
+                    "wasm32-unknown-unknown",
+                    "--release",
+                ])
+                .output()
+                .expect("run cargo to build kisal for wasm32");
+            assert!(
+                output.status.success(),
+                "building kisal for wasm32 failed:\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            target
+                .join("wasm32-unknown-unknown")
+                .join("release")
+                .join("libkisal.a")
+        })
+        .clone()
+}
+
+/// The generated kernel seam object.
+pub fn seam_object() -> Vec<u8> {
+    zaqaru::seam::build_seam_object().expect("build the kernel seam object")
+}
+
+/// Links a container: transpiled guest objects, the seam, kisal, and an
+/// image.
+///
+/// `--fatal-warnings` is the recipe rather than decoration, exactly as it is
+/// for the interop link: the seam's whole value is that a disagreement about
+/// `kisal_syscall`'s shape stops the build.
+pub fn link_container(workspace: &WorkingDirectory, guests: &[PathBuf], label: &str) -> PathBuf {
+    let image = baker::object::empty().expect("build an empty image object");
+    link_container_with_image(workspace, guests, &image, label)
+}
+
+/// The same, carrying a filesystem.
+///
+/// Every container links an image, even an empty one. kisal references the
+/// image symbols unconditionally, so a link that omitted one fails with an
+/// undefined symbol rather than producing a module that silently has no
+/// files — which is the difference between a container and a module.
+pub fn link_container_with_image(
+    workspace: &WorkingDirectory,
+    guests: &[PathBuf],
+    image: &[u8],
+    label: &str,
+) -> PathBuf {
+    let seam = workspace.write(&format!("seam.{label}.wasm.o"), seam_object());
+    let image = workspace.write(&format!("image.{label}.wasm.o"), image);
+    let mut objects: Vec<PathBuf> = guests.to_vec();
+    objects.push(seam);
+    objects.push(image);
+    objects.push(kisal_staticlib());
+    let linked = workspace.path().join(format!("container.{label}.wasm"));
+    // `--export-table` is not decoration: the host embedder needs the
+    // indirect function table to install a continuation's slot, which is how
+    // a thread is started from outside the module.
+    link_wasm(
+        &objects,
+        &linked,
+        &[
+            "--fatal-warnings",
+            "--export=cabi_realloc",
+            "--export-table",
+            "--growable-table",
+        ],
+    );
+    linked
+}
+
+/// The mount table an M1 container boots with: a console and a kernel log,
+/// both sinks a test can read back.
+pub fn m1_mounts() -> runner::store::MountTable {
+    let mut mounts = runner::store::MountTable::new();
+    mounts.mount(
+        &[b"iso", b"console"],
+        Box::new(runner::store::Sink::new()),
+    );
+    mounts.mount(&[b"iso", b"log"], Box::new(runner::store::Sink::new()));
+    mounts
+}
+
+/// The same, plus the boot entropy a container needs to have any.
+///
+/// Separate from `m1_mounts` on purpose: a container with no `/iso/random`
+/// mount has no randomness, and that is the capability model rather than an
+/// oversight. A default that quietly supplied entropy would make the
+/// distinction untestable.
+pub fn mounts_seeded(seed: &[u8]) -> runner::store::MountTable {
+    let mut mounts = m1_mounts();
+    mounts.mount(&[b"iso", b"random"], Box::new(runner::store::Sink::new()));
+    mounts
+        .write(
+            &[b"iso".to_vec(), b"random".to_vec(), b"bytes".to_vec(), b"32".to_vec()],
+            seed,
+        )
+        .expect("seed the container");
+    mounts
 }

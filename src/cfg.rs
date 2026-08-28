@@ -3,7 +3,10 @@
 //! Block leaders are the function entry, every branch target inside the
 //! function, and every instruction following a terminator. Calls are *not*
 //! terminators: a call returns to the instruction after it, so splitting
-//! there would only add blocks without adding information.
+//! there would only add blocks without adding information — except in the
+//! [`ControlFlowGraph::build_resumable`] variant, where each post-call
+//! instruction heading a block of its own is exactly the information wanted:
+//! those blocks are the points a suspended frame can be re-entered at.
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -119,7 +122,19 @@ impl ControlFlowGraph {
     }
 
     pub fn build(function: &LiftedFunction) -> Result<Self> {
-        let leaders = collect_leaders(function)?;
+        Self::build_with_leaders(function, false)
+    }
+
+    /// The same graph with every call ending its block, so that each
+    /// post-call instruction heads a block — the entry points of the
+    /// function's resume body. A call still falls through to the next block;
+    /// nothing about the terminators changes.
+    pub fn build_resumable(function: &LiftedFunction) -> Result<Self> {
+        Self::build_with_leaders(function, true)
+    }
+
+    fn build_with_leaders(function: &LiftedFunction, split_after_calls: bool) -> Result<Self> {
+        let leaders = collect_leaders(function, split_after_calls)?;
         let mut blocks = Vec::new();
 
         let starts: Vec<u64> = leaders.iter().copied().collect();
@@ -414,7 +429,7 @@ fn instruction_index(function: &LiftedFunction, offset: u64) -> Result<usize> {
         })
 }
 
-fn collect_leaders(function: &LiftedFunction) -> Result<BTreeSet<u64>> {
+fn collect_leaders(function: &LiftedFunction, split_after_calls: bool) -> Result<BTreeSet<u64>> {
     let mut leaders = BTreeSet::new();
     leaders.insert(function.offset);
 
@@ -435,7 +450,12 @@ fn collect_leaders(function: &LiftedFunction) -> Result<BTreeSet<u64>> {
             || matches!(
                 instruction.flow_control(),
                 FlowControl::Return | FlowControl::IndirectBranch
-            );
+            )
+            || (split_after_calls
+                && matches!(
+                    instruction.flow_control(),
+                    FlowControl::Call | FlowControl::IndirectCall
+                ));
         if let (true, Some(next)) = (terminates, function.instructions.get(position + 1)) {
             leaders.insert(next.offset);
         }

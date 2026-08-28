@@ -46,6 +46,14 @@ pub struct TableReference {
     pub table_index: u32,
 }
 
+/// A reference to a tag by symbol, with the index it has in *this* object's
+/// tag index space.
+#[derive(Clone, Copy, Debug)]
+pub struct TagReference {
+    pub symbol_index: u32,
+    pub tag_index: u32,
+}
+
 /// A finished function body: the bytes the code section carries, plus
 /// relocations at offsets relative to the start of those bytes.
 #[derive(Clone, Debug)]
@@ -55,6 +63,9 @@ pub struct FunctionBody {
     /// Whether the body contains SIMD instructions or `v128` locals, which
     /// obliges the object to declare the `simd128` target feature.
     pub uses_simd: bool,
+    /// Whether the body throws or catches, which obliges the object to
+    /// declare the `exception-handling` target feature.
+    pub uses_exceptions: bool,
 }
 
 /// The block type of a `block`/`loop`/`if`. Everything the transpiler emits
@@ -90,6 +101,7 @@ pub struct FunctionBodyBuilder {
     code: Vec<u8>,
     relocations: Vec<Relocation>,
     uses_simd: bool,
+    uses_exceptions: bool,
 }
 
 impl FunctionBodyBuilder {
@@ -100,6 +112,7 @@ impl FunctionBodyBuilder {
             code: Vec::new(),
             relocations: Vec::new(),
             uses_simd: false,
+            uses_exceptions: false,
         }
     }
 
@@ -134,6 +147,7 @@ impl FunctionBodyBuilder {
             bytes,
             relocations: self.relocations,
             uses_simd: self.uses_simd || self.local_types.contains(&ValueType::V128),
+            uses_exceptions: self.uses_exceptions,
         }
     }
 
@@ -206,6 +220,40 @@ impl FunctionBodyBuilder {
 
     pub fn return_(&mut self) {
         self.opcode(0x0f);
+    }
+
+    /// `throw <tag>`: raise the tag, taking its payload from the operand
+    /// stack. The standardized spelling from the exception-handling
+    /// proposal, not the legacy `try`/`catch` pair — M0's gate 4 found
+    /// wasmtime accepts only this one without an engine flag.
+    pub fn throw(&mut self, tag: TagReference) {
+        self.uses_exceptions = true;
+        self.opcode(0x08);
+        self.relocatable_unsigned_immediate(
+            RelocationKind::TagIndexLeb,
+            tag.symbol_index,
+            tag.tag_index,
+        );
+    }
+
+    /// `try_table` with one `catch` clause, empty block type: everything in
+    /// the enclosed body runs with the tag handled, and a throw of it
+    /// branches to `depth` with the tag's payload on the stack.
+    ///
+    /// Terminated by [`end`](Self::end) like any other block, and it counts
+    /// as one level of branch depth, exactly as `block` does.
+    pub fn try_table_catch(&mut self, tag: TagReference, depth: u32) {
+        self.uses_exceptions = true;
+        self.opcode(0x1f);
+        self.code.push(EMPTY_BLOCK_TYPE);
+        self.unsigned_immediate(1); // one catch clause
+        self.code.push(0x00); // `catch`: payload on the stack, no exnref
+        self.relocatable_unsigned_immediate(
+            RelocationKind::TagIndexLeb,
+            tag.symbol_index,
+            tag.tag_index,
+        );
+        self.unsigned_immediate(depth);
     }
 
     pub fn call(&mut self, function: FunctionReference) {

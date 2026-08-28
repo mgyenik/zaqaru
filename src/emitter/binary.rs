@@ -110,6 +110,10 @@ pub const SECTION_ELEMENT: u8 = 9;
 pub const SECTION_CODE: u8 = 10;
 pub const SECTION_DATA: u8 = 11;
 pub const SECTION_DATA_COUNT: u8 = 12;
+/// The exception-handling proposal's tag section. Its ordinal is out of
+/// order with its position: the binary format places it between the memory
+/// and global sections.
+pub const SECTION_TAG: u8 = 13;
 
 pub const WASM_MAGIC: [u8; 4] = [0x00, 0x61, 0x73, 0x6d];
 pub const WASM_VERSION: [u8; 4] = [0x01, 0x00, 0x00, 0x00];

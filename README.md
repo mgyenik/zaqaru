@@ -81,12 +81,45 @@ The thunk generator is given the wasm objects too, because that is where a
 foreign signature is *stated* rather than guessed — and an argument passed
 straight through leaves no trace in the native object at all. A wrong
 signature at a seam is caught by the linker rather than run: `wasm-ld` type-
-checks across objects, and refuses to connect a mismatch even without
-`--fatal-warnings`.
+checks across objects and warns on a mismatch; `--fatal-warnings` is what
+turns the warning into a refusal, which is why every recipe here passes it.
+
+`--resume` adds checkpoint-resume: every call site records where its frame
+would continue, every function gets a second body that can be entered
+there, and a generated `x86_resume` driver rebuilds a process from a copy
+of its memory and globals — the mechanics of `fork`, exercised end to end
+by `tests/fork_resume.rs`. It rests on a property the ordinary translation
+already has: at any call boundary the complete machine state is in the
+shared globals and linear memory, never on the wasm stack.
+
+`--seam` emits the kernel seam: `x86_syscall`, which the translator turns a
+`syscall` instruction into, reading the Linux syscall ABI out of the register
+globals and making it an ordinary typed call to `kisal_syscall`. That is the
+bet the container work rests on — a syscall costs a wasm call rather than a
+trap, and the kernel is just more code linked into the module.
+
+```sh
+zaqaru --seam -o seam.wasm.o
+wasm-ld --no-entry --export=cabi_realloc --export-table --growable-table \
+    guest.wasm.o seam.wasm.o libkisal.a -o container.wasm
+```
+
+The seam object also carries what a scheduler needs: the `x86_yield` tag with
+its throw and the `try_table` that catches it, and helpers that move the whole
+register file between the globals and linear memory. A blocking thread throws
+its wasm frames away, because the flush discipline already put everything of
+value in the globals and the guest stack.
+
+`kisal/` is the in-guest kernel — Rust compiled to `wasm32-unknown-unknown`,
+with a Linux syscall face upward and a two-function `ll-store` boundary
+downward, so a container's filesystem traffic never crosses to the host at
+all. `runner/` is the wasmtime host: those two imports, a mount table, and
+nothing else.
 
 `docs/design.md` has the rationale, the decision log, the current status —
 what is built and what a real binary would hit next — and what is
-deliberately out of scope.
+deliberately out of scope. `docs/container-plan.md` and
+`docs/container-build-plan.md` are the container design and its milestones.
 
 ## Building and testing
 
@@ -95,8 +128,9 @@ cargo build
 cargo test
 ```
 
-The test suite needs `gcc`, `clang` and `wasm-ld` on the path; wasmtime comes
-in as a crate. The backbone is differential execution: every corpus function
+The test suite needs `gcc`, `clang` and `wasm-ld` on the path, and the
+`wasm32-unknown-unknown` rustc target for the kernel; wasmtime comes in as a
+crate. The backbone is differential execution: every corpus function
 is compiled natively into a shared library *and* transpiled, linked and
 instantiated, then both are called with the same inputs and must agree
 exactly. Each corpus is built forty ways — both compilers, position-independent
@@ -145,6 +179,8 @@ src/
     infer.rs     recovering signatures from machine code
     marshal.rs   moving values in and out of the register file
   thunks.rs      generated entry points for functions we did not translate
+  seam.rs        the kernel seam: `syscall` as a typed call, plus the tag,
+                 the scheduler's catch, and the register-file helpers
   wasm_reader.rs the types a wasm object states for what it defines
   transpile.rs   what symbols an output object has
   emitter/       the relocatable wasm object format
@@ -155,4 +191,6 @@ tests/
   snapshots/     .wat expectations
 benches/
   kernels.rs     the promotion benchmark: transpiled vs clang-native wasm
+kisal/           the in-guest kernel: syscalls handled inside the module
+runner/          the wasmtime host: two ll-store imports and a mount table
 ```
