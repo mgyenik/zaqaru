@@ -158,7 +158,14 @@ pub fn link_corpus_executable(
     entry: &str,
     optimisation: &str,
 ) -> PathBuf {
-    link_corpus_executable_with(workspace, name, entry, optimisation, Unwind::Omitted)
+    link_corpus_executable_with(
+        workspace,
+        name,
+        entry,
+        optimisation,
+        Unwind::Omitted,
+        CodeModel::Absolute,
+    )
 }
 
 /// Whether the linked executable carries `.eh_frame`.
@@ -180,6 +187,7 @@ pub fn link_corpus_executable_with(
     entry: &str,
     optimisation: &str,
     unwind: Unwind,
+    model: CodeModel,
 ) -> PathBuf {
     let source = corpus_source(name);
     let suffix = match unwind {
@@ -188,7 +196,7 @@ pub fn link_corpus_executable_with(
     };
     let output = workspace
         .path()
-        .join(format!("{name}{optimisation}{suffix}.elf").replace('/', "."));
+        .join(format!("{name}{optimisation}{suffix}.{}.elf", model.label()).replace('/', "."));
     let source_text = source.to_string_lossy().into_owned();
     let output_text = output.to_string_lossy().into_owned();
     let entry_flag = format!("-Wl,-e,{entry}");
@@ -201,7 +209,7 @@ pub fn link_corpus_executable_with(
             flags.push("-fasynchronous-unwind-tables");
         }
         flags.push(optimisation);
-        flags.push(CodeModel::Absolute.flag());
+        flags.push(model.flag());
         flags
     };
     arguments.extend(["-static", "-nostdlib", "-nostartfiles", &entry_flag]);

@@ -625,10 +625,17 @@ impl<'a> Transpiler<'a> {
 
                 if lifted.displacement.is_none()
                     && lifted.instruction.memory_base() == iced_x86::Register::RIP
+                    // Relocatable only. There, a program-counter-relative
+                    // operand with no relocation means the assembler
+                    // resolved it against this very section, which it can
+                    // only do for something in it — so it names a function.
+                    // In a linked object *nothing* has a relocation and the
+                    // operand is an address like any other, naming data as
+                    // readily as code; it is emitted as the constant it is,
+                    // and a function's address reaches a call through the
+                    // exec map rather than through a slot recorded here.
+                    && self.object.layout != crate::reader::Layout::Linked
                 {
-                    // The assembler resolved this against the same section,
-                    // so it names a function's address with no relocation to
-                    // read — the same shortcut it takes for direct calls.
                     let target = lifted.instruction.memory_displacement64();
                     if !self.begins_a_function(function.section, target) {
                         bail!(

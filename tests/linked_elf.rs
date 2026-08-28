@@ -419,6 +419,7 @@ fn a_stripped_executable_still_has_functions() {
         "classify",
         "-O1",
         support::Unwind::Present,
+        support::CodeModel::Absolute,
     );
     let stripped = support::strip(&workspace, &named);
 
@@ -618,4 +619,98 @@ fn a_whole_program_translates() {
     );
     assert!(outcome.succeeded, "did not link:\n{}", outcome.report());
     support::validate_wasm(&std::fs::read(&module_path).expect("read"));
+}
+
+/// Functions with no stated extent, bounded by what follows them.
+///
+/// `.size` is a courtesy a compiler pays and hand-written assembly usually
+/// does not — `crtbegin.o`'s stubs carry neither a size nor an unwind entry,
+/// and they are in every binary gcc links. What is left is that a function
+/// cannot run past whatever begins after it.
+#[test]
+fn a_function_with_no_stated_size_ends_where_the_next_one_starts() {
+    let workspace = WorkingDirectory::new("linked-sizeless");
+    let path = support::link_corpus_executable(&workspace, "sizeless.s", "entry", "-O1");
+    let bytes = std::fs::read(&path).expect("read");
+    let object = ObjectFile::parse(&bytes).expect("parse");
+
+    // The premise: the symbols really do state nothing.
+    for name in ["entry", "helper"] {
+        let symbol = object
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == name)
+            .unwrap_or_else(|| panic!("`{name}` is not in the symbol table"));
+        assert_eq!(
+            symbol.size, 0,
+            "`{name}` states a size, so this proves nothing"
+        );
+    }
+
+    let functions: Vec<_> = object
+        .functions
+        .iter()
+        .filter(|function| function.name == "entry" || function.name == "helper")
+        .collect();
+    assert_eq!(functions.len(), 2, "a function went missing");
+    for function in &functions {
+        assert!(function.size > 0, "`{}` was given no extent", function.name);
+    }
+    // Neither runs into the other.
+    let entry = functions.iter().find(|f| f.name == "entry").expect("entry");
+    let helper = functions
+        .iter()
+        .find(|f| f.name == "helper")
+        .expect("helper");
+    assert!(
+        entry.offset + entry.size <= helper.offset,
+        "`entry` runs into `helper`"
+    );
+
+    zaqaru::transpile::Transpiler::new(&object)
+        .transpile()
+        .expect("translating functions bounded by their neighbours");
+}
+
+/// A linked program compiled the way a distribution compiles one.
+///
+/// `-fno-pie` turns every global's address into an immediate, which hides an
+/// entire operand shape: a distro `gcc -static` still compiles
+/// position-independently, so data is reached program-counter-relatively
+/// with no relocation left behind. In a relocatable object that shape can
+/// only mean a function in the same section — the assembler resolved it —
+/// and reading it that way in a linked one turns every global into "an
+/// address inside a function", which is refused.
+#[test]
+fn a_linked_program_reaches_its_data_relative_to_the_program_counter() {
+    let workspace = WorkingDirectory::new("linked-pic-data");
+    let path = support::link_corpus_executable_with(
+        &workspace,
+        "data.c",
+        "table_lookup",
+        "-O1",
+        support::Unwind::Omitted,
+        support::CodeModel::PositionIndependent,
+    );
+    let bytes = std::fs::read(&path).expect("read");
+    let object = ObjectFile::parse(&bytes).expect("parse");
+
+    // The premise: something really is reached relative to the program
+    // counter, with no relocation to say what it is.
+    let lifted = zaqaru::lifter::lift_object(&object).expect("lift");
+    let relative = lifted.iter().any(|function| {
+        function.instructions.iter().any(|lifted| {
+            lifted.displacement.is_none()
+                && lifted.instruction.memory_base() == iced_x86::Register::RIP
+        })
+    });
+    assert!(
+        relative,
+        "nothing in this program is reached relative to the program counter, \
+         so this proves nothing"
+    );
+
+    zaqaru::transpile::Transpiler::new(&object)
+        .transpile()
+        .expect("translating a program that reaches its own data");
 }

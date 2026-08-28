@@ -548,6 +548,14 @@ fn collect_functions(
     } else {
         std::collections::BTreeMap::new()
     };
+    // Where the next thing starts, per text section. A function whose symbol
+    // states no size still has an upper bound: it cannot run past whatever
+    // begins after it. This is the third and weakest witness, used only when
+    // the other two say nothing — `crtbegin.o`'s stubs
+    // (`deregister_tm_clones` and its neighbours) are hand-written enough to
+    // carry neither a `.size` nor an unwind entry, and they are in every
+    // binary gcc links.
+    let boundaries = symbol_boundaries(symbols, sections);
 
     let mut functions = Vec::new();
     for (index, symbol) in symbols.iter().enumerate() {
@@ -564,18 +572,30 @@ fn collect_functions(
         // without one says only where a function starts. The unwind table
         // knows how long it is.
         let size = match symbol.size {
-            0 => *unwind
+            0 => unwind
                 .get(&(sections[section].address + symbol.offset))
+                .copied()
+                .or_else(|| {
+                    next_boundary(&boundaries, section, symbol.offset)
+                        .map(|next| next - symbol.offset)
+                })
                 .ok_or_else(|| {
                     anyhow::anyhow!(
-                        "function symbol `{}` has zero size and no unwind entry; the \
-                         transpiler needs function extents (compile with a toolchain \
-                         that emits them)",
+                        "function symbol `{}` has zero size, no unwind entry and \
+                         nothing after it to bound it; the transpiler needs \
+                         function extents",
                         symbol.name
                     )
                 })?,
             size => size,
         };
+        if size == 0 {
+            bail!(
+                "function symbol `{}` is bounded to nothing by the symbol that \
+                 follows it",
+                symbol.name
+            );
+        }
         let end = symbol.offset + size;
         if end > sections[section].bytes.len() as u64 {
             bail!(
@@ -635,6 +655,49 @@ fn collect_functions(
     functions.extend(discovered);
     functions.sort_by_key(|function| (function.section, function.offset));
     Ok(functions)
+}
+
+/// Every offset something begins at, per text section, sorted.
+///
+/// Only *defined* symbols with a place, since an undefined one bounds
+/// nothing. A section symbol is skipped: it sits at offset zero and would
+/// bound the first function to nothing.
+fn symbol_boundaries(
+    symbols: &[Symbol],
+    sections: &[Section],
+) -> std::collections::HashMap<usize, Vec<u64>> {
+    let mut boundaries: std::collections::HashMap<usize, Vec<u64>> =
+        std::collections::HashMap::new();
+    for symbol in symbols {
+        let Some(section) = symbol.section else {
+            continue;
+        };
+        if !symbol.defined
+            || symbol.role == SymbolRole::Section
+            || sections[section].role != SectionRole::Text
+        {
+            continue;
+        }
+        boundaries.entry(section).or_default().push(symbol.offset);
+    }
+    for (section, offsets) in &mut boundaries {
+        // The section's own end bounds the last function in it.
+        offsets.push(sections[*section].bytes.len() as u64);
+        offsets.sort_unstable();
+        offsets.dedup();
+    }
+    boundaries
+}
+
+/// The first offset strictly after `offset` in the same section.
+fn next_boundary(
+    boundaries: &std::collections::HashMap<usize, Vec<u64>>,
+    section: usize,
+    offset: u64,
+) -> Option<u64> {
+    let offsets = boundaries.get(&section)?;
+    let index = offsets.partition_point(|candidate| *candidate <= offset);
+    offsets.get(index).copied()
 }
 
 /// Which section holds a virtual address, and where in it.
