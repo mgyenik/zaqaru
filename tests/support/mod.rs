@@ -1076,6 +1076,22 @@ pub fn link_container_with_image(
     image: &[u8],
     label: &str,
 ) -> PathBuf {
+    link_container_for_program(workspace, guests, image, label, None)
+}
+
+/// The same, for a container carrying a program that has to be *loaded*.
+///
+/// `program_top` is the highest address the linked guest's segments reach.
+/// Passing it moves the module's own data above that, which is the only
+/// thing that keeps the image blob, the allocator and the arenas out of the
+/// addresses the program must occupy — see [`baker::layout`].
+pub fn link_container_for_program(
+    workspace: &WorkingDirectory,
+    guests: &[PathBuf],
+    image: &[u8],
+    label: &str,
+    program_top: Option<u64>,
+) -> PathBuf {
     let seam = workspace.write(&format!("seam.{label}.wasm.o"), seam_object());
     let image = workspace.write(&format!("image.{label}.wasm.o"), image);
     let mut objects: Vec<PathBuf> = guests.to_vec();
@@ -1086,16 +1102,15 @@ pub fn link_container_with_image(
     // `--export-table` is not decoration: the host embedder needs the
     // indirect function table to install a continuation's slot, which is how
     // a thread is started from outside the module.
-    link_wasm(
-        &objects,
-        &linked,
-        &[
-            "--fatal-warnings",
-            "--export=cabi_realloc",
-            "--export-table",
-            "--growable-table",
-        ],
-    );
+    let reservation = baker::layout::link_arguments(program_top);
+    let mut arguments = vec![
+        "--fatal-warnings",
+        "--export=cabi_realloc",
+        "--export-table",
+        "--growable-table",
+    ];
+    arguments.extend(reservation.iter().map(String::as_str));
+    link_wasm(&objects, &linked, &arguments);
     linked
 }
 

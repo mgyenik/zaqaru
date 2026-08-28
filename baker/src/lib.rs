@@ -19,6 +19,7 @@
 
 pub mod json;
 pub mod layers;
+pub mod layout;
 pub mod object;
 pub mod tar;
 pub mod tree;
