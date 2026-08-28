@@ -653,8 +653,61 @@ fn collect_functions(
         });
     }
     functions.extend(discovered);
+
+    // And the procedure linkage table, whose entries are functions that no
+    // symbol names and no unwind entry describes.
+    //
+    // A *static* executable still has one: `R_X86_64_IRELATIVE` relocations
+    // are how an ifunc is resolved, and `__libc_start_main` walks them at
+    // startup, calls each resolver, and writes the answer into the slot the
+    // stub jumps through. So `memcpy` and `strlen` are reached through the
+    // table like anything else, and without these the calls to them resolve
+    // to nothing.
+    if layout == Layout::Linked {
+        for (index, section) in sections.iter().enumerate() {
+            if !is_linkage_table(&section.name) || section.role != SectionRole::Text {
+                continue;
+            }
+            let length = section.bytes.len() as u64;
+            // The section's alignment is the linker's own statement of how
+            // long an entry is, and it is not a constant: a stub is sixteen
+            // bytes when control-flow enforcement puts an `endbr64` in front
+            // of the jump and eight when it does not. Nothing else in the
+            // file says, and an entry size guessed wrong would split the
+            // table into functions that begin in the middle of an
+            // instruction.
+            let stride = section.alignment.max(1);
+            if length % stride != 0 {
+                bail!(
+                    "{} is {length:#x} bytes, which is not a whole number of \
+                     {stride:#x}-byte entries",
+                    section.name
+                );
+            }
+            for offset in (0..length).step_by(stride as usize) {
+                functions.push(Function {
+                    name: format!("plt.{:#x}", section.address + offset),
+                    symbol: None,
+                    section: index,
+                    offset,
+                    size: stride,
+                });
+            }
+        }
+    }
+
     functions.sort_by_key(|function| (function.section, function.offset));
     Ok(functions)
+}
+
+/// The sections whose contents are linkage-table entries rather than
+/// ordinary code.
+///
+/// `.plt` is the classic one, `.iplt` holds ifunc stubs where a linker
+/// separates them, and `.plt.sec`/`.plt.got` are the forms produced with
+/// control-flow enforcement and with early binding.
+fn is_linkage_table(name: &str) -> bool {
+    matches!(name, ".plt" | ".iplt" | ".plt.sec" | ".plt.got")
 }
 
 /// Every offset something begins at, per text section, sorted.

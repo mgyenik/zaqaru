@@ -779,3 +779,72 @@ fn an_untranslatable_function_is_refused_by_default_and_trapped_on_request() {
     );
     assert!(outcome.succeeded, "did not link:\n{}", outcome.report());
 }
+
+/// The procedure linkage table's entries are functions.
+///
+/// A static executable still has one: `ifunc` is how a libc picks between
+/// implementations at startup, and static linking keeps the mechanism —
+/// an `R_X86_64_IRELATIVE` relocation and a stub that jumps through a slot
+/// the startup code fills in. The stubs carry no symbols and no unwind
+/// entries, so nothing else in discovery finds them, and a call to one
+/// resolves to nothing.
+#[test]
+fn the_linkage_tables_entries_are_functions() {
+    let workspace = WorkingDirectory::new("linked-plt");
+    let path = support::link_corpus_executable_with(
+        &workspace,
+        "ifunc.c",
+        "through_the_table",
+        "-O1",
+        support::Unwind::Omitted,
+        support::CodeModel::Absolute,
+    );
+    let bytes = std::fs::read(&path).expect("read");
+    let object = ObjectFile::parse(&bytes).expect("parse");
+
+    // The premise: the fixture really does produce a linkage table.
+    let (index, plt) = object
+        .sections
+        .iter()
+        .enumerate()
+        .find(|(_, section)| section.name == ".plt")
+        .expect("the fixture no longer produces a `.plt`");
+    assert!(!plt.bytes.is_empty(), "an empty linkage table");
+
+    // One function per entry, each named after where it is, and none of
+    // them named by a symbol — which is why they needed finding.
+    let entries: Vec<_> = object
+        .functions
+        .iter()
+        .filter(|function| function.section == index)
+        .collect();
+    // The entry size is the section's alignment, which is eight here and
+    // sixteen where control-flow enforcement puts an `endbr64` in front of
+    // the jump — so it is read rather than assumed.
+    let stride = plt.alignment;
+    assert!(
+        stride == 8 || stride == 16,
+        "a linkage table with a {stride}-byte stride, which is neither form"
+    );
+    assert_eq!(
+        entries.len() as u64,
+        plt.bytes.len() as u64 / stride,
+        "the table did not divide into one function per entry"
+    );
+    for entry in &entries {
+        assert!(entry.symbol.is_none(), "a stub the symbol table named");
+        assert_eq!(entry.size, stride);
+    }
+
+    // And the call through the stub resolves: the jump lands on a function
+    // the translator knows, which is what was failing.
+    assert!(
+        object
+            .function_at(plt.address)
+            .is_some_and(|index| object.functions[index].name.starts_with("plt.")),
+        "the table's first entry is not a function"
+    );
+    zaqaru::transpile::Transpiler::new(&object)
+        .transpile()
+        .expect("translating a program that calls through its linkage table");
+}

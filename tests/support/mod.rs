@@ -607,6 +607,18 @@ pub fn corpus_signatures(name: &str) -> zaqaru::abi::SignatureTable {
 }
 
 /// Every source in the corpus directory, in a stable order.
+/// Corpus sources that exist *to be* untranslatable, and are therefore not
+/// part of the breadth sweep.
+///
+/// A translation policy that gives an untranslatable function a trapping
+/// body needs something untranslatable to give one to, and `hlt` is a
+/// privileged instruction nothing a container runs will ever legitimately
+/// execute — which makes it a stable stand-in for whatever the gap list
+/// holds this week. The sweep asks "is there anything in the corpus the
+/// transpiler refuses", and for these two the answer is yes on purpose.
+pub const DELIBERATELY_UNTRANSLATABLE: [&str; 2] =
+    ["untranslatable.s", "calls_untranslatable.s"];
+
 pub fn corpus_sources() -> Vec<String> {
     let directory = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
@@ -616,6 +628,7 @@ pub fn corpus_sources() -> Vec<String> {
         .map(|entry| entry.expect("corpus directory entry").file_name())
         .map(|name| name.to_string_lossy().into_owned())
         .filter(|name| name.ends_with(".c") || is_assembly(name))
+        .filter(|name| !DELIBERATELY_UNTRANSLATABLE.contains(&name.as_str()))
         .collect();
     names.sort();
     names

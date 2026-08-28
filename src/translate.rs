@@ -797,8 +797,13 @@ impl<'a> FunctionTranslator<'a> {
                         // the guest sees is that offset in the section the
                         // loader put somewhere. Linear memory is the address
                         // space, so the sum is the number the guest needs.
-                        let address = self.symbols.section_address(self.section)
-                            + instruction.memory_displacement64();
+                        // Wrapping for the same reason a backwards call
+                        // wraps: an operand below its own section's start
+                        // is a negative offset already wrapped.
+                        let address = self
+                            .symbols
+                            .section_address(self.section)
+                            .wrapping_add(instruction.memory_displacement64());
                         body.i64_const(address as i64);
                         if have_term {
                             body.i64_add();
@@ -1219,9 +1224,18 @@ impl<'a> FunctionTranslator<'a> {
             // and the offset is then relative to a section the callee is not
             // in. Adding the section's own address makes it an address,
             // which is a thing the whole program shares.
+            //
+            // Wrapping, because a target below its own section's start is a
+            // negative offset, which as an unsigned value has already
+            // wrapped — and adding the base is what wraps it back. Calling
+            // into the linkage table does exactly this: `.plt` sits below
+            // `.text`, so every call to a stub is a backwards reach.
             return Ok(CallTarget::Direct(if self.symbols.linked() {
-                self.symbols
-                    .function_at_address(self.symbols.section_address(self.section) + target)?
+                self.symbols.function_at_address(
+                    self.symbols
+                        .section_address(self.section)
+                        .wrapping_add(target),
+                )?
             } else {
                 self.symbols.function_at(self.section, target)?
             }));

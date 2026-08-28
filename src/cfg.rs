@@ -185,6 +185,14 @@ impl ControlFlowGraph {
             index_of_start,
         };
 
+        // Blocks nothing reaches are not code. Padding decodes into
+        // instructions like any other bytes, and a linkage-table stub is
+        // exactly that shape — a jump through a slot, then two bytes of
+        // `nop` to fill the entry out to its stride. Keeping the padding
+        // would ask where control goes after it, and the honest answer is
+        // that control never got there.
+        let graph = graph.without_unreachable_blocks();
+
         // Every internal transfer must land on a block boundary; anything
         // else means the leader scan missed a target.
         for index in 0..graph.blocks.len() {
@@ -211,6 +219,41 @@ impl ControlFlowGraph {
         }
 
         Ok(graph)
+    }
+
+    /// The same graph with everything the entry cannot reach removed.
+    ///
+    /// Done before the transfers are checked, so a target inside a dropped
+    /// block is still an error: an unreachable block that something jumps to
+    /// is a contradiction, and it would mean the leader scan was wrong
+    /// rather than that the bytes were padding.
+    fn without_unreachable_blocks(self) -> Self {
+        let mut reachable = std::vec![false; self.blocks.len()];
+        let mut pending = std::vec![0usize];
+        while let Some(index) = pending.pop() {
+            if std::mem::replace(&mut reachable[index], true) {
+                continue;
+            }
+            pending.extend(self.successors(index));
+        }
+        if reachable.iter().all(|reached| *reached) {
+            return self;
+        }
+        let blocks: Vec<BasicBlock> = self
+            .blocks
+            .into_iter()
+            .zip(&reachable)
+            .filter_map(|(block, keep)| keep.then_some(block))
+            .collect();
+        let index_of_start = blocks
+            .iter()
+            .enumerate()
+            .map(|(index, block)| (block.start, index))
+            .collect();
+        Self {
+            blocks,
+            index_of_start,
+        }
     }
 }
 
