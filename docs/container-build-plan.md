@@ -1616,3 +1616,74 @@ And one obligation the design had named that nothing was meeting: the
 catch has to restore the shadow-stack pointer, because the seam's own
 restore never runs for a syscall that leaves. Harmless at M6, which
 throws once; it would have bitten M7 on the second thread.
+
+## Appendix — x87: soft emulation (appended 2026-08-28)
+
+The design lives in container-plan.md's "x87 and MMX" subsystem
+section; this is the build sequence. It sits inside M6's grind — `fld`
+and friends are in the refusal tail of the static binaries the grind
+runs on — but it is scoped to the full instruction set, because the
+target is any binary; the grind decides order, not scope.
+
+**The deliverable is the `x87/` workspace crate** plus, in a second
+step, the translator lowering (`src/translate/x87.rs`, mirroring
+`vector.rs`'s outcome shape) and the symbol plumbing beside
+`syscall_entry`. Crate layout:
+
+- `f80.rs` — the representation, packing, classification.
+- `arith.rs` — extF80 add/sub/mul/div/sqrt, `fprem`/`fprem1` with the
+  partial-result protocol, round-to-int; RC and PC honored, C1 =
+  rounded-up, sticky exception flags returned.
+- `convert.rs` — f32/f64/i16/i32/i64, both directions.
+- `compare.rs` — `fcom`/`fucom` families, `fxam`, `ftst`.
+- `state.rs` — `X87State`: TOP, tags, FSW/FCW, stack faults with
+  masked responses, the env and fnsave images.
+- `ops.rs` — instruction-level semantics on `X87State`; what the
+  helpers call.
+- `transcendental.rs` — `fscale`/`fxtract` exact; `f2xm1`/`fyl2x`/
+  `fyl2xp1`/`fpatan` f64-backed v1 (via the `libm` crate — pure-Rust
+  musl algorithms; wasm32-unknown-unknown has no libm to link).
+- `ffi.rs` — wasm32-only: the static state and the `x87_*` symbols,
+  including `x87_save`/`x87_load`/`x87_image_size`/`x87_reset`.
+- The tier table, in-crate: per op, bit-exact / correctly-rounded /
+  f64-backed / not-yet — the tracker full emulation drives to done.
+
+**Testing.** Three layers, native-first like kisal's:
+
+1. Unit tests per module: exact cases, specials, the masked-response
+   matrix, env-image byte layouts.
+2. The host-FPU oracle (`x86_64` native only): property tests pushing
+   random 80-bit patterns through `asm!`-wrapped hardware instructions
+   and demanding bit-identical results and matching FSW exception
+   bits — every data-path op, all four RC values, both PC settings,
+   biased generation for denormals, zeros, infinities, NaN payloads.
+   Transcendentals compare in ulps with exact-case assertions, since
+   Intel and AMD disagree in the low bits and bit-matching is
+   incoherent. Constants (`fldpi` et al.) verify against the host in
+   every rounding mode — the internal values are more than 64 bits
+   wide and RC-sensitive, which the oracle catches for free.
+   Iteration counts sized to keep the whole oracle suite in seconds,
+   measured, per the wall-clock discipline.
+3. Corpus differentials, once the lowering exists: a `long_double.c`
+   (parse/format/arithmetic/casts/fenv shapes), an `fprem` asm corpus
+   file mirroring musl's `fmodl` loop since no compiler emits `fprem`
+   from C, and the fenv shapes the hello histogram says are live.
+
+**Order of work.** The extF80 core with the oracle first — it is the
+risk. Then state machinery, loads/stores/converts/compares; then the
+lowering and the corpus differentials; then env images; then the
+exact "transcendentals" and the f64-backed four. Gate: the x87 rows
+leave the grind's refusal tail, and a static binary doing
+`strtold`/`printf("%.21Lg")` round-trips runs differentially clean.
+
+**Named integration points, so they are not rediscovered:** M7's
+context switch calls `x87_save`/`x87_load` beside
+`x86_save_machine`/`x86_load_machine`; M10's sigframe uses
+`x87_render_fxsave`/`x87_load_fxsave`; `execve` calls `x87_reset()`.
+Later rows on the full-coverage list, ordered by evidence, none
+deniable by appeal to a workload: `ffreep` (glibc emits it) in the
+live set; `fsin`/`fcos`/`fsincos`/`fptan` at the transcendental
+target; MMX (guaranteed by x86-64 CPUID, cannot be curated away);
+`fxsave`/`fxrstor` on the sigframe render; unmasked-exception
+delivery through kisal's signal machinery, deferred-reported at
+helper entry, which is faithful because hardware defers too.

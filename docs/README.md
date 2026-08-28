@@ -18,7 +18,8 @@ Current documents:
   structfs/isotope host boundary (two ll-store imports, services under
   `/iso/`), the baked-image bundle and index format, kisal's VFS and
   resolution model, and per-subsystem designs (threads on the resume
-  machinery, futex, mmap, dynamic loading, sockets, signals).
+  machinery, futex, mmap, dynamic loading, sockets, signals, x87/MMX
+  soft emulation).
 - [container-build-plan.md](container-build-plan.md) — the implementation
   plan for the above: milestones M0–M11 from toolchain gates through
   "Flask, served", with the two integration checkpoints (hello-write,

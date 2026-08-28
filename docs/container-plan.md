@@ -1285,6 +1285,148 @@ bookkeeping around the jump needs its own design pass, so this is an
 open question, not a solved one. Not needed for the Flask target;
 needed for real-world C (libjpeg and libpng error paths).
 
+### x87 and MMX
+
+The target is any x86-64 binary, so the scope is the full x87
+instruction set — with MMX, which aliases its register file. What any
+one workload needs decides only the *order* things get built, never
+whether they do. The evidence for the order: a `gcc -static -O2` hello
+carries `fldt`, `fld`, `fxam`, `fucomi(p)`, `fnstsw`, `fnstenv`/
+`fldenv` (glibc's `feholdexcept`), `fxch`, `fnstcw`, `fabs`, `fwait` —
+fenv machinery and `__printf_fp`'s long-double classification, no
+arithmetic. musl leans much harder: `floatscan.c` and `fmt_fp` do
+their arithmetic in `long double` C, so compilers emit the whole data
+path — loads and stores at all three widths, the arithmetic family
+with their pop variants, integer converts through the `fnstcw`/`fldcw`
+truncation dance (baseline x86-64 has no `fisttp`) — and musl's
+x86-64 `expl`/`logl`/`atanl`/`fmodl` are hand-written x87 asm using
+`f2xm1`, `fyl2x`, `fyl2xp1`, `fpatan`, `fscale`, `frndint`, and
+`fprem` with the `fnstsw`-test-C2 partial-remainder loop.
+
+**Soft emulation, in a fourth body.** A workspace crate — `x87/`, Rust
+compiled to a `wasm32-unknown-unknown` staticlib like kisal — defines
+one typed helper per instruction shape, and the translator lowers each
+x87 instruction to one call, following `translate_syscall`'s pattern:
+undefined symbols the staticlib defines, signature disagreements
+caught at link. The property that makes this cheap is that **helper
+calls are intrinsics, not calls**, with respect to every existing
+discipline:
+
+- They never touch the register-file globals — the crate is Rust and
+  cannot name them, and by policy it never calls the seam accessors.
+  No flush before, no reload after; promotion is untouched.
+- They never block, never syscall, never throw. Not resume sites,
+  invisible to `--resume` and the scheduler.
+- Their effects on modelled state go through the translator's normal
+  paths: `fucomi` returns packed ZF/PF/CF for the translator to unpack
+  into its promoted flag storage; `fnstsw ax` returns the status word
+  and the translator writes AX. `fcmovcc`'s condition is evaluated
+  translator-side from the promoted flags and passed as an argument.
+
+Operands: f32/f64/integer memory operands pass **by value** — the
+translator emits the load or store with its existing addressing
+machinery, so every addressing semantic stays in one place and the
+helpers stay pure. Only the 80-bit and environment-image operands pass
+**by address**; the crate shares linear memory exactly as kisal
+already proves works.
+
+**State: zero new wasm globals.** Everything lives in one static in
+the crate's own data segment: FCW, FSW (TOP, C0–C3, sticky exception
+flags), the abridged tag byte (bit *i* = physical register *i*
+occupied, the FXSAVE convention), and eight registers stored as
+explicit-significand pairs — `{ significand: u64, sign_exponent: u16 }`,
+the hardware's own explicit-integer-bit format. TOP is **runtime
+state, deliberately**: resolving `ST(i)` at translation time is the
+classic FP-stack allocation problem and it loses here — x87 state
+crosses function boundaries (a `long double` return *is* a nonzero
+entry depth), crosses joins at different depths, and `fincstp`/`fxch`
+make depth path-dependent. Runtime indexing costs an AND on a path
+that is cold by construction.
+
+FCW is honored, not decorative: rounding control steers every
+rounding, and precision control is implemented in the arithmetic core
+(it is how extended hardware computes correctly-rounded doubles).
+Exception *flags* are recorded faithfully in FSW, including ES;
+exception *traps* are not modelled in the first version — everything
+behaves as-if-masked, and an `fldcw` that unmasks is recorded but
+arms nothing. The upgrade has a designed shape, because x87 traps are
+*deferred* on real hardware too — reported at the next x87 instruction
+or `fwait` via ES, not at the faulting one. So the check is a cheap
+test at helper entry, and delivery is SIGFPE through kisal's signal
+machinery at the existing check points; imprecise delivery is faithful
+delivery here. Real binaries do arm these (`gfortran -ffpe-trap`,
+debugging builds), so the FSW/ES bookkeeping is scrupulous from day
+one and `fwait` becomes "check ES" the moment delivery exists.
+
+`fnstenv`/`fldenv`/`fnsave`/`frstor` are in scope from the start — the
+histogram shows glibc's fenv on the live path — rendering the 28-byte
+protected-mode env image (FIP/FDP as zeros, FXSAVE-precedented,
+nothing in either libc reads them) and the 108-byte fnsave layout,
+including `fnstenv`'s side effect of masking all exceptions in the
+live FCW, which is the entire reason `feholdexcept` uses it.
+`fxsave`/`fxrstor` wait for the FXSAVE render the signal frames need
+anyway; the instruction form is a two-writer render — the crate fills
+the x87 portion, generated code fills XMM/MXCSR from the globals —
+the one place the crate and the seam cooperate on a single image.
+
+**Save, load, reset.** Fork and snapshot are free: the state is linear
+memory, so the existing memory snapshot carries it and `--resume`
+changes not at all. The crate exports `x87_save(ptr)`/`x87_load(ptr)`
+and `x87_image_size()` for M7's context switch — deliberately a
+*second* image beside `x86_save_machine`'s, because that layout is
+zaqaru-generated and this one is crate-owned, the same ownership
+argument the seam makes about `set_rsp`. `x87_reset()` is the FNINIT
+state (FCW `0x037F`, all tags empty) for `execve`; the static
+const-initializes to the same, so boot needs nothing. M10's ucontext
+fpstate gets `x87_render_fxsave`/`x87_load_fxsave`, filled genuinely
+rather than zeroed, since the real state is on hand.
+
+**Precision: true 80-bit for the data path, and why.** The registers
+hold genuine extended precision, and add/sub/mul/div/sqrt/`fprem`/
+`frndint`, the converts, and the compares are real extF80 softfloat —
+not f64-backed. Two reasons: musl's `floatscan`/`fmt_fp` were compiled
+against `LDBL_MANT_DIG == 64` and their correct rounding assumes that
+precision exists; and the project's entire testing methodology is
+bit-exact differential comparison against native runs — f64 backing
+would collapse every long-double differential into tolerance mush.
+The implementation is smaller than it sounds with `u128` on hand, and
+it has a luxury most softfloat authors lack: **the host has a real
+x87**, so the crate's native tests drive millions of random 80-bit
+patterns through `asm!`-wrapped hardware ops and demand bit-identical
+answers — every op, all four rounding modes, both precision-control
+settings, denormals, pseudo-denormals, NaN payloads.
+
+The genuinely transcendental ops (`f2xm1`, `fyl2x`, `fyl2xp1`,
+`fpatan`, and later `fsin`/`fcos`/`fsincos`/`fptan`) are the one place
+bit-exactness is not even well-defined: Intel and AMD disagree in the
+low bits, and Intel revised its own error bounds in the 2014 `fsin`
+episode — there is no "the hardware" to match. The defensible target
+is correctly-rounded-or-nearly (≤1 ulp of extended), which is better
+than hardware and just as legal; the eventual mechanism is
+double-double cores on the extF80 primitives. The first version
+computes them f64-backed with exact special cases, and the oracle
+*measures* the divergence in ulps rather than assuming it acceptable.
+Everything that merely looks transcendental but is exact — `fprem`,
+`fprem1`, `fscale`, `frndint`, `fxtract`, `fsqrt` — gets real extF80
+treatment from the start, including `fprem`'s partial-result protocol:
+C2 on incomplete reduction, quotient bits in C0/C3/C1, which is what
+`fmodl`'s loop is made of and what the trig ops reuse for |x| ≥ 2⁶³.
+
+**MMX** is part of the scope, not a courtesy: it is architecturally
+guaranteed on x86-64, so CPUID must report it — it cannot be curated
+away like AVX — and random binaries ship hand-written MMX. The
+explicit-significand register layout is what makes it cheap: `mm0..7`
+*are* the significands, an MMX write sets the exponent field to
+all-ones and the tag to valid, `emms` empties the stack — field
+access, not bit surgery. It sequences after the scalar core because
+the core is its prerequisite, not because it is optional.
+
+**The tier table is the roadmap.** Every helper carries its current
+tier — bit-exact, correctly-rounded, f64-backed, or refused — in one
+table in the crate, which the differential harness reads to choose
+bit-exact versus tolerance comparison per op. "Full emulation" is
+that table driven to done, a checklist rather than archaeology.
+
 ## Priority order
 
 Dictated by the trace, not by difficulty:
