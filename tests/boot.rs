@@ -354,3 +354,60 @@ fn calling_an_untranslated_function_names_it() {
          logged: {log}"
     );
 }
+
+/// The code around an absent weak call still runs.
+///
+/// A static link resolves a weak symbol nothing defines to address zero and
+/// emits the call anyway; the guard on a null pointer is what makes the
+/// program correct. The call can never be taken, but everything around it is
+/// ordinary code — and glibc's `__libc_start_main` is one such function, so
+/// this is the difference between a program that starts and one that does
+/// not.
+///
+/// It is checked here rather than in the differential because the property
+/// only exists in a linked program: in a relocatable object an undefined
+/// symbol is an import, and something else may yet define it.
+#[test]
+fn the_code_around_an_absent_weak_call_runs() {
+    let workspace = WorkingDirectory::new("boot-weak");
+    let elf =
+        support::link_corpus_executable(&workspace, "weak_call.s", "guarded_weak_call", "-O1");
+    let bytes = std::fs::read(&elf).expect("read");
+    let object = zaqaru::reader::ObjectFile::parse(&bytes).expect("parse");
+    let top = object
+        .segments
+        .iter()
+        .map(|segment| segment.address + segment.memory_size)
+        .max()
+        .expect("segments");
+
+    let translation = zaqaru::transpile::Transpiler::new(&object)
+        .translate()
+        .expect("translate");
+    let guest = workspace.write("weak.wasm.o", &translation.module);
+    let image = baker::object::empty().expect("an image object");
+    let module = support::link_container_for_program(
+        &workspace,
+        std::slice::from_ref(&guest),
+        &image,
+        "weak",
+        Some(top),
+    );
+    let mut container = runner::Container::instantiate(
+        &std::fs::read(&module).expect("read the container"),
+        support::m1_mounts(),
+    )
+    .expect("instantiate");
+
+    // The guard is false, so the call is skipped and the function returns
+    // its argument plus seven — every instruction after the trap included.
+    for value in [0i64, 1, -1, 12345] {
+        assert_eq!(
+            container
+                .call_guest("guarded_weak_call", [value, 0, 0, 0, 0, 0])
+                .expect("the guest trapped"),
+            value + 7,
+            "the guarded path did not run"
+        );
+    }
+}

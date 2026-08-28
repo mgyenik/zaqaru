@@ -848,3 +848,44 @@ fn the_linkage_tables_entries_are_functions() {
         .transpile()
         .expect("translating a program that calls through its linkage table");
 }
+
+/// A call to a weak symbol nothing defines.
+///
+/// A static link resolves such a symbol to address zero and emits the call
+/// anyway; the code guards it on a pointer being non-null, so it is never
+/// taken. glibc does this around its locale and threading hooks, and
+/// `__libc_start_main` — the function every program starts in — is one of
+/// the functions that contains one, so refusing over it would refuse every
+/// program's entry.
+#[test]
+fn a_call_to_a_weak_symbol_that_is_absent_traps_instead_of_refusing() {
+    let workspace = WorkingDirectory::new("linked-weak");
+    let path =
+        support::link_corpus_executable(&workspace, "weak_call.s", "guarded_weak_call", "-O1");
+    let bytes = std::fs::read(&path).expect("read");
+    let object = ObjectFile::parse(&bytes).expect("parse");
+
+    // The premise: the linker really did emit a call whose target is zero.
+    let lifted = zaqaru::lifter::lift_object(&object).expect("lift");
+    let function = lifted
+        .iter()
+        .find(|function| function.name == "guarded_weak_call")
+        .expect("the fixture no longer defines it");
+    let text = object.sections[function.section].address;
+    let calls_nothing = function.instructions.iter().any(|lifted| {
+        lifted.instruction.flow_control() == iced_x86::FlowControl::Call
+            && lifted.instruction.op_kind(0) == iced_x86::OpKind::NearBranch64
+            && text.wrapping_add(lifted.instruction.near_branch64()) == 0
+    });
+    assert!(
+        calls_nothing,
+        "nothing in the fixture calls address zero, so this proves nothing"
+    );
+
+    // The function translates whole — the call becomes a trap and the
+    // instructions around it are still there.
+    let translated = zaqaru::transpile::Transpiler::new(&object)
+        .transpile()
+        .expect("translating a function that calls an absent weak symbol");
+    support::validate_wasm(&translated);
+}

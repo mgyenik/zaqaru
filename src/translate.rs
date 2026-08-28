@@ -418,6 +418,11 @@ impl<'a> FunctionTranslator<'a> {
                 body.call(target);
                 self.state.reload(body);
             }
+            // Reached only by a program whose own guard let it through, at
+            // which point a real processor faults. The instructions before
+            // it are already emitted, so what stops is this call and not the
+            // function containing it.
+            CallTarget::Absent => body.unreachable(),
             CallTarget::Indirect => {
                 // The table slot has to be read *before* the stack pointer
                 // moves: a call through a stack slot would otherwise be read
@@ -1243,15 +1248,24 @@ impl<'a> FunctionTranslator<'a> {
             // wrapped — and adding the base is what wraps it back. Calling
             // into the linkage table does exactly this: `.plt` sits below
             // `.text`, so every call to a stub is a backwards reach.
-            return Ok(CallTarget::Direct(if self.symbols.linked() {
-                self.symbols.function_at_address(
-                    self.symbols
-                        .section_address(self.section)
-                        .wrapping_add(target),
-                )?
-            } else {
-                self.symbols.function_at(self.section, target)?
-            }));
+            if !self.symbols.linked() {
+                return Ok(CallTarget::Direct(
+                    self.symbols.function_at(self.section, target)?,
+                ));
+            }
+            let address = self
+                .symbols
+                .section_address(self.section)
+                .wrapping_add(target);
+            // A weak symbol nothing defines resolves to zero, and the code
+            // around such a call guards it on the pointer being non-null.
+            // There is no function there to name.
+            if address == 0 {
+                return Ok(CallTarget::Absent);
+            }
+            return Ok(CallTarget::Direct(
+                self.symbols.function_at_address(address)?,
+            ));
         }
 
         // Anything else computes its target: a function pointer, which is a
@@ -2812,6 +2826,15 @@ impl<'a> FunctionTranslator<'a> {
 enum CallTarget {
     Direct(FunctionReference),
     Indirect,
+    /// A call to address zero, which is a call to nothing.
+    ///
+    /// A weak symbol that no object defines resolves to zero, and code
+    /// guards the call on the pointer being non-null — glibc does exactly
+    /// this around its locale hooks, and `__libc_start_main` is one of the
+    /// functions that contains one. The call is emitted anyway, guarded, and
+    /// never taken. Real hardware would fault on it, so trapping is the
+    /// faithful translation rather than a refusal.
+    Absent,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
