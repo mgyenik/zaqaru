@@ -285,9 +285,9 @@ fn fixture_seeded(label: &str, seed: Option<[u8; 32]>) -> Fixture {
             ..ConsoleStore::default()
         },
         Registers {
-            segment_base: 0,
             memory_limit: arena.limit(),
             ceiling: arena.limit(),
+            ..Default::default()
         },
         image,
     );
@@ -2476,9 +2476,9 @@ fn a_directory_too_deep_to_name_is_refused() {
         kernel: Kernel::new(
             ConsoleStore::default(),
             Registers {
-                segment_base: 0,
                 memory_limit: arena.limit(),
                 ceiling: arena.limit(),
+                ..Default::default()
             },
             image,
         ),
@@ -2534,9 +2534,9 @@ fn a_character_device_in_the_image_reports_as_one() {
             kernel: Kernel::new(
                 ConsoleStore::default(),
                 Registers {
-                    segment_base: 0,
                     memory_limit: arena.limit(),
                     ceiling: arena.limit(),
+                    ..Default::default()
                 },
                 image,
             ),
@@ -2706,9 +2706,9 @@ fn a_directory_whose_parent_disowns_it_is_refused() {
         kernel: Kernel::new(
             ConsoleStore::default(),
             Registers {
-                segment_base: 0,
                 memory_limit: arena.limit(),
                 ceiling: arena.limit(),
+                ..Default::default()
             },
             image,
         ),

@@ -336,6 +336,10 @@ pub struct Kernel<'a, S: Store, M: Machine> {
     pub files: crate::fd::FdTable,
     /// The counter new timestamps come from. See `Kernel::now`.
     pub clock: i64,
+    /// The status the process finished with, once something has finished.
+    /// The boot path reads it after the unwind, which is the only moment
+    /// there is anything to read.
+    pub status: Option<i32>,
     /// The guest's address space: the arenas, and the tree of what is
     /// mapped where.
     pub space: crate::space::Space,
@@ -366,6 +370,7 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             vfs: crate::vfs::Vfs::new(image),
             files: crate::fd::FdTable::with_standard_streams(),
             clock: 1,
+            status: None,
             // Carved from the top of whatever the module already occupies:
             // the linker's data, the shadow stack, and anything the
             // kernel's own allocator has taken. Everything the guest is
@@ -553,6 +558,17 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             number::GETCWD => self.getcwd(arguments),
             number::CHDIR => self.chdir(arguments),
             number::FCHDIR => self.fchdir(arguments),
+
+            // Both leave, and for a single-threaded process they leave the
+            // same way: `exit` ends the only thread there is, which ends
+            // the process. Once there are threads they part company —
+            // `exit` will end one and `exit_group` all of them — and the
+            // difference belongs there, not in a status code.
+            number::EXIT | number::EXIT_GROUP => {
+                // Linux takes the low byte, which is what `wait` reports and
+                // what a shell prints.
+                Outcome::Exit((arguments.get(0) & 0xff) as i32)
+            }
 
             _ => Outcome::Fault(Fault::of(number, arguments)),
         }

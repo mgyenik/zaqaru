@@ -471,6 +471,24 @@ fn the_machine_image_layout_is_what_the_model_says() {
     );
 }
 
+/// The one number the kernel and the generated seam both have to know.
+///
+/// The kernel cannot depend on the generator — it is the thing that runs
+/// inside the module — so the sentinel that means "this thread is leaving"
+/// is written on both sides. Everywhere else a disagreement between the two
+/// is a link error, because it is a signature; here it would be silent, and
+/// the failure would be a syscall result the seam mistook for an exit. So it
+/// is a test instead.
+#[test]
+fn the_leave_sentinel_agrees_across_the_seam() {
+    assert_eq!(
+        zaqaru::seam::LEAVE,
+        kisal::LEAVE,
+        "the seam would throw on a value the kernel never sends, or miss the \
+         one it does"
+    );
+}
+
 #[test]
 fn the_machine_image_round_trips() {
     let workspace = WorkingDirectory::new("m1-image");

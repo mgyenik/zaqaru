@@ -31,3 +31,11 @@ pub const RANDOM_SEED: &[&[u8]] = &[b"iso", b"random", b"bytes", b"32"];
 /// own output and the kernel's complaints about it must never be interleaved
 /// into one stream that nobody can separate afterwards.
 pub const LOG_ERROR: &[&[u8]] = &[b"iso", b"log", b"error"];
+
+/// Where the exit status goes when the process is finished.
+///
+/// A path rather than a return value because the host reaches the container
+/// through the store and nothing else. The payload is the status; writing it
+/// is the last thing the kernel does, and the run loop returns to the host
+/// immediately after.
+pub const SHUTDOWN_COMPLETE: &[&[u8]] = &[b"iso", b"shutdown", b"complete"];

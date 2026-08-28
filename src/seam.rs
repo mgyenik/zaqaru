@@ -65,6 +65,21 @@ pub const YIELD_TAG: &str = "x86_yield";
 /// block, and the generated seam is what turns that return into a throw.
 pub const YIELD_THROW: &str = "kisal_yield";
 
+/// What the kernel returns instead of a syscall result to say the thread
+/// must *leave* rather than resume — blocked, or finished.
+///
+/// The kernel cannot throw. Wasm exceptions unwind wasm frames without
+/// running Rust's drops, so a throw raised inside a kisal frame would leak
+/// whatever that frame owned; the rule is that the kernel returns its
+/// decision and the seam turns the decision into the throw. This is that
+/// decision, and it is a return value rather than a second call because the
+/// check costs one comparison on a path every syscall takes.
+///
+/// It is safe as a sentinel because the kernel is the only thing that
+/// produces syscall results, and it never produces this one for a call that
+/// completed — asserted on the kernel's side, where the two meet.
+pub const LEAVE: i64 = 0x7a61_7161_7275_0001u64 as i64;
+
 /// The scheduler's catch: runs one guest continuation to completion or to
 /// its next yield.
 pub const RUN_THREAD: &str = "x86_run_thread";
@@ -319,12 +334,8 @@ pub fn build_seam_object() -> Result<Vec<u8>> {
         }
     };
 
-    define(
-        &mut wasm,
-        SYSCALL_ENTRY,
-        guest_type,
-        build_syscall_entry(&machine, dispatch, stack_top, guard_base),
-    );
+    // The throw is defined before the entry that calls it, because a
+    // reference to it is what the entry is built from.
     let yield_throw = define(
         &mut wasm,
         YIELD_THROW,
@@ -333,9 +344,15 @@ pub fn build_seam_object() -> Result<Vec<u8>> {
     );
     define(
         &mut wasm,
+        SYSCALL_ENTRY,
+        guest_type,
+        build_syscall_entry(&machine, dispatch, yield_throw, stack_top, guard_base),
+    );
+    define(
+        &mut wasm,
         RUN_THREAD,
         run_thread_type,
-        build_run_thread(yield_tag, guest_type, guard_base),
+        build_run_thread(&machine, yield_tag, guest_type, guard_base),
     );
     let mut body = FunctionBodyBuilder::new(0);
     body.global_get(machine.segment_base());
@@ -414,6 +431,7 @@ pub fn build_seam_object() -> Result<Vec<u8>> {
 fn build_syscall_entry(
     machine: &MachineState,
     dispatch: FunctionReference,
+    yield_throw: FunctionReference,
     stack_top: DataReference,
     guard_base: DataReference,
 ) -> FunctionBody {
@@ -438,6 +456,17 @@ fn build_syscall_entry(
         body.global_get(machine.register(number));
     }
     body.call(dispatch);
+    // Leaving is decided by the kernel and performed here: the throw exists
+    // in one place, and the kernel's frames are gone by the time anything
+    // unwinds through them.
+    let result = body.declare_local(ValueType::I64);
+    body.local_tee(result);
+    body.i64_const(LEAVE);
+    body.i64_eq();
+    body.if_();
+    body.call(yield_throw);
+    body.end();
+    body.local_get(result);
     body.global_set(machine.register(SYSCALL_NUMBER_REGISTER));
 
     for number in SYSCALL_CLOBBERED_REGISTERS {
@@ -483,8 +512,24 @@ fn build_yield_throw(tag: TagReference) -> FunctionBody {
 /// A slot rather than a fixed callee, because the two ways a thread starts
 /// running are different functions: a fresh thread enters its ELF entry
 /// directly, and a suspended one enters the resume driver.
-fn build_run_thread(tag: TagReference, guest_type: u32, guard_base: DataReference) -> FunctionBody {
+fn build_run_thread(
+    machine: &MachineState,
+    tag: TagReference,
+    guest_type: u32,
+    guard_base: DataReference,
+) -> FunctionBody {
     let mut body = FunctionBodyBuilder::new(1);
+    // The seam moves the shadow-stack pointer to the kernel's own region
+    // and puts it back when the syscall returns — and a syscall that leaves
+    // never returns, so that restore never runs. This is the only frame
+    // still standing that knows what it was, so it is what puts it back.
+    // Without this, every leave would strand the pointer inside the kernel's
+    // fixed region and the next thing to use a shadow stack would write over
+    // the kernel's frames.
+    let saved_stack_pointer = body.declare_local(ValueType::I32);
+    body.global_get(machine.linker_stack_pointer);
+    body.local_set(saved_stack_pointer);
+
     // Planted here as well as in the seam, so the guard is filled before any
     // guest code runs at all. Without it the catch below would be checking
     // a region nothing had written the sentinel into, and a thread that
@@ -499,6 +544,8 @@ fn build_run_thread(tag: TagReference, guest_type: u32, guard_base: DataReferenc
     body.return_();
     body.end(); // try_table
     body.end(); // block
+    body.local_get(saved_stack_pointer);
+    body.global_set(machine.linker_stack_pointer);
     // A yielding syscall leaves through the throw, so the seam's own check
     // never runs for it. The unwind lands here, and this is the first place
     // that can still see the guard the kernel was running above.

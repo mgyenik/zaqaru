@@ -118,11 +118,11 @@ fn fixture(label: &str) -> Fixture {
     let mut kernel = Kernel::new(
         Silent,
         Registers {
-            segment_base: 0,
             // The guest can reach the scratch area at first; the arenas
             // above it become reachable as the kernel grows into them.
             memory_limit: arena_start,
             ceiling: memory.end(),
+            ..Default::default()
         },
         image,
     );

@@ -118,19 +118,22 @@ pub unsafe extern "C" fn kisal_syscall(
                 report(kernel, &message);
                 Err(message)
             }
-            // Neither is reachable until M6 and M7 build the paths that
-            // produce them. They are refused loudly rather than silently
-            // mishandled, because a wrong answer here would be a corrupted
-            // guest.
+            // Not reachable until M7 builds the scheduler: with one
+            // thread there is nothing to switch to, so a wait that could
+            // not be satisfied would be a hang rather than a block.
             Outcome::Blocked => {
                 let message = "kisal: a syscall blocked before the scheduler exists";
                 report(kernel, message);
                 Err(message.to_string())
             }
-            Outcome::Exit(_) => {
-                let message = "kisal: a syscall exited before the boot path exists";
-                report(kernel, message);
-                Err(message.to_string())
+            // The process is finished. The kernel cannot throw — an
+            // exception unwinds wasm frames without running Rust's drops —
+            // so it records the status and hands back the sentinel that
+            // tells the seam to throw on its behalf. `boot` is what catches
+            // it.
+            Outcome::Exit(status) => {
+                kernel.status = Some(status);
+                Ok(LEAVE)
             }
         }
     });
@@ -143,10 +146,121 @@ pub unsafe extern "C" fn kisal_syscall(
     }
 }
 
+/// What a completed syscall must never return, because it is what the seam
+/// reads as "this thread is leaving".
+///
+/// Stated here as well as in the generator, which is where the seam's own
+/// copy lives; `the_leave_sentinel_agrees_across_the_seam` is what keeps the
+/// two the same number. The kernel is the only producer of syscall results,
+/// so the sentinel is unambiguous as long as no completed call returns it —
+/// which is asserted below rather than assumed.
+pub const LEAVE: i64 = 0x7a61_7161_7275_0001u64 as i64;
+
 /// Sends a kernel complaint to `/iso/log/error`.
 ///
 /// Best-effort by design: if the log mount is unavailable there is nothing
 /// useful to do about it, and the panic that follows is the loud part.
 fn report(kernel: &mut Kernel<'_, HostStore, GuestMachine>, message: &str) {
     let _ = kernel.store.write(paths::LOG_ERROR, message.as_bytes());
+}
+
+/// The generated seam, as the kernel names it.
+///
+/// Both are defined inside the same link, so a signature disagreement is a
+/// link error. `x86_run_thread` is the scheduler's catch, used here for the
+/// same reason it exists there: starting a process and scheduling a thread
+/// are the same act, and both need somewhere for the unwind to land.
+#[cfg(target_arch = "wasm32")]
+unsafe extern "C" {
+    #[link_name = "x86_slot_of"]
+    fn slot_of(address: i64) -> i32;
+    #[link_name = "x86_run_thread"]
+    fn run_thread(slot: i32) -> i32;
+}
+
+/// Boots the container: loads the program, runs it, and reports how it went.
+///
+/// The host calls this and nothing else. Everything between is inside the
+/// module — the program's bytes come from the image the module carries, the
+/// segments are copied within linear memory, and the only thing that crosses
+/// the boundary is the exit status, on its way out through
+/// `/iso/shutdown/complete`.
+///
+/// # Safety
+/// Called once, by the host, before any guest code has run.
+#[cfg(target_arch = "wasm32")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kisal_boot() -> i32 {
+    let program = with_kernel(|kernel| {
+        // Neither is configurable yet: M6 runs one program with a fixed
+        // invocation, and where the arguments come from is the baker's
+        // question rather than the kernel's.
+        kernel.exec(b"/init", &[b"/init"], &[]).map_err(|error| {
+            let mut message = String::new();
+            error.message(&mut message);
+            report(kernel, &message);
+            message
+        })
+    });
+    let entry = match program {
+        Ok(entry) => entry,
+        Err(message) => panic!("{message}"),
+    };
+
+    // SAFETY: the address is a translated function's, because the loader
+    // read it out of the same ELF the translator did.
+    let left = unsafe { run_thread(slot_of(entry as i64)) };
+
+    with_kernel(|kernel| {
+        let status = match (left, kernel.status) {
+            // It threw, and the kernel recorded why: the process exited.
+            (1, Some(status)) => status,
+            // It threw with nothing recorded, which is the scheduler's
+            // block arriving before there is a scheduler to catch it.
+            (1, None) => {
+                let message = "kisal: the guest left without exiting, and there is no \
+                               scheduler to have parked it";
+                report(kernel, message);
+                panic!("{message}");
+            }
+            // It returned. A program leaves through `exit_group`; running
+            // off the end of `_start` means the entry point returned to a
+            // caller that does not exist.
+            (_, _) => {
+                let message = "kisal: the guest returned from its entry point instead of \
+                               exiting";
+                report(kernel, message);
+                panic!("{message}");
+            }
+        };
+        let mut payload = String::new();
+        push_status(&mut payload, status);
+        let _ = kernel
+            .store
+            .write(paths::SHUTDOWN_COMPLETE, payload.as_bytes());
+        status
+    })
+}
+
+/// The exit status as the payload carries it: decimal, and nothing else.
+#[cfg(target_arch = "wasm32")]
+fn push_status(into: &mut String, status: i32) {
+    if status == 0 {
+        into.push('0');
+        return;
+    }
+    let mut digits = [0u8; 12];
+    let mut length = 0;
+    let mut value = status.unsigned_abs();
+    while value != 0 {
+        digits[length] = b'0' + (value % 10) as u8;
+        length += 1;
+        value /= 10;
+    }
+    if status < 0 {
+        into.push('-');
+    }
+    for index in (0..length).rev() {
+        into.push(digits[index] as char);
+    }
 }

@@ -473,10 +473,11 @@ fn a_stripped_executable_still_has_functions() {
 /// The boot path's way in.
 ///
 /// Every function in a linked program is local — nothing outside can name
-/// one — so the module has to define exactly one thing a caller can name,
-/// which takes the entry point's address and runs the program. Without it a
-/// linked module is a program nothing can start. The check is the real
-/// shape: a separate object with an undefined reference to it, linked.
+/// one — so the address the ELF header states is all the boot path has to
+/// go on, and the exec map is the only thing that turns one into a slot it
+/// can enter through. It therefore has to be nameable across the link, and
+/// this is the real shape of that: a separate object with an undefined
+/// reference to it.
 #[test]
 fn a_linked_module_can_be_entered_from_outside() {
     let workspace = WorkingDirectory::new("linked-entry");
@@ -496,23 +497,35 @@ fn a_linked_module_can_be_entered_from_outside() {
         &workspace,
         "boot",
         &format!(
-            "void {entry}(long long address);\n\
+            "int {slot_of}(long long address);\n\
+             int x86_run_thread(int slot);\n\
+             /* The seam calls into the kernel; this stands in for one. */\n\
+             long long kisal_syscall(long long n, long long a, long long b,\n\
+                                     long long c, long long d, long long e,\n\
+                                     long long f) {{\n\
+               (void)n; (void)a; (void)b; (void)c; (void)d; (void)e; (void)f;\n\
+               return 0;\n\
+             }}\n\
              __attribute__((export_name(\"start\")))\n\
-             void start(long long address) {{ {entry}(address); }}\n",
-            entry = zaqaru::transpile::GUEST_ENTRY
+             int start(long long address) {{ return x86_run_thread({slot_of}(address)); }}\n",
+            slot_of = zaqaru::transpile::EXEC_MAP_LOOKUP
         ),
     );
 
+    // The seam carries `x86_run_thread`, which is the catch the boot path
+    // enters through — the same one the scheduler uses, because starting a
+    // process and scheduling a thread are the same act.
+    let seam = workspace.write("seam.wasm.o", support::seam_object());
     let module_path = workspace.path().join("entry.wasm");
     let outcome = support::try_link_wasm(
-        &[object_path, caller],
+        &[object_path, caller, seam],
         &module_path,
         &["--fatal-warnings", "--export-table", "--growable-table"],
     );
     assert!(
         outcome.succeeded,
         "a caller of `{}` did not link:\n{}",
-        zaqaru::transpile::GUEST_ENTRY,
+        zaqaru::transpile::EXEC_MAP_LOOKUP,
         outcome.report()
     );
     support::validate_wasm(&std::fs::read(&module_path).expect("read"));
