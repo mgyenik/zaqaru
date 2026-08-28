@@ -61,6 +61,43 @@ pub trait SymbolResolver {
     /// same section itself, so taking its address leaves no relocation to
     /// read — only a displacement from the program counter.
     fn table_slot_at(&self, section: usize, offset: u64) -> Result<TableReference>;
+    /// Whether the input is a linked executable rather than a relocatable
+    /// object.
+    ///
+    /// The two answer the same question from different evidence. A
+    /// relocatable object has no addresses, so every reference is a
+    /// relocation naming a symbol; a linked executable has already been
+    /// placed, so a reference *is* the address it means. Nothing has to be
+    /// symbolised in linked mode — the loader puts each segment at its own
+    /// virtual address, and linear memory is the address space, so a number
+    /// in the code is already the number the guest needs.
+    fn linked(&self) -> bool {
+        false
+    }
+
+    /// The virtual address a section was placed at, or zero for a
+    /// relocatable object where nothing has been placed.
+    ///
+    /// The decoder runs with a section-relative program counter, so a
+    /// program-counter-relative operand resolves to a section offset. Adding
+    /// this is what turns it into the address the guest will actually see,
+    /// once the loader has put the section where it belongs.
+    fn section_address(&self, _section: usize) -> u64 {
+        0
+    }
+
+    /// The function that turns a virtual address into an indirect-table
+    /// slot, for a linked input where a function pointer is an address.
+    fn exec_map(&self) -> Result<FunctionReference> {
+        bail!("this input has no exec map")
+    }
+
+    /// The virtual address of a recovered jump table, for a linked input
+    /// where the loader places it and no symbol is needed to find it.
+    fn jump_table_at(&self, _section: usize, _offset: u64) -> Result<u64> {
+        bail!("this input has no addresses to resolve")
+    }
+
     /// The kernel-seam entry a `syscall` instruction calls.
     ///
     /// `syscall` names nothing — it has no operand at all — so there is no
@@ -280,10 +317,18 @@ impl<'a> FunctionTranslator<'a> {
         self.read_operand(body, lifted, 0, OperandWidth::QuadWord)
             .with_context(|| format!("translating `{}`", render(&lifted.instruction)))?;
         body.i32_wrap_i64();
-        let address = self
-            .symbols
-            .jump_table_address(table.table_section, table.table_offset)?;
-        body.i32_const_data_address(address);
+        if self.symbols.linked() {
+            // The table is at its virtual address, because that is where the
+            // loader puts the segment holding it and linear memory is the
+            // address space. So the subtraction is a constant rather than a
+            // symbol the linker will fill in.
+            body.i32_const(self.symbols.jump_table_at(table.table_section, table.table_offset)? as i32);
+        } else {
+            let address = self
+                .symbols
+                .jump_table_address(table.table_section, table.table_offset)?;
+            body.i32_const_data_address(address);
+        }
         body.i32_sub();
         Ok(())
     }
@@ -364,7 +409,17 @@ impl<'a> FunctionTranslator<'a> {
                 self.reserve_return_address(body, lifted)?;
                 self.state.flush_written(body);
                 body.local_get(slot);
-                body.i32_wrap_i64();
+                if self.symbols.linked() {
+                    // The value is a virtual address, because that is what a
+                    // function pointer is once a linker has placed
+                    // everything. The map turns it into the slot the table
+                    // is indexed by; an address that is not a function's
+                    // traps there rather than calling whatever occupies the
+                    // slot it would have been mistaken for.
+                    body.call(self.symbols.exec_map()?);
+                } else {
+                    body.i32_wrap_i64();
+                }
                 body.call_indirect(self.guest_type);
                 self.state.reload(body);
             }
@@ -707,6 +762,21 @@ impl<'a> FunctionTranslator<'a> {
             }
             None => {
                 if base == Register::RIP {
+                    if self.symbols.linked() {
+                        // Nothing to resolve — only to place. The
+                        // displacement is a section offset, because that is
+                        // what the decoder's program counter is; the address
+                        // the guest sees is that offset in the section the
+                        // loader put somewhere. Linear memory is the address
+                        // space, so the sum is the number the guest needs.
+                        let address = self.symbols.section_address(self.section)
+                            + instruction.memory_displacement64();
+                        body.i64_const(address as i64);
+                        if have_term {
+                            body.i64_add();
+                        }
+                        return Ok(());
+                    }
                     // No relocation, so the assembler already resolved this
                     // against something in the same section: the address of a
                     // function, which is a table slot.
@@ -1109,6 +1179,11 @@ impl<'a> FunctionTranslator<'a> {
         }
 
         if lifted.instruction.op_kind(0) == OpKind::NearBranch64 {
+            // A section offset in both shapes: the decoder runs with the
+            // instruction's offset within its section as the program
+            // counter, so a relative branch resolves to another offset in
+            // the same section — which is where the callee is, linked or
+            // not.
             return Ok(CallTarget::Direct(
                 self.symbols
                     .function_at(self.section, lifted.instruction.near_branch64())?,

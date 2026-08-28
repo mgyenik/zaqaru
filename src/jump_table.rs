@@ -46,12 +46,80 @@
 //! of a function, while a jump table's entries name blocks inside the
 //! function that dispatches through them — which always lie after the
 //! dispatch, and so are never function starts.
+//!
+//! ## A linked executable has no relocations
+//!
+//! Everything above reads a table through the relocations on its entries:
+//! they say where each entry points, how wide it is, and whether it holds a
+//! difference or an address. A linked executable has none — the linker
+//! consumed them and left the bytes — so all three facts have to come from
+//! the bytes themselves.
+//!
+//! The width and the form are *inferred*, by trying each and keeping
+//! whichever reads as a table. That sounds weak and is not, because the test
+//! each candidate entry has to pass is severe: its target must land exactly
+//! on an instruction boundary inside the dispatching function. Four
+//! arbitrary bytes almost never do. Two forms are tried — eight-byte
+//! absolute, which is what gcc emits for `-fno-pie`, and four-byte
+//! differences against the table's own address, which is what it emits for
+//! position-independent code — and the one yielding the longer run wins.
 
 use anyhow::{Result, bail};
 use iced_x86::FlowControl;
 
 use crate::lifter::LiftedFunction;
-use crate::reader::{ObjectFile, Relocation, SectionRole};
+use crate::reader::{Layout, ObjectFile, Relocation, SectionRole};
+
+/// How a table's entries are stored, for an input where nothing says.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct EntryForm {
+    stride: u64,
+    /// Whether an entry holds the difference between its target and the
+    /// table's own address rather than the target itself.
+    relative: bool,
+}
+
+/// The forms worth trying, in the order a compiler is likely to have used
+/// them. Both are real: `-fno-pie` gives whole addresses, and
+/// position-independent code gives four-byte differences, because a
+/// difference needs no relocation at load time.
+const ENTRY_FORMS: [EntryForm; 2] = [
+    EntryForm {
+        stride: 8,
+        relative: false,
+    },
+    EntryForm {
+        stride: 4,
+        relative: true,
+    },
+];
+
+/// Reads one entry of a linked table, and returns the section offset it
+/// names — or `None` if it does not name code in the dispatching function's
+/// section.
+fn read_linked_entry(
+    object: &ObjectFile,
+    section: usize,
+    table_offset: u64,
+    entry_offset: u64,
+    form: EntryForm,
+) -> Option<u64> {
+    let bytes = &object.sections[section].bytes;
+    let at = entry_offset as usize;
+    let end = at.checked_add(form.stride as usize)?;
+    if end > bytes.len() {
+        return None;
+    }
+    let address = if form.relative {
+        let value = i32::from_le_bytes(bytes[at..end].try_into().ok()?) as i64;
+        let table_address = object.sections[section].address.checked_add(table_offset)?;
+        (table_address as i64).checked_add(value)? as u64
+    } else {
+        u64::from_le_bytes(bytes[at..end].try_into().ok()?)
+    };
+    let (target_section, offset) = object.section_at(address)?;
+    (object.sections[target_section].role == SectionRole::Text).then_some(offset)
+}
 
 /// A recovered `switch`.
 #[derive(Clone, Debug)]
@@ -144,15 +212,21 @@ pub fn recover_all(object: &ObjectFile, functions: &mut [LiftedFunction]) -> Res
 /// each loads the address of its own shortly beforehand.
 fn propose(object: &ObjectFile, function: &LiftedFunction, position: usize) -> Option<Candidate> {
     for lifted in function.instructions[..=position].iter().rev() {
-        for reference in [lifted.displacement, lifted.immediate]
-            .into_iter()
-            .flatten()
-        {
-            let Some((section, table_offset)) =
-                data_location(object, reference.symbol, reference.addend)
-            else {
-                continue;
-            };
+        // A relocatable input names the table with a relocation; a linked
+        // one has the address in the instruction, because that is what the
+        // linker put there.
+        let locations: Vec<(usize, u64)> = if object.layout == Layout::Linked {
+            absolute_operands(&lifted.instruction)
+                .filter_map(|address| data_at(object, address))
+                .collect()
+        } else {
+            [lifted.displacement, lifted.immediate]
+                .into_iter()
+                .flatten()
+                .filter_map(|reference| data_location(object, reference.symbol, reference.addend))
+                .collect()
+        };
+        for (section, table_offset) in locations {
             if holds_block_addresses(object, function, section, table_offset) {
                 return Some(Candidate {
                     position,
@@ -165,6 +239,36 @@ fn propose(object: &ObjectFile, function: &LiftedFunction, position: usize) -> O
     None
 }
 
+/// The absolute addresses an instruction mentions.
+///
+/// A table's address reaches the dispatch as a displacement — `lea rax,
+/// [rip + table]` — or as an immediate in absolute code. Both are just
+/// numbers once the linker has been through, so both are offered and the
+/// entry scan decides which, if either, is a table.
+fn absolute_operands(instruction: &iced_x86::Instruction) -> impl Iterator<Item = u64> {
+    let mut addresses = Vec::new();
+    if instruction.memory_base() == iced_x86::Register::RIP
+        || instruction.memory_base() == iced_x86::Register::None
+    {
+        addresses.push(instruction.memory_displacement64());
+    }
+    for index in 0..instruction.op_count() {
+        match instruction.op_kind(index) {
+            iced_x86::OpKind::Immediate32to64
+            | iced_x86::OpKind::Immediate64
+            | iced_x86::OpKind::Immediate32 => addresses.push(instruction.immediate(index)),
+            _ => {}
+        }
+    }
+    addresses.into_iter().filter(|address| *address != 0)
+}
+
+/// The data location a virtual address names, if it is in a data section.
+fn data_at(object: &ObjectFile, address: u64) -> Option<(usize, u64)> {
+    let (section, offset) = object.section_at(address)?;
+    object.sections[section].role.is_data().then_some((section, offset))
+}
+
 /// Whether a data location begins a run of references to blocks *inside* this
 /// function — as opposed to a function pointer, which names a function's
 /// start.
@@ -174,6 +278,19 @@ fn holds_block_addresses(
     section: usize,
     offset: u64,
 ) -> bool {
+    if object.layout == Layout::Linked {
+        // Two entries in a row naming blocks inside this function, and
+        // neither of them its start: that is a dispatch table and not a
+        // function pointer, whichever form the entries turn out to be in.
+        return ENTRY_FORMS.iter().any(|form| {
+            (0..2).all(|index| {
+                read_linked_entry(object, section, offset, offset + index * form.stride, *form)
+                    .is_some_and(|target| {
+                        target != function.offset && begins_an_instruction(function, target)
+                    })
+            })
+        });
+    }
     let Some(relocation) = relocation_at(object, section, offset) else {
         return false;
     };
@@ -203,6 +320,17 @@ fn read_table(
     candidate: &Candidate,
     limit: u64,
 ) -> Option<JumpTable> {
+    if object.layout == Layout::Linked {
+        // Nothing says which form the entries are in, so each is tried and
+        // the longer run wins. A tie cannot happen in practice — an
+        // eight-byte absolute entry read as two four-byte differences gives
+        // targets that are not instruction boundaries — and if one did, the
+        // first form listed is the one a non-PIE compiler used.
+        return ENTRY_FORMS
+            .iter()
+            .filter_map(|form| read_linked_table(object, function, candidate, limit, *form))
+            .max_by_key(|table| table.targets.len());
+    }
     let first = relocation_at(object, candidate.table_section, candidate.table_offset)?;
     let stride = first.kind.width();
     let relative = first.kind.is_program_counter_relative();
@@ -243,6 +371,47 @@ fn read_table(
     })
 }
 
+/// Reads a linked table in one particular form, stopping where the entries
+/// stop looking like entries.
+fn read_linked_table(
+    object: &ObjectFile,
+    function: &LiftedFunction,
+    candidate: &Candidate,
+    limit: u64,
+    form: EntryForm,
+) -> Option<JumpTable> {
+    let mut targets = Vec::new();
+    for index in 0.. {
+        let entry_offset = candidate.table_offset + index * form.stride;
+        if entry_offset + form.stride > limit {
+            break;
+        }
+        let Some(target) = read_linked_entry(
+            object,
+            candidate.table_section,
+            candidate.table_offset,
+            entry_offset,
+            form,
+        ) else {
+            break;
+        };
+        if !begins_an_instruction(function, target) {
+            break;
+        }
+        targets.push(target);
+    }
+    // One entry is a coincidence waiting to happen when the evidence is
+    // bytes rather than a relocation: a single word that happens to land on
+    // an instruction boundary is not a dispatch table. Two in a row is.
+    (targets.len() >= 2).then(|| JumpTable {
+        targets,
+        table_section: candidate.table_section,
+        table_offset: candidate.table_offset,
+        stride: form.stride,
+        relative: form.relative,
+    })
+}
+
 /// The text offset one entry names.
 fn resolve_entry(
     object: &ObjectFile,
@@ -279,6 +448,32 @@ fn reject_unrecognised_dispatch(
     function: &LiftedFunction,
     position: usize,
 ) -> Result<()> {
+    if object.layout == Layout::Linked {
+        // The same question, asked of bytes: does anything this dispatch
+        // reads look like a table of blocks in this function? If it does and
+        // the scan still rejected it, the dispatch is one we failed to
+        // recover, and translating it as an indirect call would branch
+        // somewhere arbitrary.
+        for lifted in &function.instructions[..=position] {
+            for address in absolute_operands(&lifted.instruction) {
+                let Some((section, offset)) = data_at(object, address) else {
+                    continue;
+                };
+                if holds_block_addresses(object, function, section, offset) {
+                    bail!(
+                        "`{}` at {:#x} dispatches through what looks like a jump \
+                         table in {}, but its entries could not be read; \
+                         translating it as an indirect call would branch somewhere \
+                         arbitrary",
+                        crate::translate::render(&function.instructions[position].instruction),
+                        function.instructions[position].offset,
+                        object.sections[section].name,
+                    );
+                }
+            }
+        }
+        return Ok(());
+    }
     for lifted in &function.instructions[..=position] {
         for reference in [lifted.displacement, lifted.immediate]
             .into_iter()

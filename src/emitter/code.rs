@@ -204,6 +204,16 @@ impl FunctionBodyBuilder {
         self.opcode(0x0b);
     }
 
+    /// `br_if`: branch when the value on the stack is non-zero.
+    ///
+    /// Expressible as an `if` around a `br`, and worth having on its own
+    /// because a loop written that way reads as two nested blocks per
+    /// condition when it is one branch.
+    pub fn branch_if(&mut self, depth: u32) {
+        self.opcode(0x0d);
+        self.unsigned_immediate(depth);
+    }
+
     pub fn branch(&mut self, depth: u32) {
         self.opcode(0x0c);
         self.unsigned_immediate(depth);

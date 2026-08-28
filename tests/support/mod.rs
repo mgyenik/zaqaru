@@ -143,6 +143,44 @@ pub fn compile_corpus_object_as(
     compile_corpus_object_with(workspace, name, Compiler::Gcc, model, "-O1")
 }
 
+/// Links a corpus source into a static executable, the shape M6's front end
+/// consumes.
+///
+/// `-nostdlib -static` and an entry point of our own: what is being tested
+/// is the *front end*, and a libc would bring in thousands of functions
+/// before the first one under test. The result is a complete ELF — program
+/// headers, an entry point, absolute addresses, no relocations — which is
+/// everything that makes linked mode different, at a size a test can reason
+/// about.
+pub fn link_corpus_executable(
+    workspace: &WorkingDirectory,
+    name: &str,
+    entry: &str,
+    optimisation: &str,
+) -> PathBuf {
+    let source = corpus_source(name);
+    let output = workspace
+        .path()
+        .join(format!("{name}{optimisation}.elf").replace('/', "."));
+    let source_text = source.to_string_lossy().into_owned();
+    let output_text = output.to_string_lossy().into_owned();
+    let entry_flag = format!("-Wl,-e,{entry}");
+    let mut arguments: Vec<&str> = if is_assembly(name) {
+        Vec::new()
+    } else {
+        let mut flags = CORPUS_COMPILE_FLAGS.to_vec();
+        flags.push(optimisation);
+        flags.push(CodeModel::Absolute.flag());
+        flags
+    };
+    arguments.extend(["-static", "-nostdlib", "-nostartfiles", &entry_flag]);
+    arguments.push(&source_text);
+    arguments.push("-o");
+    arguments.push(&output_text);
+    run_tool(Compiler::Gcc.program(), &arguments);
+    output
+}
+
 pub fn compile_corpus_object_with(
     workspace: &WorkingDirectory,
     name: &str,

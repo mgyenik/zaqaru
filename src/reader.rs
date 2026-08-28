@@ -33,10 +33,48 @@ impl SectionRole {
     }
 }
 
+/// Which of the two shapes an input has.
+///
+/// The distinction runs through everything downstream. A relocatable object
+/// has no addresses and every reference is a relocation naming a symbol; a
+/// linked executable has addresses and no relocations at all, so a reference
+/// is already the number it resolves to. The translator has to answer the
+/// same question — "what does this operand point at" — from two different
+/// kinds of evidence.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Layout {
+    /// `gcc -c`: sections at address zero, relocations to resolve.
+    Relocatable,
+    /// A complete static executable: sections at their virtual addresses,
+    /// nothing left to relocate.
+    Linked,
+}
+
+/// A `PT_LOAD` segment, for the kernel that has to place one.
+///
+/// Kept alongside the sections rather than derived from them: what a loader
+/// maps is segments, and the section headers of a stripped binary may not
+/// even be there. `memory_size` past `file_size` is `.bss`, which the loader
+/// zeroes.
+#[derive(Clone, Debug)]
+pub struct Segment {
+    pub address: u64,
+    pub file_size: u64,
+    pub memory_size: u64,
+    pub bytes: Vec<u8>,
+    pub readable: bool,
+    pub writable: bool,
+    pub executable: bool,
+    pub alignment: u64,
+}
+
 #[derive(Clone, Debug)]
 pub struct Section {
     pub name: String,
     pub role: SectionRole,
+    /// The virtual address the section is loaded at. Zero for a relocatable
+    /// object, where nothing has been placed yet.
+    pub address: u64,
     /// Section contents. Empty for zero-filled sections, whose size is in
     /// `size` instead.
     pub bytes: Vec<u8>,
@@ -178,6 +216,12 @@ pub struct Function {
 }
 
 pub struct ObjectFile {
+    pub layout: Layout,
+    /// The entry point's virtual address, for a linked executable.
+    pub entry: u64,
+    /// The `PT_LOAD` segments a loader places. Empty for a relocatable
+    /// object, which is not loaded at all.
+    pub segments: Vec<Segment>,
     pub sections: Vec<Section>,
     /// Indexed by ELF symbol-table index, so relocations can refer to symbols
     /// directly. Entries the reader does not model are still present.
@@ -199,12 +243,18 @@ impl ObjectFile {
                 file.architecture()
             );
         }
-        if file.kind() != object::ObjectKind::Relocatable {
-            bail!(
-                "expected a relocatable object (`gcc -c`), found {:?}",
-                file.kind()
-            );
-        }
+        let layout = match file.kind() {
+            object::ObjectKind::Relocatable => Layout::Relocatable,
+            // A complete static executable. `Dynamic` is deliberately not
+            // here: a shared object still has relocations and a `PT_INTERP`
+            // consumer, and translating one without a loader would produce a
+            // module whose imports nothing resolves.
+            object::ObjectKind::Executable => Layout::Linked,
+            other => bail!(
+                "expected a relocatable object (`gcc -c`) or a static \
+                 executable, found {other:?}"
+            ),
+        };
 
         // ELF section indices are one-based and sparse from our point of
         // view; map them onto our dense vector.
@@ -221,6 +271,7 @@ impl ObjectFile {
             sections.push(Section {
                 name,
                 role,
+                address: section.address(),
                 bytes,
                 size: section.size(),
                 alignment: section.align().max(1),
@@ -228,15 +279,71 @@ impl ObjectFile {
             });
         }
 
-        let symbols = read_symbols(&file, &section_of_elf_index)?;
+        let mut symbols = read_symbols(&file, &section_of_elf_index)?;
         read_relocations(&file, &section_of_elf_index, &mut sections)?;
+        if layout == Layout::Linked {
+            // A symbol's address is a virtual address once something has
+            // been placed. The rest of the pipeline works in offsets within
+            // a section, so subtract the section's own address — which for a
+            // relocatable object is zero, and this is why it can be done in
+            // one place rather than at every use.
+            for symbol in &mut symbols {
+                if let Some(section) = symbol.section {
+                    symbol.offset = symbol.offset.saturating_sub(sections[section].address);
+                }
+            }
+        }
         let functions = collect_functions(&symbols, &sections)?;
+        let segments = read_segments(&file);
 
         Ok(Self {
+            layout,
+            entry: if layout == Layout::Linked {
+                file.entry()
+            } else {
+                0
+            },
+            segments,
             sections,
             symbols,
             functions,
         })
+    }
+
+    /// Which section holds a virtual address, and where in it.
+    ///
+    /// The linked-mode counterpart of [`Self::resolve`]: with no relocations
+    /// to name a symbol, an operand is already the address it means, and the
+    /// question becomes which section contains it.
+    pub fn section_at(&self, address: u64) -> Option<(usize, u64)> {
+        if self.layout != Layout::Linked {
+            return None;
+        }
+        self.sections.iter().enumerate().find_map(|(index, section)| {
+            let size = section.size.max(section.bytes.len() as u64);
+            // A section at address zero is one the loader does not place —
+            // debug info, symbol tables — and every address would fall in
+            // the first of them.
+            (section.address != 0
+                && address >= section.address
+                && address < section.address + size)
+                .then(|| (index, address - section.address))
+        })
+    }
+
+    /// The function whose extent contains a virtual address, if any.
+    pub fn function_at(&self, address: u64) -> Option<usize> {
+        let (section, offset) = self.section_at(address)?;
+        self.functions.iter().position(|function| {
+            function.section == section
+                && offset >= function.offset
+                && offset < function.offset + function.size
+        })
+    }
+
+    /// The virtual address a function starts at.
+    pub fn address_of(&self, function: &Function) -> u64 {
+        self.sections[function.section].address + function.offset
     }
 
     /// Where a symbolic reference lands: the defining section and the byte
@@ -392,6 +499,33 @@ fn read_relocations(
             .sort_by_key(|relocation| relocation.offset);
     }
     Ok(())
+}
+
+/// The `PT_LOAD` segments, in the order the program headers give them.
+fn read_segments(file: &object::read::File<'_>) -> Vec<Segment> {
+    use object::read::ObjectSegment;
+    file.segments()
+        .map(|segment| {
+            let flags: u32 = match segment.flags() {
+                object::SegmentFlags::Elf { p_flags, .. } => p_flags.0,
+                _ => 0,
+            };
+            let bytes = segment.data().unwrap_or(&[]).to_vec();
+            Segment {
+                address: segment.address(),
+                // `segment.size()` is the *memory* size; what is in the file
+                // is what `data` hands back, and the difference is `.bss` —
+                // which the loader zeroes rather than copies.
+                file_size: bytes.len() as u64,
+                memory_size: segment.size(),
+                bytes,
+                readable: flags & 4 != 0,
+                writable: flags & 2 != 0,
+                executable: flags & 1 != 0,
+                alignment: segment.align().max(1),
+            }
+        })
+        .collect()
 }
 
 fn collect_functions(symbols: &[Symbol], sections: &[Section]) -> Result<Vec<Function>> {

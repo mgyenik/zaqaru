@@ -82,6 +82,9 @@ struct SymbolTable<'a> {
     /// for functions another object defines.
     table_slots_by_location: HashMap<(usize, u64), TableReference>,
     table_slots_by_symbol: HashMap<usize, TableReference>,
+    /// The lookup that turns a virtual address into a table slot. Present
+    /// only for a linked input, which is the only one that needs it.
+    exec_map: Option<FunctionReference>,
     /// Data symbols standing for recovered jump tables, by where they begin.
     jump_tables: HashMap<(usize, u64), u32>,
     /// The imported [`SYSCALL_ENTRY`], present when the object contains a
@@ -148,6 +151,27 @@ impl SymbolResolver for SymbolTable<'_> {
                     self.object.sections[section].name
                 )
             })
+    }
+
+    fn linked(&self) -> bool {
+        self.object.layout == crate::reader::Layout::Linked
+    }
+
+    fn jump_table_at(&self, section: usize, offset: u64) -> Result<u64> {
+        Ok(self.object.sections[section].address + offset)
+    }
+
+    fn exec_map(&self) -> Result<FunctionReference> {
+        self.exec_map.ok_or_else(|| {
+            anyhow::anyhow!(
+                "an indirect call in a linked input, with no exec map to \
+                 turn the address into a table slot"
+            )
+        })
+    }
+
+    fn section_address(&self, section: usize) -> u64 {
+        self.object.sections[section].address
     }
 
     fn syscall_entry(&self) -> Result<FunctionReference> {
@@ -340,6 +364,11 @@ impl<'a> Transpiler<'a> {
     /// Translates the whole object, returning the serialized relocatable wasm
     /// object.
     pub fn transpile(&self) -> Result<Vec<u8>> {
+        Ok(self.translate()?.module)
+    }
+
+    /// The same, with the image patches a linked input needs.
+    pub fn translate(&self) -> Result<Translation> {
         let lifted_functions = lifter::lift_object(self.object)?;
         let references = self.classify_references(&lifted_functions)?;
 
@@ -356,6 +385,7 @@ impl<'a> Transpiler<'a> {
             functions_by_location: HashMap::new(),
             table_slots_by_location: HashMap::new(),
             table_slots_by_symbol: HashMap::new(),
+            exec_map: None,
             jump_tables: HashMap::new(),
             syscall_entry: None,
             segment_of_section: HashMap::new(),
@@ -383,11 +413,35 @@ impl<'a> Transpiler<'a> {
         // takes an index.
         self.declare_imported_functions(&mut wasm, &mut symbols, guest_type, &references)?;
         self.declare_data(&mut wasm, &mut symbols, &references)?;
-        let (mut plans, driver) = self.declare_functions(&mut wasm, &mut symbols)?;
+        let (mut plans, driver, exec_map) = self.declare_functions(&mut wasm, &mut symbols)?;
+        symbols.exec_map = exec_map;
 
         // Table slots have to exist before anything can refer to one, and
         // they are only known once every function has a symbol.
         self.assign_table_slots(&mut wasm, &mut symbols, &references, &mut plans);
+        // The static exec map, which only a linked input needs: a function
+        // pointer there is a virtual address, and this is what turns one
+        // into a slot.
+        let exec_map_body = exec_map.map(|_| {
+            let lookup_type = wasm.intern_type(FunctionType {
+                parameters: vec![ValueType::I64],
+                results: vec![ValueType::I32],
+            });
+            let mut entries: Vec<(u64, u32)> = symbols
+                .table_slots_by_location
+                .iter()
+                .map(|((section, offset), slot)| {
+                    (
+                        self.object.sections[*section].address + offset,
+                        slot.table_index,
+                    )
+                })
+                .collect();
+            // Sorted, because the lookup searches in halves.
+            entries.sort_unstable();
+            let table = build_exec_map_table(&mut wasm, &entries);
+            (lookup_type, build_exec_map_lookup(table, entries.len() as u32))
+        });
         wasm.uses_function_table = references.calls_indirectly || !wasm.table_functions.is_empty();
         self.rewrite_jump_tables(&mut wasm, &mut symbols, &references)?;
         self.translate_data_relocations(&mut wasm, &symbols, &references)?;
@@ -460,6 +514,10 @@ impl<'a> Transpiler<'a> {
             ));
         }
 
+        if let (Some(reference), Some((lookup_type, body))) = (exec_map, exec_map_body) {
+            bodies.push((reference.function_index, lookup_type, body));
+        }
+
         bodies.sort_by_key(|(index, _, _)| *index);
         for (index, type_index, body) in bodies {
             debug_assert_eq!(index, wasm.next_defined_function_index());
@@ -467,7 +525,41 @@ impl<'a> Transpiler<'a> {
                 .push(DefinedFunction { type_index, body });
         }
 
-        Ok(wasm.serialize())
+        Ok(Translation {
+            module: wasm.serialize(),
+            patches: self.image_patches(&references),
+        })
+    }
+
+    /// The jump-table rewrites a linked image needs, as bytes at addresses.
+    ///
+    /// Every entry is made to hold the same thing the relocatable path makes
+    /// it hold: its own arm number for a table of differences, and the
+    /// table's address plus that number for a table of addresses. Either way
+    /// the dispatch arrives at `table + arm`, which is what the `br_table`
+    /// subtracts the table's address back out of.
+    fn image_patches(&self, references: &TextReferences) -> Vec<Patch> {
+        if self.object.layout != crate::reader::Layout::Linked {
+            return Vec::new();
+        }
+        let mut patches = Vec::new();
+        for table in &references.tables {
+            let table_address =
+                self.object.sections[table.table_section].address + table.table_offset;
+            for (arm, (_, entry_offset)) in table.entries().enumerate() {
+                let value = if table.relative {
+                    arm as u64
+                } else {
+                    table_address + arm as u64
+                };
+                let width = table.stride as usize;
+                patches.push(Patch {
+                    address: self.object.sections[table.table_section].address + entry_offset,
+                    bytes: value.to_le_bytes()[..width].to_vec(),
+                });
+            }
+        }
+        patches
     }
 
     /// Works out what every relocation in the object means.
@@ -640,7 +732,21 @@ impl<'a> Transpiler<'a> {
             slot
         };
 
-        for location in &references.addressed_locations {
+        // In a linked executable there are no relocations, so nothing says
+        // which functions have their address taken — every one of them
+        // might, and the evidence that would narrow it was consumed by the
+        // linker. So all of them get a slot, and the exec map below is how
+        // an address finds one.
+        let addressed: Vec<(usize, u64)> = if self.object.layout == crate::reader::Layout::Linked {
+            self.object
+                .functions
+                .iter()
+                .map(|function| (function.section, function.offset))
+                .collect()
+        } else {
+            references.addressed_locations.iter().copied().collect()
+        };
+        for location in &addressed {
             let Some(function) = symbols.functions_by_location.get(location).copied() else {
                 continue;
             };
@@ -732,6 +838,17 @@ impl<'a> Transpiler<'a> {
         symbols: &mut SymbolTable<'_>,
         references: &TextReferences,
     ) -> Result<()> {
+        if self.object.layout == crate::reader::Layout::Linked {
+            // A linked executable's data reaches the guest through the
+            // loader, which copies each `PT_LOAD` segment to its own virtual
+            // address. Carrying it as module data segments as well would put
+            // a second copy at an address `wasm-ld` chose, and every operand
+            // in the program points at the first one. It would also drag in
+            // the boundary symbols a linker leaves behind — `__bss_start`,
+            // `_end` — which point *past* their section and are markers
+            // rather than objects.
+            return Ok(());
+        }
         for (index, section) in self.object.sections.iter().enumerate() {
             if !section.role.is_data() || section.size == 0 {
                 continue;
@@ -842,6 +959,14 @@ impl<'a> Transpiler<'a> {
         references: &TextReferences,
     ) -> Result<()> {
         for table in &references.tables {
+            if self.object.layout == crate::reader::Layout::Linked {
+                // Nothing to rewrite here: the bytes the guest reads come
+                // from the image the loader copies, so the rewrite is a
+                // patch to that image. It is a constant either way — the
+                // table's virtual address is known now, where in relocatable
+                // mode only the linker knows where the table lands.
+                continue;
+            }
             let Some(&segment_index) = symbols.segment_of_section.get(&table.table_section) else {
                 bail!(
                     "the jump table in {} is not in a section that became a \
@@ -969,7 +1094,7 @@ impl<'a> Transpiler<'a> {
         &self,
         wasm: &mut WasmObject,
         symbols: &mut SymbolTable<'_>,
-    ) -> Result<(Vec<FunctionPlan>, Option<FunctionReference>)> {
+    ) -> Result<(Vec<FunctionPlan>, Option<FunctionReference>, Option<FunctionReference>)> {
         let mut plans = Vec::new();
         let mut next_index = wasm.imported_functions.len() as u32;
 
@@ -1052,8 +1177,27 @@ impl<'a> Transpiler<'a> {
         } else {
             None
         };
+        if driver.is_some() {
+            next_index += 1;
+        }
 
-        Ok((plans, driver))
+        // The exec map's lookup takes an index here too, so that every
+        // definition's index is reserved in one place and the bodies can be
+        // pushed in the order they were claimed.
+        let exec_map = (self.object.layout == crate::reader::Layout::Linked).then(|| {
+            let index = next_index;
+            let symbol = wasm.add_symbol(Symbol {
+                name: EXEC_MAP_LOOKUP.to_string(),
+                target: SymbolTarget::Function(index),
+                flags: symbol_flags::LOCAL,
+            });
+            FunctionReference {
+                symbol_index: symbol,
+                function_index: index,
+            }
+        });
+
+        Ok((plans, driver, exec_map))
     }
 
     fn translate_guest_function(
@@ -1400,4 +1544,172 @@ fn wrapper_symbol_flags(symbol: &crate::reader::Symbol) -> u32 {
         _ => 0,
     };
     binding | symbol_flags::EXPORTED
+}
+
+/// A change the loader must make to the program image before it runs it.
+///
+/// A jump table's entries are rewritten so that the address the dispatch
+/// computes is `table + arm` whatever form the entries were in — which is
+/// what makes the dispatch a `br_table` over an arm number. In a relocatable
+/// object those bytes are in a data segment the module carries, so the
+/// rewrite happens there. In a linked executable the bytes reach the guest
+/// through the loader, from the image, so the rewrite has to reach the image
+/// too — and this is how it travels.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Patch {
+    /// The virtual address the bytes go at.
+    pub address: u64,
+    pub bytes: Vec<u8>,
+}
+
+/// A finished translation: the module, and whatever the image needs done to
+/// it before the module can run.
+pub struct Translation {
+    pub module: Vec<u8>,
+    pub patches: Vec<Patch>,
+}
+
+/// The name the exec map's lookup function is given, so a dump can point at
+/// it and a linked module can be inspected.
+pub const EXEC_MAP_LOOKUP: &str = "x86_slot_of";
+/// The data segment holding the map itself.
+pub const EXEC_MAP_TABLE: &str = "x86_exec_map";
+
+/// One entry: a virtual address and the table slot the function at it holds.
+/// Sixteen bytes so the address is eight-byte aligned, which is what a load
+/// wants and what makes the search's arithmetic a shift.
+const EXEC_MAP_ENTRY: u64 = 16;
+
+/// Builds the static exec map: virtual address to indirect-table slot.
+///
+/// This exists because a linked executable has no relocations, so nothing
+/// turns a function pointer into a table slot at translation time. A
+/// function pointer in the guest is a *virtual address* — the number the
+/// linker put there — and stays one, because that is what the guest can
+/// store, compare and pass around. What has to happen instead is that every
+/// indirect call translates the address it was given into a slot, and this
+/// is the table it reads.
+///
+/// Sorted by address and searched in halves. The alternative — a slot for
+/// every address in the text section — would be a table the size of the
+/// program; the alternative to *that*, a scan, is linear in the number of
+/// functions and CPython has thousands. A binary search is fourteen
+/// comparisons for ten thousand functions, on a path the plan says is hot
+/// and M11 measures.
+fn build_exec_map_table(wasm: &mut WasmObject, entries: &[(u64, u32)]) -> DataReference {
+    let mut bytes = Vec::with_capacity(entries.len() * EXEC_MAP_ENTRY as usize);
+    for (address, slot) in entries {
+        bytes.extend_from_slice(&address.to_le_bytes());
+        bytes.extend_from_slice(&slot.to_le_bytes());
+        bytes.extend_from_slice(&[0; 4]);
+    }
+    let segment_index = wasm.data_segments.len() as u32;
+    let size = bytes.len() as u32;
+    wasm.data_segments.push(DataSegment {
+        name: format!(".rodata.{EXEC_MAP_TABLE}"),
+        alignment_log2: 3,
+        bytes,
+        relocations: Vec::new(),
+    });
+    DataReference {
+        symbol_index: wasm.add_symbol(Symbol {
+            name: EXEC_MAP_TABLE.to_string(),
+            target: SymbolTarget::Data(Some(DataSymbolLocation {
+                segment_index,
+                offset: 0,
+                size,
+            })),
+            flags: symbol_flags::LOCAL,
+        }),
+        addend: 0,
+    }
+}
+
+/// `x86_slot_of(address: i64) -> i32`: the slot for a function address, or a
+/// trap.
+///
+/// A trap, and not a sentinel. An indirect call through an address that is
+/// not a function is a guest that has already gone wrong — a corrupted
+/// pointer, a jump into data — and the useful thing is to stop where it
+/// happened. A sentinel slot would turn it into a call to whatever occupies
+/// that slot, which is the same bug arriving somewhere else.
+fn build_exec_map_lookup(table: DataReference, count: u32) -> FunctionBody {
+    let mut body = FunctionBodyBuilder::new(1);
+    let low = body.declare_local(ValueType::I32);
+    let high = body.declare_local(ValueType::I32);
+    let middle = body.declare_local(ValueType::I32);
+
+    body.i32_const(0);
+    body.local_set(low);
+    body.i32_const(count as i32);
+    body.local_set(high);
+
+    body.block();
+    body.loop_();
+    // while low < high
+    body.local_get(low);
+    body.local_get(high);
+    body.i32_ge_unsigned();
+    body.branch_if(1);
+
+    // middle = low + (high - low) / 2
+    body.local_get(high);
+    body.local_get(low);
+    body.i32_sub();
+    body.i32_const(1);
+    body.i32_shr_unsigned();
+    body.local_get(low);
+    body.i32_add();
+    body.local_set(middle);
+
+    // The address stored at `middle`.
+    body.i32_const_data_address(table);
+    body.local_get(middle);
+    body.i32_const(EXEC_MAP_ENTRY as i32);
+    body.i32_mul();
+    body.i32_add();
+    body.local_tee(middle);
+    body.i64_load(3, 0);
+
+    // Found: return its slot.
+    body.local_get(0);
+    body.i64_eq();
+    body.if_();
+    body.local_get(middle);
+    body.i32_load(2, 8);
+    body.return_();
+    body.end();
+
+    // Otherwise halve. `middle` now holds a byte address, so the index has
+    // to be recovered from it — cheaper than keeping both.
+    body.local_get(middle);
+    body.i64_load(3, 0);
+    body.local_get(0);
+    body.i64_lt_unsigned();
+    body.if_();
+    // The entry is below the target: search above it.
+    body.local_get(middle);
+    body.i32_const_data_address(table);
+    body.i32_sub();
+    body.i32_const(EXEC_MAP_ENTRY as i32);
+    body.i32_div_unsigned();
+    body.i32_const(1);
+    body.i32_add();
+    body.local_set(low);
+    body.else_();
+    body.local_get(middle);
+    body.i32_const_data_address(table);
+    body.i32_sub();
+    body.i32_const(EXEC_MAP_ENTRY as i32);
+    body.i32_div_unsigned();
+    body.local_set(high);
+    body.end();
+
+    body.branch(0);
+    body.end(); // loop
+    body.end(); // block
+
+    // Not a function.
+    body.unreachable();
+    body.finish()
 }
