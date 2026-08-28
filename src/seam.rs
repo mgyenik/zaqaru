@@ -39,7 +39,7 @@ use crate::emitter::{
     ImportedFunction, ValueType, WasmObject,
 };
 use crate::machine::{
-    Flag, MachineState, OperandWidth, REGISTER_NAMES, STACK_POINTER_REGISTER,
+    Flag, MachineState, OperandWidth, REGISTER_NAMES, STACK_ALIGNMENT, STACK_POINTER_REGISTER,
     VECTOR_REGISTER_COUNT, VectorHalf,
 };
 use crate::transpile::SYSCALL_ENTRY;
@@ -126,9 +126,6 @@ pub const NO_EXEC_MAP: i32 = -1;
 
 pub const GET_STACK_POINTER: &str = "x86_get_rsp";
 pub const SET_STACK_POINTER: &str = "x86_set_rsp";
-
-/// Alignment `wasm-ld` and clang's shadow stack both assume.
-const STACK_ALIGNMENT: i32 = 16;
 
 /// The kernel's own stack, and the symbol naming it.
 ///

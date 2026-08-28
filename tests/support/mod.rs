@@ -767,6 +767,21 @@ impl LinkedModule {
     pub fn call_guest(&mut self, name: &str, arguments: [i64; 6]) -> i64 {
         self.call_guest_fully(name, arguments, [0.0; 8]).0
     }
+
+    /// Two doubles in, a double out — the shape a `long double` corpus
+    /// function has, since the extended value itself cannot cross.
+    pub fn call_guest_float(&mut self, name: &str, arguments: [f64; 2]) -> f64 {
+        let mut floats = [0.0; 8];
+        floats[..2].copy_from_slice(&arguments);
+        self.call_guest_fully(name, [0; 6], floats).1
+    }
+
+    /// The same, for a function answering with an integer.
+    pub fn call_guest_float_returning_integer(&mut self, name: &str, arguments: [f64; 2]) -> i64 {
+        let mut floats = [0.0; 8];
+        floats[..2].copy_from_slice(&arguments);
+        self.call_guest_fully(name, [0; 6], floats).0
+    }
 }
 
 /// Both halves of a differential comparison over the same corpus sources:
@@ -840,6 +855,10 @@ impl DifferentialFixture {
                         let linked = workspace
                             .path()
                             .join(format!("linked.{variant}.wasm").replace('/', "."));
+                        // Unconditionally: an archive contributes only what
+                        // is referenced, so a fixture with no x87 in it
+                        // links exactly as before.
+                        wasm_objects.push(x87_staticlib());
                         link_wasm(&wasm_objects, &linked, &[]);
                         transpiled.push((variant, LinkedModule::instantiate(&linked)));
                     }
@@ -981,6 +1000,7 @@ impl MixedFixture {
                         wasm_objects.extend(foreign_objects.iter().cloned());
 
                         let linked = workspace.path().join(format!("linked.{flat}.wasm"));
+                        wasm_objects.push(x87_staticlib());
                         // `--fatal-warnings` is the recipe, not decoration: a
                         // boundary signature that disagrees with the foreign
                         // side has to stop the build rather than be noted.
@@ -1036,6 +1056,49 @@ pub unsafe fn native_function<'library, Signature: Copy>(
 /// Built into a target directory of its own: cargo takes a lock per
 /// directory, and sharing the host build's would deadlock a test that is
 /// itself running under cargo.
+/// The x87 archive, built for wasm32 once per test run.
+///
+/// It joins every link unconditionally rather than only where an object
+/// uses the stack: an archive contributes only the members something
+/// references, so a container with no x87 in it pays nothing, and the
+/// alternative is a "does this need x87" question asked in several places
+/// that can disagree.
+///
+/// Its own target directory, for the reason `kisal_staticlib` has one:
+/// cargo takes a lock per directory and these tests are themselves running
+/// under cargo.
+pub fn x87_staticlib() -> PathBuf {
+    static BUILT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    BUILT
+        .get_or_init(|| {
+            let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+            let target = root.join("target").join("wasm-x87");
+            let output = Command::new(env!("CARGO"))
+                .current_dir(root)
+                .env("CARGO_TARGET_DIR", &target)
+                .args([
+                    "build",
+                    "-p",
+                    "x87",
+                    "--target",
+                    "wasm32-unknown-unknown",
+                    "--release",
+                ])
+                .output()
+                .expect("run cargo to build x87 for wasm32");
+            assert!(
+                output.status.success(),
+                "building x87 for wasm32 failed:\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            target
+                .join("wasm32-unknown-unknown")
+                .join("release")
+                .join("libx87.a")
+        })
+        .clone()
+}
+
 pub fn kisal_staticlib() -> PathBuf {
     static BUILT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     BUILT
@@ -1118,6 +1181,7 @@ pub fn link_container_for_program(
     objects.push(seam);
     objects.push(image);
     objects.push(kisal_staticlib());
+    objects.push(x87_staticlib());
     let linked = workspace.path().join(format!("container.{label}.wasm"));
     // `--export-table` is not decoration: the host embedder needs the
     // indirect function table to install a continuation's slot, which is how

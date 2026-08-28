@@ -35,12 +35,9 @@ use crate::emitter::linking::{Symbol, SymbolTarget, symbol_flags};
 use crate::emitter::{
     DefinedFunction, ENVIRONMENT_MODULE, FunctionType, ImportedFunction, ValueType, WasmObject,
 };
-use crate::machine::{MachineState, STACK_POINTER_REGISTER};
+use crate::machine::{MachineState, STACK_ALIGNMENT, STACK_POINTER_REGISTER};
 use crate::reader::ObjectFile;
 use crate::transpile::{GUEST_SUFFIX, Transpiler};
-
-/// Alignment `wasm-ld` and clang's shadow stack both assume.
-const STACK_ALIGNMENT: i32 = 16;
 
 /// The function symbols a link set calls but none of its objects define.
 ///

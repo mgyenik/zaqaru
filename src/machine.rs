@@ -478,6 +478,14 @@ struct Promotion {
 /// is the one place that decides whether a cell lives in its global or in a
 /// local. Without a promotion map every cell resolves to its global, which
 /// is the unpromoted configuration — not a separate code path.
+/// Alignment `wasm-ld` and clang's shadow stack both assume.
+///
+/// Shared because three places set the linker's stack pointer to somewhere
+/// other than where it was — the interop thunk, the kernel seam, and an x87
+/// instruction's helper call — and they must agree about what a stack
+/// pointer is allowed to be.
+pub const STACK_ALIGNMENT: i32 = 16;
+
 pub struct FunctionState<'a> {
     machine: &'a MachineState,
     promotion: Option<Promotion>,
@@ -499,6 +507,15 @@ impl<'a> FunctionState<'a> {
     /// a path nothing takes often.
     pub fn timestamp(&self) -> GlobalReference {
         self.machine.timestamp
+    }
+
+    /// The linker's shadow-stack pointer.
+    ///
+    /// A translated body needs it only to take it away: an instruction
+    /// lowered to a call into a helper crate must not let that helper's
+    /// frame land on the guest's stack.
+    pub fn linker_stack_pointer(&self) -> GlobalReference {
+        self.machine.linker_stack_pointer
     }
 
     fn register_storage(&self, number: usize) -> Storage {

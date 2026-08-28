@@ -92,6 +92,11 @@ struct SymbolTable<'a> {
     untranslated: Option<FunctionReference>,
     /// The imported [`NO_FUNCTION_AT`], present for a linked input.
     no_function_at: Option<FunctionReference>,
+    /// The x87 helpers, indexed by [`crate::translate::x87::X87Helper`],
+    /// present when anything in the object uses the stack.
+    x87_helpers: [Option<FunctionReference>; crate::translate::x87::X87Helper::ALL.len()],
+    /// The top of [`X87_STACK`], present alongside the helpers.
+    x87_stack: Option<DataReference>,
     /// The imported [`SYSCALL_ENTRY`], present when the object contains a
     /// `syscall` at all.
     syscall_entry: Option<FunctionReference>,
@@ -192,6 +197,25 @@ impl SymbolResolver for SymbolTable<'_> {
                 "a `syscall` was translated but `{SYSCALL_ENTRY}` was never \
                  declared; the instruction scan and the import declaration \
                  disagree about what this object contains"
+            )
+        })
+    }
+
+    fn x87_helper(&self, helper: crate::translate::x87::X87Helper) -> Result<FunctionReference> {
+        self.x87_helpers[helper.index()].ok_or_else(|| {
+            anyhow::anyhow!(
+                "an x87 instruction was translated but `{}` was never \
+                 declared; the scan and the declaration disagree",
+                helper.symbol_name()
+            )
+        })
+    }
+
+    fn x87_stack(&self) -> Result<DataReference> {
+        self.x87_stack.ok_or_else(|| {
+            anyhow::anyhow!(
+                "an x87 instruction was translated but `{X87_STACK}` was \
+                 never reserved; the scan and the declaration disagree"
             )
         })
     }
@@ -415,6 +439,8 @@ impl<'a> Transpiler<'a> {
             exec_map: None,
             untranslated: None,
             no_function_at: None,
+            x87_helpers: [None; crate::translate::x87::X87Helper::ALL.len()],
+            x87_stack: None,
             jump_tables: HashMap::new(),
             syscall_entry: None,
             segment_of_section: HashMap::new(),
@@ -677,6 +703,9 @@ impl<'a> Transpiler<'a> {
                 if function.jump_tables.contains_key(&position) {
                     continue;
                 }
+                if crate::translate::x87::is_x87_mnemonic(lifted.instruction.mnemonic()) {
+                    references.uses_x87 = true;
+                }
                 if lifted.instruction.mnemonic() == iced_x86::Mnemonic::Syscall {
                     references.issues_syscalls = true;
                     continue;
@@ -907,6 +936,34 @@ impl<'a> Transpiler<'a> {
                 symbol_index,
                 function_index,
             });
+        }
+
+        // Every x87 helper, when anything uses the stack at all.
+        //
+        // All of them rather than the ones actually reached: per-helper
+        // tracking would need a second scan that can drift from the first,
+        // and `wasm-ld` resolves only what is called, so an unused import
+        // costs a line in a section nothing reads.
+        if references.uses_x87 {
+            symbols.x87_stack = Some(define_x87_stack(wasm));
+            for helper in crate::translate::x87::X87Helper::ALL {
+                let function_index = wasm.imported_functions.len() as u32;
+                let type_index = wasm.intern_type(helper.signature());
+                wasm.imported_functions.push(ImportedFunction {
+                    module: ENVIRONMENT_MODULE.to_string(),
+                    field: helper.symbol_name().to_string(),
+                    type_index,
+                });
+                let symbol_index = wasm.add_symbol(Symbol {
+                    name: helper.symbol_name().to_string(),
+                    target: SymbolTarget::Function(function_index),
+                    flags: symbol_flags::UNDEFINED,
+                });
+                symbols.x87_helpers[helper.index()] = Some(FunctionReference {
+                    symbol_index,
+                    function_index,
+                });
+            }
         }
 
         // The exec map's own failure, which only a linked input can have.
@@ -1573,6 +1630,56 @@ fn build_resume_driver(machine: &MachineState, resume_type: u32) -> FunctionBody
     body.finish()
 }
 
+/// Reserves the region a host-entry wrapper runs its guest on.
+///
+/// `.bss`, so the module carries a symbol rather than sixty-four kilobytes
+/// of zeros.
+fn define_x87_stack(wasm: &mut WasmObject) -> DataReference {
+    let segment_index = wasm.data_segments.len() as u32;
+    wasm.data_segments.push(DataSegment {
+        name: format!(".bss.{X87_STACK}"),
+        alignment_log2: 4,
+        bytes: vec![0; X87_STACK_SIZE as usize],
+        relocations: Vec::new(),
+    });
+    let symbol_index = wasm.add_symbol(Symbol {
+        name: X87_STACK.to_string(),
+        target: SymbolTarget::Data(Some(DataSymbolLocation {
+            segment_index,
+            offset: 0,
+            size: X87_STACK_SIZE,
+        })),
+        // Local, because every object using x87 wants its own and
+        // they must not collapse onto one another.
+        flags: symbol_flags::LOCAL,
+    });
+    DataReference {
+        symbol_index,
+        // The top: a stack grows down from the end of its region.
+        addend: X87_STACK_SIZE as i32,
+    }
+}
+
+/// The stack an x87 helper runs on, and the symbol naming it.
+///
+/// A helper cannot borrow the guest's, and this is the same rule the seam's
+/// kernel stack states: SysV lets a compiler keep values in the 128 bytes
+/// *below* `%rsp` without moving it, and the guest's stack pointer is where
+/// a host-entry wrapper started it — the linker's own. A helper frame
+/// allocated from there lands exactly in that red zone.
+///
+/// It is not hypothetical. A `long double` comparison stores its two
+/// operands in the red zone, executes two x87 instructions, and reads them
+/// back; with the helpers on the guest's stack it read back what the helper
+/// had written, and the answer was wrong in a way no single instruction's
+/// test could see.
+const X87_STACK: &str = "x87_helper_stack";
+
+/// How much of it there is. Sized like the kernel's region: the helpers are
+/// leaf-ish Rust with a bounded call depth, and a fixed region cannot grow
+/// into anything.
+const X87_STACK_SIZE: u32 = 64 * 1024;
+
 /// Starts the guest stack from the linker's stack pointer.
 ///
 /// SysV asks for `rsp % 16 == 8` at entry, as if a return address had just
@@ -1645,6 +1752,11 @@ struct TextReferences {
     /// that only receives function pointers needs the table without putting
     /// anything in it.
     calls_indirectly: bool,
+    /// Whether anything uses the x87 stack, and so whether its helpers must
+    /// be imported. Answered by the same scan that finds the syscalls,
+    /// because imports occupy the low end of the function index space and
+    /// have to be declared before any body takes an index.
+    uses_x87: bool,
     /// Whether the object contains a `syscall`, which is what obliges it to
     /// import the kernel seam. There is no relocation to notice, so the
     /// instruction scan is the only evidence.

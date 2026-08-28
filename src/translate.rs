@@ -10,6 +10,7 @@
 //!   the translator does not model is an error naming the instruction.
 
 mod vector;
+pub mod x87;
 
 use anyhow::{Context, Result, bail};
 use iced_x86::{
@@ -111,6 +112,31 @@ pub trait SymbolResolver {
     /// symbol itself when the object contains one, and this is how the
     /// translation reaches it.
     fn syscall_entry(&self) -> Result<FunctionReference>;
+
+    /// One of the `x87` crate's helpers.
+    ///
+    /// Defaulted to a refusal so that only the real symbol table implements
+    /// it: a test standing in for one has no helpers to name, and an x87
+    /// instruction reaching it means the scan and the declaration disagree.
+    fn x87_helper(&self, helper: crate::translate::x87::X87Helper) -> Result<FunctionReference> {
+        bail!(
+            "an x87 instruction was translated but `{}` was never declared; \
+             the scan and the declaration disagree",
+            helper.symbol_name()
+        )
+    }
+
+    /// The top of the stack the x87 helpers run on.
+    ///
+    /// Defaulted alongside [`Self::x87_helper`], and refused for the same
+    /// reason: reaching it without a real symbol table means the scan and
+    /// the declaration disagree.
+    fn x87_stack(&self) -> Result<DataReference> {
+        bail!(
+            "an x87 instruction was translated but no helper stack was \
+             reserved; the scan and the declaration disagree"
+        )
+    }
 }
 
 /// How far a translated `syscall` moves `%rsp`: the 128-byte red zone it must
@@ -628,6 +654,14 @@ impl<'a> FunctionTranslator<'a> {
             Mnemonic::Xgetbv => self.translate_extended_control(body),
             Mnemonic::Bsf => self.translate_bit_scan(body, lifted, true),
             Mnemonic::Bsr => self.translate_bit_scan(body, lifted, false),
+            // `tzcnt` and `lzcnt` are encoded as `rep bsf` and `rep bsr`,
+            // and a processor without the extensions that name them ignores
+            // the prefix and executes exactly those. This container reports
+            // such a processor — see `cpuid` — so that is what they are
+            // here, which is also why a libc emits them without asking:
+            // they degrade rather than fault.
+            Mnemonic::Tzcnt => self.translate_bit_scan(body, lifted, true),
+            Mnemonic::Lzcnt => self.translate_bit_scan(body, lifted, false),
             Mnemonic::Bswap => self.translate_byte_swap(body, lifted),
             // Reads the shadow-stack pointer, and is a no-op on a processor
             // whose shadow stack is off — which is every processor this
@@ -722,10 +756,15 @@ impl<'a> FunctionTranslator<'a> {
             Mnemonic::Pop => self.translate_pop(body, lifted),
             other => match self.translate_vector(body, lifted)? {
                 vector::VectorOutcome::Translated => Ok(()),
-                vector::VectorOutcome::NotAVectorInstruction => bail!(
-                    "instruction `{}` ({other:?}) is not implemented",
-                    render(&lifted.instruction)
-                ),
+                vector::VectorOutcome::NotAVectorInstruction => {
+                    match self.translate_x87(body, lifted)? {
+                        x87::X87Outcome::Translated => Ok(()),
+                        x87::X87Outcome::NotAnX87Instruction => bail!(
+                            "instruction `{}` ({other:?}) is not implemented",
+                            render(&lifted.instruction)
+                        ),
+                    }
+                }
             },
         }
     }

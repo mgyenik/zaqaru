@@ -3032,3 +3032,152 @@ fn functions_entered_at_a_shared_body_match_native() {
         }
     }
 }
+
+/// `long double` against native — the x87 stack as a C compiler reaches it.
+///
+/// Eighty bits is a format wasm has no type for, so these are the only
+/// instructions in the system translated into calls rather than into wasm:
+/// the arithmetic lives in the `x87` crate, where it is a softfloat tested
+/// against the host's own FPU. What this checks is the other half — that the
+/// lowering picks the right helper, passes its arguments the right way
+/// round, and puts the answers back where the guest expects them.
+///
+/// The boundary is `double` and `long` on purpose. SysV passes an extended
+/// value on the stack and returns it in `st0`, which the harness's typed
+/// wrappers cannot marshal, so the extended work happens inside each
+/// function and only its result crosses.
+#[test]
+fn long_double_arithmetic_matches_native() {
+    let mut fixture = DifferentialFixture::build("long-double", &["long_double.c"]);
+
+    const DOUBLES: [f64; 12] = [
+        0.0,
+        -0.0,
+        1.0,
+        -1.0,
+        0.5,
+        3.141592653589793,
+        1e-300,
+        1e300,
+        f64::MIN_POSITIVE,
+        -2.718281828459045,
+        123456789.0,
+        1.0000000000000002,
+    ];
+
+    let mut generator = Pseudorandom::new(0x6c64_6f75_0000_0001);
+    let mut pairs: Vec<(f64, f64)> = Vec::new();
+    for &a in &DOUBLES {
+        for &b in &DOUBLES {
+            pairs.push((a, b));
+        }
+    }
+    for _ in 0..RANDOM_ITERATIONS / 8 {
+        pairs.push((
+            f64::from_bits(generator.next_u64()),
+            f64::from_bits(generator.next_u64()),
+        ));
+    }
+
+    for name in [
+        "divide_significand",
+        "divide_exponent",
+        "compare_branch",
+        "compare_unordered",
+        "denormal_class",
+    ] {
+        let native = unsafe {
+            native_function::<unsafe extern "C" fn(f64, f64) -> i64>(&fixture.native, name)
+        };
+        for &(a, b) in &pairs {
+            let expected = unsafe { native(a, b) };
+            for (variant, module) in &mut fixture.transpiled {
+                assert_eq!(
+                    module.call_guest_float_returning_integer(name, [a, b]),
+                    expected,
+                    "{name}({a:e}, {b:e}) disagreed with native in {variant}"
+                );
+            }
+        }
+    }
+
+    for name in [
+        "constant_quarter",
+        "chain_step1",
+        "chain_step2",
+        "chain_step3",
+        "subtract_extended",
+        "divide_residual",
+        "constant_third",
+        "load_add_store",
+        "extended_chain",
+        "spilled_chain",
+        "round_trip_float",
+        "magnitude",
+    ] {
+        let native = unsafe {
+            native_function::<unsafe extern "C" fn(f64, f64) -> f64>(&fixture.native, name)
+        };
+        for &(a, b) in &pairs {
+            let expected = unsafe { native(a, b) };
+            for (variant, module) in &mut fixture.transpiled {
+                let got = module.call_guest_float(name, [a, b]);
+                // Bit-compared, not approximately: an extended intermediate
+                // rounded to `double` is one exact value, and a translation
+                // computing in `double` throughout gives another.
+                assert_eq!(
+                    got.to_bits(),
+                    expected.to_bits(),
+                    "{name}({a:e}, {b:e}) disagreed with native in {variant}: \
+                     {got:e} vs {expected:e}"
+                );
+            }
+        }
+    }
+}
+
+/// The x87 stack's own shapes, hand-written and checked against native.
+///
+/// Compiler output reaches whichever forms the optimiser wanted; these reach
+/// the ones a wrong stack index or a reversed operand hides in. Every case
+/// builds its operands from integers so the caller names exact values, and
+/// returns something that differs when the shape is wrong.
+#[test]
+fn x87_stack_shapes_match_native() {
+    let mut fixture = DifferentialFixture::build("x87-control", &["x87_control.s"]);
+
+    let mut inputs: Vec<(i64, i64)> = Vec::new();
+    for a in [0i64, 1, -1, 2, 7, -7, 1000, -1000, i32::MAX as i64] {
+        for b in [1i64, -1, 2, 3, -3, 11, 1000] {
+            inputs.push((a, b));
+        }
+    }
+
+    for name in [
+        "compare_integers",
+        "compare_after_exchange",
+        "compare_after_duplicate",
+        "subtract_into_second",
+        "subtract_reversed_into_second",
+        "divide_into_second",
+        "divide_reversed_into_second",
+        "subtract_into_top",
+        "subtract_reversed_into_top",
+        "stack_depth",
+        "red_zone_across_helpers",
+    ] {
+        let native = unsafe {
+            native_function::<unsafe extern "C" fn(i64, i64) -> i64>(&fixture.native, name)
+        };
+        for &(a, b) in &inputs {
+            let expected = unsafe { native(a, b) };
+            for (variant, module) in &mut fixture.transpiled {
+                assert_eq!(
+                    module.call_guest(name, [a, b, 0, 0, 0, 0]),
+                    expected,
+                    "{name}({a}, {b}) disagreed with native in {variant}"
+                );
+            }
+        }
+    }
+}
