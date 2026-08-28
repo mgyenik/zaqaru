@@ -1893,6 +1893,17 @@ fn packed_lanes_match_native() {
         "lane_pslldq_16",
         "lane_movmskpd",
         "lane_movmskps",
+        "lane_pminub",
+        "lane_pmaxub",
+        "lane_pminsw",
+        "lane_pmaxsw",
+        "lane_pmovmskb",
+        "lane_pmovmskb_after_compare",
+        "lane_punpcklbw",
+        "lane_punpckhbw",
+        "lane_punpcklwd",
+        "lane_punpckhwd",
+        "lane_broadcast_byte",
     ]
     .into_iter()
     .map(str::to_string)

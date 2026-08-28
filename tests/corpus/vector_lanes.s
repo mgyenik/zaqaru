@@ -184,6 +184,56 @@ lane_movmskps:
 	ret
 	.size	lane_movmskps, .-lane_movmskps
 
+/* The byte-grain gather, which is the one that matters: every SSE2 string
+   function turns sixteen lanes of comparison into an integer this way, and
+   it is by far the most-used vector instruction in a static libc. */
+	.globl	lane_pmovmskb
+	.type	lane_pmovmskb, @function
+lane_pmovmskb:
+	lane_prologue
+	pmovmskb	%xmm0, %eax
+	ret
+	.size	lane_pmovmskb, .-lane_pmovmskb
+
+/* And after a comparison, which is how it actually appears. */
+	.globl	lane_pmovmskb_after_compare
+	.type	lane_pmovmskb_after_compare, @function
+lane_pmovmskb_after_compare:
+	lane_prologue
+	pcmpeqb		%xmm1, %xmm0
+	pmovmskb	%xmm0, %eax
+	ret
+	.size	lane_pmovmskb_after_compare, .-lane_pmovmskb_after_compare
+
+/* ---- lane-wise extrema --------------------------------------------------- */
+
+/* x86 has these only where it happened to need them: unsigned bytes and
+   signed words. An SSE2 `strlen` reaches for `pminub` every iteration. */
+	lane_case	lane_pminub, pminub %xmm1, %xmm0
+	lane_case	lane_pmaxub, pmaxub %xmm1, %xmm0
+	lane_case	lane_pminsw, pminsw %xmm1, %xmm0
+	lane_case	lane_pmaxsw, pmaxsw %xmm1, %xmm0
+
+/* ---- interleaves at byte and word grain ---------------------------------- */
+
+	lane_case	lane_punpcklbw, punpcklbw %xmm1, %xmm0
+	lane_case	lane_punpckhbw, punpckhbw %xmm1, %xmm0
+	lane_case	lane_punpcklwd, punpcklwd %xmm1, %xmm0
+	lane_case	lane_punpckhwd, punpckhwd %xmm1, %xmm0
+
+/* Interleaving a register with itself, which is how an SSE2 `memset`
+   broadcasts one byte across a whole vector — the shape that actually
+   appears in a libc. */
+	.globl	lane_broadcast_byte
+	.type	lane_broadcast_byte, @function
+lane_broadcast_byte:
+	lane_prologue
+	punpcklbw	%xmm0, %xmm0
+	punpcklwd	%xmm0, %xmm0
+	movq		%xmm0, %rax
+	ret
+	.size	lane_broadcast_byte, .-lane_broadcast_byte
+
 /* ---- packed floating-point arithmetic ------------------------------------ */
 
 	double_lane_case	lane_addpd, addpd %xmm1, %xmm0

@@ -558,6 +558,13 @@ impl<'a> FunctionTranslator<'a> {
             // precisely so that the answer on such a machine is the zero it
             // just put there.
             Mnemonic::Rdsspq | Mnemonic::Rdsspd => Ok(()),
+            // The other half of the same story: adjusting or restoring a
+            // shadow stack that does not exist. Both are defined to do
+            // nothing when the feature is off, which is why a libc can call
+            // them unconditionally.
+            Mnemonic::Incsspq | Mnemonic::Incsspd | Mnemonic::Rstorssp | Mnemonic::Saveprevssp => {
+                Ok(())
+            }
             Mnemonic::Stmxcsr => self.translate_store_control_register(body, lifted),
             Mnemonic::Rol => self.translate_rotate(body, lifted, true),
             Mnemonic::Ror => self.translate_rotate(body, lifted, false),

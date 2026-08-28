@@ -36,7 +36,8 @@ use super::{FunctionTranslator, is_immediate, render};
 use FloatWidth::{Double, Single};
 use PackedOperation::{
     Add, ConvertFromSignedLanes, Equal, FloatAdd, FloatDivide, FloatMultiply, FloatSquareRoot,
-    FloatSubtract, GreaterSigned, Multiply, Subtract,
+    FloatSubtract, GreaterSigned, MaximumSigned, MaximumUnsigned, MinimumSigned, MinimumUnsigned,
+    Multiply, Subtract,
 };
 
 /// Whether the vector translation recognised an instruction, so that one that
@@ -281,6 +282,17 @@ impl FunctionTranslator<'_> {
                 self.packed_binary(body, lifted, Multiply(LaneWidth::DoubleWord))?
             }
             Mnemonic::Pmuludq => self.translate_unsigned_wide_multiply(body, lifted)?,
+            // The extrema, which x86 offers only where it happened to need
+            // them: unsigned bytes and signed words. An SSE2 `strlen`
+            // reaches for `pminub` on every iteration.
+            Mnemonic::Pminub => {
+                self.packed_binary(body, lifted, MinimumUnsigned(LaneWidth::Byte))?
+            }
+            Mnemonic::Pmaxub => {
+                self.packed_binary(body, lifted, MaximumUnsigned(LaneWidth::Byte))?
+            }
+            Mnemonic::Pminsw => self.packed_binary(body, lifted, MinimumSigned(LaneWidth::Word))?,
+            Mnemonic::Pmaxsw => self.packed_binary(body, lifted, MaximumSigned(LaneWidth::Word))?,
             Mnemonic::Pcmpeqb => self.packed_binary(body, lifted, Equal(LaneWidth::Byte))?,
             Mnemonic::Pcmpeqw => self.packed_binary(body, lifted, Equal(LaneWidth::Word))?,
             Mnemonic::Pcmpeqd => self.packed_binary(body, lifted, Equal(LaneWidth::DoubleWord))?,
@@ -325,6 +337,10 @@ impl FunctionTranslator<'_> {
             // compiles even with no vector in sight.
             Mnemonic::Movmskpd => self.translate_sign_mask(body, lifted, LaneWidth::QuadWord)?,
             Mnemonic::Movmskps => self.translate_sign_mask(body, lifted, LaneWidth::DoubleWord)?,
+            // The same gathering at byte grain, and by far the most common
+            // of the three: it is how every SSE2 string function turns
+            // sixteen lanes of comparison into an integer to scan.
+            Mnemonic::Pmovmskb => self.translate_sign_mask(body, lifted, LaneWidth::Byte)?,
 
             // ---- packed shifts ----------------------------------------------
             Mnemonic::Psllw => {
@@ -388,6 +404,22 @@ impl FunctionTranslator<'_> {
                     lane: usize::from(selector >> (2 * lane)) & 3,
                 });
                 self.translate_shuffle(body, lifted, lanes)?
+            }
+            // Interleaving at byte and word grain, which the doubleword
+            // shuffle below cannot express. `punpcklbw` against a register
+            // holding one byte is how an SSE2 `memset` broadcasts its fill
+            // value across a whole vector.
+            Mnemonic::Punpcklbw => {
+                self.translate_interleave(body, lifted, LaneWidth::Byte, false)?
+            }
+            Mnemonic::Punpckhbw => {
+                self.translate_interleave(body, lifted, LaneWidth::Byte, true)?
+            }
+            Mnemonic::Punpcklwd => {
+                self.translate_interleave(body, lifted, LaneWidth::Word, false)?
+            }
+            Mnemonic::Punpckhwd => {
+                self.translate_interleave(body, lifted, LaneWidth::Word, true)?
             }
             Mnemonic::Punpckldq | Mnemonic::Unpcklps => self.translate_shuffle(
                 body,
@@ -1350,6 +1382,62 @@ impl FunctionTranslator<'_> {
         Ok(locals)
     }
 
+    /// Interleaves the lanes of two operands, taking one half of each.
+    ///
+    /// The output's even lanes come from the destination and its odd lanes
+    /// from the source, both read out of the same half — the low one for
+    /// `punpckl`, the high one for `punpckh`. Sixteen bytes in, sixteen
+    /// bytes out, so exactly half of each input is consumed.
+    ///
+    /// The shuffle below cannot express this at byte or word grain: it works
+    /// in doubleword lanes, and these move pieces smaller than one.
+    fn translate_interleave(
+        &mut self,
+        body: &mut FunctionBodyBuilder,
+        lifted: &LiftedInstruction,
+        lanes: LaneWidth,
+        high: bool,
+    ) -> Result<()> {
+        let destination = self.expect_vector_operand(&lifted.instruction, 0)?;
+        let operands = [
+            self.park_operand_halves(body, lifted, 0)?,
+            self.park_operand_halves(body, lifted, 1)?,
+        ];
+        let bits = lanes.bits();
+        let per_half = 64 / bits;
+        let taken = usize::from(high);
+        let mask = if bits == 64 {
+            u64::MAX
+        } else {
+            (1u64 << bits) - 1
+        };
+
+        for (slot, output) in [VectorHalf::Low, VectorHalf::High].into_iter().enumerate() {
+            for lane in 0..per_half {
+                let position = slot as u32 * per_half + lane;
+                // Even from the destination, odd from the source, and each
+                // step of two in the output is one step of one in the input.
+                let operand = (position % 2) as usize;
+                let from = position / 2;
+
+                body.local_get(operands[operand][taken]);
+                if from > 0 {
+                    body.i64_const(i64::from(from * bits));
+                    body.i64_shr_unsigned();
+                }
+                body.i64_const(mask as i64);
+                body.i64_and();
+                if lane > 0 {
+                    body.i64_const(i64::from(lane * bits));
+                    body.i64_shl();
+                    body.i64_or();
+                }
+            }
+            self.state.write_vector(body, destination, output);
+        }
+        Ok(())
+    }
+
     /// Rebuilds all 128 bits of the destination out of doubleword lanes taken
     /// from the two operands — `pshufd` and the rest of the shuffle family.
     fn translate_shuffle(
@@ -1471,6 +1559,12 @@ enum PackedOperation {
     Multiply(LaneWidth),
     Equal(LaneWidth),
     GreaterSigned(LaneWidth),
+    /// Lane-wise minimum and maximum, which x86 has only at byte and word
+    /// grain and only in the signedness each mnemonic names.
+    MinimumUnsigned(LaneWidth),
+    MinimumSigned(LaneWidth),
+    MaximumUnsigned(LaneWidth),
+    MaximumSigned(LaneWidth),
     FloatAdd(FloatWidth),
     FloatSubtract(FloatWidth),
     FloatMultiply(FloatWidth),
@@ -1565,6 +1659,14 @@ fn emit_packed(
         PackedOperation::Equal(LaneWidth::Word) => body.i16x8_equal(),
         PackedOperation::Equal(LaneWidth::DoubleWord) => body.i32x4_equal(),
         PackedOperation::Equal(LaneWidth::QuadWord) => body.i64x2_equal(),
+        PackedOperation::MinimumUnsigned(LaneWidth::Byte) => body.i8x16_min_unsigned(),
+        PackedOperation::MinimumUnsigned(LaneWidth::Word) => body.i16x8_min_unsigned(),
+        PackedOperation::MinimumSigned(LaneWidth::Byte) => body.i8x16_min_signed(),
+        PackedOperation::MinimumSigned(LaneWidth::Word) => body.i16x8_min_signed(),
+        PackedOperation::MaximumUnsigned(LaneWidth::Byte) => body.i8x16_max_unsigned(),
+        PackedOperation::MaximumUnsigned(LaneWidth::Word) => body.i16x8_max_unsigned(),
+        PackedOperation::MaximumSigned(LaneWidth::Byte) => body.i8x16_max_signed(),
+        PackedOperation::MaximumSigned(LaneWidth::Word) => body.i16x8_max_signed(),
         PackedOperation::GreaterSigned(LaneWidth::Byte) => body.i8x16_greater_signed(),
         PackedOperation::GreaterSigned(LaneWidth::Word) => body.i16x8_greater_signed(),
         PackedOperation::GreaterSigned(LaneWidth::DoubleWord) => body.i32x4_greater_signed(),
@@ -1581,6 +1683,19 @@ fn emit_packed(
         PackedOperation::FloatSquareRoot(Double) => body.f64x2_sqrt(),
         PackedOperation::ConvertFromSignedLanes(Single) => body.f32x4_convert_i32x4_signed(),
         PackedOperation::ConvertFromSignedLanes(Double) => body.f64x2_convert_low_i32x4_signed(),
+        // x86 has the extrema only at byte and word grain, and only in the
+        // signedness each mnemonic names — there is no `pminuw` before
+        // SSE4.1 and no `pminub` for doublewords at all. Nothing should ask
+        // for the rest, and if something does it says so.
+        PackedOperation::MinimumUnsigned(lanes)
+        | PackedOperation::MinimumSigned(lanes)
+        | PackedOperation::MaximumUnsigned(lanes)
+        | PackedOperation::MaximumSigned(lanes) => bail!(
+            "`{}` asks for a lane-wise extremum at {} bits, which x86 has no \
+             instruction for",
+            crate::translate::render(instruction),
+            lanes.bits()
+        ),
     }
     Ok(())
 }
