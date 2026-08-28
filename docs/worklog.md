@@ -802,3 +802,175 @@ native side of a differential runs inside the test process, whose heap *is*
 the break — moving it would move glibc's allocator out from under the
 harness. It is covered where the arena belongs to nobody else, and the
 harness header says so rather than leaving a gap for someone to notice.
+
+## 2026-08-28 — M6: the linked-ELF front end and the exec path
+
+The scope correction the build plan records — that consuming a *linked*
+executable is not deferrable, because a musl-static CPython is one —
+turned out to run further than "the reader learns a second input shape".
+It reaches the translator's operands, the data segments, the jump-table
+rewrite, the bake's memory layout, and the kernel's boot path, and the
+thread through all of it is one sentence: **a linked executable's
+operands are addresses, so the only place its bytes can be right is at
+those addresses.**
+
+### What the two shapes actually differ in
+
+A relocatable object has no addresses. Every reference is a relocation
+naming a symbol, and the linker decides later where that symbol lands.
+A linked executable has already decided. So the three places an operand
+becomes a number needed separate answers, and one of the three I got
+wrong first:
+
+- **Program-counter-relative operands** resolve to a *section offset*,
+  not an address, because the decoder runs with the instruction's offset
+  within its section as its program counter. The address the guest sees
+  is that offset plus wherever the loader put the section. The first
+  version emitted the displacement unchanged, on the reasoning that a
+  linked input's operands "are already addresses" — true of the file,
+  false of what `iced` hands back.
+- **Call targets** need nothing at all, for the same reason from the
+  other side: a relative branch resolves within its own section, so the
+  offset is right in both shapes. A branch I added to look up the callee
+  by virtual address was removed.
+- **Jump table entries** have to be rewritten, and that is where the
+  shapes genuinely part company. See below.
+
+### The main binary *is* loaded now, and the arenas had to move
+
+`container-plan.md`'s address-space section opens with "a simplifying
+fact first: the main binary is never loaded." That was written when the
+main binary was always relocatable, and it stopped being true here. A
+linked program's segments are copied to their virtual addresses, which
+linear memory can do because linear memory is ours.
+
+Except that those addresses are *low* — a `-no-pie` x86-64 executable's
+first `PT_LOAD` is at `0x400000` — and `wasm-ld` places module data from
+`1024` upward. Three collisions, none fixable at run time:
+
+1. `__image_blob` holds every file in the image, a hundred megabytes for
+   a real one. It covers four megabytes long before it ends, so the
+   bytes the program must occupy are the image the program is being read
+   out of.
+2. The `brk` and `mmap` arenas are carved from the top of what the module
+   occupies at boot — above the module's data, and therefore above the
+   program. `brk` then walks straight through the program's text.
+3. Reading the program in order to load it allocates tens of megabytes,
+   and the allocator takes those pages from the end of memory. Its arena
+   moves past `0x400000`, and placing the program then overwrites the
+   live allocator that made the read possible. This one only bites at a
+   binary size big enough to matter, which is the worst way to find out.
+
+"Carve the arenas around the program" cannot fix any of them, because
+the program's base is *below* the module's data rather than above it:
+the region is taken before kisal runs an instruction. So the bake
+decides instead — `baker::layout` sets `--global-base` above everything
+the program occupies, and everything downstream of the data is then
+above the program by construction. A container with nothing to load
+keeps the linker's default, because reserving a region for a program
+that does not exist would cost every relocatable-tier container a hole
+it has no use for.
+
+kisal checks the result rather than assuming it, against `__global_base`
+— the linker's own symbol, so the check compares what the bake decided
+with what the program needs, at the one moment when saying so is still
+useful.
+
+### Two defects the end-to-end run found, that nothing else would have
+
+Both were invisible to every narrower test, and both were found the
+first time a whole program actually ran.
+
+**The exec map wrote its table slots as constants.** Every object
+numbers its own table entries from one, and the linker renumbers them as
+it merges the tables. The map is *data*, so a slot written there as a
+constant stayed whatever the translated object called it — and in a
+container that number belongs to the seam, whose `kisal_yield` takes the
+first slot. Entering the program threw instead of running it. The
+symptom was perfect: `x86_slot_of(entry)` returned 1, no syscall was
+ever dispatched, and the kernel reported a thread that left without
+exiting. The slots are relocations now.
+
+**Nothing applied the translator's image patches.** A linked jump
+table's entries are rewritten so the dispatch computes `table + arm`
+whatever form they held — that is what makes the translated dispatch a
+`br_table` over an arm number. For a relocatable object those bytes are
+in a data segment the module carries, so the translator rewrites them
+itself; for a linked one they are in the program, and the program
+reaches the guest through the image. So the rewrite has to reach the
+image, which makes it bake-time work: `baker::program::apply` maps each
+patch's virtual address back to the file offset that holds it. Without
+it the guest ran correctly until its first `switch` and then went
+somewhere else.
+
+The general lesson is the one this project keeps relearning: a value
+that is *data* rather than an instruction operand does not get the
+linker's attention unless something asks for it. Both bugs are that.
+
+### `.eh_frame`, which turned out to be worth more than planned
+
+The plan scoped code discovery to `.symtab` plus FDEs and deliberately
+excluded stripped binaries as later hardening. Reading `.eh_frame`
+properly gave the stripped case for free, so it is in: a zero-size
+symbol takes its extent from the matching entry instead of being a hard
+error, and an extent no symbol covers becomes a function named after its
+own address. `a_stripped_executable_still_has_functions` checks that
+stripping changes nothing — the same extents come back, from the other
+witness.
+
+What it cost was reading the CIE properly rather than assuming the
+common shape. The augmentation string decides the pointer encoding; a
+personality routine's address has to be stepped over by exactly its own
+width or the `R` encoding read next is a byte of that address; and an
+indirect encoding names a slot a dynamic loader fills, which is refused
+outright because a guessed extent silently translates the wrong bytes.
+
+### Decisions
+
+**One number is written on both sides of the seam.** The kernel cannot
+throw — a wasm exception unwinds wasm frames without running Rust's
+drops, so a throw raised inside a kisal frame would leak whatever that
+frame owned. So the kernel returns a sentinel and the seam turns it into
+the throw. Everywhere else the two sides meet, a disagreement is a link
+error because it is a signature; this one would be silent, so
+`the_leave_sentinel_agrees_across_the_seam` is what keeps them equal.
+The kernel also asserts that no completed syscall ever returns it, which
+is what makes the sentinel unambiguous rather than merely unlikely.
+
+**Starting a process and scheduling a thread are the same act.** M6
+added no catch of its own: `x86_run_thread` already enters a slot under
+a `try_table`, which is exactly what boot needs. A trampoline added
+earlier in the milestone was deleted once that was clear — what the boot
+path actually needed was the address-to-slot lookup made nameable across
+the link, one exported function instead of two.
+
+**The catch now restores the shadow-stack pointer.** The design named
+this obligation and nothing was paying it: the seam moves the pointer
+into the kernel's fixed region and restores it when the syscall returns,
+and a syscall that *leaves* never returns. Every leave was stranding it
+inside the kernel's own frames. It bit nothing yet because M6 throws
+once and returns to the host; it would have bitten M7 on the second
+thread.
+
+**Only `%rsp` is written at boot.** Every other register a Linux process
+starts with is zero, and a wasm global starts at zero — so the kernel
+needs one accessor rather than a copy of the machine image's layout,
+which is the layout it would otherwise have to restate and could
+silently disagree about.
+
+**A function's symbol is now optional.** A function found in the unwind
+table and not the symbol table has no name, which means nothing outside
+the object can call it: it binds locally and gets no host wrapper. That
+is not a special case bolted on, it is the same rule local functions
+already followed.
+
+### Still open in M6
+
+The acceptance ladder has not been climbed: this runs a corpus program,
+not musl BusyBox and not CPython. The baker does not yet drive the
+translator over an image's ELFs — `baker::program` and `baker::layout`
+are the pieces that pass will use, and the boot test assembles them by
+hand in the meantime. The syscall grind (`uname`, `prlimit64`,
+`sched_getaffinity`, `getrandom`, `rseq`, the clock rows, `readv`/
+`writev`, the recorded signal rows) has not started, and neither has the
+strace-diff harness or the determinism check.

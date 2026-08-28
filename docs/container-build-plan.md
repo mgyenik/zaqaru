@@ -1530,3 +1530,89 @@ binding:
   is a design-doc edit first), and the loud-error worklist it
   generated is either empty or explicitly moved to a later
   milestone's text. "Works on my machine today" closes nothing.
+
+---
+
+## Appendix — M6 progress (appended 2026-08-28)
+
+Appended rather than folded into M6's section above, so that what the
+plan said before the work and what the work found stay separately
+readable.
+
+### Built and green
+
+**The linked-ELF front end**, complete:
+
+- Code discovery from `.symtab` *and* `.eh_frame` FDEs, with the
+  stripped case included rather than deferred — reading the CIE
+  augmentation properly to find the pointer encoding gave it for free.
+  A zero-size symbol takes its extent from its unwind entry; an extent
+  no symbol covers becomes a function named after its address.
+- The entry point, `PT_LOAD` segments, and `section_at`.
+- Operands resolving to what they already are, with one correction the
+  plan did not anticipate: a program-counter-relative operand resolves
+  to a *section offset*, because that is what the decoder's program
+  counter is, and the address is that offset plus where the loader put
+  the section. Call targets need no change at all.
+- The static exec map and the discriminating indirect call.
+- Jump-table recovery from absolute addresses — the milestone's named
+  novel analysis. It works, and it exposed a second half the plan did
+  not name: the recovered table's entries have to be *rewritten*, and
+  in linked mode those bytes reach the guest through the image rather
+  than through a module data segment. They travel as image patches the
+  bake applies (`baker::program`).
+- A linked input contributes no module data segments at all. The loader
+  places `PT_LOAD`; a second copy at a `wasm-ld`-chosen address would
+  leave every operand pointing at the first one.
+
+**Kisal's exec path**: program headers parsed, segments placed, the
+initial stack built with argv, envp and the auxv the plan specifies
+(`AT_PHDR` from `PT_PHDR` or the covering segment and refused if
+neither, `AT_PHNUM`, `AT_PAGESZ`, `AT_ENTRY`, `AT_BASE` = 0,
+`AT_RANDOM` from the seeded CSPRNG, `AT_SECURE` = 0, and no
+`AT_SYSINFO_EHDR`), entry through its table slot, `exit_group` through
+the EH shim to a boot-level catch and out to `/iso/shutdown/complete`.
+
+**One correction to the address-space design.** The design doc's
+"the main binary is never loaded" holds for the relocatable tier only.
+A linked program is loaded, at its own low virtual addresses, and the
+module's data — the image blob first — occupies those addresses by
+default. Carving the arenas around the region cannot fix it, because the
+region is below the module's data rather than above it. So the bake
+places the module's data above the program (`baker::layout`,
+`--global-base`), and kisal checks the result against `__global_base`
+at load. This is a change to the plan's assumptions, not to its
+milestones.
+
+### Not yet built
+
+- The acceptance ladder. `tests/boot.rs` runs a *corpus* program end to
+  end — a real one, with a hand-written `_start`, argv and auxv read off
+  the stack, and an exit status out through the store — but not musl
+  BusyBox and not CPython.
+- The baker driving the translator over an image's ELFs. The two pieces
+  that pass needs (`baker::layout`, `baker::program`) exist and are
+  tested; nothing yet calls them from a `bake` invocation.
+- The grind: `uname`, `prlimit64`, `sched_getaffinity`, `getrandom`,
+  `rseq` → `ENOSYS`, `set_tid_address`/`set_robust_list`,
+  `clock_gettime`/`gettimeofday`, `nanosleep`, the `getpid`/`getuid`
+  family, `readv`/`writev`, and the recorded `rt_sigaction`/
+  `rt_sigprocmask`. Plus the instruction gap list.
+- The strace-diff harness as the real oracle, and the determinism check.
+
+### What running it end to end found
+
+Two defects that no narrower test could have reached, both fixed:
+
+1. **The exec map wrote table slots as constants.** Objects number their
+   own table entries from one and the linker renumbers them on merge, so
+   the constants named whichever object won that number — the seam,
+   whose `kisal_yield` holds the first slot. Entering the program threw
+   instead of running it. The slots are relocations now.
+2. **Nothing applied the image patches.** The guest ran correctly until
+   its first `switch` and then dispatched through an unrewritten table.
+
+And one obligation the design had named that nothing was meeting: the
+catch has to restore the shadow-stack pointer, because the seam's own
+restore never runs for a syscall that leaves. Harmless at M6, which
+throws once; it would have bitten M7 on the second thread.
