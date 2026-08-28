@@ -52,6 +52,7 @@ pub mod number {
     pub const FUTEX: i64 = 202;
     pub const GETDENTS64: i64 = 217;
     pub const SET_TID_ADDRESS: i64 = 218;
+    pub const GETTID: i64 = 186;
     pub const CLOCK_GETTIME: i64 = 228;
     pub const EXIT_GROUP: i64 = 231;
     pub const OPENAT: i64 = 257;
@@ -63,6 +64,8 @@ pub mod number {
     pub const STATX: i64 = 332;
     pub const RSEQ: i64 = 334;
     pub const CLONE3: i64 = 435;
+    pub const SET_ROBUST_LIST: i64 = 273;
+    pub const PRLIMIT64: i64 = 302;
 
     pub const PWRITE64: i64 = 18;
     pub const RENAME: i64 = 82;
@@ -183,6 +186,9 @@ pub mod number {
             FUTEX => "futex",
             GETDENTS64 => "getdents64",
             SET_TID_ADDRESS => "set_tid_address",
+            SET_ROBUST_LIST => "set_robust_list",
+            PRLIMIT64 => "prlimit64",
+            GETTID => "gettid",
             CLOCK_GETTIME => "clock_gettime",
             EXIT_GROUP => "exit_group",
             OPENAT => "openat",
@@ -343,6 +349,49 @@ pub struct Kernel<'a, S: Store, M: Machine> {
     /// The guest's address space: the arenas, and the tree of what is
     /// mapped where.
     pub space: crate::space::Space,
+    /// Where the kernel would write a zero when this thread ends, from
+    /// `set_tid_address`. Recorded until M7 has a thread whose ending
+    /// something could be waiting for.
+    pub clear_child_tid: u64,
+    /// The head of this thread's robust futex list, from
+    /// `set_robust_list`. Recorded with the same horizon.
+    pub robust_list: u64,
+}
+
+/// The container's only process, which is the first in its own namespace.
+pub const PROCESS_ID: i64 = 1;
+
+/// The size Linux requires of a `struct robust_list_head`, and refuses any
+/// other. A caller passing a different one was built against a different
+/// kernel.
+const ROBUST_LIST_HEAD_SIZE: u64 = 24;
+
+/// The soft and hard limits for a resource, or `None` where nothing here
+/// decides one.
+///
+/// Only what has a real answer. A limit invented for a resource this
+/// container does not model would be a number a guest could size something
+/// against, and nothing would keep it.
+pub fn resource_limit_for(resource: u32) -> Option<(u64, u64)> {
+    /// No limit, which is how Linux spells one that is not enforced.
+    const INFINITY: u64 = u64::MAX;
+    const RLIMIT_STACK: u32 = 3;
+    const RLIMIT_NOFILE: u32 = 7;
+    const RLIMIT_AS: u32 = 9;
+    match resource {
+        // The stack the guest was actually given, taken from the one place
+        // that decides it rather than restated here.
+        RLIMIT_STACK => Some((crate::exec::STACK_BYTES, INFINITY)),
+        // Descriptors: the table is bounded, and this is that bound.
+        RLIMIT_NOFILE => Some((
+            crate::fd::MAX_DESCRIPTORS as u64,
+            crate::fd::MAX_DESCRIPTORS as u64,
+        )),
+        // Address space: wasm memory grows to four gigabytes and no
+        // further, which is a real ceiling rather than a chosen one.
+        RLIMIT_AS => Some((u32::MAX as u64, u32::MAX as u64)),
+        _ => None,
+    }
 }
 
 impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
@@ -371,6 +420,8 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             files: crate::fd::FdTable::with_standard_streams(),
             clock: 1,
             status: None,
+            clear_child_tid: 0,
+            robust_list: 0,
             // Carved from the top of whatever the module already occupies:
             // the linker's data, the shadow stack, and anything the
             // kernel's own allocator has taken. Everything the guest is
@@ -559,6 +610,24 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             number::CHDIR => self.chdir(arguments),
             number::FCHDIR => self.fchdir(arguments),
 
+            // ---- who and what this process is ---------------------------
+            //
+            // Everything here is fixed. A container's entry process is the
+            // first in its own namespace, which is what makes the answer a
+            // constant rather than something to derive.
+            number::GETPID | number::GETTID => Outcome::Done(PROCESS_ID),
+            number::SET_TID_ADDRESS => self.set_tid_address(arguments),
+            number::SET_ROBUST_LIST => self.set_robust_list(arguments),
+            number::PRLIMIT64 => self.prlimit64(arguments),
+            number::GETRANDOM => self.getrandom(arguments),
+            // Restartable sequences, refused for real. glibc asks once at
+            // startup and takes `ENOSYS` for an answer by never using the
+            // feature again — which is the whole point of refusing it here
+            // rather than pretending: a registration that appeared to
+            // succeed would leave the guest expecting the kernel to restart
+            // its critical sections, and nothing would.
+            number::RSEQ => Outcome::Done(Errno::NoSys.as_result()),
+
             // Both leave, and for a single-threaded process they leave the
             // same way: `exit` ends the only thread there is, which ends
             // the process. Once there are threads they part company —
@@ -572,6 +641,134 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
 
             _ => Outcome::Fault(Fault::of(number, arguments)),
         }
+    }
+
+    /// `set_tid_address(2)`: where to write a zero when this thread ends.
+    ///
+    /// The kernel clears that word and futex-wakes anything waiting on it,
+    /// which is how `pthread_join` learns a thread is gone. Recorded rather
+    /// than acted on: there is one thread, nothing can be waiting for it,
+    /// and by the time it ends the process has. M7 is where the recorded
+    /// address starts being used.
+    ///
+    /// It never fails, and it answers with the caller's thread id.
+    fn set_tid_address(&mut self, arguments: Arguments) -> Outcome {
+        self.clear_child_tid = arguments.get(0) as u64;
+        Outcome::Done(PROCESS_ID)
+    }
+
+    /// `set_robust_list(2)`: the list of futexes to release if this thread
+    /// dies holding them.
+    ///
+    /// Recorded for the same reason and with the same horizon as
+    /// `set_tid_address`. The length is checked because Linux checks it —
+    /// a caller passing a structure of the wrong size is a caller built
+    /// against a different kernel, and accepting it would leave the list
+    /// unreadable later.
+    fn set_robust_list(&mut self, arguments: Arguments) -> Outcome {
+        if arguments.get(1) as u64 != ROBUST_LIST_HEAD_SIZE {
+            return Outcome::Done(Errno::Invalid.as_result());
+        }
+        self.robust_list = arguments.get(0) as u64;
+        Outcome::Done(0)
+    }
+
+    /// `prlimit64(2)`: this process's resource limits.
+    ///
+    /// Only the reading half, and only for the limits that have a real
+    /// answer here. The stack's is the one that matters: glibc reads it at
+    /// startup to size a thread's stack attribute, and the number it gets
+    /// back has to be the stack the guest was actually given — see
+    /// `crate::exec::STACK_BYTES`, which is where it comes from rather than
+    /// being restated.
+    ///
+    /// Setting a limit is refused by name. A limit that appeared to change
+    /// and did not would be a guest sizing something against a promise
+    /// nothing keeps.
+    fn prlimit64(&mut self, arguments: Arguments) -> Outcome {
+        let process = arguments.get(0);
+        let resource = arguments.get(1) as u32;
+        let new_limit = arguments.get(2) as u64;
+        let old_limit = arguments.get(3) as u64;
+
+        // Zero means this process, and this process is the only one.
+        if process != 0 && process != PROCESS_ID {
+            return Outcome::Done(Errno::NoProcess.as_result());
+        }
+        if new_limit != 0 {
+            return Outcome::Fault(Fault::detailed(
+                number::PRLIMIT64,
+                arguments,
+                "changing a resource limit",
+            ));
+        }
+        let Some((soft, hard)) = resource_limit_for(resource) else {
+            return Outcome::Fault(Fault::detailed(
+                number::PRLIMIT64,
+                arguments,
+                "a resource whose limit nothing here decides",
+            ));
+        };
+        if old_limit == 0 {
+            // Reading nothing, which is how a caller checks that a resource
+            // exists at all.
+            return Outcome::Done(0);
+        }
+        let mut bytes = [0u8; 16];
+        bytes[..8].copy_from_slice(&soft.to_le_bytes());
+        bytes[8..].copy_from_slice(&hard.to_le_bytes());
+        // SAFETY: bounds-checked against the guest's memory before writing.
+        match unsafe { self.memory().write(old_limit, &bytes) } {
+            Ok(()) => Outcome::Done(0),
+            Err(errno) => Outcome::Done(errno.as_result()),
+        }
+    }
+
+    /// `getrandom(2)`: bytes from the kernel's own generator.
+    ///
+    /// From the seeded stream everything else draws on, so a run replays:
+    /// see [`crate::random`]. Never blocks and never partially fills — the
+    /// generator is always ready, which is what `GRND_NONBLOCK` asks about
+    /// and the only reason a real kernel would answer with less than was
+    /// asked for.
+    fn getrandom(&mut self, arguments: Arguments) -> Outcome {
+        const GRND_NONBLOCK: i64 = 0x1;
+        const GRND_RANDOM: i64 = 0x2;
+        const GRND_INSECURE: i64 = 0x4;
+
+        let buffer = arguments.get(0) as u64;
+        let length = arguments.get(1) as u64;
+        let flags = arguments.get(2);
+        if flags & !(GRND_NONBLOCK | GRND_RANDOM | GRND_INSECURE) != 0 {
+            return Outcome::Done(Errno::Invalid.as_result());
+        }
+        if let Err(errno) = self.memory().check(buffer, length) {
+            return Outcome::Done(errno.as_result());
+        }
+        if length == 0 {
+            return Outcome::Done(0);
+        }
+        // In chunks, so that a guest asking for a megabyte does not put a
+        // megabyte on the kernel's own stack — which is a fixed region with
+        // a guard right below it.
+        let mut chunk = [0u8; 256];
+        let mut written = 0u64;
+        while written < length {
+            let want = chunk.len().min((length - written) as usize);
+            if let Err(errno) = self.random.fill(&mut chunk[..want]) {
+                // Nothing has been written yet on the first pass, and a
+                // generator that stops mid-way cannot happen: it is refused
+                // for having no seed at all or not at all.
+                return Outcome::Done(errno.as_result());
+            }
+            // SAFETY: the whole range was bounds-checked above, and this is
+            // a part of it.
+            if let Err(errno) = unsafe { self.memory().write(buffer + written, &chunk[..want]) } {
+                return Outcome::Done(errno.as_result());
+            }
+            written += want as u64;
+        }
+        Outcome::Done(length as i64)
     }
 
     /// `arch_prctl(2)`: the only way the thread pointer moves.

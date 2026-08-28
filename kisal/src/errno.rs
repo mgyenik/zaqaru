@@ -10,6 +10,9 @@
 pub enum Errno {
     Perm = 1,
     NoEntry = 2,
+    /// No such process. `prlimit64` is the one row that names a process
+    /// other than this one, and there is no other one.
+    NoProcess = 3,
     Io = 5,
     NoDevice = 19,
     BadFile = 9,
@@ -57,6 +60,7 @@ impl Errno {
         match self {
             Self::Perm => "EPERM",
             Self::NoEntry => "ENOENT",
+            Self::NoProcess => "ESRCH",
             Self::Io => "EIO",
             Self::NoDevice => "ENODEV",
             Self::BadFile => "EBADF",
