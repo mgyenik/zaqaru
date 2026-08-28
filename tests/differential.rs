@@ -2492,3 +2492,91 @@ fn carrying_arithmetic_matches_native() {
         }
     }
 }
+
+/// `xchg`, `xadd` and `cmpxchg` against native, at every width and through
+/// memory.
+///
+/// This family is what every libc locks with, and it is why a static glibc
+/// `hello` could not be translated: 43 of the functions reachable from
+/// `_start` use one of them, `__pthread_mutex_lock` and `__calloc` among
+/// them. The three are checked together because they are one shape — read
+/// the destination, compute, write one or both operands back — and what
+/// separates them is exactly what a differential can see: which operand
+/// receives what, and which flags survive.
+#[test]
+fn atomic_read_modify_write_matches_native() {
+    let mut fixture = DifferentialFixture::build("atomic-rmw", &["atomic_rmw.s"]);
+
+    // Values astride every width's wrap point, so the carry and overflow
+    // rules are exercised at the boundary rather than only in the middle.
+    const EDGES: [i64; 12] = [
+        0,
+        1,
+        -1,
+        0x7f,
+        0x80,
+        0xff,
+        0x7fff,
+        0x8000,
+        0xffff,
+        0x7fff_ffff,
+        0xffff_ffff,
+        i64::MIN,
+    ];
+
+    let mut inputs: Vec<(i64, i64, i64)> = Vec::new();
+    for &left in &EDGES {
+        for &right in &EDGES {
+            // The third argument is `cmpxchg`'s replacement, and for the
+            // others is ignored — except that equal first and second
+            // arguments are the case `cmpxchg` is *about*, so they are
+            // reached by `left == right` above rather than by luck.
+            inputs.push((left, right, 0x5a5a_5a5a_5a5a_5a5a_u64 as i64));
+            inputs.push((left, left, right));
+        }
+    }
+    let mut generator = Pseudorandom::new(0x7863_6867_0000_0001);
+    for _ in 0..RANDOM_ITERATIONS {
+        inputs.push((
+            generator.next_i64(),
+            generator.next_i64(),
+            generator.next_i64(),
+        ));
+    }
+
+    for name in [
+        "xchg_qword",
+        "xchg_qword_other",
+        "xchg_dword",
+        "xchg_dword_upper",
+        "xchg_byte",
+        "xchg_memory",
+        "xchg_same",
+        "xadd_qword_sum",
+        "xadd_qword_old",
+        "xadd_qword_flags",
+        "xadd_dword_sum",
+        "xadd_byte_flags",
+        "xadd_memory",
+        "cmpxchg_qword_destination",
+        "cmpxchg_qword_accumulator",
+        "cmpxchg_qword_flags",
+        "cmpxchg_dword_destination",
+        "cmpxchg_byte_flags",
+        "cmpxchg_memory",
+    ] {
+        let native = unsafe {
+            native_function::<unsafe extern "C" fn(i64, i64, i64) -> i64>(&fixture.native, name)
+        };
+        for &(first, second, third) in &inputs {
+            let expected = unsafe { native(first, second, third) };
+            for (variant, module) in &mut fixture.transpiled {
+                assert_eq!(
+                    module.call_guest(name, [first, second, third, 0, 0, 0]),
+                    expected,
+                    "{name}({first}, {second}, {third}) disagreed with native in {variant}"
+                );
+            }
+        }
+    }
+}

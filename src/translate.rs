@@ -515,6 +515,9 @@ impl<'a> FunctionTranslator<'a> {
             Mnemonic::Cdq => self.translate_sign_into_data_register(body, OperandWidth::DoubleWord),
             Mnemonic::Cqo => self.translate_sign_into_data_register(body, OperandWidth::QuadWord),
             Mnemonic::Mov => self.translate_move(body, lifted),
+            Mnemonic::Xchg => self.translate_exchange(body, lifted),
+            Mnemonic::Xadd => self.translate_exchange_and_add(body, lifted),
+            Mnemonic::Cmpxchg => self.translate_compare_and_exchange(body, lifted),
             Mnemonic::Movzx | Mnemonic::Movsx | Mnemonic::Movsxd => {
                 self.translate_extending_move(body, lifted)
             }
@@ -1595,6 +1598,134 @@ impl<'a> FunctionTranslator<'a> {
     /// The two- and three-operand forms of `imul`, which keep only the low
     /// half of the product.
     /// `cbw`/`cwde`/`cdqe`: widen the accumulator in place, signed.
+    /// `xchg`: the two operands swap, and no flag moves.
+    ///
+    /// With a memory operand this is atomic whether or not it carries a
+    /// `lock` prefix, which is why every libc uses it to release a mutex.
+    /// Nothing here makes it atomic and nothing has to: the scheduler
+    /// switches threads only at syscalls, so no other actor can observe the
+    /// two halves apart. If that ever stops being true — preemption at
+    /// arbitrary points — this is one of the places that has to change, and
+    /// it is written here so the search finds it.
+    fn translate_exchange(
+        &mut self,
+        body: &mut FunctionBodyBuilder,
+        lifted: &LiftedInstruction,
+    ) -> Result<()> {
+        let width = self.destination_width(&lifted.instruction)?;
+        let value_type = width.value_type();
+        let first = self.temporaries.take(body, value_type);
+        let second = self.temporaries.take(body, value_type);
+
+        // Both read before either is written: the operands can name the same
+        // register, and a swap that reads the second one afterwards would
+        // read what it had just written.
+        self.read_operand(body, lifted, 0, width)?;
+        body.local_set(first);
+        self.read_operand(body, lifted, 1, width)?;
+        body.local_set(second);
+
+        self.write_operand(body, lifted, 0, width, second)?;
+        self.write_operand(body, lifted, 1, width, first)
+    }
+
+    /// `xadd`: the destination gets the sum, the source gets the
+    /// destination's old value, and the flags are an ordinary addition's.
+    fn translate_exchange_and_add(
+        &mut self,
+        body: &mut FunctionBodyBuilder,
+        lifted: &LiftedInstruction,
+    ) -> Result<()> {
+        let width = self.destination_width(&lifted.instruction)?;
+        let value_type = width.value_type();
+        let destination = self.temporaries.take(body, value_type);
+        let source = self.temporaries.take(body, value_type);
+        let sum = self.temporaries.take(body, value_type);
+
+        self.read_operand(body, lifted, 0, width)?;
+        body.local_set(destination);
+        self.read_operand(body, lifted, 1, width)?;
+        body.local_set(source);
+
+        body.local_get(destination);
+        body.local_get(source);
+        emit_binary(body, width, BinaryOperation::Add);
+        body.local_set(sum);
+
+        // The source first: it takes the destination's *old* value, and the
+        // two can name the same register only if they are the same, in which
+        // case x86 leaves the sum there.
+        self.write_operand(body, lifted, 1, width, destination)?;
+        self.write_operand(body, lifted, 0, width, sum)?;
+        self.emit_flags(
+            body,
+            FlagRule::Addition,
+            width,
+            OperationValues {
+                left: destination,
+                right: source,
+                result: sum,
+            },
+            true,
+        );
+        Ok(())
+    }
+
+    /// `cmpxchg`: compare the accumulator with the destination, and write
+    /// one of them.
+    ///
+    /// Equal, and the source replaces the destination; unequal, and the
+    /// destination replaces the accumulator. Either way the flags are those
+    /// of `cmp accumulator, destination` — which is what makes `ZF` the
+    /// answer to "did it take", and what every compare-and-swap loop
+    /// branches on.
+    fn translate_compare_and_exchange(
+        &mut self,
+        body: &mut FunctionBodyBuilder,
+        lifted: &LiftedInstruction,
+    ) -> Result<()> {
+        let width = self.destination_width(&lifted.instruction)?;
+        let value_type = width.value_type();
+        let destination = self.temporaries.take(body, value_type);
+        let source = self.temporaries.take(body, value_type);
+        let expected = self.temporaries.take(body, value_type);
+        let difference = self.temporaries.take(body, value_type);
+
+        self.read_operand(body, lifted, 0, width)?;
+        body.local_set(destination);
+        self.read_operand(body, lifted, 1, width)?;
+        body.local_set(source);
+        self.state.read_register(body, accumulator(width));
+        body.local_set(expected);
+
+        body.local_get(expected);
+        body.local_get(destination);
+        emit_binary(body, width, BinaryOperation::Subtract);
+        body.local_set(difference);
+        self.emit_flags(
+            body,
+            FlagRule::Subtraction,
+            width,
+            OperationValues {
+                left: expected,
+                right: destination,
+                result: difference,
+            },
+            true,
+        );
+
+        body.local_get(expected);
+        body.local_get(destination);
+        emit_equal(body, width);
+        body.if_();
+        self.write_operand(body, lifted, 0, width, source)?;
+        body.else_();
+        body.local_get(destination);
+        self.state.write_register(body, accumulator(width));
+        body.end();
+        Ok(())
+    }
+
     fn translate_widen_accumulator(
         &mut self,
         body: &mut FunctionBodyBuilder,
