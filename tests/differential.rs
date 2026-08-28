@@ -2722,3 +2722,79 @@ fn a_branch_past_a_lock_prefix_matches_native() {
         }
     }
 }
+
+/// `bsf`, `bsr`, `bswap`, `rdsspq` and `stmxcsr` against native.
+///
+/// The scans are here for what they do with nothing to find: a source of
+/// zero has no lowest or highest set bit, and x86 sets the zero flag and
+/// leaves the destination *unchanged* rather than zeroing it. Every scan
+/// below preloads its destination, so a translation that wrote a zero would
+/// show up as a wrong answer instead of a plausible one.
+#[test]
+fn bit_scans_and_byte_swaps_match_native() {
+    let mut fixture = DifferentialFixture::build("bit-scan", &["bit_scan.s"]);
+
+    let mut inputs: Vec<(i64, i64)> = Vec::new();
+    const VALUES: [i64; 14] = [
+        0,
+        1,
+        2,
+        3,
+        0x80,
+        0x100,
+        0xffff,
+        0x1_0000,
+        0x8000_0000,
+        0xffff_ffff,
+        i64::MIN,
+        i64::MAX,
+        -1,
+        0x0123_4567_89ab_cdef,
+    ];
+    for &value in &VALUES {
+        // The second argument is what the destination held first, and a
+        // scan of zero has to leave it there.
+        for &previous in &[0x1234_5678_9abc_def0_u64 as i64, 0, -1] {
+            inputs.push((value, previous));
+        }
+    }
+    let mut generator = Pseudorandom::new(0x6273_6600_0000_0001);
+    for _ in 0..RANDOM_ITERATIONS {
+        // Sparse values as well as dense ones, so a scan usually has a
+        // single bit to find rather than always the lowest.
+        let bit = generator.next_u64() % 64;
+        inputs.push((1i64 << bit, generator.next_i64()));
+        inputs.push((generator.next_i64(), generator.next_i64()));
+    }
+
+    for name in [
+        "bsf_qword",
+        "bsr_qword",
+        "bsf_dword",
+        "bsr_dword",
+        "bsf_word",
+        "bsr_word",
+        "bsf_qword_zero",
+        "bsr_qword_zero",
+        "bsf_dword_zero",
+        "bswap_qword",
+        "bswap_dword",
+        "bswap_dword_upper",
+        "shadow_stack_pointer",
+        "sse_control_register",
+    ] {
+        let native = unsafe {
+            native_function::<unsafe extern "C" fn(i64, i64) -> i64>(&fixture.native, name)
+        };
+        for &(value, previous) in &inputs {
+            let expected = unsafe { native(value, previous) };
+            for (variant, module) in &mut fixture.transpiled {
+                assert_eq!(
+                    module.call_guest(name, [value, previous, 0, 0, 0, 0]),
+                    expected,
+                    "{name}({value:#x}, {previous:#x}) disagreed with native in {variant}"
+                );
+            }
+        }
+    }
+}

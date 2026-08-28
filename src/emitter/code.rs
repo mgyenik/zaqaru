@@ -455,6 +455,8 @@ impl FunctionBodyBuilder {
         i64_rotate_left = 0x89, i64_rotate_right = 0x8a,
         i32_wrap_i64 = 0xa7,
         i64_extend_i32_signed = 0xac, i64_extend_i32_unsigned = 0xad,
+        i32_count_leading_zeros = 0x67, i32_count_trailing_zeros = 0x68,
+        i64_count_leading_zeros = 0x79, i64_count_trailing_zeros = 0x7a,
         i32_popcnt = 0x69, i64_popcnt = 0x7b,
         i32_extend8_signed = 0xc0, i32_extend16_signed = 0xc1,
         i64_extend8_signed = 0xc2, i64_extend16_signed = 0xc3,

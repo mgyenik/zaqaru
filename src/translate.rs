@@ -504,6 +504,17 @@ impl<'a> FunctionTranslator<'a> {
             Mnemonic::Not => self.translate_complement(body, lifted),
             Mnemonic::Inc => self.translate_step(body, lifted, FlagRule::Addition),
             Mnemonic::Dec => self.translate_step(body, lifted, FlagRule::Subtraction),
+            Mnemonic::Bsf => self.translate_bit_scan(body, lifted, true),
+            Mnemonic::Bsr => self.translate_bit_scan(body, lifted, false),
+            Mnemonic::Bswap => self.translate_byte_swap(body, lifted),
+            // Reads the shadow-stack pointer, and is a no-op on a processor
+            // whose shadow stack is off — which is every processor this
+            // runs on, since nothing here implements control-flow
+            // enforcement. glibc writes it as `xor %eax,%eax; rdsspq %rax`
+            // precisely so that the answer on such a machine is the zero it
+            // just put there.
+            Mnemonic::Rdsspq | Mnemonic::Rdsspd => Ok(()),
+            Mnemonic::Stmxcsr => self.translate_store_control_register(body, lifted),
             Mnemonic::Rol => self.translate_rotate(body, lifted, true),
             Mnemonic::Ror => self.translate_rotate(body, lifted, false),
             Mnemonic::Bt => self.translate_bit_test(body, lifted, BitAction::Read),
@@ -1554,6 +1565,156 @@ impl<'a> FunctionTranslator<'a> {
         self.emit_shift_flags(body, kind, width, value, count, result);
         body.end();
         Ok(())
+    }
+
+    /// `bsf`/`bsr`: the index of the lowest or highest set bit.
+    ///
+    /// A source of zero has no such index, and x86 says so by setting the
+    /// zero flag and leaving the destination *unchanged* — not zero, which
+    /// is a real distinction because the destination often holds something
+    /// the caller still wants. Every other flag is undefined, and hardware
+    /// leaves them alone.
+    fn translate_bit_scan(
+        &mut self,
+        body: &mut FunctionBodyBuilder,
+        lifted: &LiftedInstruction,
+        forward: bool,
+    ) -> Result<()> {
+        let width = self.destination_width(&lifted.instruction)?;
+        let value_type = width.value_type();
+        let value = self.temporaries.take(body, value_type);
+        let empty = self.temporaries.take(body, ValueType::I32);
+        let result = self.temporaries.take(body, value_type);
+
+        self.read_operand(body, lifted, 1, width)?;
+        body.local_set(value);
+        body.local_get(value);
+        emit_is_zero(body, width);
+        body.local_tee(empty);
+        self.state.write_flag(body, Flag::Zero);
+
+        body.local_get(empty);
+        body.i32_eqz();
+        body.if_();
+        // Counted in the carrier, which is right at either width: the bits
+        // above a narrow operand are zero, so nothing below the highest set
+        // bit is missed and the highest set bit's index is the carrier's
+        // width less its leading zeros.
+        match (width.carrier(), forward) {
+            (Carrier::I32, true) => {
+                body.local_get(value);
+                body.i32_count_trailing_zeros();
+            }
+            (Carrier::I64, true) => {
+                body.local_get(value);
+                body.i64_count_trailing_zeros();
+            }
+            (Carrier::I32, false) => {
+                body.i32_const(31);
+                body.local_get(value);
+                body.i32_count_leading_zeros();
+                body.i32_sub();
+            }
+            (Carrier::I64, false) => {
+                body.i64_const(63);
+                body.local_get(value);
+                body.i64_count_leading_zeros();
+                body.i64_sub();
+            }
+        }
+        body.local_set(result);
+        self.write_operand(body, lifted, 0, width, result)?;
+        body.end();
+        Ok(())
+    }
+
+    /// `bswap`: the bytes of a register in the opposite order.
+    ///
+    /// Writes no flag. The sixteen-bit form is architecturally undefined —
+    /// it zeroes the register on some processors and does nothing on others
+    /// — so it is refused rather than given one of those meanings.
+    fn translate_byte_swap(
+        &mut self,
+        body: &mut FunctionBodyBuilder,
+        lifted: &LiftedInstruction,
+    ) -> Result<()> {
+        let width = self.destination_width(&lifted.instruction)?;
+        if width != OperandWidth::DoubleWord && width != OperandWidth::QuadWord {
+            bail!(
+                "`{}` swaps {} bytes, a form x86 leaves undefined",
+                render(&lifted.instruction),
+                width.bytes()
+            );
+        }
+        let value_type = width.value_type();
+        let value = self.temporaries.take(body, value_type);
+        let result = self.temporaries.take(body, value_type);
+
+        self.read_operand(body, lifted, 0, width)?;
+        body.local_set(value);
+
+        // Byte `n` of the source becomes byte `bytes - 1 - n`, which is a
+        // shift by the difference and a mask in the destination's place.
+        let bytes = width.bytes() as i64;
+        for from in 0..bytes {
+            let to = bytes - 1 - from;
+            let shift = (to - from) * 8;
+            body.local_get(value);
+            match width.carrier() {
+                Carrier::I32 => {
+                    if shift >= 0 {
+                        body.i32_const(shift as i32);
+                        body.i32_shl();
+                    } else {
+                        body.i32_const(-shift as i32);
+                        body.i32_shr_unsigned();
+                    }
+                    body.i32_const((0xffi64 << (to * 8)) as i32);
+                    body.i32_and();
+                    if from != 0 {
+                        body.i32_or();
+                    }
+                }
+                Carrier::I64 => {
+                    if shift >= 0 {
+                        body.i64_const(shift);
+                        body.i64_shl();
+                    } else {
+                        body.i64_const(-shift);
+                        body.i64_shr_unsigned();
+                    }
+                    body.i64_const(0xffi64 << (to * 8));
+                    body.i64_and();
+                    if from != 0 {
+                        body.i64_or();
+                    }
+                }
+            }
+        }
+        body.local_set(result);
+        self.write_operand(body, lifted, 0, width, result)
+    }
+
+    /// `stmxcsr`: the SSE control and status register, as this machine has
+    /// it.
+    ///
+    /// Nothing here models one. What is stored is the value a process starts
+    /// with — every exception masked, round to nearest even, no exception
+    /// raised — which is what it would read on a machine where nothing has
+    /// changed it. `ldmxcsr` is deliberately *not* implemented: reading a
+    /// register whose value is fixed is honest, and accepting a write to one
+    /// while ignoring what it says would make a rounding mode change
+    /// silently do nothing.
+    fn translate_store_control_register(
+        &mut self,
+        body: &mut FunctionBodyBuilder,
+        lifted: &LiftedInstruction,
+    ) -> Result<()> {
+        const DEFAULT_CONTROL: i64 = 0x1f80;
+        let value = self.temporaries.take(body, ValueType::I32);
+        body.i32_const(DEFAULT_CONTROL as i32);
+        body.local_set(value);
+        self.write_operand(body, lifted, 0, OperandWidth::DoubleWord, value)
     }
 
     /// `rol`/`ror`: the bits that leave one end arrive at the other.
