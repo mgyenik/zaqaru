@@ -1520,6 +1520,17 @@ binding:
   suite, the strace-diff, and real-image bakes run at milestone gates
   and after refactors that touch shared machinery — never after every
   edit.
+- **A test's own runtime is a permanent tax, and it compounds.** A
+  regression set costing two minutes buys thirty iterations an hour; one
+  costing ten seconds buys hundreds, and the difference is paid on every
+  change for as long as the project exists. So the cost of a test is part
+  of its design, not an afterthought: measure where a slow suite's time
+  actually goes before restructuring it (the answer, once, was the *build
+  profile* — dependencies compiled unoptimized, worth 6.5×), and do not
+  pay for the same expensive artefact once per assertion. Cases that need
+  one container share one and keep a name each. What this never means is
+  `#[ignore]` on the slow ones, which improves the number by not running
+  the test.
 - **Fixture bakes stay small.** M3–M5 test images are trees of
   dozens of files baked in milliseconds; the real CPython image is
   baked at M6+ gates and cached between runs. A full bake in an inner

@@ -2098,3 +2098,88 @@ Open, and none of it blocking the tier:
 - **Breadth.** Three dynamic files read closely and fifteen more parsed in a
   spike is not a population. The `/usr/bin` sweep at a real base is the
   measurement, and it is cheap; it has not been run.
+
+## 2026-08-29 — binaries we did not compile, and the cost of the suite itself
+
+### Three stripped coreutils
+
+`/usr/bin/true`, `/bin/echo` and `/usr/bin/uname` run. Every dynamic program
+before them was compiled by the test at flags the test chose, which is a
+weaker claim than it sounds — these are whatever the distribution shipped,
+stripped, linked by someone else's toolchain, with the packager's `crt`
+files. Four gaps between the two, each surfaced by running one of them:
+
+- **`DT_INIT`'s function had no witness at all.** `.init` holds `_init`; a
+  stripped binary gives it no symbol and `crti.o` gives it no unwind entry,
+  so nothing saw it — while the loader calls it before `main` every run. The
+  ABI defines `.init` and `.fini` as holding exactly one function each
+  beginning at the section's start, which is strong evidence available in
+  any file with section headers. All three died at the first byte of their
+  own `.init`.
+- **Dynamic relocations were never harvested.** The read walked
+  `section.relocations()`, which finds nothing in a linked file: `.rela.dyn`
+  is not attached to a target section the way a relocatable object's
+  `.rela.text` is. So D3's best witness was silently absent from every
+  position-independent file, and a PIE embeds an `R_X86_64_RELATIVE` for
+  every pointer it holds — exactly the addresses no instruction names.
+  `main`, handed to `__libc_start_main` through a GOT slot, is the first one
+  every program needs. The tell was in a histogram printed hours earlier:
+  `libc.so.6` showed **zero** `FileStated` functions, which is impossible
+  for a PIE, and I read past it.
+- **A function can fall out through alignment.** `__memcpy_chk` ends at
+  `0xba96d`, three `nop` bytes follow, `memcpy` starts at `0xba970`, and the
+  first really does fall into the second. Asking only about `0xba96d` found
+  nothing and emitted a trap where the program has a path. The fall-out
+  target is now the next function after the gap when everything between is
+  filler; skipping *code* to reach it would invent control flow, so that
+  stays a trap.
+- **`uname`**, an M6 grind row, was the only thing between `/usr/bin/uname`
+  and printing `Linux`.
+
+### The suite was costing more than the work
+
+The regression set had reached about 105 seconds, and I had run it four
+times in an afternoon while proposing to add a fourth dynamic case to it.
+The arithmetic that makes this a defect rather than an annoyance: two
+minutes buys thirty iterations an hour, ten seconds buys hundreds, and the
+difference is paid on every change for the life of the project.
+
+**Measured before restructuring, and the measurement moved the answer.** The
+same work takes 0.87s to bake and 1.97s to run through the release binaries
+against ~25s inside a test — so the bottleneck was not the tests' shape but
+the *build profile*. `Cargo.toml` carried no `[profile]` sections at all, so
+every run used debug builds of `iced-x86`, which decodes once per
+instruction of every function translated, and of `wasmtime`, which compiles
+every body of every container a test builds — fifteen thousand for a
+dynamic-tier module.
+
+    dynamic_boot   78.0s → 12.0s
+    glibc_boot     20.1s →  2.6s
+    boot            1.4s →  0.3s
+
+Debug info is kept and `debug-assertions` is untouched: it is set
+independently of `opt-level`, so every assertion and overflow check inside a
+dependency still fires. That distinction came from being asked what debug
+dependencies actually buy when a test fails — the first version of the
+change also set `debug = false`, which would have cost line numbers in a
+dependency panic for no runtime gain. The diagnostics this project actually
+reads are wasm backtraces out of a trapping guest, which come from the guest
+module's own name section and are unaffected by any of it.
+
+Then the duplicated work: three C programs differing by ten lines, each
+separately translating all of `libc.so.6`, linking 22 MB and handing it to
+the engine. One container now, shared through a `OnceLock`, with a `#[test]`
+and a name each and one labelled output line per case — six named cases
+where there were four, in 8.0s instead of 12.0s. The whole set is ~15s.
+
+What was deliberately not done: `#[ignore]` on the slow tests, which
+improves the number by not running them.
+
+### And, again
+
+The edit adding the distribution-binary test was interrupted, reported as
+"not written", and had in fact already applied — the file had the test and
+it passed. The worklog records this exact pattern from the day before: **a
+tool call that is stopped is not evidence that its effects were not
+applied.** Twice now, and both times the recovery was cheap only because
+something else printed the truth.
