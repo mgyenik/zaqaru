@@ -3191,6 +3191,35 @@ fn functions_entered_at_a_shared_body_match_native() {
     }
 }
 
+/// A branch target inside what a linear sweep decodes as one instruction.
+///
+/// Only the branch-taken path is exercised, and that is the point rather
+/// than a limitation: the bytes the other path runs into are not
+/// instructions, which is exactly why a sweep is wrong about them. What is
+/// under test is that the function translates at all — swept linearly the
+/// branch target is not an instruction boundary and the whole function is
+/// refused — and that the path that is real still computes the right thing.
+#[test]
+fn a_branch_into_a_straddled_boundary_still_decodes() {
+    let mut fixture = DifferentialFixture::build("straddled-boundary", &["straddled_boundary.s"]);
+    let native = unsafe {
+        native_function::<unsafe extern "C" fn(i64, i64) -> i64>(
+            &fixture.native,
+            "straddled_boundary",
+        )
+    };
+    for value in [0i64, 1, -1, 35, i64::MAX - 7] {
+        let expected = unsafe { native(1, value) };
+        for (variant, module) in &mut fixture.transpiled {
+            assert_eq!(
+                module.call_guest("straddled_boundary", [1, value, 0, 0, 0, 0]),
+                expected,
+                "straddled_boundary(1, {value}) disagreed with native in {variant}"
+            );
+        }
+    }
+}
+
 /// A tail jump whose target reads the jumper's stack frame.
 ///
 /// Every other fixture's tail-call target touches only registers, which is

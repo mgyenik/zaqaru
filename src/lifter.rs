@@ -6,8 +6,11 @@
 //! becomes `symbol + addend` rather than a number. Program-counter relativity
 //! is resolved away here, so nothing downstream needs to know it existed.
 
+use std::collections::BTreeSet;
+use std::ops::Bound;
+
 use anyhow::{Context, Result, bail};
-use iced_x86::{Decoder, DecoderOptions, Instruction};
+use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction, OpKind};
 
 use crate::reader::{Function, ObjectFile};
 
@@ -82,13 +85,35 @@ impl LiftedFunction {
 /// Jump tables are *not* recovered here: a table's extent depends on where
 /// the next one begins, which is only knowable across the whole object. Use
 /// [`lift_object`], which does both.
-fn decode_function(object: &ObjectFile, function_index: usize) -> Result<LiftedFunction> {
-    let function: &Function = &object.functions[function_index];
-    let section = &object.sections[function.section];
-    let start = function.offset as usize;
-    let end = start + function.size as usize;
-    let body = &section.bytes[start..end];
+/// Whether control continues past an instruction into the next bytes.
+///
+/// A `ret` or an unconditional jump does not, which is what makes the bytes
+/// after one nobody's instructions.
+fn continues_past(instruction: &Instruction) -> bool {
+    !matches!(
+        instruction.flow_control(),
+        FlowControl::Return | FlowControl::UnconditionalBranch | FlowControl::IndirectBranch
+    )
+}
 
+/// How many times [`decode_function`] will re-sweep before deciding its own
+/// reasoning is wrong. Every real function settles in one or two.
+const MAX_DECODE_ROUNDS: usize = 8;
+
+/// One sweep, with a set of offsets that are known to begin instructions.
+///
+/// An instruction that would span one of them is discarded and decoding
+/// resumes there. What is thrown away is unreachable by construction — it is
+/// only ever the bytes after a call that does not return — so the fall-through
+/// this leaves behind, from the instruction before the discarded one straight
+/// to the boundary, describes a path no execution takes.
+fn decode_pass(
+    object: &ObjectFile,
+    function: &Function,
+    body: &[u8],
+    boundaries: &BTreeSet<u64>,
+    poisoned: &mut BTreeSet<u64>,
+) -> Result<Vec<LiftedInstruction>> {
     let mut decoder = Decoder::with_ip(64, body, function.offset, DecoderOptions::NONE);
     let mut instructions = Vec::new();
 
@@ -96,11 +121,27 @@ fn decode_function(object: &ObjectFile, function_index: usize) -> Result<LiftedF
         let offset = decoder.ip();
         let instruction = decoder.decode();
         if instruction.is_invalid() {
-            bail!(
-                "undecodable bytes in `{}` at offset {:#x}",
-                function.name,
-                offset
-            );
+            // Not an error yet. Bytes nothing reaches are not instructions
+            // and are not required to decode as any — the padding after a
+            // call that never returns is exactly that, and here it happens
+            // to spell a `lock` prefix on a register operand, which no
+            // decoder will accept. Whether this mattered is decided after
+            // the boundaries have settled: if something falls through into
+            // it, it is an error and says so.
+            poisoned.insert(offset);
+            decoder.set_position((offset - function.offset) as usize + 1)?;
+            decoder.set_ip(offset + 1);
+            continue;
+        }
+        let length = instruction.len() as u64;
+        if let Some(boundary) = boundaries
+            .range((Bound::Excluded(offset), Bound::Excluded(offset + length)))
+            .next()
+            .copied()
+        {
+            decoder.set_position((boundary - function.offset) as usize)?;
+            decoder.set_ip(boundary);
+            continue;
         }
         let constant_offsets = decoder.get_constant_offsets(&instruction);
         let lifted =
@@ -112,6 +153,90 @@ fn decode_function(object: &ObjectFile, function_index: usize) -> Result<LiftedF
                     )
                 })?;
         instructions.push(lifted);
+    }
+    Ok(instructions)
+}
+
+fn decode_function(object: &ObjectFile, function_index: usize) -> Result<LiftedFunction> {
+    let function: &Function = &object.functions[function_index];
+    let section = &object.sections[function.section];
+    let start = function.offset as usize;
+    let end = start + function.size as usize;
+    let body = &section.bytes[start..end];
+
+    // Decoding is a fixpoint rather than a sweep, because a linear sweep can
+    // be wrong about where instructions begin.
+    //
+    // The bytes after a call to a function that never returns are not
+    // instructions — nothing reaches them — but a decoder does not know
+    // that and decodes them anyway, and what it produces can *straddle* the
+    // place a real instruction starts. glibc's `____longjmp_chk` is the
+    // case: two branches target one offset, and the padding after its
+    // `call __fortify_fail` decodes into an instruction that spans through
+    // it. Sweeping linearly, that offset is not an instruction boundary and
+    // the function is refused.
+    //
+    // So: sweep, collect the branch targets, and if any of them landed
+    // inside an instruction, sweep again with that offset known to be a
+    // boundary — an instruction that would straddle one is discarded and
+    // decoding resumes there. Each round can only discover more boundaries
+    // and there are finitely many offsets, so it terminates; the bound is
+    // there to make a bug in that reasoning loud rather than silent.
+    let mut boundaries: BTreeSet<u64> = BTreeSet::new();
+    let mut instructions;
+    let mut poisoned = BTreeSet::new();
+    let mut rounds = 0;
+    loop {
+        poisoned.clear();
+        instructions = decode_pass(object, function, body, &boundaries, &mut poisoned)?;
+        let starts: BTreeSet<u64> = instructions.iter().map(|lifted| lifted.offset).collect();
+        let discovered: BTreeSet<u64> = instructions
+            .iter()
+            .filter(|lifted| {
+                matches!(
+                    lifted.instruction.flow_control(),
+                    FlowControl::ConditionalBranch
+                        | FlowControl::UnconditionalBranch
+                        | FlowControl::Call
+                ) && lifted.instruction.op0_kind() == OpKind::NearBranch64
+            })
+            .map(|lifted| lifted.instruction.near_branch64())
+            .filter(|target| {
+                *target >= function.offset
+                    && *target < function.offset + function.size
+                    && !starts.contains(target)
+                    && !boundaries.contains(target)
+            })
+            .collect();
+        if discovered.is_empty() {
+            // Now that the boundaries have settled, undecodable bytes are an
+            // error exactly when something runs into them: an instruction
+            // that continues and whose next byte is the first poisoned one.
+            // That is the case where the decode has lost sync with the
+            // program, which has to be loud — the alternative is a
+            // translation quietly missing instructions.
+            for lifted in &instructions {
+                let next = lifted.offset + lifted.length();
+                if poisoned.contains(&next) && continues_past(&lifted.instruction) {
+                    bail!(
+                        "undecodable bytes in `{}` at offset {next:#x}, which \
+                         `{:#x}` runs into",
+                        function.name,
+                        lifted.offset
+                    );
+                }
+            }
+            break;
+        }
+        boundaries.extend(discovered);
+        rounds += 1;
+        if rounds > MAX_DECODE_ROUNDS {
+            bail!(
+                "the instruction boundaries in `{}` did not settle after \
+                 {MAX_DECODE_ROUNDS} rounds",
+                function.name
+            );
+        }
     }
 
     Ok(LiftedFunction {

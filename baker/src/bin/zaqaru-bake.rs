@@ -120,9 +120,11 @@ fn main() -> Result<()> {
 /// are somewhere a failed bake can be looked at.
 fn tempdir(output: &Path) -> Result<PathBuf> {
     let directory = output.with_extension("bake");
-    if directory.exists() {
-        std::fs::remove_dir_all(&directory).ok();
-    }
+    // Whatever is there, not just a directory: the name is derived from the
+    // output's, so it collides with anything a caller happened to put beside
+    // it — a log named after the same stem, for instance.
+    std::fs::remove_dir_all(&directory).ok();
+    std::fs::remove_file(&directory).ok();
     std::fs::create_dir_all(&directory)
         .with_context(|| format!("creating {}", directory.display()))?;
     Ok(directory)
