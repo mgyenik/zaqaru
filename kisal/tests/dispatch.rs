@@ -711,3 +711,105 @@ fn clock_gettime_refuses_what_it_cannot_parse() {
         );
     }
 }
+
+/// A signal mask is read back, and the two signals that cannot be blocked
+/// are not.
+#[test]
+fn the_signal_mask_is_kept_and_read_back() {
+    let mut kernel = Kernel::new(Recording::default(), Registers::default(), empty_image());
+    let mut set = 0u64.to_le_bytes();
+    let mut old = [0u8; 8];
+    let mask = |how: i64, set: &mut [u8; 8], old: &mut [u8; 8]| {
+        Arguments::new([
+            how,
+            set.as_mut_ptr() as usize as i64,
+            old.as_mut_ptr() as usize as i64,
+            8,
+            0,
+            0,
+        ])
+    };
+
+    // Block SIGABRT (6) and SIGKILL (9); only the first can be blocked.
+    set = (signal_bit(6) | signal_bit(9)).to_le_bytes();
+    assert_eq!(
+        kernel.dispatch(number::RT_SIGPROCMASK, mask(0, &mut set, &mut old)),
+        Outcome::Done(0)
+    );
+    assert_eq!(u64::from_le_bytes(old), 0, "the mask started non-empty");
+
+    set = 0u64.to_le_bytes();
+    assert_eq!(
+        kernel.dispatch(number::RT_SIGPROCMASK, mask(2, &mut set, &mut old)),
+        Outcome::Done(0)
+    );
+    assert_eq!(
+        u64::from_le_bytes(old),
+        signal_bit(6),
+        "SIGKILL was blockable, or SIGABRT was not kept"
+    );
+
+    // A size other than eight is a caller built against another kernel.
+    let mut wrong = Arguments::new([0, set.as_mut_ptr() as usize as i64, 0, 16, 0, 0]);
+    wrong.values[3] = 16;
+    assert_eq!(
+        kernel.dispatch(number::RT_SIGPROCMASK, wrong),
+        Outcome::Done(Errno::Invalid.as_result())
+    );
+}
+
+/// A fatal signal sent to this process ends it; a blocked one does not.
+///
+/// This is `abort`: it unblocks `SIGABRT` and raises it at itself, precisely
+/// so nothing can stop it. The status is what `wait` reports for a process
+/// killed by a signal, which a shell prints as 128 plus the number.
+#[test]
+fn a_fatal_signal_to_this_process_ends_it() {
+    let mut kernel = Kernel::new(Recording::default(), Registers::default(), empty_image());
+    let raise = |signal: i64| Arguments::new([1, 1, signal, 0, 0, 0]);
+
+    assert_eq!(
+        kernel.dispatch(number::TGKILL, raise(6)),
+        Outcome::Exit(134)
+    );
+
+    // Blocked, so it stays pending and nothing delivers it.
+    let mut set = signal_bit(6).to_le_bytes();
+    let mut old = [0u8; 8];
+    assert_eq!(
+        kernel.dispatch(
+            number::RT_SIGPROCMASK,
+            Arguments::new([
+                0,
+                set.as_mut_ptr() as usize as i64,
+                old.as_mut_ptr() as usize as i64,
+                8,
+                0,
+                0
+            ])
+        ),
+        Outcome::Done(0)
+    );
+    assert_eq!(kernel.dispatch(number::TGKILL, raise(6)), Outcome::Done(0));
+
+    // A signal whose default action is to be ignored never ends anything.
+    assert_eq!(kernel.dispatch(number::TGKILL, raise(28)), Outcome::Done(0));
+
+    // A thread that does not exist, and a signal number that is not one.
+    assert_eq!(
+        kernel.dispatch(number::TGKILL, Arguments::new([1, 2, 6, 0, 0, 0])),
+        Outcome::Done(Errno::NoProcess.as_result())
+    );
+    assert_eq!(
+        kernel.dispatch(number::TGKILL, raise(0)),
+        Outcome::Done(Errno::Invalid.as_result())
+    );
+    assert_eq!(
+        kernel.dispatch(number::TGKILL, raise(65)),
+        Outcome::Done(Errno::Invalid.as_result())
+    );
+}
+
+fn signal_bit(signal: i64) -> u64 {
+    1u64 << (signal - 1)
+}

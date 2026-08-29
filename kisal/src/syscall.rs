@@ -54,6 +54,7 @@ pub mod number {
     pub const GETDENTS64: i64 = 217;
     pub const SET_TID_ADDRESS: i64 = 218;
     pub const GETTID: i64 = 186;
+    pub const TGKILL: i64 = 234;
     pub const CLOCK_GETTIME: i64 = 228;
     pub const EXIT_GROUP: i64 = 231;
     pub const OPENAT: i64 = 257;
@@ -193,6 +194,7 @@ pub mod number {
             GETTID => "gettid",
             CLOCK_GETTIME => "clock_gettime",
             EXIT_GROUP => "exit_group",
+            TGKILL => "tgkill",
             OPENAT => "openat",
             NEWFSTATAT => "newfstatat",
             GETRANDOM => "getrandom",
@@ -355,6 +357,10 @@ pub struct Kernel<'a, S: Store, M: Machine> {
     /// `set_tid_address`. Recorded until M7 has a thread whose ending
     /// something could be waiting for.
     pub clear_child_tid: u64,
+    /// Which signals this thread has blocked, one bit each, signal one at
+    /// bit zero. Only self-directed signals can ever be affected by it —
+    /// nothing outside a container can send one.
+    blocked_signals: u64,
     /// The head of this thread's robust futex list, from
     /// `set_robust_list`. Recorded with the same horizon.
     pub robust_list: u64,
@@ -449,6 +455,7 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             clock: 1,
             status: None,
             clear_child_tid: 0,
+            blocked_signals: 0,
             robust_list: 0,
             // Carved from the top of whatever the module already occupies:
             // the linker's data, the shadow stack, and anything the
@@ -661,6 +668,8 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             number::PRLIMIT64 => self.prlimit64(arguments),
             number::GETRANDOM => self.getrandom(arguments),
             number::CLOCK_GETTIME => self.clock_gettime(arguments),
+            number::RT_SIGPROCMASK => self.signal_mask(arguments),
+            number::TGKILL => self.tgkill(arguments),
             // Restartable sequences, refused for real. glibc asks once at
             // startup and takes `ENOSYS` for an answer by never using the
             // feature again — which is the whole point of refusing it here
@@ -810,6 +819,105 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             written += want as u64;
         }
         Outcome::Done(length as i64)
+    }
+
+    /// `rt_sigprocmask(2)`: which signals this thread has blocked.
+    ///
+    /// Recorded and honoured, but only for signals the process sends to
+    /// itself, because those are the only signals there are: nothing outside
+    /// a container can send one, and the kernel raises none of its own. So
+    /// the mask is not a pretence — it decides exactly what it is asked to
+    /// decide, which is what happens when the guest raises a signal on
+    /// itself while it is blocked.
+    ///
+    /// `abort` is the caller that matters. It unblocks `SIGABRT` and then
+    /// sends it, precisely so that a handler cannot stop it, and a mask that
+    /// was ignored would let a program that had blocked `SIGABRT` keep
+    /// running past its own `assert`.
+    fn signal_mask(&mut self, arguments: Arguments) -> Outcome {
+        const SIG_BLOCK: i64 = 0;
+        const SIG_UNBLOCK: i64 = 1;
+        const SIG_SETMASK: i64 = 2;
+
+        let how = arguments.get(0);
+        let set = arguments.get(1) as u64;
+        let old = arguments.get(2) as u64;
+        // Linux checks the size and refuses anything else, because a caller
+        // passing a different one was built against a different kernel.
+        if arguments.get(3) != 8 {
+            return Outcome::Done(Errno::Invalid.as_result());
+        }
+
+        if old != 0 {
+            if let Err(errno) = self.memory().check(old, 8) {
+                return Outcome::Done(errno.as_result());
+            }
+            // SAFETY: the eight bytes were bounds-checked immediately above.
+            if let Err(errno) = unsafe {
+                self.memory()
+                    .write(old, &self.blocked_signals.to_le_bytes())
+            } {
+                return Outcome::Done(errno.as_result());
+            }
+        }
+        // A null set is a caller that only wanted to read the mask.
+        if set == 0 {
+            return Outcome::Done(0);
+        }
+        // SAFETY: `slice` bounds-checks the range itself, and the bytes are
+        // copied out before anything else can move memory.
+        let mask = match unsafe { self.memory().slice(set, 8) } {
+            Ok(bytes) => u64::from_le_bytes(bytes.try_into().expect("eight bytes")),
+            Err(errno) => return Outcome::Done(errno.as_result()),
+        };
+        self.blocked_signals = match how {
+            SIG_BLOCK => self.blocked_signals | mask,
+            SIG_UNBLOCK => self.blocked_signals & !mask,
+            SIG_SETMASK => mask,
+            _ => return Outcome::Done(Errno::Invalid.as_result()),
+        };
+        // `SIGKILL` and `SIGSTOP` cannot be blocked, and Linux drops them
+        // from the mask silently rather than refusing the call.
+        self.blocked_signals &= !(signal_bit(SIGKILL) | signal_bit(SIGSTOP));
+        Outcome::Done(0)
+    }
+
+    /// `tgkill(2)`: send a signal to a thread, which here is always this one.
+    ///
+    /// There is one thread and no way for a signal to arrive from outside, so
+    /// the only question this has to answer is what happens when a process
+    /// signals itself — and for the signals whose default action is to
+    /// terminate, the answer is that it dies. `abort` is why: it raises
+    /// `SIGABRT` at itself and expects not to come back.
+    ///
+    /// A blocked signal stays pending forever instead, which is the same
+    /// thing that happens on Linux when nothing ever unblocks it. Handlers
+    /// are not modelled at all — `rt_sigaction` is still unimplemented, so a
+    /// program that installed one has already been told the truth loudly
+    /// rather than having its handler silently skipped here.
+    fn tgkill(&mut self, arguments: Arguments) -> Outcome {
+        let group = arguments.get(0);
+        let thread = arguments.get(1);
+        let signal = arguments.get(2);
+        if group != PROCESS_ID || thread != PROCESS_ID {
+            // The only thread there is. Anything else names a thread that
+            // does not exist.
+            return Outcome::Done(Errno::NoProcess.as_result());
+        }
+        if !(1..=64).contains(&signal) {
+            return Outcome::Done(Errno::Invalid.as_result());
+        }
+        if self.blocked_signals & signal_bit(signal) != 0 {
+            // Pending, and nothing will ever deliver it.
+            return Outcome::Done(0);
+        }
+        if terminates(signal) {
+            // What `wait` reports for a process killed by a signal: the
+            // number in the low seven bits. A shell prints 128 plus it.
+            return Outcome::Exit(128 + signal as i32);
+        }
+        // The default action is to ignore it, and there is no handler to run.
+        Outcome::Done(0)
     }
 
     /// `clock_gettime(2)`: what time it is, in the clock the caller names.
@@ -1163,4 +1271,34 @@ fn parse_nanoseconds(bytes: &[u8]) -> Option<i64> {
     let magnitude = digits.parse::<i128>().ok()?;
     let signed = if negative { -magnitude } else { magnitude };
     i64::try_from(signed).ok()
+}
+
+/// `SIGKILL` and `SIGSTOP`, the two a thread may not block.
+const SIGKILL: i64 = 9;
+const SIGSTOP: i64 = 19;
+
+/// A signal's bit in a mask. Signal one is bit zero, which is the off-by-one
+/// every signal mask carries.
+fn signal_bit(signal: i64) -> u64 {
+    1u64 << (signal - 1)
+}
+
+/// Whether a signal's default action ends the process.
+///
+/// The list is Linux's: what is *not* here is the handful whose default is to
+/// ignore or to stop. Getting this backwards for one signal would mean a
+/// program that raises it either dies when it should not or keeps running
+/// when it should not, so it is written out rather than approximated.
+fn terminates(signal: i64) -> bool {
+    const SIGCHLD: i64 = 17;
+    const SIGCONT: i64 = 18;
+    const SIGTSTP: i64 = 20;
+    const SIGTTIN: i64 = 21;
+    const SIGTTOU: i64 = 22;
+    const SIGURG: i64 = 23;
+    const SIGWINCH: i64 = 28;
+    !matches!(
+        signal,
+        SIGCHLD | SIGCONT | SIGSTOP | SIGTSTP | SIGTTIN | SIGTTOU | SIGURG | SIGWINCH
+    )
 }
