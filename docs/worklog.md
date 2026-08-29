@@ -1234,3 +1234,253 @@ corpus differentials (`long_double.c`, the `fprem` asm loop), and the
 build-plan appendix's later rows (`fsin` family, MMX, `fxsave`,
 unmasked delivery — the tier table in `x87/src/lib.rs` is the
 tracker).
+
+## 2026-08-28 — x87 lowered, a static glibc long double, and the ledger
+
+The `x87` crate is now reached by translated instructions, and two static
+glibc programs run end to end through the container path. What follows is
+the state of the x87 plan, what fell out of it, and — at the end — every
+open thread in one place, because several of them were found by accident
+and would otherwise be lost.
+
+### The x87 plan, X1 through X5
+
+**X1–X3** (symbol plumbing, the lowering module, the staticlib in every
+link) are done. `src/translate/x87.rs` is ~900 lines: 59 helpers, one
+`FunctionTranslator` method per instruction shape.
+
+Three things the lowering had to get right, each of which cost a bug first:
+
+- **Which operand carries the stack index is not constant.** `ffree st(2)`
+  and `fld st(2)` have one operand and it *is* the index; `fxch st(1)`,
+  `fcom st(2)` and `fcmovb st, st(2)` have two, of which the first is
+  always ST0; `fcompp` has none and means `st(1)`. The last operand is the
+  index in every form that has one. Reading operand 0 is right about
+  `st(1)` by accident, which is why it survived until something asked
+  about `st(2)`.
+- **`DE E1` is `fsubrp` and `DE F9` is `fdivp`.** The AT&T spelling is
+  reversed from the opcode.
+- **A helper must not run on the guest's stack.** This is the kernel seam's
+  rule and not the interop thunk's, and the distinction is the one SysV
+  draws: a foreign *call* may eat its caller's red zone, so a thunk hands
+  the callee the guest's own stack pointer. An x87 instruction is not a
+  call, and a compiler will keep a `long double`'s bytes in the 128 bytes
+  below `%rsp` across one. `x87_helper_stack` is that region;
+  `red_zone_across_helpers` is the fixture that reads a value back across
+  two x87 instructions and was off by a helper frame until it existed.
+
+**X4** is done, and was done twice. The first pass covered what gcc and
+clang emit, which is a little over half of what the lowering implements.
+`x87_coverage.s` is the other half — the eight conditional moves, the
+compares that answer in the condition codes rather than the flags, the
+integer-operand arithmetic at both widths, four of the seven constants,
+`ffreep`, `fnop`, `fnclex`, `fninit`. Both fixtures were checked by
+breaking them: with the operand index read from operand 0,
+`compare_registers` fails; with `fcmovnbe` mapped to `ae`,
+`move_if_not_below_or_equal` fails. A fixture that large passing first
+time is not evidence on its own.
+
+`f2xm1`, `fyl2x`, `fyl2xp1` and `fpatan` are deliberately excluded from the
+differential. The crate backs them with f64 and *measures* its divergence
+from the hardware rather than matching it, so a bit-exact comparison
+against native is the one test they must not be given.
+
+`x87_control.s` gained what X4 named: the `fprem`/`fprem1` loops in the
+shape musl's `fmodl` writes them — the C2 protocol end to end, which
+terminates only if the partial-step rule is right — plus `fscale`,
+`fxtract` in both halves, `fxam` over every operand class,
+`fincstp`/`fdecstp` walked all the way round, `fnsave`/`frstor` and
+`fnstenv`/`fldenv` round trips with a clobber between, and the
+control-word round trip `fesetround` would have emitted, written by hand
+because the corpus links no libc. The denormal class had to be *made*
+rather than passed in: a subnormal `double` arrives normalised through
+`fldl`, so it is scaled into the extended format's basement in the
+register instead.
+
+`x87_lowering.rs` asserts the two properties a differential structurally
+cannot see: that the helpers are imported with the types the crate
+defines, and that nothing is flushed between two adjacent x87
+instructions. The second corrected itself — the `global.set` in that gap
+is the linker stack pointer being switched off the guest's stack, so the
+test asserts it is *there* as well as asserting nothing else is.
+
+### X5 — the gate
+
+Two static glibc programs, `gcc -static -O2`:
+
+| program | result |
+| --- | --- |
+| `puts("hello")` | prints, exits 0 |
+| `strtold` + `printf("%.21Lg")` ×3 | byte-identical to the same binary run natively |
+
+21 significant digits is past what a double-backed answer can fake: an
+extended significand carries a little over 19.
+
+Refusals on a static glibc `hello`, continuing the table above:
+
+| refused (total) | reachable from `_start` | after |
+| --- | --- | --- |
+| 421 | 138 | the atomic family |
+| 237 | 3 | x87, the saturating family, wide division |
+| 187 | 3 | `ConditionalLeaveOrFallOut` |
+
+The three are `_dl_runtime_resolve_fxsave`, `_dl_runtime_resolve_xsave`
+and `_dl_runtime_resolve_xsavec`, which a *static* program stores a
+pointer to and never calls — as both programs running to completion
+demonstrates. They need `fxsave`/`xsave`, which is X7c.
+
+**The reachability number changed meaning twice, both times because the
+tool was flattering itself.** `examples/refusals` originally followed
+direct calls only, which stops at `_start` — `main` is handed to
+`__libc_start_main` as a pointer — and reported the whole program
+unreachable, which reads as good news. Then it followed address-taken
+edges but not the edge from a piece that runs off its end into the one
+below, so every piece of a split function after the first was invisible;
+it reported three reachable refusals for a program that then trapped in a
+fourth. It follows all three kinds now, and the number is still a lower
+bound: a function reached only through a pointer computed at run time is
+invisible to it, and an address-taken function counts as reached whether
+or not anything calls it.
+
+### Two instructions the gate needed that were not x87
+
+**`psubusb`**, in `strtold`'s digit scanner, where the clamp at zero *is*
+the comparison. Its whole family went in — all eight saturating forms,
+because x86 and wasm have exactly the same eight.
+
+**`div` at eight bytes.** It trapped whenever `rdx` held anything but the
+sign, which the docs named as post-MVP work; glibc's `strtold` scales a
+mantissa by dividing a value that genuinely occupies both registers, so
+post-MVP was the wrong answer. `x86_divide_128` is one function per
+module: restartable long division a bit at a time, behind a fast path for
+the dividends that do fit. The two-digit Knuth recurrence would be quicker
+and is not worth it — the fast path takes nearly every division, and the
+loop can be read and checked against the machine in a way the recurrence
+cannot. The remainder deliberately does not come back from it:
+`dividend − quotient × divisor` is exact in the low 64 bits, because the
+true remainder is smaller than the divisor. `wide_division.s` is assembly
+because no C expression builds a 128-bit dividend — a compiler emits `div`
+only after `cqo` or a zeroed `rdx`, which is exactly why a translation
+handling only that case passes every test written in C.
+
+### The two binaries, and what putting a command line on the pipeline found
+
+`zaqaru-bake` and `zaqaru-run` are what the build plan has been calling
+for — baker as "the bake tool: translator driving, the final link", runner
+as test support that "graduates to a binary".
+
+    $ gcc -static -O2 hello.c -o hello
+    $ zaqaru-bake hello -o hello.wasm
+    $ zaqaru-run hello.wasm
+
+Two failures immediately, neither of which any test could have found.
+
+The first was in the host: boot entropy goes to `/iso/random/bytes/32`,
+where the count is the last path segment, and the CLI wrote to
+`/iso/random/bytes` and ignored the error. The guest's `getrandom` found
+nothing, and glibc did what it does without entropy — seeded itself from
+`clock_gettime`, three layers from the cause.
+
+The second was real. **A conditional branch that leaves the function was
+assumed to continue inside it when not taken, and splitting makes that
+false.** A piece cut in front of another piece can end with one, and then
+both edges leave: the taken one to wherever it names, the untaken one into
+the piece below. It is glibc's `memcpy` — the size check against the
+non-temporal threshold is the last instruction of a split piece and its
+fall-through is the first byte of the next. So `puts` of a 41-character
+string trapped where `puts` of `"hello"` did not, and every "branch into
+another function is out of scope" refusal in a static glibc binary, all
+fifty of them, was this one shape. `Terminator::ConditionalLeaveOrFallOut`
+is that shape and there are now none.
+
+### `clock_gettime`
+
+A native process never issues it — glibc reads the clock out of the vDSO
+in userspace, which is why it appears in no `strace` and why nothing
+noticed it was missing until a container went looking. There is no vDSO
+here and `AT_SYSINFO_EHDR` is absent from the auxv, so glibc takes the
+syscall path it keeps for that case.
+
+`/iso/time/realtime_ns` and `/iso/time/monotonic_ns`, read on every call
+rather than counted here: a container's sense of time is something its
+host grants. Nanoseconds as a decimal integer rather than the isotope
+spec's ISO 8601 and counter forms — every caller is `clock_gettime`, which
+wants a `timespec`, and going through a formatted date would mean parsing
+a calendar in the kernel to produce a number the host already had. This is
+the ns-typed extension the design proposes.
+
+A container whose host mounted no `/iso/time` has no clock, and asking
+what time it is fails rather than being answered with the epoch. Same
+capability decision as entropy, for a stronger reason: a plausible wrong
+time is a certificate that verifies, an expiry that has not passed, and a
+log that says something untrue.
+
+### An overclaim, recorded because the pattern is the point
+
+Two programs passing became "a working C program with glibc" in how this
+was reported. Two programs is two programs. The refusal count was 187 and
+the reachable count was per-binary — a measurement about *those* binaries,
+reported as a property of the system. The correction: those two programs
+run; arbitrary C does not, and every new program finds the next missing
+thing. That is what this document has been calling the grind, and the
+honest unit is one binary at a time with no claim attached until it runs.
+
+Also recorded: the X6 change below (`kisal/src/machine.rs`,
+`kisal/src/exec.rs`) was swept into commit 95cb177 by a `git add -A`, and
+that commit's message says nothing about it.
+
+### The ledger — everything open, in one place
+
+**x87, from `docs/x87-plan.md`:**
+
+- **X6 is wired and unproven.** `Machine::reset_floating_point` is called
+  from `Kernel::exec`, importing `x87_reset` on wasm. Its stated
+  acceptance — a container that execs twice, the second seeing FNINIT
+  state — is *not buildable*: there is no `execve` syscall row, and
+  `Kernel::exec` is reachable only from `kisal_boot`. A fresh instance
+  also already starts in FNINIT, so the reset is unobservable on a first
+  exec either way. What exists is the call site and the fact that every
+  container link must now resolve `x87_reset`.
+- **X7a** `fsin`/`fcos`/`fsincos`/`fptan` — C2-partial protocol for
+  |x| ≥ 2⁶³, `fptan` pushes 1.0, ≤1 ulp at extended via double-double
+  reduction, oracle by ulp tolerance.
+- **X7b** `fbld`/`fbstp` — ten-byte packed BCD, m80-style by address.
+- **X7c** `fxsave`/`fxrstor` and the sigframe render. **This is what the
+  three remaining reachable refusals in every static glibc binary need.**
+- **X7d** MMX. **X7e** unmasked-exception delivery.
+
+**Instructions a real program has already asked for and not got**, from
+the refusal tail of a static glibc binary using `perror`, AVX excluded
+because curated CPUID never selects it:
+
+| instruction | count | what wants it |
+| --- | --- | --- |
+| `packuswb` | 1 | `main`, once `perror` is in the program — blocks every error path |
+| `pcmpistri` | 3 | SSE4.2 string search |
+| `bzhi` | 3 | BMI2 |
+| `sfence` | 2 | the non-temporal `memcpy` tail |
+| `pshufb` | 2 | SSSE3 |
+| `pminud` | 2 | SSE4.1 |
+| `xsave`, `xsavec`, `fxsave` | 3 | the `_dl_runtime_resolve_*` trio |
+
+**Syscalls a real program has already asked for and not got:**
+`rt_sigprocmask` (14), reached through `abort()`; and `execve`, which
+nothing can reach because there is no row for it.
+
+**Undiagnosed, and the most serious item here:** a **stack-canary
+mismatch**. A program with three `timespec` locals, a `volatile` delay
+loop and `perror` on its error paths reaches `__stack_chk_fail` →
+`abort()`. The same program without `perror` runs correctly, and a
+canary-carrying program with no clock call also runs correctly. So it is
+neither the canary machinery alone nor the clock alone. Not yet
+understood, and it is a correctness bug rather than a missing feature.
+
+**Test debt:** `tests/glibc_boot.rs` currently carries a clock test that
+fails — its program uses `perror`, so it is blocked on `packuswb` and the
+canary question, not on the clock. `clock_gettime` itself is proven by
+four kisal unit tests and by a container printing the same second as the
+host.
+
+**Milestone debt, from `docs/container-build-plan.md`:** M6's acceptance
+ladder (musl BusyBox, CPython), the strace-diff harness, and the
+determinism check are untouched.

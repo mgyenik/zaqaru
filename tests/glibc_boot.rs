@@ -91,6 +91,69 @@ int main(void) {
     );
 }
 
+/// The clock, which a native process reaches without a syscall at all.
+///
+/// glibc reads the time out of the vDSO page, in userspace, which is why
+/// `clock_gettime` appears in no `strace` and why it was invisible until a
+/// container went looking for it. There is no vDSO here and the auxv this
+/// kernel builds omits `AT_SYSINFO_EHDR`, so glibc takes the syscall path it
+/// keeps for exactly that case.
+///
+/// The assertion is against this process's own clock, with a window wide
+/// enough that a slow machine does not fail it and narrow enough that a
+/// wrong unit, a truncated division or a stuck value cannot pass: a
+/// container reporting the epoch, or milliseconds where seconds belong, is
+/// out by decades.
+#[test]
+fn a_static_glibc_program_reads_the_clock() {
+    let program = r#"
+#include <stdio.h>
+#include <time.h>
+int main(void) {
+    struct timespec wall, first, second;
+    if (clock_gettime(CLOCK_REALTIME, &wall) != 0) { perror("realtime"); return 1; }
+    if (clock_gettime(CLOCK_MONOTONIC, &first) != 0) { perror("monotonic"); return 1; }
+    for (volatile long i = 0; i < 200000; i++) { }
+    if (clock_gettime(CLOCK_MONOTONIC, &second) != 0) { perror("monotonic"); return 1; }
+
+    long long advance = (second.tv_sec - first.tv_sec) * 1000000000LL
+                      + (second.tv_nsec - first.tv_nsec);
+    printf("%lld %ld %d\n", (long long)wall.tv_sec, wall.tv_nsec, advance > 0);
+    return 0;
+}
+"#;
+    let before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("the host clock is after 1970")
+        .as_secs() as i64;
+    let out = run_static_glibc("glibc-clock", program);
+    let after = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("the host clock is after 1970")
+        .as_secs() as i64;
+
+    let fields: Vec<&str> = out.split_whitespace().collect();
+    assert_eq!(fields.len(), 3, "the program printed {out:?}");
+    let seconds: i64 = fields[0].parse().expect("the wall clock is a number");
+    let nanoseconds: i64 = fields[1].parse().expect("the remainder is a number");
+
+    assert!(
+        (before..=after).contains(&seconds),
+        "the container read {seconds}, and this process saw {before}..={after} \
+         around it"
+    );
+    assert!(
+        (0..1_000_000_000).contains(&nanoseconds),
+        "the remainder {nanoseconds} is not inside one second, so the \
+         division that produced it is wrong"
+    );
+    assert_eq!(
+        fields[2], "1",
+        "the monotonic clock did not advance across a delay, so it is a \
+         constant rather than a clock"
+    );
+}
+
 /// Builds a static glibc program, translates it, bakes it into an image,
 /// boots it, and returns what it wrote to stdout.
 fn run_static_glibc(name: &str, program: &str) -> String {
@@ -161,6 +224,7 @@ fn run_static_glibc(name: &str, program: &str) -> String {
     }
     let mut mounts = support::mounts_seeded(&[0x77; 32]);
     mounts.mount(&[b"iso", b"shutdown"], Box::new(runner::store::Sink::new()));
+    mounts.mount(&[b"iso", b"time"], Box::new(runner::store::Clock::new()));
     let mut container = runner::Container::instantiate(
         &std::fs::read(&module).expect("read the container"),
         mounts,

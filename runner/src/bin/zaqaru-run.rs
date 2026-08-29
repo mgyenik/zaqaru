@@ -60,8 +60,8 @@ fn main() -> ExitCode {
     }
 }
 
-/// What a container boots with: a console, a kernel log, entropy, and
-/// somewhere to record that it finished.
+/// What a container boots with: a console, a kernel log, entropy, a clock,
+/// and somewhere to record that it finished.
 ///
 /// The entropy is not a default that happens to be here — a container with
 /// no `/iso/random` mount has none, and that is the capability model rather
@@ -73,6 +73,7 @@ fn mounts() -> runner::store::MountTable {
     mounts.mount(&[b"iso", b"log"], Box::new(runner::store::Sink::new()));
     mounts.mount(&[b"iso", b"random"], Box::new(runner::store::Sink::new()));
     mounts.mount(&[b"iso", b"shutdown"], Box::new(runner::store::Sink::new()));
+    mounts.mount(&[b"iso", b"time"], Box::new(runner::store::Clock::new()));
 
     // Exactly as many bytes as the seed holds. `/dev/urandom` is a
     // character device and never reports end of file, so a read that stops

@@ -113,6 +113,65 @@ impl MountTable {
     }
 }
 
+/// The host's clock, answering `/iso/time/realtime_ns` and
+/// `/iso/time/monotonic_ns`.
+///
+/// Read on every access rather than sampled once, because that is what a
+/// clock is. The two paths are different clocks and not two spellings of
+/// one: the wall clock can be set backwards by the host at any moment, and
+/// the monotonic one cannot, which is the whole reason a program picks
+/// between them.
+///
+/// Monotonic time is measured from this store's construction, so a
+/// container sees a clock that starts near zero when it boots. Linux
+/// measures from its own boot and the difference is invisible to any
+/// correct program: monotonic time promises an origin that does not move
+/// during a run, never a particular origin.
+pub struct Clock {
+    started: std::time::Instant,
+}
+
+impl Default for Clock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Clock {
+    pub fn new() -> Self {
+        Self {
+            started: std::time::Instant::now(),
+        }
+    }
+}
+
+impl Store for Clock {
+    fn read(&mut self, path: &[Vec<u8>]) -> Result<Option<Vec<u8>>, String> {
+        let leaf = path.last().map(Vec::as_slice);
+        let nanoseconds: i128 = match leaf {
+            Some(b"realtime_ns") => {
+                // Before 1970 is representable and the arithmetic says so,
+                // rather than the host's clock being assumed sane.
+                match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+                    Ok(since) => since.as_nanos() as i128,
+                    Err(before) => -(before.duration().as_nanos() as i128),
+                }
+            }
+            Some(b"monotonic_ns") => self.started.elapsed().as_nanos() as i128,
+            _ => return Ok(None),
+        };
+        Ok(Some(nanoseconds.to_string().into_bytes()))
+    }
+
+    fn write(&mut self, path: &[Vec<u8>], _data: &[u8]) -> Result<Vec<Vec<u8>>, String> {
+        Err(format!(
+            "{} is a clock; setting the host's time from inside a container \
+             is not something this store does",
+            render(path)
+        ))
+    }
+}
+
 /// A path as a diagnostic string. Segments are bytes, so anything that is
 /// not valid UTF-8 is shown escaped rather than lost.
 pub fn render(path: &[Vec<u8>]) -> String {

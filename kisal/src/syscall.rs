@@ -660,6 +660,7 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             number::SET_ROBUST_LIST => self.set_robust_list(arguments),
             number::PRLIMIT64 => self.prlimit64(arguments),
             number::GETRANDOM => self.getrandom(arguments),
+            number::CLOCK_GETTIME => self.clock_gettime(arguments),
             // Restartable sequences, refused for real. glibc asks once at
             // startup and takes `ENOSYS` for an answer by never using the
             // feature again — which is the whole point of refusing it here
@@ -809,6 +810,74 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             written += want as u64;
         }
         Outcome::Done(length as i64)
+    }
+
+    /// `clock_gettime(2)`: what time it is, in the clock the caller names.
+    ///
+    /// The host has the clock and the kernel does not, so this is a store
+    /// read on every call rather than a counter kept here. That is the
+    /// honest shape: a container's sense of time is something its host
+    /// grants, and a container whose host mounted no `/iso/time` has none.
+    ///
+    /// The vDSO is why this row exists at all. A native process never issues
+    /// this syscall — glibc reads the clock out of the vDSO page in
+    /// userspace, which is why it appears in no `strace`. There is no vDSO
+    /// here and `AT_SYSINFO_EHDR` is absent from the auxv we build, so glibc
+    /// takes the syscall path it keeps for exactly that case.
+    fn clock_gettime(&mut self, arguments: Arguments) -> Outcome {
+        // The clocks Linux numbers. The coarse variants are the same clocks
+        // read from a cached page, which is a resolution promise rather than
+        // a different time, and `BOOTTIME` differs from `MONOTONIC` only
+        // across a suspend this container cannot observe.
+        const REALTIME: i64 = 0;
+        const MONOTONIC: i64 = 1;
+        const MONOTONIC_RAW: i64 = 4;
+        const REALTIME_COARSE: i64 = 5;
+        const MONOTONIC_COARSE: i64 = 6;
+        const BOOTTIME: i64 = 7;
+
+        let path = match arguments.get(0) {
+            REALTIME | REALTIME_COARSE => crate::paths::TIME_REALTIME,
+            MONOTONIC | MONOTONIC_RAW | MONOTONIC_COARSE | BOOTTIME => crate::paths::TIME_MONOTONIC,
+            // Per-process and per-thread CPU time, which this kernel does
+            // not account for, and anything else. Linux answers `EINVAL`
+            // for a clock it does not have, and so does this.
+            _ => return Outcome::Done(Errno::Invalid.as_result()),
+        };
+
+        let destination = arguments.get(1) as u64;
+        // Two eight-byte fields, checked before anything is read: a caller
+        // that passed a bad pointer gets `EFAULT` whatever the clock says.
+        if let Err(errno) = self.memory().check(destination, 16) {
+            return Outcome::Done(errno.as_result());
+        }
+
+        let mut bytes = Vec::new();
+        if self.store.read(path, &mut bytes) != crate::abi::StoreOutcome::Present {
+            // No clock mounted. Refused by name rather than answered with
+            // zero, which would be a time — the epoch — and would be
+            // believed.
+            return Outcome::Done(Errno::Invalid.as_result());
+        }
+        let Some(nanoseconds) = parse_nanoseconds(&bytes) else {
+            return Outcome::Done(Errno::Invalid.as_result());
+        };
+
+        // `timespec` is a whole-seconds field and a remainder that is always
+        // positive, which is division rounding towards negative infinity
+        // rather than towards zero. Only the wall clock can be negative, and
+        // only before 1970, but the arithmetic is written once and correctly
+        // rather than for the times we expect.
+        let seconds = nanoseconds.div_euclid(1_000_000_000);
+        let remainder = nanoseconds.rem_euclid(1_000_000_000);
+        let mut image = [0u8; 16];
+        image[..8].copy_from_slice(&seconds.to_le_bytes());
+        image[8..].copy_from_slice(&remainder.to_le_bytes());
+        // SAFETY: the sixteen bytes were bounds-checked above.
+        if let Err(errno) = unsafe { self.memory().write(destination, &image) } {
+            return Outcome::Done(errno.as_result());
+        }
+        Outcome::Done(0)
     }
 
     /// `arch_prctl(2)`: the only way the thread pointer moves.
@@ -1070,4 +1139,28 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
         self.store.last_error(&mut message);
         let _ = self.store.write(paths::LOG_ERROR, &message);
     }
+}
+
+/// A signed decimal integer of nanoseconds, as the store hands it over.
+///
+/// Written by hand because the answer has to be exact: a clock read through
+/// a float would lose the low digits of any realtime value — 2026 is past
+/// 2^60 nanoseconds, and an f64 carries 53 bits of significand, so the last
+/// hundred nanoseconds would simply not be there.
+///
+/// Surrounding whitespace is accepted because a host writing a number into a
+/// file is entitled to end it with a newline. Anything else is refused: a
+/// clock that half-parsed is worse than one that failed.
+fn parse_nanoseconds(bytes: &[u8]) -> Option<i64> {
+    let text = core::str::from_utf8(bytes).ok()?.trim();
+    let (negative, digits) = match text.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, text.strip_prefix('+').unwrap_or(text)),
+    };
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let magnitude = digits.parse::<i128>().ok()?;
+    let signed = if negative { -magnitude } else { magnitude };
+    i64::try_from(signed).ok()
 }

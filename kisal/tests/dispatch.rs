@@ -525,3 +525,189 @@ fn the_two_arms_of_a_read_result_do_not_leak_into_each_other() {
     let message = failed.error().expect("err carries a message");
     assert_eq!((message.pointer, message.length), (0x2000, 11));
 }
+
+/// A store that answers the clock paths, so the time the guest reads is a
+/// time the test chose.
+struct Clock {
+    realtime: Vec<u8>,
+    monotonic: Vec<u8>,
+}
+
+impl Store for Clock {
+    fn read(&mut self, path: &[&[u8]], into: &mut Vec<u8>) -> StoreOutcome {
+        let bytes = if path == paths::TIME_REALTIME {
+            &self.realtime
+        } else if path == paths::TIME_MONOTONIC {
+            &self.monotonic
+        } else {
+            return StoreOutcome::Absent;
+        };
+        if bytes.is_empty() {
+            return StoreOutcome::Absent;
+        }
+        into.extend_from_slice(bytes);
+        StoreOutcome::Present
+    }
+
+    fn write(&mut self, _path: &[&[u8]], _data: &[u8]) -> StoreOutcome {
+        StoreOutcome::Present
+    }
+}
+
+/// The `timespec` a `clock_gettime` left behind.
+fn timespec(image: &[u8; 16]) -> (i64, i64) {
+    (
+        i64::from_le_bytes(image[..8].try_into().expect("eight bytes")),
+        i64::from_le_bytes(image[8..].try_into().expect("eight bytes")),
+    )
+}
+
+fn clock_of(clock: i64, destination: &mut [u8; 16]) -> Arguments {
+    Arguments::new([clock, destination.as_mut_ptr() as usize as i64, 0, 0, 0, 0])
+}
+
+/// `clock_gettime` splits the host's nanoseconds into a `timespec`, and the
+/// two clocks are two clocks.
+///
+/// A native process never issues this syscall — glibc reads the vDSO — so
+/// nothing about it can be checked by comparing against a `strace`. What can
+/// be checked is that the arithmetic is right and that the caller reaches
+/// the clock it asked for, which is what this does: the two paths hold
+/// deliberately different times, and every clock id lands on one of them.
+#[test]
+fn clock_gettime_divides_the_hosts_nanoseconds() {
+    let store = Clock {
+        realtime: b"1756400000123456789".to_vec(),
+        monotonic: b"42000000042\n".to_vec(),
+    };
+    let mut kernel = Kernel::new(store, Registers::default(), empty_image());
+
+    let mut image = [0u8; 16];
+    assert_eq!(
+        kernel.dispatch(number::CLOCK_GETTIME, clock_of(0, &mut image)),
+        Outcome::Done(0)
+    );
+    assert_eq!(timespec(&image), (1_756_400_000, 123_456_789));
+
+    // The trailing newline a host writing a number into a file is entitled
+    // to leave behind.
+    assert_eq!(
+        kernel.dispatch(number::CLOCK_GETTIME, clock_of(1, &mut image)),
+        Outcome::Done(0)
+    );
+    assert_eq!(timespec(&image), (42, 42));
+
+    // Every id Linux numbers, landing on the clock it names. `MONOTONIC_RAW`,
+    // the coarse pair and `BOOTTIME` are the same two clocks under other
+    // promises, and answering them from the wrong one would be a bug no
+    // caller could see until it went backwards.
+    for (clock, expected) in [
+        (0i64, 1_756_400_000i64),
+        (5, 1_756_400_000),
+        (1, 42),
+        (4, 42),
+        (6, 42),
+        (7, 42),
+    ] {
+        assert_eq!(
+            kernel.dispatch(number::CLOCK_GETTIME, clock_of(clock, &mut image)),
+            Outcome::Done(0),
+            "clock {clock} was refused"
+        );
+        assert_eq!(
+            timespec(&image).0,
+            expected,
+            "clock {clock} read the wrong one"
+        );
+    }
+
+    // Per-process and per-thread CPU time, which this kernel does not
+    // account for.
+    for clock in [2i64, 3, 11, -1] {
+        assert_eq!(
+            kernel.dispatch(number::CLOCK_GETTIME, clock_of(clock, &mut image)),
+            Outcome::Done(Errno::Invalid.as_result()),
+            "clock {clock} was answered"
+        );
+    }
+}
+
+/// A time before 1970 is a negative count of nanoseconds, and `timespec`'s
+/// remainder is still positive: the seconds field rounds towards negative
+/// infinity rather than towards zero.
+///
+/// Division that truncates gets this wrong by a whole second and only for
+/// dates nobody tests with, which is why it is written down here.
+#[test]
+fn clock_gettime_floors_a_time_before_the_epoch() {
+    let store = Clock {
+        realtime: b"-1500000000".to_vec(),
+        monotonic: b"0".to_vec(),
+    };
+    let mut kernel = Kernel::new(store, Registers::default(), empty_image());
+
+    let mut image = [0u8; 16];
+    assert_eq!(
+        kernel.dispatch(number::CLOCK_GETTIME, clock_of(0, &mut image)),
+        Outcome::Done(0)
+    );
+    // −1.5 seconds is −2 seconds plus half of one, not −1 seconds minus half.
+    assert_eq!(timespec(&image), (-2, 500_000_000));
+
+    assert_eq!(
+        kernel.dispatch(number::CLOCK_GETTIME, clock_of(1, &mut image)),
+        Outcome::Done(0)
+    );
+    assert_eq!(timespec(&image), (0, 0));
+}
+
+/// A container whose host mounted no clock has none, and asking what time it
+/// is fails rather than being told the epoch.
+///
+/// The same capability decision as entropy, for a stronger reason: a
+/// plausible wrong time is a certificate that verifies, an expiry that has
+/// not passed, and a log that says something untrue.
+#[test]
+fn clock_gettime_without_a_mount_is_refused_rather_than_invented() {
+    let mut kernel = Kernel::new(Recording::default(), Registers::default(), empty_image());
+    let mut image = [0xa5u8; 16];
+    for clock in [0i64, 1] {
+        assert_eq!(
+            kernel.dispatch(number::CLOCK_GETTIME, clock_of(clock, &mut image)),
+            Outcome::Done(Errno::Invalid.as_result())
+        );
+    }
+    assert_eq!(image, [0xa5u8; 16], "the destination was written anyway");
+}
+
+/// A clock that answers something other than a number is a broken host, not
+/// a time.
+#[test]
+fn clock_gettime_refuses_what_it_cannot_parse() {
+    for answer in [
+        &b""[..],
+        b"   ",
+        b"twelve",
+        b"12.5",
+        b"1e9",
+        b"0x10",
+        b"12 34",
+        b"-",
+        // Past what a `timespec`'s seconds field can hold, which is a host
+        // answering in some other unit.
+        b"999999999999999999999",
+    ] {
+        let store = Clock {
+            realtime: answer.to_vec(),
+            monotonic: answer.to_vec(),
+        };
+        let mut kernel = Kernel::new(store, Registers::default(), empty_image());
+        let mut image = [0u8; 16];
+        assert_eq!(
+            kernel.dispatch(number::CLOCK_GETTIME, clock_of(0, &mut image)),
+            Outcome::Done(Errno::Invalid.as_result()),
+            "{:?} was accepted as a time",
+            String::from_utf8_lossy(answer)
+        );
+    }
+}
