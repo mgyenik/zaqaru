@@ -3284,6 +3284,214 @@ fn long_double_arithmetic_matches_native() {
 /// Compiler output reaches whichever forms the optimiser wanted; these reach
 /// the ones a wrong stack index or a reversed operand hides in. Every case
 /// builds its operands from integers so the caller names exact values, and
+
+/// The mnemonics no compiler emits, checked against the hardware one at a
+/// time.
+///
+/// `long_double.c` covers what gcc and clang produce, which is a little over
+/// half of what the lowering implements. This is the other half: the
+/// conditional moves, the compares that answer in the condition codes, the
+/// integer-operand arithmetic, four of the seven constants. Every case names
+/// a stack slot other than ST(0), because a lowering that read the wrong
+/// operand is right about `st(1)` by accident — which is how the `fxch` bug
+/// survived until something asked it about `st(2)`.
+///
+/// `f2xm1`, `fyl2x`, `fyl2xp1` and `fpatan` are deliberately not here. The
+/// crate backs them with f64 and measures its divergence from the hardware
+/// rather than matching it, so a bit-exact comparison against native is the
+/// one test they must not be given; their oracle lives in the crate.
+#[test]
+fn x87_uncompiled_mnemonics_match_native() {
+    let mut fixture = DifferentialFixture::build("x87-coverage", &["x87_coverage.s"]);
+
+    // Constants take no operand, so one call each is the whole test.
+    for name in [
+        "constant_one",
+        "constant_log2_ten",
+        "constant_log2_e",
+        "constant_pi",
+        "constant_log10_two",
+        "constant_ln_two",
+        "constant_zero",
+    ] {
+        let native =
+            unsafe { native_function::<unsafe extern "C" fn() -> i64>(&fixture.native, name) };
+        let expected = unsafe { native() };
+        for (variant, module) in &mut fixture.transpiled {
+            assert_eq!(
+                module.call_guest(name, [0; 6]),
+                expected,
+                "{name} disagreed with native in {variant}"
+            );
+        }
+    }
+    // A constant that came back as another constant would pass above; these
+    // are seven distinct numbers and the test says so.
+    let distinct: std::collections::HashSet<i64> = [
+        "constant_one",
+        "constant_log2_ten",
+        "constant_log2_e",
+        "constant_pi",
+        "constant_log10_two",
+        "constant_ln_two",
+        "constant_zero",
+    ]
+    .iter()
+    .map(|name| fixture.transpiled[0].1.call_guest(name, [0; 6]))
+    .collect();
+    assert_eq!(distinct.len(), 7, "two constants loaded the same value");
+
+    // The `double`-operand cases.
+    let mut doubles: Vec<(f64, f64)> = Vec::new();
+    for a in [
+        0.0f64,
+        -0.0,
+        1.0,
+        -1.0,
+        2.5,
+        -2.5,
+        7.0,
+        1e300,
+        1e-300,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NAN,
+    ] {
+        for b in [1.0f64, -1.0, 2.5, 7.0, 0.0, f64::NAN] {
+            doubles.push((a, b));
+        }
+    }
+
+    for name in [
+        "absolute_value",
+        "negate",
+        "round_to_integer",
+        "test_against_zero",
+        "compare_registers",
+        "compare_and_pop",
+        "compare_and_pop_both",
+        "compare_unordered_registers",
+        "compare_unordered_pop",
+        "compare_unordered_pop_both",
+        "compare_memory_double",
+        "compare_memory_double_pop",
+        "store_integer_keeping",
+    ] {
+        let native = unsafe {
+            native_function::<unsafe extern "C" fn(i64, i64) -> i64>(&fixture.native, name)
+        };
+        for &(a, b) in &doubles {
+            let (left, right) = (a.to_bits() as i64, b.to_bits() as i64);
+            let expected = unsafe { native(left, right) };
+            for (variant, module) in &mut fixture.transpiled {
+                assert_eq!(
+                    module.call_guest(name, [left, right, 0, 0, 0, 0]),
+                    expected,
+                    "{name}({a}, {b}) disagreed with native in {variant}"
+                );
+            }
+        }
+    }
+
+    // `sqrt` and the integer stores want operands they are defined on: a
+    // negative square root and an out-of-range conversion both produce the
+    // indefinite value, which is a real answer but not the one these are
+    // asking about.
+    for name in ["square_root", "store_short"] {
+        let native = unsafe {
+            native_function::<unsafe extern "C" fn(i64, i64) -> i64>(&fixture.native, name)
+        };
+        for a in [0.0f64, 1.0, 2.0, 2.5, 1024.0, 1e30, 30000.0, 0.25] {
+            let left = a.to_bits() as i64;
+            let expected = unsafe { native(left, 0) };
+            for (variant, module) in &mut fixture.transpiled {
+                assert_eq!(
+                    module.call_guest(name, [left, 0, 0, 0, 0, 0]),
+                    expected,
+                    "{name}({a}) disagreed with native in {variant}"
+                );
+            }
+        }
+    }
+
+    // Arithmetic against an integer operand, and the compares that take one.
+    for name in [
+        "integer_add",
+        "integer_subtract",
+        "integer_subtract_reversed",
+        "integer_multiply",
+        "integer_divide",
+        "integer_divide_reversed",
+        "short_add",
+        "short_divide_reversed",
+        "compare_memory_integer",
+        "compare_memory_integer_pop",
+    ] {
+        let native = unsafe {
+            native_function::<unsafe extern "C" fn(i64, i64) -> i64>(&fixture.native, name)
+        };
+        for a in [0.0f64, 1.0, -1.0, 2.5, -2.5, 1e10, -7.25] {
+            for b in [1i64, -1, 2, 3, -3, 1000, -32768, 32767] {
+                let left = a.to_bits() as i64;
+                let expected = unsafe { native(left, b) };
+                for (variant, module) in &mut fixture.transpiled {
+                    assert_eq!(
+                        module.call_guest(name, [left, b, 0, 0, 0, 0]),
+                        expected,
+                        "{name}({a}, {b}) disagreed with native in {variant}"
+                    );
+                }
+            }
+        }
+    }
+
+    // The conditional moves, whose condition is an integer comparison: the
+    // inputs have to reach both orders and equality for all eight forms to
+    // be told apart.
+    for name in [
+        "move_if_below",
+        "move_if_equal",
+        "move_if_below_or_equal",
+        "move_if_unordered",
+        "move_if_not_below",
+        "move_if_not_equal",
+        "move_if_not_below_or_equal",
+        "move_if_not_unordered",
+    ] {
+        let native = unsafe {
+            native_function::<unsafe extern "C" fn(i64, i64) -> i64>(&fixture.native, name)
+        };
+        for &(a, b) in &[(0i64, 0i64), (1, 0), (0, 1), (-1, 1), (1, -1), (7, 7)] {
+            let expected = unsafe { native(a, b) };
+            for (variant, module) in &mut fixture.transpiled {
+                assert_eq!(
+                    module.call_guest(name, [a, b, 0, 0, 0, 0]),
+                    expected,
+                    "{name}({a}, {b}) disagreed with native in {variant}"
+                );
+            }
+        }
+    }
+
+    // The housekeeping, whose whole effect is in the status and control
+    // words.
+    for name in ["clear_exceptions", "initialise_unit", "free_and_pop"] {
+        let native = unsafe {
+            native_function::<unsafe extern "C" fn(i64, i64) -> i64>(&fixture.native, name)
+        };
+        for a in [0i64, 1, -1, 4242] {
+            let expected = unsafe { native(a, 0) };
+            for (variant, module) in &mut fixture.transpiled {
+                assert_eq!(
+                    module.call_guest(name, [a, 0, 0, 0, 0, 0]),
+                    expected,
+                    "{name}({a}) disagreed with native in {variant}"
+                );
+            }
+        }
+    }
+}
+
 /// returns something that differs when the shape is wrong.
 #[test]
 fn x87_stack_shapes_match_native() {
@@ -3308,6 +3516,10 @@ fn x87_stack_shapes_match_native() {
         "subtract_reversed_into_top",
         "stack_depth",
         "red_zone_across_helpers",
+        "rotate_stack",
+        "status_word_keeps_upper_bytes",
+        "save_and_restore",
+        "environment_round_trip",
     ] {
         let native = unsafe {
             native_function::<unsafe extern "C" fn(i64, i64) -> i64>(&fixture.native, name)
@@ -3322,5 +3534,71 @@ fn x87_stack_shapes_match_native() {
                 );
             }
         }
+    }
+
+    // The cases whose operands are `double` bit patterns rather than
+    // integers: `fprem`'s protocol, `fscale`, `fxtract` and `fxam` all say
+    // something about exponents, and integers loaded through `fildll` reach
+    // almost none of what they can say.
+    let mut doubles: Vec<(f64, f64)> = Vec::new();
+    for a in [
+        1.0f64,
+        -1.0,
+        0.0,
+        -0.0,
+        3.75,
+        -3.75,
+        1e300,
+        1e-300,
+        f64::MIN_POSITIVE,
+        f64::MIN_POSITIVE / 4.0,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NAN,
+        2251799813685248.0,
+    ] {
+        for b in [1.0f64, -1.0, 2.0, 0.5, -0.5, 3.0, 7.25, 1e-300, 1e300] {
+            doubles.push((a, b));
+        }
+    }
+
+    for name in [
+        "partial_remainder",
+        "ieee_remainder",
+        "scale_by_power",
+        "extract_significand",
+        "extract_exponent",
+        "classify",
+        "classify_denormal",
+        "rounding_round_trip",
+    ] {
+        let native = unsafe {
+            native_function::<unsafe extern "C" fn(i64, i64) -> i64>(&fixture.native, name)
+        };
+        for &(a, b) in &doubles {
+            let (left, right) = (a.to_bits() as i64, b.to_bits() as i64);
+            let expected = unsafe { native(left, right) };
+            for (variant, module) in &mut fixture.transpiled {
+                assert_eq!(
+                    module.call_guest(name, [left, right, 0, 0, 0, 0]),
+                    expected,
+                    "{name}({a}, {b}) disagreed with native in {variant}"
+                );
+            }
+        }
+    }
+
+    // `classify_empty` takes no operand: what it asks about is the one tag
+    // value no value can produce.
+    let native = unsafe {
+        native_function::<unsafe extern "C" fn() -> i64>(&fixture.native, "classify_empty")
+    };
+    let expected = unsafe { native() };
+    for (variant, module) in &mut fixture.transpiled {
+        assert_eq!(
+            module.call_guest("classify_empty", [0; 6]),
+            expected,
+            "classify_empty disagreed with native in {variant}"
+        );
     }
 }
