@@ -371,6 +371,19 @@ impl<'a> Overlay<'a> {
         self.lower.contents(inode).map_err(|_| Errno::Io)
     }
 
+    /// The base the bake placed a translated ELF at.
+    ///
+    /// An upper file has none, and that is the design rather than an
+    /// omission: a file the container wrote at run time was never
+    /// translated, so there is no address its code was resolved at. Mapping
+    /// one executable is the loud error the container plan names.
+    pub fn prelink_base(&self, number: u32) -> Option<u64> {
+        match is_upper(number) {
+            true => None,
+            false => self.lower.prelink_base(number),
+        }
+    }
+
     pub fn xattr_count(&self, inode: &Inode, number: u32) -> Result<u32, Errno> {
         if is_upper(number) {
             // Extended attributes are not copied up. Nothing writes one —

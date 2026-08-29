@@ -52,51 +52,9 @@ fn main() -> Result<()> {
         .context("usage: zaqaru-bake <program> [-o <container.wasm>] [--root <directory>]")?;
     let output = output.unwrap_or_else(|| program.with_extension("wasm"));
 
-    let bytes =
-        std::fs::read(&program).with_context(|| format!("reading {}", program.display()))?;
-    let object = zaqaru::reader::ObjectFile::parse(&bytes)
-        .with_context(|| format!("reading {} as an ELF program", program.display()))?;
-    if object.layout != zaqaru::reader::Layout::Linked {
-        bail!(
-            "{} is a relocatable object, not a linked program — a container \
-             boots a program, so link it first",
-            program.display()
-        );
-    }
-
-    // Where the loader will have placed the program, which is where the
-    // module's own data has to start above.
-    let top = object
-        .segments
-        .iter()
-        .map(|segment| segment.address + segment.memory_size)
-        .max()
-        .context("the program has no loadable segments")?;
-
-    // A function that cannot be translated becomes a body that names itself
-    // and stops, rather than refusing the whole program: a program is worth
-    // running when the path it takes is translated, whatever else it
-    // carries. What could not be translated is reported here, because it is
-    // a worklist.
-    let translation = zaqaru::transpile::Transpiler::new(&object)
-        .with_untranslatable(zaqaru::transpile::Untranslatable::Trap)
-        .translate()
-        .context("translating the program")?;
-    if !translation.refused.is_empty() {
-        eprintln!(
-            "zaqaru-bake: {} of {} functions were not translated and will stop \
-             the container if called",
-            translation.refused.len(),
-            object.functions.len()
-        );
-    }
-
+    // The filesystem the container will have, before the translated files
+    // go into it.
     let workspace = tempdir(&output)?;
-    let guest = workspace.join("program.wasm.o");
-    std::fs::write(&guest, &translation.module).context("writing the translated program")?;
-
-    // The image: whatever filesystem the container is to have, with the
-    // program at the path kisal's boot path opens.
     let image_root = workspace.join("image");
     std::fs::create_dir_all(&image_root).context("creating the image tree")?;
     match &root {
@@ -113,15 +71,36 @@ fn main() -> Result<()> {
             }
         }
     }
-    let mut placed = bytes.clone();
-    baker::program::apply(&mut placed, &translation.patches)
-        .context("patching the program to agree with its translation")?;
-    std::fs::write(image_root.join("init"), &placed).context("placing the program in the image")?;
-    let image =
-        baker::object::emit(&baker::bake_directory(&image_root).context("baking the image")?)
-            .context("emitting the image object")?;
+    let tree = baker::tree::Tree::from_directory(&image_root).context("reading the image tree")?;
+
+    let search = root.clone().unwrap_or_else(|| PathBuf::from("/"));
+    let baked = baker::bake::container(&program, &search, tree)?;
+
+    if baked.placed.len() > 1 {
+        eprintln!(
+            "zaqaru-bake: {} files translated:{}",
+            baked.placed.len(),
+            baked
+                .placed
+                .iter()
+                .map(|(path, base)| format!("\n  {base:#012x}  {path}"))
+                .collect::<String>()
+        );
+    }
+    if !baked.refused.is_empty() {
+        eprintln!(
+            "zaqaru-bake: {} of {} functions were not translated and will stop \
+             the container if called",
+            baked.refused.len(),
+            baked.functions
+        );
+    }
+
+    let guest = workspace.join("program.wasm.o");
+    std::fs::write(&guest, &baked.module).context("writing the translated program")?;
     let image_object = workspace.join("image.wasm.o");
-    std::fs::write(&image_object, &image).context("writing the image object")?;
+    std::fs::write(&image_object, &baked.image).context("writing the image object")?;
+    let top = baked.top;
 
     let seam = workspace.join("seam.wasm.o");
     std::fs::write(

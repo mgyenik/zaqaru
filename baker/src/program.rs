@@ -26,10 +26,20 @@ use zaqaru::transpile::Patch;
 /// loader will never place, and a jump table that is not rewritten
 /// dispatches to whatever the original entry held.
 pub fn apply(bytes: &mut [u8], patches: &[Patch]) -> Result<()> {
+    apply_at(bytes, patches, 0)
+}
+
+/// The same, for a file the bake placed at a base.
+///
+/// A patch's address is where the *translation* found the table, which is an
+/// address in the placed program; the file's own headers describe it at a
+/// base of zero. The bias is what reconciles the two, and it is the same
+/// number `ObjectFile::parse_at` and `Program::parse_at` were given.
+pub fn apply_at(bytes: &mut [u8], patches: &[Patch], bias: u64) -> Result<()> {
     if patches.is_empty() {
         return Ok(());
     }
-    let program = Program::parse(bytes).map_err(|error| {
+    let program = Program::parse_at(bytes, bias).map_err(|error| {
         let mut message = String::new();
         error.message(&mut message);
         anyhow::anyhow!("{message}")

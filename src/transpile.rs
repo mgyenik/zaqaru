@@ -644,40 +644,67 @@ impl<'a> Transpiler<'a> {
 
         Ok(Translation {
             module: wasm.serialize(),
-            patches: self.image_patches(&references),
+            patches: self.image_patches(&references)?,
             refused,
         })
     }
 
     /// The jump-table rewrites a linked image needs, as bytes at addresses.
     ///
-    /// Every entry is made to hold the same thing the relocatable path makes
-    /// it hold: its own arm number for a table of differences, and the
-    /// table's address plus that number for a table of addresses. Either way
-    /// the dispatch arrives at `table + arm`, which is what the `br_table`
-    /// subtracts the table's address back out of.
-    fn image_patches(&self, references: &TextReferences) -> Vec<Patch> {
+    /// Every entry is made to hold whatever makes the dispatch's own
+    /// arithmetic arrive at `table + arm`, which is what the `br_table`
+    /// subtracts the table's address back out of: the arm number for a table
+    /// of differences from itself, the table's address plus the arm for a
+    /// table of whole addresses, and the distance between the two bases plus
+    /// the arm for a computed goto measuring from a code label.
+    fn image_patches(&self, references: &TextReferences) -> Result<Vec<Patch>> {
         if self.object.layout != crate::reader::Layout::Linked {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let mut patches = Vec::new();
         for table in &references.tables {
             let table_address =
                 self.object.sections[table.table_section].address + table.table_offset;
             for (arm, (_, entry_offset)) in table.entries().enumerate() {
-                let value = if table.relative {
-                    arm as u64
-                } else {
-                    table_address + arm as u64
+                // Whatever the dispatch's own arithmetic is, it has to end up
+                // computing `table_address + arm`, because that is what the
+                // `br_table` subtracts. An entry is added to its base, so the
+                // entry has to be the difference between the two — which is
+                // `arm` in the ordinary case where the base *is* the table,
+                // and something larger for a computed goto whose entries are
+                // differences from a code label.
+                let value = match table.base {
+                    Some(base) => table_address.wrapping_sub(base).wrapping_add(arm as u64),
+                    None => table_address + arm as u64,
                 };
                 let width = table.stride as usize;
+                // The guest sign-extends a narrow entry before adding it to
+                // the base, so a difference that does not fit the entry is
+                // not a difference this rewrite can express — and writing
+                // the low bytes of one would dispatch somewhere arbitrary
+                // rather than fail. Refused instead, naming the table.
+                if width < 8 {
+                    let bits = width as u32 * 8;
+                    let signed = value as i64;
+                    let low = -(1i64 << (bits - 1));
+                    let high = (1i64 << (bits - 1)) - 1;
+                    if signed < low || signed > high {
+                        bail!(
+                            "the jump table at {table_address:#x} measures its \
+                             entries from {:#x}, which is {} bytes away — too \
+                             far to write into a {width}-byte entry",
+                            table.base.unwrap_or(table_address),
+                            signed.abs()
+                        );
+                    }
+                }
                 patches.push(Patch {
                     address: self.object.sections[table.table_section].address + entry_offset,
                     bytes: value.to_le_bytes()[..width].to_vec(),
                 });
             }
         }
-        patches
+        Ok(patches)
     }
 
     /// Works out what every relocation in the object means.
@@ -1196,7 +1223,10 @@ impl<'a> Transpiler<'a> {
                 let start = entry_offset as usize;
                 let end = start + table.stride as usize;
                 segment.bytes[start..end].fill(0);
-                if table.relative {
+                if table.relative() {
+                    // A relocatable input's relative entries are always
+                    // differences from the table itself, so the difference to
+                    // write is just the arm.
                     let value = (arm as u64).to_le_bytes();
                     let width = table.stride as usize;
                     segment.bytes[start..end].copy_from_slice(&value[..width]);

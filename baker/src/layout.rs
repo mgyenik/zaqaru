@@ -51,6 +51,41 @@ const WASM_PAGE: u64 = 65536;
 /// every relocatable-tier container a hole it has no use for.
 pub const DEFAULT_DATA_BASE: u64 = 1024;
 
+/// Where the bake starts placing position-independent files.
+///
+/// High on purpose, and the reason is discovery rather than layout. A
+/// shared object's text begins a few kilobytes above its base, so at a low
+/// base it sits exactly where the program's own integer constants sit —
+/// every `mov $0x1770,%eax` reads as an instruction taking the address of
+/// code, and the operand harvest cannot tell the two apart. Measured on
+/// `ld-linux-x86-64.so.2`: read at zero, eleven address-taken functions
+/// against three at a base up here, and the eight extra ones shredded a
+/// region no strong witness covered into pieces beginning partway through
+/// real instructions.
+///
+/// A quarter of a gigabyte of address space is what it costs. Address
+/// space, not memory: nothing writes to the gap, and a wasm engine reserves
+/// rather than commits. Higher would be better still for the same reason,
+/// and the ceiling is the 32-bit address space everything has to share.
+pub const DYNAMIC_BASE: u64 = 0x1000_0000;
+
+/// Modules are packed upward from [`DYNAMIC_BASE`] at this alignment.
+///
+/// A whole wasm page, which is more than the 4 KiB any loader asks for and
+/// keeps every module boundary a boundary memory can be grown to.
+pub const MODULE_ALIGNMENT: u64 = WASM_PAGE;
+
+/// The lowest address a *fixed* executable may be linked at.
+///
+/// The same argument as [`DYNAMIC_BASE`], from the other side. When a file
+/// states its own addresses there is no base to choose, so the only
+/// available answer is to refuse — and the floor for refusing someone
+/// else's choice has to sit well below the base we pick for our own.
+/// `0x400000` is what GNU ld and lld both emit for `-no-pie`, and it is
+/// where the entire tested corpus lives; anything under a megabyte would
+/// have to have been linked that way on purpose.
+pub const MINIMUM_FIXED_ADDRESS: u64 = 0x10_0000;
+
 /// Where the module's data must start for a program occupying up to `top`.
 ///
 /// No headroom: the region holds the loaded program and nothing else, and

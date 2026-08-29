@@ -94,7 +94,7 @@ pub struct Load {
     pub executable: bool,
 }
 
-/// A linked executable, read far enough to place it.
+/// A linked executable or shared object, read far enough to place it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Program {
     pub entry: u64,
@@ -104,15 +104,39 @@ pub struct Program {
     pub header_size: u64,
     pub header_count: u64,
     pub loads: Vec<Load>,
+    /// Whether the file states its own addresses or expects a base.
+    pub kind: Kind,
+    /// `PT_INTERP`'s bytes, as a file range: the path of the dynamic loader
+    /// this program must be started through. `None` for a static one, and
+    /// that absence is the whole of how the two are told apart at boot.
+    pub interpreter: Option<(u64, u64)>,
+    /// `PT_DYNAMIC`'s address and size, already at the bias. What holds
+    /// `DT_NEEDED`, which is how a bake finds the libraries to translate.
+    pub dynamic: Option<(u64, u64)>,
+}
+
+/// Whether a file states its own addresses or is placed at a base.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    /// `ET_EXEC`: the addresses in the file are the addresses, and the only
+    /// bias it can be read at is zero.
+    Fixed,
+    /// `ET_DYN`: a shared object or position-independent executable, whose
+    /// addresses are relative to a base someone else chooses. Here that
+    /// someone is the bake — see the prelink design in `container-plan.md`.
+    PositionIndependent,
 }
 
 const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
 const CLASS_64: u8 = 2;
 const LITTLE_ENDIAN: u8 = 1;
 const TYPE_EXECUTABLE: u16 = 2;
+const TYPE_SHARED: u16 = 3;
 const MACHINE_X86_64: u16 = 62;
 
 const PT_LOAD: u32 = 1;
+const PT_DYNAMIC: u32 = 2;
+const PT_INTERP: u32 = 3;
 const PT_PHDR: u32 = 6;
 
 const PF_X: u32 = 1;
@@ -120,7 +144,19 @@ const PF_W: u32 = 2;
 const PF_R: u32 = 4;
 
 impl Program {
+    /// Reads a file that states its own addresses.
     pub fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        Self::parse_at(bytes, 0)
+    }
+
+    /// Reads a file as though a loader had placed it at `bias`.
+    ///
+    /// The mirror of `zaqaru::reader::ObjectFile::parse_at`, and it has to
+    /// be: the translator resolved this file's operands at a base, and the
+    /// loader has to put the bytes at the same one or every one of those
+    /// operands points at nothing. Both halves take the same number from
+    /// the bake, and this is the half that copies the bytes.
+    pub fn parse_at(bytes: &[u8], bias: u64) -> Result<Self, Error> {
         if bytes.len() < 64 {
             return Err(Error::Truncated("header"));
         }
@@ -133,21 +169,29 @@ impl Program {
         if bytes[5] != LITTLE_ENDIAN {
             return Err(Error::NotLoadable("it is not little-endian"));
         }
-        // `ET_DYN` is deliberately refused rather than loaded at a base of
-        // our choosing: a position-independent executable's operands were
-        // translated as the addresses they hold, so moving it would move
+        let kind = match read_u16(bytes, 16) {
+            TYPE_EXECUTABLE => Kind::Fixed,
+            TYPE_SHARED => Kind::PositionIndependent,
+            _ => {
+                return Err(Error::NotLoadable(
+                    "it is neither an executable nor a shared object",
+                ));
+            }
+        };
+        // A file that states its own addresses cannot be moved: its operands
+        // were translated as the addresses they hold, so a bias would move
         // the program out from under its own code.
-        if read_u16(bytes, 16) != TYPE_EXECUTABLE {
+        if kind == Kind::Fixed && bias != 0 {
             return Err(Error::NotLoadable(
-                "it is not a fixed-address executable (a shared object or PIE \
-                 needs a loader this does not have)",
+                "it is a fixed-address executable, which cannot be placed \
+                 anywhere but at the addresses it states",
             ));
         }
         if read_u16(bytes, 18) != MACHINE_X86_64 {
             return Err(Error::NotLoadable("it is not x86-64"));
         }
 
-        let entry = read_u64(bytes, 24);
+        let entry = read_u64(bytes, 24) + bias;
         let table = read_u64(bytes, 32);
         let header_size = u64::from(read_u16(bytes, 54));
         let header_count = u64::from(read_u16(bytes, 56));
@@ -164,20 +208,38 @@ impl Program {
 
         let mut loads = Vec::new();
         let mut stated_headers = None;
+        let mut interpreter = None;
+        let mut dynamic = None;
         for index in 0..header_count {
             let at = (table + index * header_size) as usize;
-            let kind = read_u32(bytes, at);
-            if kind == PT_PHDR {
-                stated_headers = Some(read_u64(bytes, at + 16));
+            let segment = read_u32(bytes, at);
+            if segment == PT_PHDR {
+                stated_headers = Some(read_u64(bytes, at + 16) + bias);
                 continue;
             }
-            if kind != PT_LOAD {
+            if segment == PT_INTERP {
+                let offset = read_u64(bytes, at + 8);
+                let size = read_u64(bytes, at + 32);
+                let end = offset
+                    .checked_add(size)
+                    .ok_or(Error::Truncated("interpreter path"))?;
+                if end > bytes.len() as u64 {
+                    return Err(Error::Truncated("interpreter path"));
+                }
+                interpreter = Some((offset, size));
+                continue;
+            }
+            if segment == PT_DYNAMIC {
+                dynamic = Some((read_u64(bytes, at + 16) + bias, read_u64(bytes, at + 40)));
+                continue;
+            }
+            if segment != PT_LOAD {
                 continue;
             }
             let flags = read_u32(bytes, at + 4);
             let load = Load {
                 offset: read_u64(bytes, at + 8),
-                address: read_u64(bytes, at + 16),
+                address: read_u64(bytes, at + 16) + bias,
                 file_size: read_u64(bytes, at + 32),
                 memory_size: read_u64(bytes, at + 40),
                 readable: flags & PF_R != 0,
@@ -225,6 +287,20 @@ impl Program {
             header_size,
             header_count,
             loads,
+            kind,
+            interpreter,
+            dynamic,
+        })
+    }
+
+    /// The interpreter's path, as the bytes of `PT_INTERP` without its
+    /// terminating null.
+    pub fn interpreter_path<'a>(&self, bytes: &'a [u8]) -> Option<&'a [u8]> {
+        let (offset, size) = self.interpreter?;
+        let path = bytes.get(offset as usize..(offset + size) as usize)?;
+        Some(match path.iter().position(|byte| *byte == 0) {
+            Some(end) => &path[..end],
+            None => path,
         })
     }
 
@@ -316,6 +392,7 @@ pub fn build_stack(
     argv: &[&[u8]],
     envp: &[&[u8]],
     program: &Program,
+    interpreter: Option<u64>,
     random: &[u8; RANDOM_BYTES],
 ) -> Result<Stack, Error> {
     let (low, high) = region;
@@ -368,7 +445,11 @@ pub fn build_stack(
         (auxv::PHENT, program.header_size),
         (auxv::PHNUM, program.header_count),
         (auxv::PAGESZ, crate::space::PAGE),
-        (auxv::BASE, 0),
+        // Where the dynamic loader was placed, or zero when there is none.
+        // `ld.so` reads this to find itself, and the *program's* entry has
+        // to be `AT_ENTRY` rather than the loader's, because the loader
+        // finishes its work by jumping there.
+        (auxv::BASE, interpreter.unwrap_or(0)),
         (auxv::ENTRY, program.entry),
         (auxv::UID, 0),
         (auxv::EUID, 0),
@@ -530,18 +611,34 @@ mod tests {
         assert_eq!(Program::parse(&bytes), Err(Error::HeadersUnmapped));
     }
 
+    /// A shared object is placed at the bias the bake assigned it, and
+    /// every address it states moves with it.
     #[test]
-    fn a_shared_object_is_refused_rather_than_placed_somewhere() {
-        // `ET_DYN`. Loading it at a base of our choosing would move the
-        // program out from under operands that were translated as the
-        // addresses they hold.
+    fn a_shared_object_is_placed_at_its_bias() {
         let bytes = elf(
-            3,
+            TYPE_SHARED,
             MACHINE_X86_64,
-            &[[PT_LOAD as u64, 4, 0, 0, 0x100, 0x100]],
-            0x100,
+            &[[PT_LOAD as u64, 4, 0, 0, 0x200, 0x200]],
+            0x200,
         );
-        assert!(matches!(Program::parse(&bytes), Err(Error::NotLoadable(_))));
+        let program = Program::parse_at(&bytes, 0x1000_0000).expect("parse");
+        assert_eq!(program.kind, Kind::PositionIndependent);
+        assert_eq!(program.base(), 0x1000_0000);
+        assert_eq!(program.entry, 0x1000_0000 + 0x401000);
+        // The headers are at file offset 64 inside a segment mapped from
+        // offset zero, so they move with everything else.
+        assert_eq!(program.headers, 0x1000_0040);
+    }
+
+    /// A fixed-address executable cannot be moved, and asking is an error
+    /// rather than a silent relocation: its operands were translated as the
+    /// addresses they hold.
+    #[test]
+    fn a_fixed_executable_refuses_a_bias() {
+        assert!(matches!(
+            Program::parse_at(&ordinary(), 0x1000_0000),
+            Err(Error::NotLoadable(_))
+        ));
     }
 
     #[test]
@@ -579,7 +676,7 @@ mod tests {
         let argv: [&[u8]; 3] = [b"python3", b"-c", b"print(1)"];
         let envp: [&[u8]; 2] = [b"PATH=/usr/bin", b"HOME=/root"];
         let random = [0x5au8; RANDOM_BYTES];
-        let stack = build_stack(region, &argv, &envp, &program, &random).expect("build");
+        let stack = build_stack(region, &argv, &envp, &program, None, &random).expect("build");
 
         assert_eq!(
             stack.stack_pointer % 16,
@@ -697,7 +794,7 @@ mod tests {
         let huge = std::vec![b'x'; 4096];
         let argv: [&[u8]; 1] = [&huge];
         assert!(matches!(
-            build_stack((0x1000, 0x1800), &argv, &[], &program, &[0; RANDOM_BYTES]),
+            build_stack((0x1000, 0x1800), &argv, &[], &program, None, &[0; RANDOM_BYTES]),
             Err(Error::StackTooSmall { .. })
         ));
     }
@@ -726,6 +823,25 @@ pub fn module_data_base() -> u64 {
 #[cfg(not(target_arch = "wasm32"))]
 pub fn module_data_base() -> u64 {
     u64::MAX
+}
+
+/// Refuses a position-independent file the bake never placed.
+///
+/// A base of zero is a real answer for a fixed-address executable and a
+/// meaningless one for a shared object: its code was resolved at some
+/// address by the translator, and if the image carries no record of which,
+/// then this file was never translated. Loading it anyway would put bytes at
+/// address zero that no exec-map entry describes, and the first indirect
+/// call through them would report a miss for an address that was never the
+/// question. Saying so here names the file instead.
+fn untranslated(program: &Program, base: u64) -> Result<(), Error> {
+    match program.kind == Kind::PositionIndependent && base == 0 {
+        true => Err(Error::NotLoadable(
+            "it is a shared object the bake did not translate, so there is no \
+             address its code was resolved at",
+        )),
+        false => Ok(()),
+    }
 }
 
 /// Whether a program fits in the region reserved for it.
@@ -770,10 +886,86 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
         // to allocate this much at all because the bake put the allocator
         // above the region the program is about to occupy — see
         // `baker::layout`.
-        let file = self.read_whole(path)?;
-        let program = Program::parse(&file)?;
-        check_region(&program, module_data_base())?;
+        let (file, base) = self.read_whole(path)?;
+        let program = Program::parse_at(&file, base)?;
+        untranslated(&program, base)?;
 
+        // A dynamic program is not entered directly. `PT_INTERP` names the
+        // loader that must run first — it maps the libraries, applies the
+        // relocations, and only then jumps to the program's own entry — and
+        // the loader is an ordinary translated module like any other, placed
+        // by the same bake at its own base. So both files are loaded, the
+        // auxiliary vector says where each of them went, and control goes to
+        // the loader.
+        let interpreter = match program.interpreter_path(&file) {
+            Some(interpreter) => {
+                let (bytes, base) = self.read_whole(interpreter).map_err(|_| {
+                    Error::NotLoadable(
+                        "the dynamic loader its `PT_INTERP` names is not in the image",
+                    )
+                })?;
+                let loader = Program::parse_at(&bytes, base)?;
+                untranslated(&loader, base)?;
+                Some((bytes, loader))
+            }
+            None => None,
+        };
+
+        let top = interpreter
+            .as_ref()
+            .map_or(program.top(), |(_, loader)| loader.top().max(program.top()));
+        if top > module_data_base() {
+            return Err(Error::RegionOccupied {
+                top,
+                data: module_data_base(),
+            });
+        }
+
+        for (file, program) in core::iter::once((&file, &program))
+            .chain(interpreter.iter().map(|(bytes, loader)| (bytes, loader)))
+        {
+            self.place(file, program)?;
+        }
+
+        let stack = self.reserve_stack()?;
+        let random = self.random_bytes();
+        let built = build_stack(
+            stack,
+            argv,
+            envp,
+            &program,
+            interpreter.as_ref().map(|(_, loader)| loader.base()),
+            &random,
+        )?;
+        // SAFETY: the region came from the address space, which grew memory
+        // to cover it, and the block ends exactly at the region's top.
+        unsafe {
+            self.memory()
+                .write(built.address, &built.bytes)
+                .map_err(|_| Error::StackTooSmall {
+                    needed: built.bytes.len() as u64,
+                    region: stack.1 - stack.0,
+                })?;
+        }
+        self.machine.set_stack_pointer(built.stack_pointer as i64);
+        // A new program gets a new floating-point unit. Nothing else resets
+        // it, and its state does not live in the register file the rest of
+        // this function sets up — it is inside the `x87` crate, which is why
+        // this is a call rather than a store.
+        self.machine.reset_floating_point();
+
+        // `/proc/self/exe` is a fact about the program that was started, and
+        // this is the moment there is one.
+        if let Ok(text) = core::str::from_utf8(path) {
+            self.set_executable(text);
+        }
+        Ok(interpreter
+            .as_ref()
+            .map_or(program.entry, |(_, loader)| loader.entry))
+    }
+
+    /// Copies one file's segments to the addresses they belong at.
+    fn place(&mut self, file: &[u8], program: &Program) -> Result<(), Error> {
         for load in &program.loads {
             // Recorded as a mapping before anything is written into it. The
             // guest's own memory is not special to it: glibc applies
@@ -827,37 +1019,11 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
                     .map_err(|_| Error::NotLoadable("a segment does not fit in memory"))?;
             }
         }
-
-        let stack = self.reserve_stack()?;
-        let random = self.random_bytes();
-        let built = build_stack(stack, argv, envp, &program, &random)?;
-        // SAFETY: the region came from the address space, which grew memory
-        // to cover it, and the block ends exactly at the region's top.
-        unsafe {
-            self.memory()
-                .write(built.address, &built.bytes)
-                .map_err(|_| Error::StackTooSmall {
-                    needed: built.bytes.len() as u64,
-                    region: stack.1 - stack.0,
-                })?;
-        }
-        self.machine.set_stack_pointer(built.stack_pointer as i64);
-        // A new program gets a new floating-point unit. Nothing else resets
-        // it, and its state does not live in the register file the rest of
-        // this function sets up — it is inside the `x87` crate, which is why
-        // this is a call rather than a store.
-        self.machine.reset_floating_point();
-
-        // `/proc/self/exe` is a fact about the program that was started, and
-        // this is the moment there is one.
-        if let Ok(text) = core::str::from_utf8(path) {
-            self.set_executable(text);
-        }
-        Ok(program.entry)
+        Ok(())
     }
 
-    /// The whole of a file, as bytes.
-    fn read_whole(&self, path: &[u8]) -> Result<Vec<u8>, Error> {
+    /// The whole of a file, as bytes, and the base the bake placed it at.
+    fn read_whole(&self, path: &[u8]) -> Result<(Vec<u8>, u64), Error> {
         let root = self.vfs.root();
         let vnode = self
             .vfs
@@ -877,7 +1043,14 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
         let contents = filesystem
             .contents(&inode, vnode.inode)
             .map_err(|_| Error::NotLoadable("its contents cannot be read"))?;
-        Ok(contents.to_vec())
+        // A file the bake did not translate has no base, and a
+        // position-independent one then has nowhere it can go — its code was
+        // never resolved at any address. A fixed-address executable is the
+        // other case and needs no base, which is why zero is the answer
+        // rather than a refusal here: `Program::parse_at` is what refuses a
+        // shared object it cannot place.
+        let base = filesystem.prelink_base(vnode.inode).unwrap_or(0);
+        Ok((contents.to_vec(), base))
     }
 
     /// The initial stack's region, as an ordinary anonymous mapping.

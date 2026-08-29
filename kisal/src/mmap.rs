@@ -85,6 +85,41 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
             ));
         }
 
+        // Where a translated ELF goes is not the allocator's to choose.
+        //
+        // This is the run-time half of "prelink at bake". The bake assigned
+        // this file a base and translated its code *at* that base, so every
+        // internal reference in it — and every entry the exec map holds for
+        // it — is an address in that region. A loader asking to map it
+        // "anywhere" must be told that address and no other, or it will
+        // relocate against a base nothing was translated at and the first
+        // call into the library reports a miss for an address that was never
+        // the question.
+        //
+        // The loader's own `MAP_FIXED` carving of the segments then lands
+        // where the translation assumed, because it computes those addresses
+        // from what this call returned.
+        let (hint, flags) = match self.placement(&backing, offset as u64, flags) {
+            Ok(placement) => placement.unwrap_or((hint, flags)),
+            Err(errno) => return Outcome::Done(errno.as_result()),
+        };
+
+        // Executing bytes nobody translated is not something that can be
+        // half-done. The design names this a loud error precisely because
+        // the alternative is a container that runs until it calls into the
+        // mapping and then reports a miss on an address with no story.
+        if prot_bits & prot::EXEC != 0
+            && matches!(backing, Backing::File { .. })
+            && !self.is_translated(&backing).unwrap_or(false)
+        {
+            return Outcome::Fault(Fault::detailed(
+                number::MMAP,
+                arguments,
+                "an executable mapping of a file the bake did not translate, \
+                 whose code therefore does not exist in this module",
+            ));
+        }
+
         let request = Request {
             hint,
             length,
@@ -126,6 +161,43 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
             return Err(Errno::NoDevice);
         }
         Ok(Backing::File { vnode, offset })
+    }
+
+    /// Whether a mapping's file is an ELF the bake translated.
+    fn is_translated(&self, backing: &Backing) -> Result<bool, Errno> {
+        let Backing::File { vnode, .. } = backing else {
+            return Ok(false);
+        };
+        Ok(self.vfs.inode(*vnode)?.flags & crate::image::inode_flags::EXEC_TRANSPILED != 0)
+    }
+
+    /// Where a translated ELF must be mapped, when the caller did not say.
+    ///
+    /// `None` means the caller's own hint and flags stand: the file is not a
+    /// translated ELF, or the caller used `MAP_FIXED` and has therefore
+    /// already computed an address from an earlier answer of ours.
+    ///
+    /// The address is the base plus the file offset being mapped, which is
+    /// the same thing for every well-formed shared object: a loader maps
+    /// from the first segment's file offset, and that segment's virtual
+    /// address is congruent to it — that congruence is what lets a loader
+    /// map a file at all.
+    fn placement(
+        &self,
+        backing: &Backing,
+        offset: u64,
+        flags: i32,
+    ) -> Result<Option<(u64, i32)>, Errno> {
+        if flags & map::FIXED != 0 || !self.is_translated(backing)? {
+            return Ok(None);
+        }
+        let Backing::File { vnode, .. } = backing else {
+            return Ok(None);
+        };
+        let Some(base) = self.vfs.filesystem_of(*vnode)?.prelink_base(vnode.inode) else {
+            return Ok(None);
+        };
+        Ok(Some((base + offset, flags | map::FIXED)))
     }
 
     /// Copies a file's bytes into a mapping that was just made.

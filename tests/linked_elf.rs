@@ -370,10 +370,23 @@ fn a_linked_switch_is_rewritten_through_image_patches() {
                 );
                 let mut value = [0u8; 8];
                 value[..patch.bytes.len()].copy_from_slice(&patch.bytes);
-                let value = u64::from_le_bytes(value);
-                // Whichever form the table was in, the dispatch reaches
-                // `table + arm` — directly, or by adding the table itself.
-                let reached = if table.relative { base + value } else { value };
+                // Sign-extended from the entry's own width, which is what
+                // the guest's `movslq` does to a narrow entry before adding
+                // it to whatever it measures from.
+                let bits = patch.bytes.len() as u32 * 8;
+                let value = match bits < 64 {
+                    true => ((u64::from_le_bytes(value) << (64 - bits)) as i64 >> (64 - bits)) as u64,
+                    false => u64::from_le_bytes(value),
+                };
+                // Whichever form the table was in, and whatever its entries
+                // are measured from, the dispatch reaches `table + arm`.
+                // That is the invariant the whole rewrite exists to hold:
+                // the `br_table` subtracts the table's address, so every
+                // spelling of the arithmetic has to end at the same place.
+                let reached = match table.base {
+                    Some(from) => from.wrapping_add(value),
+                    None => value,
+                };
                 assert_eq!(
                     reached,
                     base + arm,

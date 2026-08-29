@@ -275,6 +275,23 @@ impl ObjectFile {
     /// allocated sections, segments, the entry point, and the addends of the
     /// relocations discovery harvests — and to nothing else. `base` must be
     /// zero for a relocatable object, which is not loaded at all.
+    ///
+    /// **A low base costs discovery quality, and silently.** A
+    /// position-independent file's text begins a few kilobytes above its
+    /// base, and at a low base that is exactly where ordinary integer
+    /// constants live — so `mov $0x1770,%eax` reads as an instruction taking
+    /// the address of code, and the operand harvest cannot tell the two
+    /// apart. Measured on this machine's `ld-linux-x86-64.so.2`: read at
+    /// zero, eleven address-taken functions against three at a real base,
+    /// and the eight extra ones shredded a region no strong witness covered
+    /// into pieces beginning partway through real instructions.
+    ///
+    /// This is not checked here, and the reason is that there is nothing to
+    /// check: for a position-independent file the base is not the file's
+    /// property but ours, chosen at bake time, so a bad one is a bake that
+    /// chose badly rather than an input that arrived badly. The floor lives
+    /// where the choice is made — `baker::layout::DYNAMIC_BASE`. What is
+    /// right here is to say what the choice costs.
     pub fn parse_at(bytes: &[u8], base: u64) -> Result<Self> {
         let file =
             object::read::File::parse(bytes).context("parsing the input as an object file")?;
@@ -303,26 +320,6 @@ impl ObjectFile {
         };
         if base != 0 && layout != Layout::Linked {
             bail!("a relocatable object has nothing to place, so it has no base");
-        }
-        // A position-independent file read at zero is not merely unplaced;
-        // its evidence is *worse*, and silently so. Its text begins a few
-        // kilobytes up, which is exactly where ordinary integer constants
-        // live, so every `mov $0x1770,%eax` in the program reads as an
-        // instruction taking the address of code. Measured on this
-        // machine's `ld-linux-x86-64.so.2`: eleven address-taken functions
-        // at base zero against three at a real base, and the eight extra
-        // ones shredded a region no strong witness covered into pieces that
-        // begin partway through real instructions.
-        //
-        // The design's answer is the base itself — "prelink at bake" exists
-        // partly for this — so reading one at zero is refused rather than
-        // answered with a function list that looks plausible and is not.
-        if base == 0 && file.kind() == object::ObjectKind::Dynamic {
-            bail!(
-                "a position-independent file has to be read at the base a bake \
-                 assigns it: at zero its text sits where ordinary integer \
-                 constants sit, and discovery cannot tell one from the other"
-            );
         }
 
         // ELF section indices are one-based and sparse from our point of

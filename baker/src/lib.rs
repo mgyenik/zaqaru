@@ -17,6 +17,8 @@
 //! else, so there is nothing to preserve. They are filled by the `docker
 //! save` path, where tar's `uname`/`gname` records carry them.
 
+pub mod bake;
+pub mod dynamic;
 pub mod json;
 pub mod layers;
 pub mod layout;
@@ -103,6 +105,11 @@ enum Contents {
 #[derive(Default)]
 struct Builder {
     inodes: Vec<Pending>,
+    /// Parallel to `inodes`: the base a translated ELF was placed at, and
+    /// zero for everything else. Kept beside the inode rather than in it
+    /// because the record is exactly full and because a prelink base is a
+    /// fact about a handful of files, not about every one.
+    bases: Vec<u32>,
     /// Byte strings, deduplicated. Names repeat heavily across a rootfs.
     strings: Vec<u8>,
     interned: HashMap<Vec<u8>, u32>,
@@ -187,11 +194,19 @@ impl Builder {
         {
             flags |= inode_flags::MMAP_ALIGNED;
         }
+        // The bake translated this file and chose where it goes. The flag is
+        // the cheap test — `mmap` consults the prelink records only for an
+        // inode carrying it — and it is also what makes mapping an
+        // *untranslated* ELF executable a loud error rather than a hang.
+        if meta.prelink_base.is_some() {
+            flags |= inode_flags::EXEC_TRANSPILED;
+        }
 
         let uname_ref = self.intern(&meta.uname);
         let gname_ref = self.intern(&meta.gname);
 
         let number = self.inodes.len() as u32;
+        self.bases.push(meta.prelink_base.unwrap_or(0));
         self.inodes.push(Pending {
             inode: Inode {
                 mode: meta.mode,
@@ -368,17 +383,37 @@ impl Builder {
             }
         }
 
+        // The prelink records: which inodes are translated ELFs and where
+        // the bake placed each. Sorted by inode, because that is how kisal
+        // searches them when a mapping asks where a library goes.
+        let mut modules: Vec<(u32, u32)> = self
+            .inodes
+            .iter()
+            .enumerate()
+            .filter_map(|(number, pending)| {
+                (pending.inode.flags & inode_flags::EXEC_TRANSPILED != 0)
+                    .then_some((number as u32, self.bases[number]))
+            })
+            .collect();
+        modules.sort_unstable();
+        let mut module_records = Vec::with_capacity(modules.len() * kisal::image::MODULE_SIZE);
+        for (inode, base) in &modules {
+            module_records.extend_from_slice(&inode.to_le_bytes());
+            module_records.extend_from_slice(&base.to_le_bytes());
+        }
+
         let inode_offset = HEADER_SIZE;
         let dirent_offset = inode_offset + self.inodes.len() * INODE_SIZE;
         let string_offset = dirent_offset + dirents.len();
         let xattr_offset = string_offset + self.strings.len();
+        let module_offset = xattr_offset + self.xattrs.len();
 
         // Every region's extent is a `u32` in the index, so a bake that
         // overflows one has to fail rather than record a length modulo 2^32 —
         // which would validate against a shorter blob and read zeros for
         // every file above the wrap. A rootfs over four gigabytes is routine
         // for the images this is aimed at.
-        let total = xattr_offset + self.xattrs.len();
+        let total = module_offset + module_records.len();
         for (what, size) in [
             ("the file contents", blob.len()),
             ("the directory entries", dirents.len()),
@@ -408,6 +443,8 @@ impl Builder {
             self.xattrs.len() as u32,
             root,
             blob.len() as u32,
+            module_offset as u32,
+            modules.len() as u32,
         );
         index.extend_from_slice(&header);
         for pending in &self.inodes {
@@ -418,6 +455,7 @@ impl Builder {
         index.extend_from_slice(&dirents);
         index.extend_from_slice(&self.strings);
         index.extend_from_slice(&self.xattrs);
+        index.extend_from_slice(&module_records);
 
         Ok(Image { blob, index })
     }

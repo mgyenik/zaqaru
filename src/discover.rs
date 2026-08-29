@@ -342,7 +342,52 @@ pub fn discover(
         functions.sort_by_key(|function| (function.section, function.offset));
     }
     split_at_interior_entries(sections, &mut functions)?;
+    make_names_unique(sections, &mut functions);
     Ok(functions)
+}
+
+/// Makes every function's name unique, because a wasm symbol's must be and
+/// an ELF's need not be.
+///
+/// Two independent reasons a linked file names one thing twice, both of them
+/// ordinary rather than exotic:
+///
+/// - **`.symtab` and `.dynsym` are two views of the same code.** An exported
+///   function is in both, so reading both — which a stripped shared object
+///   requires, since it has only the second — sees it twice at one address.
+///   That is one function with one name, and the duplicate is dropped.
+/// - **Symbol versioning puts one name at several addresses.** glibc ships
+///   `memcpy@GLIBC_2.2.5` beside `memcpy@GLIBC_2.14`, and the version lives
+///   in `.gnu.version` rather than in the name, so the symbol table says
+///   `memcpy` twice about two genuinely different functions. Those are kept
+///   and told apart by where they are.
+///
+/// Every occurrence of a colliding name is qualified, not merely the later
+/// ones: which copy is "the first" depends on the order two symbol tables
+/// happened to be read in, and a name that silently means a different
+/// function depending on that is worse than a name with an address in it.
+fn make_names_unique(sections: &[Section], functions: &mut Vec<Function>) {
+    let mut seen: std::collections::HashSet<(usize, u64, String)> =
+        std::collections::HashSet::new();
+    functions.retain(|function| {
+        seen.insert((function.section, function.offset, function.name.clone()))
+    });
+
+    let mut count: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for function in functions.iter() {
+        *count.entry(function.name.as_str()).or_default() += 1;
+    }
+    let collides: std::collections::HashSet<String> = count
+        .into_iter()
+        .filter(|(_, count)| *count > 1)
+        .map(|(name, _)| name.to_string())
+        .collect();
+    for function in functions.iter_mut() {
+        if collides.contains(&function.name) {
+            let address = sections[function.section].address + function.offset;
+            function.name = format!("{}.{address:#x}", function.name);
+        }
+    }
 }
 
 fn collect_functions(

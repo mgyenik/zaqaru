@@ -32,16 +32,26 @@
 //! strings   length-prefixed byte strings: names, symlink targets,
 //!           owner names, xattr names and values
 //! xattrs    per-inode blocks referencing the strings region
+//! modules   sorted (inode, prelink base) pairs, one per translated ELF
 //! ```
+//!
+//! The modules region is small on purpose. A prelink base is a fact about
+//! the handful of files that are translated ELFs, not about every inode, so
+//! it costs eight bytes per module rather than eight bytes per inode — which
+//! on a real rootfs is the difference between a few dozen bytes and a
+//! quarter of a megabyte. The `EXEC_TRANSPILED` flag on the inode is the
+//! cheap test for whether to look here at all.
 
 /// `KISI` — kisal image.
 pub const MAGIC: u32 = u32::from_le_bytes(*b"KISI");
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 
-pub const HEADER_SIZE: usize = 48;
+pub const HEADER_SIZE: usize = 56;
 /// Fixed and packed: `stat` is `inode_offset + index * INODE_SIZE`.
 pub const INODE_SIZE: usize = 64;
 pub const DIRENT_SIZE: usize = 12;
+/// One prelink record: the inode, and the base the bake placed it at.
+pub const MODULE_SIZE: usize = 8;
 
 /// What went wrong reading the index. Every variant names a place, because
 /// the only useful thing to say about a malformed image is where it broke.
@@ -246,6 +256,8 @@ struct Header {
     /// derivable from the regions; the blob's is not, and a module that
     /// carries both as bare symbols has no other way to learn it.
     blob_size: u32,
+    module_offset: u32,
+    module_count: u32,
 }
 
 /// A baked image: the index and the blob its regular files live in.
@@ -287,6 +299,8 @@ impl<'a> Image<'a> {
             xattr_size: word(index, 36),
             root_inode: word(index, 40),
             blob_size: word(index, 44),
+            module_offset: word(index, 48),
+            module_count: word(index, 52),
         };
 
         // Validate the regions once, here, so that everything after is an
@@ -301,6 +315,11 @@ impl<'a> Image<'a> {
             ("dirents", header.dirent_offset, header.dirent_size as u64),
             ("strings", header.string_offset, header.string_size as u64),
             ("xattrs", header.xattr_offset, header.xattr_size as u64),
+            (
+                "modules",
+                header.module_offset,
+                (header.module_count as u64) * (MODULE_SIZE as u64),
+            ),
         ] {
             let end = (offset as u64)
                 .checked_add(size)
@@ -345,6 +364,39 @@ impl<'a> Image<'a> {
             INODE_SIZE as u64,
             "inode",
         )?))
+    }
+
+    /// The base the bake placed a translated ELF at, if this inode is one.
+    ///
+    /// This is the run-time half of "prelink at bake". The loader asks to
+    /// map a library "anywhere"; the answer has to be the address the
+    /// translator resolved that library's operands at, or every one of them
+    /// points at nothing. The bake wrote the number here, and this is where
+    /// `mmap` reads it back.
+    ///
+    /// A `u32` because linear memory is 32-bit: a base that did not fit
+    /// would be a base nothing could be loaded at.
+    pub fn prelink_base(&self, number: u32) -> Option<u64> {
+        // Sorted by inode, so this is a binary search — though in practice
+        // the region holds a handful of entries and the loop below would do.
+        let region = self.index.get(
+            self.header.module_offset as usize
+                ..self.header.module_offset as usize
+                    + self.header.module_count as usize * MODULE_SIZE,
+        )?;
+        let mut low = 0usize;
+        let mut high = self.header.module_count as usize;
+        while low < high {
+            let middle = low + (high - low) / 2;
+            let at = middle * MODULE_SIZE;
+            let inode = word(region, at);
+            match inode.cmp(&number) {
+                core::cmp::Ordering::Less => low = middle + 1,
+                core::cmp::Ordering::Greater => high = middle,
+                core::cmp::Ordering::Equal => return Some(u64::from(word(region, at + 4))),
+            }
+        }
+        None
     }
 
     /// A length-prefixed byte string from the strings region.
@@ -521,6 +573,7 @@ fn long(bytes: &[u8], at: usize) -> u64 {
 
 /// Writes an index header. Here rather than in the baker for the same reason
 /// [`Inode::write`] is: one definition, so a round trip is a real check.
+#[allow(clippy::too_many_arguments)]
 pub fn write_header(
     into: &mut [u8; HEADER_SIZE],
     inode_count: u32,
@@ -533,6 +586,8 @@ pub fn write_header(
     xattr_size: u32,
     root_inode: u32,
     blob_size: u32,
+    module_offset: u32,
+    module_count: u32,
 ) {
     into[0..4].copy_from_slice(&MAGIC.to_le_bytes());
     into[4..8].copy_from_slice(&VERSION.to_le_bytes());
@@ -546,6 +601,8 @@ pub fn write_header(
     into[36..40].copy_from_slice(&xattr_size.to_le_bytes());
     into[40..44].copy_from_slice(&root_inode.to_le_bytes());
     into[44..48].copy_from_slice(&blob_size.to_le_bytes());
+    into[48..52].copy_from_slice(&module_offset.to_le_bytes());
+    into[52..56].copy_from_slice(&module_count.to_le_bytes());
 }
 
 /// The total length of an index whose header is `header`.
@@ -560,7 +617,26 @@ pub fn index_length(header: &[u8]) -> Result<usize, ImageError> {
     if word(header, 0) != MAGIC {
         return Err(ImageError::BadMagic);
     }
-    Ok(word(header, 32) as usize + word(header, 36) as usize)
+    // The end of the region that ends last, rather than of whichever region
+    // the writer happens to put last. An earlier version read exactly the
+    // xattr region's end, which was true until the modules region was added
+    // after it — and then the slice was eight bytes short, `parse` refused
+    // it, and the refusal happened inside the kernel's own construction,
+    // where there is no kernel yet to report it. A length that has to be
+    // updated whenever a region is added is a length that will not be.
+    let inodes = (word(header, 12) as u64) + (word(header, 8) as u64) * (INODE_SIZE as u64);
+    let end = [
+        inodes,
+        word(header, 16) as u64 + word(header, 20) as u64,
+        word(header, 24) as u64 + word(header, 28) as u64,
+        word(header, 32) as u64 + word(header, 36) as u64,
+        word(header, 48) as u64 + word(header, 52) as u64 * (MODULE_SIZE as u64),
+    ]
+    .into_iter()
+    .max()
+    .expect("the array is not empty")
+    .max(HEADER_SIZE as u64);
+    usize::try_from(end).map_err(|_| ImageError::TruncatedRegion("index"))
 }
 
 /// The blob length an index header declares.

@@ -243,6 +243,9 @@ fn assemble(index: &mut Vec<u8>, inodes: &[Inode], dirents: &[u8], strings: &[u8
         0,
         0,
         0,
+        // A synthetic mount holds no ELF, so there is nothing to prelink.
+        0,
+        0,
     );
     for inode in inodes {
         let mut record = [0u8; INODE_SIZE];

@@ -74,25 +74,59 @@ use crate::reader::{Layout, ObjectFile, Relocation, SectionRole};
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct EntryForm {
     stride: u64,
-    /// Whether an entry holds the difference between its target and the
-    /// table's own address rather than the target itself.
-    relative: bool,
+    /// What an entry is a difference *from*, or `None` when it holds the
+    /// target outright.
+    ///
+    /// Usually the table's own address, which is what a compiler emits for a
+    /// `switch` in position-independent code. Not always: a **computed
+    /// goto** stores differences from a code label instead, because the
+    /// source wrote `&&label - &&base` and the compiler had no reason to
+    /// pick the table. glibc's `__vfprintf_internal` is exactly this — its
+    /// dispatch does
+    ///
+    /// ```text
+    /// lea    table(%rip),%rsi
+    /// lea    base(%rip),%rdi      ; a label inside the function
+    /// movslq (%rsi,%rax,4),%rax
+    /// add    %rdi,%rax
+    /// jmp    *%rax
+    /// ```
+    ///
+    /// and reading its entries against the table's address gives targets
+    /// that are not instruction boundaries, so the table is not recognised
+    /// at all and the dispatch becomes an indirect call into the middle of a
+    /// function. The base is not guessed: it is an address the dispatch
+    /// sequence itself computes.
+    base: Option<u64>,
 }
 
 /// The forms worth trying, in the order a compiler is likely to have used
 /// them. Both are real: `-fno-pie` gives whole addresses, and
 /// position-independent code gives four-byte differences, because a
 /// difference needs no relocation at load time.
-const ENTRY_FORMS: [EntryForm; 2] = [
-    EntryForm {
+/// The forms to try for one candidate table, in the order a compiler is
+/// likely to have used them.
+///
+/// Eight-byte whole addresses is what `-fno-pie` gives. Four-byte
+/// differences is what position-independent code gives, and the thing they
+/// are differences from is either the table itself or some address the
+/// dispatch computes — so every text address the dispatch mentions is
+/// offered as a base, and the entry scan decides.
+fn entry_forms(table_address: u64, bases: &[u64]) -> Vec<EntryForm> {
+    let mut forms = vec![EntryForm {
         stride: 8,
-        relative: false,
-    },
-    EntryForm {
+        base: None,
+    }];
+    forms.push(EntryForm {
         stride: 4,
-        relative: true,
-    },
-];
+        base: Some(table_address),
+    });
+    forms.extend(bases.iter().map(|base| EntryForm {
+        stride: 4,
+        base: Some(*base),
+    }));
+    forms
+}
 
 /// Reads one entry of a linked table, and returns the section offset it
 /// names — or `None` if it does not name code in the dispatching function's
@@ -100,7 +134,6 @@ const ENTRY_FORMS: [EntryForm; 2] = [
 fn read_linked_entry(
     object: &ObjectFile,
     section: usize,
-    table_offset: u64,
     entry_offset: u64,
     form: EntryForm,
 ) -> Option<u64> {
@@ -110,12 +143,12 @@ fn read_linked_entry(
     if end > bytes.len() {
         return None;
     }
-    let address = if form.relative {
-        let value = i32::from_le_bytes(bytes[at..end].try_into().ok()?) as i64;
-        let table_address = object.sections[section].address.checked_add(table_offset)?;
-        (table_address as i64).checked_add(value)? as u64
-    } else {
-        u64::from_le_bytes(bytes[at..end].try_into().ok()?)
+    let address = match form.base {
+        Some(base) => {
+            let value = i32::from_le_bytes(bytes[at..end].try_into().ok()?) as i64;
+            (base as i64).checked_add(value)? as u64
+        }
+        None => u64::from_le_bytes(bytes[at..end].try_into().ok()?),
     };
     let (target_section, offset) = object.section_at(address)?;
     (object.sections[target_section].role == SectionRole::Text).then_some(offset)
@@ -131,12 +164,18 @@ pub struct JumpTable {
     pub table_offset: u64,
     /// Bytes per entry, taken from the width of the entries' relocations.
     pub stride: u64,
-    /// Whether entries are stored as differences from the table, which is
-    /// what decides how they are rewritten.
-    pub relative: bool,
+    /// What an entry is a difference from, or `None` when it holds its
+    /// target outright. See [`EntryForm::base`]; this is what decides how
+    /// the entries are rewritten.
+    pub base: Option<u64>,
 }
 
 impl JumpTable {
+    /// Whether entries hold differences rather than whole addresses.
+    pub fn relative(&self) -> bool {
+        self.base.is_some()
+    }
+
     pub fn byte_length(&self) -> u64 {
         self.targets.len() as u64 * self.stride
     }
@@ -155,6 +194,10 @@ struct Candidate {
     position: usize,
     table_section: usize,
     table_offset: u64,
+    /// Text addresses the dispatch sequence computes, offered as bases for
+    /// the relative form. Evidence rather than search: each is an address
+    /// the code itself puts in a register on the way to the jump.
+    bases: Vec<u64>,
 }
 
 /// Finds every jump table in an object and attaches each to the function that
@@ -232,7 +275,25 @@ pub fn recover_all(object: &ObjectFile, functions: &mut [LiftedFunction]) -> Res
 /// Nearest matters: a function with two dispatches names both tables, and
 /// each loads the address of its own shortly beforehand.
 fn propose(object: &ObjectFile, function: &LiftedFunction, position: usize) -> Option<Candidate> {
+    let mut bases: Vec<u64> = Vec::new();
     for lifted in function.instructions[..=position].iter().rev() {
+        // Every text address this instruction computes, kept for the entry
+        // scan: a computed goto's entries are differences from one of them.
+        if object.layout == Layout::Linked {
+            bases.extend(
+                absolute_operands(
+                    &lifted.instruction,
+                    object.sections[function.section].address,
+                )
+                .filter(|address| {
+                    object
+                        .section_at(*address)
+                        .is_some_and(|(section, _)| {
+                            object.sections[section].role == SectionRole::Text
+                        })
+                }),
+            );
+        }
         // A relocatable input names the table with a relocation; a linked
         // one has the address in the instruction, because that is what the
         // linker put there.
@@ -251,11 +312,12 @@ fn propose(object: &ObjectFile, function: &LiftedFunction, position: usize) -> O
                 .collect()
         };
         for (section, table_offset) in locations {
-            if holds_block_addresses(object, function, section, table_offset) {
+            if holds_block_addresses(object, function, section, table_offset, &bases) {
                 return Some(Candidate {
                     position,
                     table_section: section,
                     table_offset,
+                    bases: bases.clone(),
                 });
             }
         }
@@ -315,14 +377,16 @@ fn holds_block_addresses(
     function: &LiftedFunction,
     section: usize,
     offset: u64,
+    bases: &[u64],
 ) -> bool {
     if object.layout == Layout::Linked {
         // Two entries in a row naming blocks inside this function, and
         // neither of them its start: that is a dispatch table and not a
         // function pointer, whichever form the entries turn out to be in.
-        return ENTRY_FORMS.iter().any(|form| {
+        let table_address = object.sections[section].address + offset;
+        return entry_forms(table_address, bases).iter().any(|form| {
             (0..2).all(|index| {
-                read_linked_entry(object, section, offset, offset + index * form.stride, *form)
+                read_linked_entry(object, section, offset + index * form.stride, *form)
                     .is_some_and(|target| {
                         target != function.offset && begins_an_instruction(function, target)
                     })
@@ -365,10 +429,12 @@ fn read_table(
         // eight-byte absolute entry read as two four-byte differences gives
         // targets that are not instruction boundaries — and if one did, the
         // first form listed is the one a non-PIE compiler used.
-        return ENTRY_FORMS
-            .iter()
+        let table_address =
+            object.sections[candidate.table_section].address + candidate.table_offset;
+        return entry_forms(table_address, &candidate.bases)
+            .into_iter()
             .filter_map(|form| {
-                read_linked_table(object, function, candidate, limit, *form, boundaries)
+                read_linked_table(object, function, candidate, limit, form, boundaries)
             })
             .max_by_key(|table| table.targets.len());
     }
@@ -408,7 +474,11 @@ fn read_table(
         table_section: candidate.table_section,
         table_offset: candidate.table_offset,
         stride,
-        relative,
+        // A relocatable input's relative entries are always differences
+        // from the table's own address; the relocations say so.
+        base: relative.then(|| {
+            object.sections[candidate.table_section].address + candidate.table_offset
+        }),
     })
 }
 
@@ -429,13 +499,8 @@ fn read_linked_table(
         if entry_offset + form.stride > limit {
             break;
         }
-        let Some(target) = read_linked_entry(
-            object,
-            candidate.table_section,
-            candidate.table_offset,
-            entry_offset,
-            form,
-        ) else {
+        let Some(target) = read_linked_entry(object, candidate.table_section, entry_offset, form)
+        else {
             break;
         };
         // An instruction boundary anywhere in this section, not only in the
@@ -458,7 +523,7 @@ fn read_linked_table(
         table_section: candidate.table_section,
         table_offset: candidate.table_offset,
         stride: form.stride,
-        relative: form.relative,
+        base: form.base,
     })
 }
 
@@ -504,6 +569,22 @@ fn reject_unrecognised_dispatch(
         // the scan still rejected it, the dispatch is one we failed to
         // recover, and translating it as an indirect call would branch
         // somewhere arbitrary.
+        // The same bases `propose` offers, so that this refuses exactly what
+        // that failed to read rather than a different set.
+        let bases: Vec<u64> = function.instructions[..=position]
+            .iter()
+            .flat_map(|lifted| {
+                absolute_operands(
+                    &lifted.instruction,
+                    object.sections[function.section].address,
+                )
+            })
+            .filter(|address| {
+                object
+                    .section_at(*address)
+                    .is_some_and(|(section, _)| object.sections[section].role == SectionRole::Text)
+            })
+            .collect();
         for lifted in &function.instructions[..=position] {
             for address in absolute_operands(
                 &lifted.instruction,
@@ -512,7 +593,7 @@ fn reject_unrecognised_dispatch(
                 let Some((section, offset)) = data_at(object, address) else {
                     continue;
                 };
-                if holds_block_addresses(object, function, section, offset) {
+                if holds_block_addresses(object, function, section, offset, &bases) {
                     bail!(
                         "`{}` at {:#x} dispatches through what looks like a jump \
                          table in {}, but its entries could not be read; \

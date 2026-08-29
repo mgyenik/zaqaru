@@ -115,7 +115,7 @@ fn dump_function(output: &mut String, object: &ObjectFile, function: &LiftedFunc
                 table.table_offset,
                 table.targets.len(),
                 table.stride,
-                if table.relative {
+                if table.relative() {
                     "relative"
                 } else {
                     "absolute"
