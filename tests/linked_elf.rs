@@ -1056,3 +1056,55 @@ fn an_unmodelled_relocation_type_does_not_stop_the_read() {
         eprintln!("no stripped system binary to read; this test checked nothing");
     }
 }
+
+/// A callback the binary only ever *computes* the address of.
+///
+/// Nothing calls `handler` directly, no symbol survives stripping, and the
+/// fixture is built without unwind tables — so the one instruction that
+/// takes its address is the only thing in the file saying it is there. It is
+/// the shape a callback, a vtable slot and a dispatch table all have, and
+/// the reason discovery harvests operands and not only branch targets.
+///
+/// The evidence is also higher-precision than scanning data would be: an
+/// instruction that manipulates an address is a stronger statement than a
+/// bit pattern that resembles one. It is still weak evidence — it says a
+/// number exists, not that control goes there — so the padding filter is
+/// what keeps it from minting functions out of constants.
+#[test]
+fn a_callback_is_found_by_the_instruction_that_takes_its_address() {
+    use zaqaru::discover::Witness;
+
+    let workspace = WorkingDirectory::new("linked-callback");
+    let named = support::link_corpus_executable_with(
+        &workspace,
+        "callback_table.c",
+        "through_a_pointer",
+        "-O1",
+        support::Unwind::Omitted,
+        support::CodeModel::Absolute,
+    );
+    let handler = {
+        let object = ObjectFile::parse(&std::fs::read(&named).expect("read")).expect("parse");
+        let function = object
+            .functions
+            .iter()
+            .find(|function| function.name == "handler")
+            .expect("the callback, which the unstripped binary names");
+        object.sections[function.section].address + function.offset
+    };
+
+    let stripped = support::strip(&workspace, &named);
+    let object = ObjectFile::parse(&std::fs::read(&stripped).expect("read")).expect("parse");
+    let found = object
+        .functions
+        .iter()
+        .find(|function| object.sections[function.section].address + function.offset == handler)
+        .unwrap_or_else(|| panic!("nothing was discovered at the callback {handler:#x}"));
+    assert_eq!(
+        found.witness,
+        Witness::AddressTaken,
+        "the callback was found by {:?}, so this is not testing the operand \
+         harvest",
+        found.witness
+    );
+}

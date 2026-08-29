@@ -83,6 +83,10 @@ pub enum Witness {
     FileStated,
     /// A direct call or jump from code already discovered.
     Transfer,
+    /// An instruction takes this address: a program-counter-relative `lea`,
+    /// or an immediate in non-position-independent code. How a callback is
+    /// registered before anything calls it.
+    AddressTaken,
     /// Cut out of a function that something branched into partway. The piece
     /// before it keeps its original witness.
     InteriorEntry,
@@ -103,7 +107,7 @@ impl Witness {
             | Witness::LinkageTable
             | Witness::InitialiserArray
             | Witness::FileStated => true,
-            Witness::Transfer => false,
+            Witness::Transfer | Witness::AddressTaken => false,
             // Not evidence of its own: a cut redistributes a function that
             // strong or weak evidence had already established, and the
             // pieces inherit whatever standing it had.
@@ -607,6 +611,112 @@ fn initialiser_array_targets(sections: &[Section]) -> std::collections::BTreeSet
     targets
 }
 
+/// The address-taken candidates that survive the negative filters.
+///
+/// Held to a stricter standard than a transfer target, because the evidence
+/// is weaker: an instruction that jumps somewhere says control goes there,
+/// while one that computes a number says only that the number exists. So a
+/// candidate landing on inter-function padding is dropped — a branch target
+/// never lands on padding, and an integer that happens to equal a text
+/// address routinely does.
+fn addressed_placements(
+    coverage: &Coverage,
+    sections: &[Section],
+    addressed: &std::collections::BTreeSet<u64>,
+    already: &[Function],
+) -> Vec<Function> {
+    let claimed: std::collections::BTreeSet<(usize, u64)> = already
+        .iter()
+        .map(|function| (function.section, function.offset))
+        .collect();
+    placements(coverage, sections, addressed, Witness::AddressTaken)
+        .into_iter()
+        .filter(|function| !claimed.contains(&(function.section, function.offset)))
+        .filter(|function| {
+            let section = &sections[function.section];
+            let start = function.offset as usize;
+            let end = (start + 16).min(section.bytes.len());
+            !is_padding(&section.bytes[start..end])
+        })
+        .collect()
+}
+
+/// Whether bytes are what a linker puts *between* functions.
+///
+/// A negative witness, and the reason the weak witnesses can afford to be
+/// as free as they are. Branch targets never land on padding, so this
+/// constrains only the evidence that needs constraining: an immediate
+/// operand is a number, and `0x401000` landing on inter-function filler is
+/// an integer rather than a function.
+///
+/// The shapes are the ones a linker and an assembler emit: zero fill, the
+/// `int3` a linker uses to make a fall-through fault, and the single- and
+/// multi-byte `nop`s an assembler pads with. `0x66` prefixes lead the wide
+/// forms and are counted rather than recursed through, so that a real
+/// instruction beginning with one is not mistaken for filler.
+fn is_padding(bytes: &[u8]) -> bool {
+    let Some(first) = bytes.first() else {
+        return true;
+    };
+    if matches!(first, 0x00 | 0xcc | 0x90) {
+        return true;
+    }
+    let prefixes = bytes.iter().take_while(|byte| **byte == 0x66).count();
+    matches!(
+        bytes.get(prefixes..),
+        Some([0x0f, 0x1f, ..]) | Some([0x90, ..])
+    )
+}
+
+/// Every address one function's instructions *name*, as distinct from every
+/// address they transfer to.
+///
+/// A callback is registered before it is ever called, and the registration
+/// is an instruction too — `lea handler(%rip), %rdi`, or `mov $handler,
+/// %edi` where the code is not position-independent. Nothing transfers to
+/// the handler directly and no symbol need name it, so without this it is
+/// invisible until something calls through the pointer at run time.
+///
+/// These are exactly the values the discriminating indirect call will later
+/// hand to the exec map. Collecting them at bake time is the same question
+/// asked where a miss is cheap.
+///
+/// The two operand shapes are not interchangeable and the difference is
+/// easy to get backwards: a program-counter-relative operand is an offset
+/// the decoder resolved against a section-relative program counter, so the
+/// section's address has to be added back; an immediate is already the
+/// address it means.
+fn collect_addressed(
+    section: &Section,
+    instruction: &iced_x86::Instruction,
+    into: &mut std::collections::BTreeSet<u64>,
+) {
+    match instruction.memory_base() {
+        iced_x86::Register::RIP => {
+            into.insert(
+                section
+                    .address
+                    .wrapping_add(instruction.memory_displacement64()),
+            );
+        }
+        iced_x86::Register::None => {
+            into.insert(instruction.memory_displacement64());
+        }
+        _ => {}
+    }
+    for index in 0..instruction.op_count() {
+        if matches!(
+            instruction.op_kind(index),
+            iced_x86::OpKind::Immediate32to64
+                | iced_x86::OpKind::Immediate64
+                | iced_x86::OpKind::Immediate32
+        ) {
+            into.insert(instruction.immediate(index));
+        }
+    }
+    into.remove(&0);
+}
+
 /// Every address one function transfers to directly.
 ///
 /// The decoder runs with a section-relative program counter, so an operand
@@ -618,6 +728,7 @@ fn collect_transfer_targets(
     sections: &[Section],
     function: &Function,
     into: &mut std::collections::BTreeSet<u64>,
+    addressed: &mut std::collections::BTreeSet<u64>,
 ) {
     let section = &sections[function.section];
     let from = function.offset as usize;
@@ -633,6 +744,7 @@ fn collect_transfer_targets(
     );
     while decoder.can_decode() {
         let instruction = decoder.decode();
+        collect_addressed(section, &instruction, addressed);
         if instruction.op0_kind() != iced_x86::OpKind::NearBranch64 {
             continue;
         }
@@ -730,15 +842,29 @@ fn placements(
 fn fill_from_transfers(coverage: &mut Coverage, sections: &[Section]) -> Result<()> {
     const ROUNDS: usize = 16;
     let mut targets = std::collections::BTreeSet::new();
+    let mut addressed = std::collections::BTreeSet::new();
     let mut examined = 0;
     for round in 0..=ROUNDS {
         let known = coverage.functions().len();
         for index in examined..known {
-            collect_transfer_targets(sections, &coverage.functions()[index], &mut targets);
+            collect_transfer_targets(
+                sections,
+                &coverage.functions()[index],
+                &mut targets,
+                &mut addressed,
+            );
         }
         examined = known;
 
-        let placed = placements(coverage, sections, &targets, Witness::Transfer);
+        // Transfer targets first, and separately, because the two are not
+        // equally good evidence even though both are weak. An instruction
+        // that jumps somewhere is saying that control goes there; one that
+        // computes an address is saying only that the number exists. Where
+        // both point at the same place the stronger reading is recorded.
+        let mut placed = placements(coverage, sections, &targets, Witness::Transfer);
+        placed.extend(addressed_placements(
+            coverage, sections, &addressed, &placed,
+        ));
         if placed.is_empty() {
             return Ok(());
         }
@@ -812,6 +938,18 @@ fn split_once(sections: &[Section], functions: &mut Vec<Function>) -> Result<boo
                     instruction.flow_control(),
                     iced_x86::FlowControl::ConditionalBranch
                         | iced_x86::FlowControl::UnconditionalBranch
+                        // A direct call names an entry as plainly as a jump
+                        // does. It matters where a weak witness had to guess
+                        // an extent: in a region with no unwind coverage a
+                        // filled function runs to the next thing known to
+                        // start, which can be tens of kilobytes and dozens
+                        // of real functions away, and every call into one of
+                        // them then lands "in the middle of a function".
+                        // Compilers do not call into the interior of a
+                        // function they emitted, so a call that appears to
+                        // is evidence that the extent, not the call, is
+                        // wrong.
+                        | iced_x86::FlowControl::Call
                 )
             {
                 targets
