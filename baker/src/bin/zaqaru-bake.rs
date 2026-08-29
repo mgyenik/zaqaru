@@ -23,6 +23,7 @@ fn main() -> Result<()> {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
     let mut program: Option<PathBuf> = None;
     let mut output: Option<PathBuf> = None;
+    let mut root: Option<PathBuf> = None;
     let mut arguments = arguments.iter();
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
@@ -31,15 +32,24 @@ fn main() -> Result<()> {
                     arguments.next().context("`-o` needs a path after it")?,
                 ));
             }
+            "--root" => {
+                root = Some(PathBuf::from(
+                    arguments.next().context("`--root` needs a path after it")?,
+                ));
+            }
             "-h" | "--help" => {
-                println!("usage: zaqaru-bake <program> [-o <container.wasm>]");
+                println!(
+                    "usage: zaqaru-bake <program> [-o <container.wasm>] \
+                     [--root <directory>]"
+                );
                 return Ok(());
             }
             other if other.starts_with('-') => bail!("unknown option `{other}`"),
             other => program = Some(PathBuf::from(other)),
         }
     }
-    let program = program.context("usage: zaqaru-bake <program> [-o <container.wasm>]")?;
+    let program = program
+        .context("usage: zaqaru-bake <program> [-o <container.wasm>] [--root <directory>]")?;
     let output = output.unwrap_or_else(|| program.with_extension("wasm"));
 
     let bytes =
@@ -85,15 +95,31 @@ fn main() -> Result<()> {
     let guest = workspace.join("program.wasm.o");
     std::fs::write(&guest, &translation.module).context("writing the translated program")?;
 
-    // The image: the program itself, at the path kisal's boot path opens.
-    let root = workspace.join("image");
-    std::fs::create_dir_all(&root).context("creating the image tree")?;
+    // The image: whatever filesystem the container is to have, with the
+    // program at the path kisal's boot path opens.
+    let image_root = workspace.join("image");
+    std::fs::create_dir_all(&image_root).context("creating the image tree")?;
+    match &root {
+        Some(source) => copy_tree(source, &image_root)
+            .with_context(|| format!("copying {} into the image", source.display()))?,
+        None => {
+            // A program with no filesystem cannot open a file, and the first
+            // thing an ordinary one does is write a temporary. Directories
+            // rather than files: what goes in them is the guest's business,
+            // and the overlay is what makes them writable.
+            for directory in ["tmp", "var", "var/tmp", "home", "dev", "proc", "etc"] {
+                std::fs::create_dir_all(image_root.join(directory))
+                    .with_context(|| format!("creating /{directory} in the image"))?;
+            }
+        }
+    }
     let mut placed = bytes.clone();
     baker::program::apply(&mut placed, &translation.patches)
         .context("patching the program to agree with its translation")?;
-    std::fs::write(root.join("init"), &placed).context("placing the program in the image")?;
-    let image = baker::object::emit(&baker::bake_directory(&root).context("baking the image")?)
-        .context("emitting the image object")?;
+    std::fs::write(image_root.join("init"), &placed).context("placing the program in the image")?;
+    let image =
+        baker::object::emit(&baker::bake_directory(&image_root).context("baking the image")?)
+            .context("emitting the image object")?;
     let image_object = workspace.join("image.wasm.o");
     std::fs::write(&image_object, &image).context("writing the image object")?;
 
@@ -113,6 +139,27 @@ fn main() -> Result<()> {
     ];
     link(&objects, &output, top)?;
     eprintln!("zaqaru-bake: wrote {}", output.display());
+    Ok(())
+}
+
+/// Copies a directory tree, so that the program can be placed into a copy of
+/// it rather than into the caller's own.
+///
+/// Symbolic links are followed rather than preserved, which is a simplifying
+/// choice this will have to give up when it bakes a real distribution image:
+/// a libc's `.so` symlink farm is not decoration. It is enough for a tree
+/// someone assembled to run one program.
+fn copy_tree(from: &Path, to: &Path) -> Result<()> {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let target = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_tree(&entry.path(), &target)?;
+        } else {
+            std::fs::copy(entry.path(), &target)?;
+        }
+    }
     Ok(())
 }
 
