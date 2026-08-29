@@ -24,6 +24,31 @@ evidence sources combined under rules — and a measured account of which
 evidence is trustworthy. This document adopts what survives contact with
 our failure model and names what does not.
 
+## A base is part of the evidence
+
+A position-independent file — which nearly everything shipped is — states
+its addresses relative to zero and is read at the base a bake assigns it
+(`ObjectFile::parse_at`). That base is not bookkeeping: **read at zero, a
+shared object's text sits where its own integer constants sit**, a few
+kilobytes up, so `mov $0x1770,%eax` reads as an instruction taking the
+address of code and the operand harvest cannot tell the two apart.
+
+Measured on `ld-linux-x86-64.so.2`: eleven address-taken functions at base
+zero against three at a real base, and the eight extra ones shredded a
+region no strong witness covered into pieces beginning partway through real
+instructions. The floor is `baker::layout::DYNAMIC_BASE`, and it lives there
+rather than in the reader because for a position-independent file the base
+is *ours* — a bad one is a bake that chose badly, not an input that arrived
+badly.
+
+The same argument from the other side, where there is no choice to make: a
+*fixed* executable linked low is refused
+(`baker::layout::MINIMUM_FIXED_ADDRESS`), since its addresses are its own
+and refusing is the only available answer. In practice this is close to
+vacuous — `mmap_min_addr` forbids under 64 KiB and both GNU ld and lld emit
+`0x400000` — which is why the floor for refusing someone else's choice sits
+well below the base we pick for our own.
+
 ## The problem, and the asymmetry that shapes everything
 
 A linked executable must be split into functions before translation:
@@ -63,6 +88,7 @@ here":
 | witness | what it says | status |
 |---|---|---|
 | `.symtab` `STT_FUNC` value + size | start and extent | built (`collect_functions`) |
+| `.dynsym` `STT_FUNC` value + size | the same, and the *only* symbol table a stripped shared object has, because linking against one requires it | built (`read_symbols`) |
 | `.eh_frame` FDE | start and extent; sizes a sizeless symbol; names functions no symbol does | built (`unwind_extents`, `src/eh_frame.rs`) |
 | the next known start | an upper bound for anything sizeless — a function cannot run past whatever begins after it | built (`symbol_boundaries`, `next_boundary`) |
 | `.init_array` / `.preinit_array` / `.fini_array` entries | the runtime is told to call here | built (in `discover_from_transfers`) |
@@ -216,10 +242,28 @@ The concept the witness list lacked entirely, and the reason the surveyed
 systems afford aggressive positive rules at their measured precision. The
 ones adopted:
 
-- **Padding is never a function.** A candidate whose first bytes are
-  `0x00`, `0xcc`, or a multi-byte NOP run is rejected. Branch targets
-  never land on padding, so this constrains only the weak witnesses —
-  which are the ones that need constraining.
+- **Padding is never a function**, whatever named it. A candidate whose
+  first bytes are `0x00`, `0xcc`, or a multi-byte NOP run — including the
+  `cs`-prefixed wide forms, `66 2e 0f 1f 84 …`, which GNU as emits — is
+  rejected.
+
+  This was first written as a constraint on the weak witnesses alone, on
+  the argument that a branch target never lands on padding. **Real input
+  says otherwise, and the filter now applies at both doors.** The case that
+  forced it: glibc's signal-return trampoline carries an `.eh_frame` FDE
+  beginning one byte *before* `__restore_rt`, so that unwinding a signal
+  frame — whose return address is the trampoline's first byte — finds an
+  entry covering `pc - 1`. That is the unwinder's convention rather than a
+  mistake in the binary, and it makes a strong witness name an address that
+  is not an instruction boundary at all. Accepting it translates the tail of
+  a `nop` as code, which is the silent failure this design exists to avoid;
+  refusing it costs at most a loud miss on an address nothing transfers to.
+
+  The rejection also happens in `placements`, before extents are computed,
+  because filler must not *bound* a neighbour either: a padding candidate
+  discarded afterwards still leaves the function before it ending inside a
+  `nop`, which the lifter then refuses to decode — a failure that presents
+  three functions away from its cause.
 - **A jump table's arms are not functions.** Any run or target already
   consumed by jump-table recovery (`src/jump_table.rs`) is excluded;
   the cluster rule above covers the case where the owning function is

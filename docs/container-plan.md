@@ -1001,7 +1001,15 @@ each DSO loads at most once per process — true of ld.so anyway;
 
 **Mechanism: the shadow GOT.** A cross-DSO call is `call foo@plt` →
 `jmp *GOT[n]`, an indirect transfer whose operand is a code address
-ld.so wrote, not a table slot. Three layers:
+ld.so wrote, not a table slot. Three layers — and a correction from
+building it, stated first because reading the three in order leaves the
+opposite impression: **only the middle layer is needed for a cross-DSO call
+to work, and it is machinery that already exists.** In linked mode every
+indirect transfer is an exec-map lookup, and a GOT slot holds an address the
+bake translated at, so the generic fallback *is* the discriminating indirect
+call and nothing had to be built. The shadow array is a cache in front of
+it: worth having, not a prerequisite, and now with a working baseline to
+measure against.
 
 - *Discrimination is free*: table slots are small integers, mapped
   code addresses sit megabytes up in the arena; one bounds check

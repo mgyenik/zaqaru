@@ -1860,3 +1860,241 @@ moves:
   files are much less blind than a stripped static one, and D3's relocation
   harvest pays off far better there besides. *Running* one is the phase-two
   milestone as designed.
+
+## 2026-08-29 — the dynamic tier: a PIE, ld.so and libc as one module
+
+`gcc -O2 hello.c` produces a position-independent executable that cannot run
+until something maps `libc.so.6` and patches its GOT. That something is now
+glibc's own `ld.so`, translated ahead of time and running as ordinary guest
+code. `tests/dynamic_boot.rs` is the gate.
+
+This is `container-plan.md`'s "Dynamic linking and ld.so" built as written —
+prelink at bake, one exec map, `mmap` of a translated ELF answering with the
+address its code was translated at. It was listed in
+`container-build-plan.md` as phase two; the sweep the day before is what
+moved it, because static is 2.3% of what ships.
+
+### The shadow GOT is not needed for correctness, and that was already true
+
+The design gives the cross-DSO call three layers: discrimination, a generic
+fallback through the exec map, and a shadow array as a fast path. Building
+it turned up that **the generic fallback is the discriminating indirect call
+that already exists**. A `jmp *GOT[n]` is an indirect transfer; in linked
+mode every indirect transfer is an exec-map lookup; the GOT holds an address
+the loader wrote, which is an address the bake translated at. Nothing was
+needed. The shadow GOT stays an optimisation with a measurable baseline
+rather than a prerequisite — which is worth recording because the design
+does not say so, and reading it top to bottom leaves the impression that a
+cache has to exist before a call can work.
+
+### What was actually built
+
+- **The bake takes a closure, not a file.** `baker::dynamic` reads
+  `PT_INTERP` and `DT_NEEDED` and resolves them against the tree the image
+  is made from, transitively, in load order. `/etc/ld.so.cache` is
+  deliberately not read: it is a cache, it names files the search path also
+  names, and trusting it would make a bake depend on the host's cache being
+  right about the host's filesystem.
+- **Every file gets a base, and they are translated as one unit.** Not
+  because translating them separately is hard — because the *exec map*
+  cannot be built separately, and in linked mode every cross-module call is
+  a lookup in it. `ObjectFile::merge` is that unit; module-qualified
+  function names fall out of it, and paid for themselves within the hour
+  (see the backtrace below).
+- **`kisal::exec` loads two files** — the program and its interpreter — with
+  an auxv saying where each went, `AT_BASE` the loader's and `AT_ENTRY`
+  still the program's, and enters the loader.
+- **`mmap` of a translated ELF returns its prelink base.** The run-time half
+  of prelinking. The bases ride in a new index region, eight bytes per
+  module rather than per inode, with `EXEC_TRANSPILED` as the cheap test for
+  whether to look at all. Mapping a file the bake did *not* translate with
+  `PROT_EXEC` is now the loud error the design names.
+
+### `ld.so` was the easy part
+
+The design calls transpiling ld.so and glibc "the labeled grind". Measured
+before assuming: **`ld-linux-x86-64.so.2` refuses five functions, all of
+them the `_dl_runtime_resolve` trio** (`fxsave`, `xsave`, `xsavec`, and two
+AVX `vmovdqa` forms) — which `DF_1_NOW` guarantees never run. `libc.so.6`
+adds 211 more, none reachable. The whole of a dynamic hello — 4909 functions
+across three files — translates in under a second.
+
+The grind that did happen was somewhere else entirely: two discovery
+defects and a jump-table defect, all in code that already existed and was
+only exercised properly by real shared objects.
+
+### Reading a position-independent file at zero destroys its evidence
+
+Discovery on `ld.so` at base zero produced eleven address-taken functions
+against three at a real base, and the eight extra ones shredded a region no
+strong witness covered into pieces beginning partway through real
+instructions. The cause is arithmetic rather than subtle: a shared object's
+text starts a few kilobytes above its base, which at zero is exactly where
+ordinary integer constants live, so `mov $0x1770,%eax` reads as an
+instruction taking the address of code.
+
+The first version of this guarded it in the reader — refuse `ET_DYN` at base
+zero — and that was the wrong shape twice over. Zero is not the problem, low
+is, so the check tested one value of a continuous property; and for
+`ET_DYN` the base is *ours*, chosen at bake time, so the only way to get a
+bad one is our own bug. The floor lives in `baker::layout::DYNAMIC_BASE`
+now, where the choice is made, and `parse_at` documents what a low base
+costs.
+
+The mirror case — a *fixed* executable linked low — is one we cannot fix by
+choosing, only refuse, and `MINIMUM_FIXED_ADDRESS` does. It is close to
+vacuous in practice: `mmap_min_addr` forbids under 64 KiB and both GNU ld
+and lld put `-no-pie` text at `0x400000`. An earlier version of this entry
+justified the check with firmware and unikernels, which was invented — those
+make no syscalls, touch `cr3` and page tables, and are not programs this
+project is ever handed.
+
+### Padding is not a function, whatever named it
+
+Two defects, both about filler, both found by glibc:
+
+- `is_padding` did not know the `cs`-prefixed multi-byte nops
+  (`66 2e 0f 1f 84 …`), so functions were minted out of the space between
+  real ones.
+- **A strong witness can name something that is not an instruction.**
+  glibc's signal-return trampoline carries an `.eh_frame` entry beginning
+  one byte *before* `__restore_rt`, so that unwinding a signal frame — whose
+  return address is the trampoline's first byte — finds an entry covering
+  `pc - 1`. It is the unwinder's convention, not a mistake in the binary.
+
+`docs/code-discovery.md` scopes the padding rule to weak witnesses, on the
+argument that a branch target never lands on padding. That is wrong on real
+input, and the filter now sits at both doors — accepting the FDE would
+translate the tail of a `nop` as code, which is the silent failure the whole
+design exists to avoid, where refusing it costs at most a loud miss on an
+address nothing in a container transfers to.
+
+It also sits in `placements`, because filler must not *bound* a neighbour
+either: a padding candidate discarded after the extents were computed still
+leaves the function before it ending in the middle of a `nop`, which the
+lifter then refuses to decode. That one presented as "undecodable bytes",
+three functions away from its cause.
+
+### ELF names cannot be wasm symbol names
+
+Two independent reasons one file names a thing twice. `.symtab` and
+`.dynsym` are two views of the same code, and reading both — which a
+stripped shared object requires, since it has only the second — sees an
+exported function once in each. And symbol *versioning* puts one name at
+several addresses: glibc ships `memcpy@GLIBC_2.2.5` beside
+`memcpy@GLIBC_2.14`, with the version in `.gnu.version` rather than in the
+name.
+
+Exact duplicates are dropped; a name at several addresses is qualified by
+address — every occurrence rather than the later ones, because which copy is
+"first" depends only on the order two symbol tables happened to be read in.
+
+### The index's length was the end of whichever region came last
+
+Adding the prelink-base region made the container die with an *empty* kernel
+log, which is a specific and useful symptom: every failure path in
+`kisal_boot` reports before it panics, except the ones inside the kernel's
+own construction — where there is no kernel yet to report with. So an empty
+log names the image.
+
+`index_length` read `xattr_offset + xattr_size`, true until a region was
+added after it. The slice came back eight bytes short, `Image::parse`
+refused it, and the panic had nothing to say. It now takes the end of
+whatever region ends last, because a length that must be updated when a
+region is added is a length that will not be.
+
+Found by bisecting rather than by reading: the library path passed its
+tests, the tool failed, and stashing the working tree proved the difference
+was mine before any theory got attached to it. Three of the theories tried
+first were wrong.
+
+### A computed goto measures from a label, and its dispatches get merged
+
+The one that took longest, and the only one that was a real design gap
+rather than an oversight.
+
+`fprintf` died at `libc+0x6a090`, an address inside `__vfprintf_internal`.
+The backtrace named it, and named the path to it, because functions are
+qualified by module now:
+
+    kisal_no_function_at
+    x86_slot_of
+    libc.so.6!fn.0x100b9080_guest
+    libc.so.6!fn.0x100bb500_guest
+    libc.so.6!__printf_chk_guest
+    /init!main_guest
+
+Two things were wrong, one behind the other.
+
+**First: entries measured from a code label.** glibc's printf writes
+`&&label - &&do_form_unknown`, so the dispatch is
+
+    lea    table(%rip),%rsi
+    lea    base(%rip),%rdi      ; a label inside the function
+    movslq (%rsi,%rax,4),%rax
+    add    %rdi,%rax
+    jmp    *%rax
+
+Reading those entries against the *table's* address — the only relative form
+the recovery knew — gives targets that are not instruction boundaries, so
+the table is not recognised at all and the dispatch becomes an indirect call
+into the middle of a function. The base is not guessed: it is an address the
+dispatch sequence itself computes, so every text address in the backward
+scan is offered and the entry scan decides. The rewrite absorbs it —
+writing `table − base + arm` makes the guest arrive at `table + arm` as
+before — so the dispatch lowering needed no change, and a difference too
+large for its entry is refused rather than truncated.
+
+That fixed `fprintf` and not `printf`, which is how the second one showed
+up.
+
+**Second: `gcc -O2` merges identical tails, and the tail of a computed goto
+is `jmp *%rax`.** `__vfprintf_internal` has **six thirty-two-entry tables,
+all measured from one label, and twenty-nine jumps between them**. A given
+jump is reached from several paths that each loaded a different table, so
+attributing a table by proximity is not merely unreliable — there is no
+single right answer. Eighteen of the twenty-nine had been given the same
+table.
+
+The failure has two modes and neither is loud. Subtracting the wrong address
+gives an arm number that is sometimes outside the table, where it falls back
+to the exec map and reports a miss on an address that was never a function;
+and sometimes *inside* it, where it branches to the wrong arm and says
+nothing. The second is what made this worth fixing properly rather than
+sharpening the heuristic.
+
+So an arm space is a property of what the dispatch measures *from*, not of a
+table. Every table sharing an origin contributes its arms to one list, each
+dispatch branches over the whole list, and each table's entries are
+rewritten to index into it — after which which table a jump was handed stops
+mattering, because any of them names an arm of the same space. Which is what
+the hardware was doing all along. In the relocatable pipeline every table's
+origin is its own address, so each group holds one table and nothing moves.
+
+`zaqaru --dump` grew `--at` and learned to print what each table measures
+from. That is how "six tables, one base, twenty-nine jumps" became a fact
+instead of an inference — three earlier theories about this failure were
+wrong, and all three would have survived another round of reading.
+
+### Where it stands
+
+A dynamic program that *uses* its library runs, output byte-identical to the
+same binary run natively: `qsort` through a callback from the executable,
+`malloc`/`free`, `snprintf` with `%s`/`%d`/`%.3f`, a libm call, `strlen`,
+and a file written and read back through the overlay.
+
+Open, and none of it blocking the tier:
+
+- **The shadow GOT**, as the optimisation it turns out to be.
+- **`dlopen`** — untried. Baked libraries should work by the same path; a
+  library that arrived at run time is the named loud error.
+- **A second library.** Everything so far resolves to one `libc.so.6`;
+  `-lm` on this system is absorbed into libc, so the multi-library closure
+  is exercised in code and not yet by a program.
+- **`ld.so.cache`.** The baker does not regenerate `/etc/ld.so.cache` as the
+  design says it should. Nothing needed it, because the loader's search path
+  finds the files at the paths the bake placed them — but an image that
+  ships a stale cache naming a file that is not there has not been tried.
+- **Breadth.** Three dynamic files read closely and fifteen more parsed in a
+  spike is not a population. The `/usr/bin` sweep at a real base is the
+  measurement, and it is cheap; it has not been run.

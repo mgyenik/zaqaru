@@ -1,6 +1,7 @@
 # Building the container runtime: kisal, the baker, and the seams
 
-Status: **in progress — M0 through M5 built and green (2026-08-28).**
+Status: **in progress — M0 through M5 built and green (2026-08-28); M6's
+front end and the dynamic tier built (2026-08-29).**
 [container-plan.md](container-plan.md) is the design authority this
 plan implements; where the two disagree, the design doc wins and this
 plan gets corrected. M0's verdicts get written into its section as the
@@ -54,15 +55,21 @@ milestone shrinks rather than the tier changing to glibc.
 **Explicitly not in this plan**, deferred to phase two with their
 designs already written in the design doc:
 
-- **Dynamic linking** — bake-time prelink, the shadow GOT, ld.so and
-  its relocation machinery. The static tier keeps those off the
-  critical path. One correction discovered while planning M5/M6: the
-  **linked-ELF front end is *not* deferrable** — a musl-static CPython
-  is a linked executable, so consuming linked ELFs (code discovery on
-  a complete binary, concrete-address operands, kisal's boot-time
-  `PT_LOAD` placement and an auxv with `AT_PHDR`, which musl's own TLS
-  init reads) lands in M6. Only the *dynamic* half of the design doc's
-  ld.so section is phase two.
+- ~~**Dynamic linking**~~ — **built, 2026-08-29**; see the appendix at the
+  end of this document and the worklog entry of that date. It was listed
+  here as phase two on the argument that the static tier keeps it off the
+  critical path, which was right about the sequencing and wrong about the
+  size of what it defers: a sweep of `/usr/bin` found static to be 2.3% of
+  what ships. It was brought forward for that reason, and turned out to be
+  a week's worth of estimate and a day's worth of work — `ld.so` itself
+  refuses five functions, all of them the `_dl_runtime_resolve` trio that
+  `DF_1_NOW` guarantees never runs.
+
+  The correction discovered while planning M5/M6 stands and is what made
+  this cheap: the **linked-ELF front end is not deferrable** — a
+  musl-static CPython is a linked executable, so consuming linked ELFs
+  landed in M6, and the dynamic tier is that front end plus a base per
+  file.
 - **fork, the router, and fd hoisting** — the target workload never
   forks. The resume machinery fork needs is already built and tested;
   the router is not, and no milestone here creates one.
@@ -1687,3 +1694,43 @@ target; MMX (guaranteed by x86-64 CPUID, cannot be curated away);
 `fxsave`/`fxrstor` on the sigframe render; unmasked-exception
 delivery through kisal's signal machinery, deferred-reported at
 helper entry, which is faithful because hardware defers too.
+
+## Appendix — the dynamic tier (appended 2026-08-29)
+
+Listed above as phase two and built early, for the reason recorded there.
+What it delivers: `gcc -O2 hello.c` — a position-independent executable,
+`ld.so` and `libc.so.6` — bakes into one container and runs, with the loader
+executing as ordinary translated guest code. `tests/dynamic_boot.rs` is the
+gate, its widest case a program that uses the library rather than calling
+into it once: `qsort` through a callback from the executable, an allocator,
+formatted output, a libm call, and a file written and read back, all
+byte-identical to the same binary run natively.
+
+Built as `container-plan.md` designs it, with one correction to that
+document (folded in there): **the shadow GOT is an optimisation, not a
+prerequisite.** Its generic fallback is the discriminating indirect call the
+linked-ELF front end already has, so a cross-DSO call resolves through the
+exec map with nothing added.
+
+The pieces, and where they live:
+
+- `baker::dynamic` — `PT_INTERP` and `DT_NEEDED` resolved against the tree
+  the image is made from, transitively. Not `/etc/ld.so.cache`: it names
+  files the search path also names, and reading it would make a bake depend
+  on the host's cache being right about the host's filesystem.
+- `baker::layout::DYNAMIC_BASE` — where bases are assigned, high enough that
+  a library's text does not sit among its own integer constants. See
+  `code-discovery.md`, which carries the measurement.
+- `ObjectFile::parse_at` and `merge` — one translation unit for every file,
+  because the exec map has to span them.
+- `kisal::exec` — the program and its interpreter both loaded, an auxv
+  saying where each went, control to the loader.
+- `kisal`'s `mmap` — a translated ELF is mapped at its prelink base, read
+  from a new index region. Mapping an *untranslated* file executable is the
+  loud error the design names.
+
+**Not built, and not blocking:** the shadow GOT; `dlopen` (untried; baked
+libraries should work by the same path); `/etc/ld.so.cache` regeneration
+(nothing needed it, since the loader finds the files at the paths the bake
+placed them). **Not measured:** breadth. Three dynamic files read closely
+and fifteen more through a parse spike is not a population.
