@@ -27,3 +27,24 @@ wasmtime = "48.0.1"
 [[bench]]
 name = "kernels"
 harness = false
+
+# Dependencies are built optimized even for tests.
+#
+# Not a preference: the suite's cost is dominated by three of them running
+# unoptimized. `iced-x86` decodes once per instruction of every function
+# translated, `wasmtime` compiles every body of every container a test
+# builds, and a dynamic-tier container is fifteen thousand bodies. The same
+# work takes 0.87s to bake and 1.97s to run through the release binaries,
+# and an order of magnitude more in a debug test — multiplied by every run
+# of every test for as long as the project exists.
+#
+# Debug *info* is kept, and `debug-assertions` is untouched: it is set
+# independently of `opt-level`, so every `debug_assert!` and overflow check
+# inside a dependency still fires. What optimization costs is frames merged
+# by inlining, and the diagnostics this project actually reads — a wasm
+# backtrace out of a trapping guest — come from the guest module's own name
+# section rather than from any of this. If a failure ever genuinely needs an
+# unoptimized dependency, that is one `CARGO_PROFILE_DEV_PACKAGE_<crate>_OPT_LEVEL=0`
+# on one test, not a tax on every run.
+[profile.dev.package."*"]
+opt-level = 2
