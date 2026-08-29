@@ -20,6 +20,13 @@ Current documents:
   resolution model, and per-subsystem designs (threads on the resume
   machinery, futex, mmap, dynamic loading, sockets, signals, x87/MMX
   soft emulation).
+- [code-discovery.md](code-discovery.md) — the design authority for how the
+  linked-ELF front end decides where functions are: the strong/weak witness
+  invariant (strong witnesses bound, weak witnesses only fill uncovered
+  gaps), the built witnesses and the ones still to build, the negative
+  filters, the computed-goto trap the invariant defends against, the
+  saturated tier that makes an arbitrary binary run when the witnesses
+  miss (D1–D6), and the survey of the field it rests on.
 - [x87-plan.md](x87-plan.md) — the plan that finishes the x87: symbol
   plumbing and the translator lowering (X1–X2), linking the staticlib
   into every build (X3), corpus differentials (X4), the refusal-tail

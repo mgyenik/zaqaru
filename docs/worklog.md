@@ -1683,3 +1683,59 @@ the edit had been rejected and nothing written. It had already been
 applied, and had displaced a neighbouring doc comment on the way in. It was
 found still in the file afterwards. A tool call that is stopped is not
 evidence that its effects were not applied.
+
+## 2026-08-29 — D1: the busybox unwind hole is in the binary, not the parser
+
+`docs/code-discovery.md` opens with a gate: before building a weaker
+witness to cover a 640 KB hole, check whether the hole is real. Ghidra
+reaches near-total function recall on Linux binaries from `.eh_frame`
+alone, so a hole that size is unusual enough to be a parser bug first and
+a fact second.
+
+It is a fact. The verdict, with the numbers:
+
+| | |
+| --- | --- |
+| `src/eh_frame.rs::frames` on the stripped busybox | **2040** frames |
+| `readelf --debug-dump=frames \| grep -c FDE` | **2040** |
+| `.eh_frame_hdr`'s own count | **does not exist** — see below |
+
+The parser agrees exactly with an external reader, so D1's first outcome —
+a parse or layout artifact that would have shrunk everything below — is
+ruled out.
+
+The third cross-check the milestone asks for is unavailable rather than
+skipped: this binary has **no `.eh_frame_hdr` section and no
+`PT_GNU_EH_FRAME` program header**. It was linked without
+`--eh-frame-hdr`, which is what a program that never unwinds at run time
+gets. So there is no binary-search table to count against, and saying so
+is the honest answer where inventing a third number would not be.
+
+Coverage, per executable section, measured by `examples/frames`:
+
+| section | bytes | frames | covered |
+| --- | --- | --- | --- |
+| `.init` | 27 | 0 | 0% |
+| `.plt` | 336 | 0 | 0% |
+| `.text` | 1,734,359 | 2040 | **61.8%** |
+| `.fini` | 13 | 0 | 0% |
+
+The uncovered 38.2% of `.text` is not scattered. It is **one contiguous
+tail hole at `0x50ac21`, 646,198 bytes — 631 KiB, 37.3% of the section** —
+plus 15,656 bytes spread over 1835 small interior gaps, which are the
+inter-function padding a linker leaves and not missing functions. The
+entry point at `0x410870` is inside coverage; the applet-table target
+`0x511aa5` that stopped the run is inside the hole.
+
+So the binary genuinely carries no asynchronous unwind tables for the last
+631 KiB of its text, and **D5 is confirmed necessary**. `.init`, `.plt` and
+`.fini` having no frames at all is expected and already handled — hand-written
+crt fragments and linkage stubs are what the fourth witness and the
+linkage-table witness are for.
+
+One correction to the previous entry: it put the hole's start at
+`0x50a970`, which was the last FDE *start* rather than the last FDE's
+*end*. The hole begins at `0x50ac21`. It also reached that figure by
+comparing against `0x5a8858`, which is `.fini` — `.text` does end one byte
+below it, so the conclusion held, but by luck rather than by measurement.
+`examples/frames` exists so the next such number comes from a tool.
