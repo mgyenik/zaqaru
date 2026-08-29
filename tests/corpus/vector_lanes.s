@@ -105,6 +105,21 @@
 	lane_case	lane_pmuludq, pmuludq %xmm1, %xmm0
 	lane_case	lane_pmuludq_memory, pmuludq SWAPPED(%rsp), %xmm0
 
+/* The saturating forms, which x86 has at byte and word grain in both
+ * signednesses. Saturation is the whole content of these instructions, so a
+ * case that never reaches a bound tests nothing: the caller's own pattern
+ * decides that, and `differential.rs` drives these with values that clamp at
+ * both ends as well as values that do not. */
+	lane_case	lane_paddsb, paddsb %xmm1, %xmm0
+	lane_case	lane_paddsw, paddsw %xmm1, %xmm0
+	lane_case	lane_paddusb, paddusb %xmm1, %xmm0
+	lane_case	lane_paddusw, paddusw %xmm1, %xmm0
+	lane_case	lane_psubsb, psubsb %xmm1, %xmm0
+	lane_case	lane_psubsw, psubsw %xmm1, %xmm0
+	lane_case	lane_psubusb, psubusb %xmm1, %xmm0
+	lane_case	lane_psubusw, psubusw %xmm1, %xmm0
+	lane_case	lane_psubusb_memory, psubusb SWAPPED(%rsp), %xmm0
+
 /* ---- packed comparisons -------------------------------------------------- */
 
 	lane_case	lane_pcmpeqb, pcmpeqb %xmm1, %xmm0

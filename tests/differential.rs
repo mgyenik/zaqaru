@@ -335,6 +335,140 @@ fn an_irreducible_function_still_matches_native() {
     check_binary(&mut fixture, "irreducible", &inputs);
 }
 
+/// The 128-bit dividend, which is the shape of `div` no C expression
+/// produces and which the translation gets from a helper rather than inline.
+///
+/// The cases are chosen to divide: the native side runs the same
+/// instruction, and a divide error there kills the test process rather than
+/// producing a value to disagree with. Everything the machine faults on is
+/// therefore untested here on purpose, and tested by the translation
+/// trapping on the same condition — which is what `x86_divide_128` does and
+/// what the unreachable it emits means.
+///
+/// The interesting values are the ones near the edge of what fits: a
+/// quotient of exactly `2^64 - 1`, a dividend whose high half is one below
+/// the divisor, and for the signed forms a quotient of exactly `i64::MIN`,
+/// which is the one magnitude two's complement allows on the negative side
+/// and not on the positive.
+#[test]
+fn wide_division_matches_native() {
+    let mut fixture = DifferentialFixture::build("wide-division", &["wide_division.s"]);
+    let mut generator = Pseudorandom::new(0x12_8d1_0000_0001);
+
+    // (high, low, divisor), every one of them with `high < divisor` so the
+    // quotient fits in sixty-four bits.
+    let mut unsigned: Vec<(u64, u64, u64)> = vec![
+        (0, 0, 1),
+        (0, u64::MAX, 1),
+        (0, 12345, 7),
+        (1, 0, 2),
+        (1, 0, u64::MAX),
+        (1, 1, 3),
+        // A quotient of exactly `2^64 - 1`, the widest deliverable answer.
+        (u64::MAX - 1, u64::MAX, u64::MAX),
+        // The high half one below the divisor, which is the boundary the
+        // overflow check sits on, at a divisor small enough that the loop
+        // runs every one of its sixty-four iterations with work to do.
+        (6, u64::MAX, 7),
+        (1, 0, 2),
+        (0x7fff_ffff_ffff_ffff, 0, 0x8000_0000_0000_0000),
+        (3, 0x1234_5678_9abc_def0, 0x0fed_cba9_8765_4321),
+    ];
+    while unsigned.len() < RANDOM_ITERATIONS {
+        let divisor = generator.next_i64() as u64;
+        if divisor == 0 {
+            continue;
+        }
+        let high = (generator.next_i64() as u64) % divisor;
+        unsigned.push((high, generator.next_i64() as u64, divisor));
+    }
+
+    for name in ["wide_unsigned_quotient", "wide_unsigned_remainder"] {
+        let native = unsafe {
+            native_function::<unsafe extern "C" fn(u64, u64, u64) -> u64>(&fixture.native, name)
+        };
+        for &(high, low, divisor) in &unsigned {
+            let expected = unsafe { native(high, low, divisor) };
+            for (variant, module) in fixture.transpiled.iter_mut() {
+                let observed = module
+                    .call_guest(name, [high as i64, low as i64, divisor as i64, 0, 0, 0])
+                    as u64;
+                assert_eq!(
+                    observed, expected,
+                    "{name}({high:#x}, {low:#x}, {divisor:#x}) [{variant}]: \
+                     transpiled gives {observed:#x}, native gives {expected:#x}"
+                );
+            }
+        }
+    }
+
+    // The memory-operand form, on the same inputs.
+    let native = unsafe {
+        native_function::<unsafe extern "C" fn(u64, u64, u64) -> u64>(
+            &fixture.native,
+            "wide_unsigned_quotient_memory",
+        )
+    };
+    for &(high, low, divisor) in &unsigned {
+        let expected = unsafe { native(high, low, divisor) };
+        for (variant, module) in fixture.transpiled.iter_mut() {
+            let observed = module.call_guest(
+                "wide_unsigned_quotient_memory",
+                [high as i64, low as i64, divisor as i64, 0, 0, 0],
+            ) as u64;
+            assert_eq!(
+                observed, expected,
+                "wide_unsigned_quotient_memory({high:#x}, {low:#x}, {divisor:#x}) \
+                 [{variant}]: transpiled gives {observed:#x}, native gives {expected:#x}"
+            );
+        }
+    }
+
+    // The signed forms. A signed 128-bit dividend is built from a magnitude
+    // that divides and a sign put on it, so that the quotient is known to
+    // fit before the machine is asked.
+    let mut signed: Vec<(i64, i64, i64)> = vec![
+        (0, 0, 1),
+        (0, 1, 1),
+        (-1, -1, 1),
+        (-1, -1, -1),
+        (0, i64::MAX, 1),
+        (-1, i64::MIN, 1),
+        // A quotient of exactly `i64::MIN`: `-2^64 / 2`, which the negative
+        // side has room for and the positive side does not.
+        (-1, 0, 2),
+        (0, 0, i64::MIN),
+    ];
+    while signed.len() < RANDOM_ITERATIONS {
+        let divisor = generator.next_i64();
+        if divisor == 0 || divisor == i64::MIN {
+            continue;
+        }
+        // A quotient that fits, by construction: pick it first.
+        let quotient = generator.next_i64() >> 1;
+        let remainder = (generator.next_i64() as u64 % divisor.unsigned_abs()) as i64;
+        let product = (quotient as i128) * (divisor as i128) + i128::from(remainder);
+        signed.push(((product >> 64) as i64, product as i64, divisor));
+    }
+
+    for name in ["wide_signed_quotient", "wide_signed_remainder"] {
+        let native = unsafe {
+            native_function::<unsafe extern "C" fn(i64, i64, i64) -> i64>(&fixture.native, name)
+        };
+        for &(high, low, divisor) in &signed {
+            let expected = unsafe { native(high, low, divisor) };
+            for (variant, module) in fixture.transpiled.iter_mut() {
+                let observed = module.call_guest(name, [high, low, divisor, 0, 0, 0]);
+                assert_eq!(
+                    observed, expected,
+                    "{name}({high:#x}, {low:#x}, {divisor:#x}) [{variant}]: \
+                     transpiled gives {observed:#x}, native gives {expected:#x}"
+                );
+            }
+        }
+    }
+}
+
 /// Division, and the sign extension that builds the double-width dividend it
 /// consumes.
 ///
@@ -1848,6 +1982,15 @@ fn packed_lanes_match_native() {
         "lane_pmulld",
         "lane_pmuludq",
         "lane_pmuludq_memory",
+        "lane_paddsb",
+        "lane_paddsw",
+        "lane_paddusb",
+        "lane_paddusw",
+        "lane_psubsb",
+        "lane_psubsw",
+        "lane_psubusb",
+        "lane_psubusw",
+        "lane_psubusb_memory",
         "lane_pcmpeqb",
         "lane_pcmpeqw",
         "lane_pcmpeqd",

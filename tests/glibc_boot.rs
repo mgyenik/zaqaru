@@ -16,19 +16,94 @@ fn path(segments: &[&[u8]]) -> Vec<Vec<u8>> {
 
 #[test]
 fn a_static_glibc_hello_runs() {
-    let workspace = WorkingDirectory::new("glibc-hello");
-
-    // Built the way a distribution builds one, which is the point.
-    let source = workspace.write(
-        "hello.c",
+    let out = run_static_glibc(
+        "glibc-hello",
         "#include <stdio.h>\nint main(void){ puts(\"hello\"); return 0; }\n",
     );
-    let elf = workspace.path().join("hello.elf");
+    assert_eq!(out, "hello\n");
+}
+
+/// A `long double` end to end, through the library code that really uses
+/// one.
+///
+/// `strtold` and `printf("%Lg")` are not a demonstration written to exercise
+/// x87 — they are glibc's own extended-precision paths, and between them
+/// they run the multiplication, the comparisons, the `fprem`-driven scaling
+/// and the control-word manipulation that `__printf_fp` needs. The output is
+/// compared against the same program run natively, so the assertion is that
+/// every one of those agreed with the hardware to the last digit printed,
+/// not merely that nothing trapped.
+///
+/// 21 significant digits is deliberate: an extended double carries 64 bits
+/// of significand, a little over 19 decimal digits, so asking for 21 prints
+/// past the point where a double-backed answer could hide.
+#[test]
+fn a_static_glibc_long_double_prints_what_the_hardware_prints() {
+    let program = r#"
+#include <stdio.h>
+#include <stdlib.h>
+int main(void) {
+    long double value = strtold("3.14159265358979323846", NULL);
+    long double square = value * value;
+    long double ratio = square / 2.718281828459045235L;
+    printf("%.21Lg\n", value);
+    printf("%.21Lg\n", square);
+    printf("%.21Lg\n", ratio);
+    printf("%d %d\n", value > 3.0L, ratio < value);
+    return 0;
+}
+"#;
+    let native = {
+        let workspace = WorkingDirectory::new("long-double-native");
+        let source = workspace.write("main.c", program);
+        let elf = workspace.path().join("native.elf");
+        support::run_tool(
+            "gcc",
+            &[
+                "-static",
+                "-O2",
+                &source.to_string_lossy(),
+                "-o",
+                &elf.to_string_lossy(),
+            ],
+        );
+        let output = std::process::Command::new(&elf)
+            .output()
+            .expect("run the program natively");
+        assert!(output.status.success(), "the native run failed");
+        let text = String::from_utf8(output.stdout).expect("native output is text");
+        // Without this the comparison below could be two empty strings
+        // agreeing, which is the one way this test could pass while proving
+        // nothing.
+        assert_eq!(
+            text.lines().count(),
+            4,
+            "the native run printed {text:?}, which is not the four lines \
+             the program writes"
+        );
+        text
+    };
+
+    let transpiled = run_static_glibc("glibc-long-double", program);
+    assert_eq!(
+        transpiled, native,
+        "the container printed a different long double than the hardware did"
+    );
+}
+
+/// Builds a static glibc program, translates it, bakes it into an image,
+/// boots it, and returns what it wrote to stdout.
+fn run_static_glibc(name: &str, program: &str) -> String {
+    let workspace = WorkingDirectory::new(name);
+
+    // Built the way a distribution builds one, which is the point.
+    let source = workspace.write("program.c", program);
+    let elf = workspace.path().join("program.elf");
     support::run_tool(
         "gcc",
         &[
             "-static",
-            "-O1",
+            "-O2",
             &source.to_string_lossy(),
             "-o",
             &elf.to_string_lossy(),
@@ -60,8 +135,8 @@ fn a_static_glibc_hello_runs() {
         .iter()
         .map(|refusal| format!("{}: {}\n", refusal.name, refusal.reason))
         .collect();
-    std::fs::write("/tmp/glibc-refused.txt", &worklist).expect("write the worklist");
-    let guest = workspace.write("hello.wasm.o", &translation.module);
+    workspace.write("refused.txt", worklist.as_bytes());
+    let guest = workspace.write("program.wasm.o", &translation.module);
 
     let root = workspace.path().join("image");
     std::fs::create_dir_all(&root).expect("create the image tree");
@@ -71,14 +146,19 @@ fn a_static_glibc_hello_runs() {
     let image = baker::object::emit(&baker::bake_directory(&root).expect("bake"))
         .expect("emit the image object");
 
+    // Kept where a failing run can disassemble it: the workspace goes away
+    // with the test.
     let module = support::link_container_for_program(
         &workspace,
         std::slice::from_ref(&guest),
         &image,
-        "glibc",
+        name,
         Some(top),
     );
 
+    if std::env::var_os("ZAQARU_KEEP_CONTAINER").is_some() {
+        std::fs::copy(&module, format!("/tmp/{name}.wasm")).expect("keep the container");
+    }
     let mut mounts = support::mounts_seeded(&[0x77; 32]);
     mounts.mount(&[b"iso", b"shutdown"], Box::new(runner::store::Sink::new()));
     let mut container = runner::Container::instantiate(
@@ -129,8 +209,9 @@ fn a_static_glibc_hello_runs() {
     )
     .into_owned();
     assert_eq!(
-        out, "hello\n",
-        "status {status}\nstderr: {err:?}\nkernel log: {log}"
+        status, 0,
+        "the program exited {status}\nstdout: {out:?}\nstderr: {err:?}\n\
+         kernel log: {log}"
     );
-    assert_eq!(status, 0);
+    out
 }

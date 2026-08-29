@@ -1,6 +1,8 @@
 (module
   (type (;0;) (func))
-  (type (;1;) (func (param i64 i64 i64 i64 i64 i64 f64 f64 f64 f64 f64 f64 f64 f64) (result i64 f64)))
+  (type (;1;) (func (param i32 i32)))
+  (type (;2;) (func (param i64)))
+  (type (;3;) (func (param i64 i64 i64 i64 i64 i64 f64 f64 f64 f64 f64 f64 f64 f64) (result i64 f64)))
   (import "env" "__linear_memory" (memory (;0;) 0))
   (import "env" "__stack_pointer" (global (;0;) (mut i32)))
   (global (;1;) (mut i64) i64.const 0)
@@ -56,9 +58,11 @@
   (global (;51;) (mut i32) i32.const 0)
   (global (;52;) (mut i32) i32.const 0)
   (global (;53;) (mut i32) i32.const 0)
-  (global (;54;) (mut i64) i64.const 0)
+  (global (;54;) (mut i32) i32.const 0)
+  (global (;55;) (mut i64) i64.const 0)
+  (global (;56;) (mut i64) i64.const 0)
   (func (;0;) (type 0)
-    (local i64 i64 i64 i64 i32 i32 i32 i32 i32 i32 i32)
+    (local i64 i64 i64 i64 i32 i32 i32 i32 i32 i32 i32 i32)
     global.get 1
     local.set 0
     global.get 5
@@ -77,18 +81,20 @@
     local.set 7
     global.get 53
     local.set 8
+    global.get 54
+    local.set 9
     loop ;; label = @1
       block ;; label = @2
         block ;; label = @3
-          local.get 9
+          local.get 10
           br_table 0 (;@3;) 1 (;@2;)
         end
         local.get 3
         local.get 2
         i64.add
         i32.wrap_i64
-        local.set 10
-        local.get 10
+        local.set 11
+        local.get 11
         i64.extend_i32_u
         local.set 0
         local.get 1
@@ -104,7 +110,7 @@
       unreachable
     end
   )
-  (func (;1;) (type 1) (param i64 i64 i64 i64 i64 i64 f64 f64 f64 f64 f64 f64 f64 f64) (result i64 f64)
+  (func (;1;) (type 3) (param i64 i64 i64 i64 i64 i64 f64 f64 f64 f64 f64 f64 f64 f64) (result i64 f64)
     local.get 0
     global.set 8
     local.get 1
@@ -157,7 +163,7 @@
     global.get 17
     f64.reinterpret_i64
   )
-  (@custom "linking" (after code) "\02\08\f3\059\02\10\00\02\01\01\07x86_rax\02\01\02\07x86_rcx\02\01\03\07x86_rdx\02\01\04\07x86_rbx\02\01\05\07x86_rsp\02\01\06\07x86_rbp\02\01\07\07x86_rsi\02\01\08\07x86_rdi\02\01\09\06x86_r8\02\01\0a\06x86_r9\02\01\0b\07x86_r10\02\01\0c\07x86_r11\02\01\0d\07x86_r12\02\01\0e\07x86_r13\02\01\0f\07x86_r14\02\01\10\07x86_r15\02\01\11\0bx86_xmm0_lo\02\01\12\0bx86_xmm0_hi\02\01\13\0bx86_xmm1_lo\02\01\14\0bx86_xmm1_hi\02\01\15\0bx86_xmm2_lo\02\01\16\0bx86_xmm2_hi\02\01\17\0bx86_xmm3_lo\02\01\18\0bx86_xmm3_hi\02\01\19\0bx86_xmm4_lo\02\01\1a\0bx86_xmm4_hi\02\01\1b\0bx86_xmm5_lo\02\01\1c\0bx86_xmm5_hi\02\01\1d\0bx86_xmm6_lo\02\01\1e\0bx86_xmm6_hi\02\01\1f\0bx86_xmm7_lo\02\01 \0bx86_xmm7_hi\02\01!\0bx86_xmm8_lo\02\01\22\0bx86_xmm8_hi\02\01#\0bx86_xmm9_lo\02\01$\0bx86_xmm9_hi\02\01%\0cx86_xmm10_lo\02\01&\0cx86_xmm10_hi\02\01'\0cx86_xmm11_lo\02\01(\0cx86_xmm11_hi\02\01)\0cx86_xmm12_lo\02\01*\0cx86_xmm12_hi\02\01+\0cx86_xmm13_lo\02\01,\0cx86_xmm13_hi\02\01-\0cx86_xmm14_lo\02\01.\0cx86_xmm14_hi\02\01/\0cx86_xmm15_lo\02\010\0cx86_xmm15_hi\02\011\06x86_zf\02\012\06x86_sf\02\013\06x86_cf\02\014\06x86_of\02\015\06x86_pf\02\016\0bx86_fs_base\00\04\00\09add_guest\00 \01\03add")
-  (@custom "reloc.CODE" (after code) "\04\1f\07\09\01\07\11\05\07\19\07\07!\08\07)1\0712\0793\07A4\07I5\07t\01\07|\05\07\8c\01\08\07\94\01\07\07\9c\01\03\07\a4\01\02\07\ac\01\09\07\b4\01\0a\07\bd\01\11\07\c6\01\13\07\cf\01\15\07\d8\01\17\07\e1\01\19\07\ea\01\1b\07\f3\01\1d\07\fc\01\1f\07\82\02\00\07\8f\02\05\07\95\02\05\00\aa\027\07\b0\02\01\07\b6\02\11")
+  (@custom "linking" (after code) "\02\08\88\06;\02\10\00\02\01\01\07x86_rax\02\01\02\07x86_rcx\02\01\03\07x86_rdx\02\01\04\07x86_rbx\02\01\05\07x86_rsp\02\01\06\07x86_rbp\02\01\07\07x86_rsi\02\01\08\07x86_rdi\02\01\09\06x86_r8\02\01\0a\06x86_r9\02\01\0b\07x86_r10\02\01\0c\07x86_r11\02\01\0d\07x86_r12\02\01\0e\07x86_r13\02\01\0f\07x86_r14\02\01\10\07x86_r15\02\01\11\0bx86_xmm0_lo\02\01\12\0bx86_xmm0_hi\02\01\13\0bx86_xmm1_lo\02\01\14\0bx86_xmm1_hi\02\01\15\0bx86_xmm2_lo\02\01\16\0bx86_xmm2_hi\02\01\17\0bx86_xmm3_lo\02\01\18\0bx86_xmm3_hi\02\01\19\0bx86_xmm4_lo\02\01\1a\0bx86_xmm4_hi\02\01\1b\0bx86_xmm5_lo\02\01\1c\0bx86_xmm5_hi\02\01\1d\0bx86_xmm6_lo\02\01\1e\0bx86_xmm6_hi\02\01\1f\0bx86_xmm7_lo\02\01 \0bx86_xmm7_hi\02\01!\0bx86_xmm8_lo\02\01\22\0bx86_xmm8_hi\02\01#\0bx86_xmm9_lo\02\01$\0bx86_xmm9_hi\02\01%\0cx86_xmm10_lo\02\01&\0cx86_xmm10_hi\02\01'\0cx86_xmm11_lo\02\01(\0cx86_xmm11_hi\02\01)\0cx86_xmm12_lo\02\01*\0cx86_xmm12_hi\02\01+\0cx86_xmm13_lo\02\01,\0cx86_xmm13_hi\02\01-\0cx86_xmm14_lo\02\01.\0cx86_xmm14_hi\02\01/\0cx86_xmm15_lo\02\010\0cx86_xmm15_hi\02\011\06x86_zf\02\012\06x86_sf\02\013\06x86_cf\02\014\06x86_of\02\015\06x86_pf\02\016\06x86_df\02\017\0bx86_fs_base\02\018\07x86_tsc\00\04\00\09add_guest\00 \01\03add")
+  (@custom "reloc.CODE" (after code) "\04 \07\09\01\07\11\05\07\19\07\07!\08\07)1\0712\0793\07A4\07I5\07Q6\07|\01\07\84\01\05\07\94\01\08\07\9c\01\07\07\a4\01\03\07\ac\01\02\07\b4\01\09\07\bc\01\0a\07\c5\01\11\07\ce\01\13\07\d7\01\15\07\e0\01\17\07\e9\01\19\07\f2\01\1b\07\fb\01\1d\07\84\02\1f\07\8a\02\00\07\97\02\05\07\9d\02\05\00\b2\029\07\b8\02\01\07\be\02\11")
   (@custom "target_features" (after code) "\02+\0fmutable-globals+\08sign-ext")
 )

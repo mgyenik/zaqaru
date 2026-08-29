@@ -35,9 +35,10 @@ use super::{FunctionTranslator, is_immediate, render};
 
 use FloatWidth::{Double, Single};
 use PackedOperation::{
-    Add, ConvertFromSignedLanes, Equal, FloatAdd, FloatDivide, FloatMultiply, FloatSquareRoot,
-    FloatSubtract, GreaterSigned, MaximumSigned, MaximumUnsigned, MinimumSigned, MinimumUnsigned,
-    Multiply, Subtract,
+    Add, AddSaturatingSigned, AddSaturatingUnsigned, ConvertFromSignedLanes, Equal, FloatAdd,
+    FloatDivide, FloatMultiply, FloatSquareRoot, FloatSubtract, GreaterSigned, MaximumSigned,
+    MaximumUnsigned, MinimumSigned, MinimumUnsigned, Multiply, Subtract, SubtractSaturatingSigned,
+    SubtractSaturatingUnsigned,
 };
 
 /// Whether the vector translation recognised an instruction, so that one that
@@ -288,6 +289,34 @@ impl FunctionTranslator<'_> {
             Mnemonic::Psubw => self.packed_binary(body, lifted, Subtract(LaneWidth::Word))?,
             Mnemonic::Psubd => self.packed_binary(body, lifted, Subtract(LaneWidth::DoubleWord))?,
             Mnemonic::Psubq => self.packed_binary(body, lifted, Subtract(LaneWidth::QuadWord))?,
+            // The saturating forms. `strtold`'s digit scanner reaches for
+            // `psubusb` to test a byte against a range in one instruction,
+            // which is the shape a saturating subtract is really for: the
+            // clamp at zero is the comparison.
+            Mnemonic::Paddsb => {
+                self.packed_binary(body, lifted, AddSaturatingSigned(LaneWidth::Byte))?
+            }
+            Mnemonic::Paddsw => {
+                self.packed_binary(body, lifted, AddSaturatingSigned(LaneWidth::Word))?
+            }
+            Mnemonic::Paddusb => {
+                self.packed_binary(body, lifted, AddSaturatingUnsigned(LaneWidth::Byte))?
+            }
+            Mnemonic::Paddusw => {
+                self.packed_binary(body, lifted, AddSaturatingUnsigned(LaneWidth::Word))?
+            }
+            Mnemonic::Psubsb => {
+                self.packed_binary(body, lifted, SubtractSaturatingSigned(LaneWidth::Byte))?
+            }
+            Mnemonic::Psubsw => {
+                self.packed_binary(body, lifted, SubtractSaturatingSigned(LaneWidth::Word))?
+            }
+            Mnemonic::Psubusb => {
+                self.packed_binary(body, lifted, SubtractSaturatingUnsigned(LaneWidth::Byte))?
+            }
+            Mnemonic::Psubusw => {
+                self.packed_binary(body, lifted, SubtractSaturatingUnsigned(LaneWidth::Word))?
+            }
             Mnemonic::Pmullw => self.packed_binary(body, lifted, Multiply(LaneWidth::Word))?,
             Mnemonic::Pmulld => {
                 self.packed_binary(body, lifted, Multiply(LaneWidth::DoubleWord))?
@@ -1572,6 +1601,13 @@ enum PackedOperation {
     GreaterSigned(LaneWidth),
     /// Lane-wise minimum and maximum, which x86 has only at byte and word
     /// grain and only in the signedness each mnemonic names.
+    /// Saturating add and subtract, which clamp at the lane's bound instead
+    /// of wrapping. x86 has them at byte and word grain in both
+    /// signednesses and nowhere else, and wasm has exactly the same eight.
+    AddSaturatingSigned(LaneWidth),
+    AddSaturatingUnsigned(LaneWidth),
+    SubtractSaturatingSigned(LaneWidth),
+    SubtractSaturatingUnsigned(LaneWidth),
     MinimumUnsigned(LaneWidth),
     MinimumSigned(LaneWidth),
     MaximumUnsigned(LaneWidth),
@@ -1666,6 +1702,26 @@ fn emit_packed(
         PackedOperation::Multiply(LaneWidth::DoubleWord) => body.i32x4_mul(),
         PackedOperation::Multiply(LaneWidth::QuadWord) => body.i64x2_mul(),
         PackedOperation::Multiply(LaneWidth::Byte) => return Err(unsupported()),
+        PackedOperation::AddSaturatingSigned(LaneWidth::Byte) => body.i8x16_add_saturating_signed(),
+        PackedOperation::AddSaturatingSigned(LaneWidth::Word) => body.i16x8_add_saturating_signed(),
+        PackedOperation::AddSaturatingUnsigned(LaneWidth::Byte) => {
+            body.i8x16_add_saturating_unsigned()
+        }
+        PackedOperation::AddSaturatingUnsigned(LaneWidth::Word) => {
+            body.i16x8_add_saturating_unsigned()
+        }
+        PackedOperation::SubtractSaturatingSigned(LaneWidth::Byte) => {
+            body.i8x16_sub_saturating_signed()
+        }
+        PackedOperation::SubtractSaturatingSigned(LaneWidth::Word) => {
+            body.i16x8_sub_saturating_signed()
+        }
+        PackedOperation::SubtractSaturatingUnsigned(LaneWidth::Byte) => {
+            body.i8x16_sub_saturating_unsigned()
+        }
+        PackedOperation::SubtractSaturatingUnsigned(LaneWidth::Word) => {
+            body.i16x8_sub_saturating_unsigned()
+        }
         PackedOperation::Equal(LaneWidth::Byte) => body.i8x16_equal(),
         PackedOperation::Equal(LaneWidth::Word) => body.i16x8_equal(),
         PackedOperation::Equal(LaneWidth::DoubleWord) => body.i32x4_equal(),
@@ -1701,9 +1757,13 @@ fn emit_packed(
         PackedOperation::MinimumUnsigned(lanes)
         | PackedOperation::MinimumSigned(lanes)
         | PackedOperation::MaximumUnsigned(lanes)
-        | PackedOperation::MaximumSigned(lanes) => bail!(
-            "`{}` asks for a lane-wise extremum at {} bits, which x86 has no \
-             instruction for",
+        | PackedOperation::MaximumSigned(lanes)
+        | PackedOperation::AddSaturatingSigned(lanes)
+        | PackedOperation::AddSaturatingUnsigned(lanes)
+        | PackedOperation::SubtractSaturatingSigned(lanes)
+        | PackedOperation::SubtractSaturatingUnsigned(lanes) => bail!(
+            "`{}` asks for a lane-wise extremum or saturating step at {} \
+             bits, which x86 has no instruction for",
             crate::translate::render(instruction),
             lanes.bits()
         ),

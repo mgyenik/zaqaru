@@ -97,6 +97,9 @@ struct SymbolTable<'a> {
     x87_helpers: [Option<FunctionReference>; crate::translate::x87::X87Helper::ALL.len()],
     /// The top of [`X87_STACK`], present alongside the helpers.
     x87_stack: Option<DataReference>,
+    /// The module's own [`WIDE_DIVISION`], present when anything divides a
+    /// 128-bit dividend.
+    wide_division: Option<FunctionReference>,
     /// The imported [`SYSCALL_ENTRY`], present when the object contains a
     /// `syscall` at all.
     syscall_entry: Option<FunctionReference>,
@@ -207,6 +210,15 @@ impl SymbolResolver for SymbolTable<'_> {
                 "an x87 instruction was translated but `{}` was never \
                  declared; the scan and the declaration disagree",
                 helper.symbol_name()
+            )
+        })
+    }
+
+    fn wide_division(&self) -> Result<FunctionReference> {
+        self.wide_division.ok_or_else(|| {
+            anyhow::anyhow!(
+                "a 128-bit division was translated but `{WIDE_DIVISION}` was \
+                 never declared; the scan and the declaration disagree"
             )
         })
     }
@@ -441,6 +453,7 @@ impl<'a> Transpiler<'a> {
             no_function_at: None,
             x87_helpers: [None; crate::translate::x87::X87Helper::ALL.len()],
             x87_stack: None,
+            wide_division: None,
             jump_tables: HashMap::new(),
             syscall_entry: None,
             segment_of_section: HashMap::new(),
@@ -483,8 +496,10 @@ impl<'a> Transpiler<'a> {
             &references,
         )?;
         self.declare_data(&mut wasm, &mut symbols, &references)?;
-        let (mut plans, driver, exec_map) = self.declare_functions(&mut wasm, &mut symbols)?;
+        let (mut plans, driver, exec_map, wide_division) =
+            self.declare_functions(&mut wasm, &mut symbols, &references)?;
         symbols.exec_map = exec_map;
+        symbols.wide_division = wide_division;
 
         // Table slots have to exist before anything can refer to one, and
         // they are only known once every function has a symbol.
@@ -614,6 +629,11 @@ impl<'a> Transpiler<'a> {
             bodies.push((reference.function_index, lookup_type, body));
         }
 
+        if let Some(reference) = wide_division {
+            let type_index = wasm.intern_type(wide_division_type());
+            bodies.push((reference.function_index, type_index, build_wide_division()));
+        }
+
         bodies.sort_by_key(|(index, _, _)| *index);
         for (index, type_index, body) in bodies {
             debug_assert_eq!(index, wasm.next_defined_function_index());
@@ -705,6 +725,9 @@ impl<'a> Transpiler<'a> {
                 }
                 if crate::translate::x87::is_x87_mnemonic(lifted.instruction.mnemonic()) {
                     references.uses_x87 = true;
+                }
+                if crate::translate::divides_wide(&lifted.instruction) {
+                    references.divides_wide = true;
                 }
                 if lifted.instruction.mnemonic() == iced_x86::Mnemonic::Syscall {
                     references.issues_syscalls = true;
@@ -1272,8 +1295,10 @@ impl<'a> Transpiler<'a> {
         &self,
         wasm: &mut WasmObject,
         symbols: &mut SymbolTable<'_>,
+        references: &TextReferences,
     ) -> Result<(
         Vec<FunctionPlan>,
+        Option<FunctionReference>,
         Option<FunctionReference>,
         Option<FunctionReference>,
     )> {
@@ -1387,7 +1412,26 @@ impl<'a> Transpiler<'a> {
                 function_index: index,
             }
         });
-        Ok((plans, driver, exec_map))
+        if exec_map.is_some() {
+            next_index += 1;
+        }
+
+        // The wide-division helper, for the same reason and in the same
+        // place: its index is reserved here so the bodies can be pushed in
+        // the order the indices were claimed.
+        let wide_division = references.divides_wide.then(|| {
+            let index = next_index;
+            let symbol = wasm.add_symbol(Symbol {
+                name: WIDE_DIVISION.to_string(),
+                target: SymbolTarget::Function(index),
+                flags: symbol_flags::LOCAL,
+            });
+            FunctionReference {
+                symbol_index: symbol,
+                function_index: index,
+            }
+        });
+        Ok((plans, driver, exec_map, wide_division))
     }
 
     fn translate_guest_function(
@@ -1761,6 +1805,11 @@ struct TextReferences {
     /// import the kernel seam. There is no relocation to notice, so the
     /// instruction scan is the only evidence.
     issues_syscalls: bool,
+    /// Whether anything divides a 128-bit dividend, which is what obliges
+    /// the object to define [`WIDE_DIVISION`]. Found by the same scan, for
+    /// the same reason: a defined function's index has to be reserved before
+    /// any body is built.
+    divides_wide: bool,
 }
 
 impl TextReferences {
@@ -1973,6 +2022,247 @@ fn build_exec_map_table(wasm: &mut WasmObject, entries: &[(u64, TableReference)]
 /// The `unreachable` after the call is not reached — the kernel's report
 /// ends the run — but a body has to end, and ending in a trap says that
 /// falling out of here was never a possibility.
+/// The module's 128-by-64 division helper, as the linker sees it.
+///
+/// `div` and `idiv` at eight-byte width take a dividend twice as wide as any
+/// wasm type, so unlike every narrower form they cannot be computed inline.
+/// One function per module rather than one expansion per site: the algorithm
+/// is a loop, and sixty-four sites carrying sixty-four copies of it is a
+/// module nobody wants to read or to load.
+///
+/// Local, so that two transpiled objects linked together each keep their own
+/// and neither has to be the definition.
+const WIDE_DIVISION: &str = "x86_divide_128";
+
+/// The wide-division helper's shape: the dividend's high and low halves, the
+/// divisor, and whether the operands are signed; the quotient comes back.
+///
+/// The remainder is deliberately not returned. It is `dividend - quotient *
+/// divisor`, and the low sixty-four bits of that are exact — the true
+/// remainder is smaller than the divisor, so nothing it needs lives above
+/// them. The caller computes it in two instructions rather than the helper
+/// returning a pair.
+fn wide_division_type() -> FunctionType {
+    FunctionType {
+        parameters: vec![
+            ValueType::I64,
+            ValueType::I64,
+            ValueType::I64,
+            ValueType::I32,
+        ],
+        results: vec![ValueType::I64],
+    }
+}
+
+/// `x86_divide_128`: the quotient of a 128-bit dividend by a 64-bit divisor.
+///
+/// Restartable long division, one bit at a time, because wasm has no wider
+/// type to borrow and no widening divide. Sixty-four iterations is slower
+/// than the two-digit Knuth recurrence would be, and it is chosen anyway:
+/// the fast path in front of it takes every division whose dividend fits in
+/// sixty-four bits, which is nearly all of them, and what is left is a
+/// handful of calls inside a library's own extended-precision arithmetic.
+/// The loop is short enough to read and to check against the machine, and
+/// the recurrence is not.
+///
+/// Every case hardware raises `#DE` for traps here instead: a zero divisor,
+/// and a quotient too wide for the accumulator. That is not a shortcut — a
+/// divide error is a fault, and a trap is what a fault is in a translated
+/// program.
+fn build_wide_division() -> FunctionBody {
+    const HIGH: u32 = 0;
+    const LOW: u32 = 1;
+    const DIVISOR: u32 = 2;
+    const SIGNED: u32 = 3;
+
+    let mut body = FunctionBodyBuilder::new(4);
+    let quotient = body.declare_local(ValueType::I64);
+    let remainder = body.declare_local(ValueType::I64);
+    let bit = body.declare_local(ValueType::I64);
+    let carry = body.declare_local(ValueType::I64);
+    let negative = body.declare_local(ValueType::I32);
+    let high = body.declare_local(ValueType::I64);
+    let low = body.declare_local(ValueType::I64);
+    let divisor = body.declare_local(ValueType::I64);
+
+    // A zero divisor is a divide error before anything else is looked at.
+    body.local_get(DIVISOR);
+    body.i64_eqz();
+    body.if_();
+    body.unreachable();
+    body.end();
+
+    // Signed division is unsigned division of the magnitudes, with the sign
+    // put back afterwards. `negative` records whether the two operands
+    // disagreed, which is what decides the quotient's sign.
+    body.local_get(HIGH);
+    body.local_set(high);
+    body.local_get(LOW);
+    body.local_set(low);
+    body.local_get(DIVISOR);
+    body.local_set(divisor);
+    body.i32_const(0);
+    body.local_set(negative);
+
+    body.local_get(SIGNED);
+    body.if_();
+    // The dividend's sign is its high half's.
+    body.local_get(high);
+    body.i64_const(0);
+    body.i64_lt_signed();
+    body.if_();
+    body.i32_const(1);
+    body.local_set(negative);
+    // Negating a 128-bit value: complement both halves and add one, with the
+    // carry out of the low half landing in the high.
+    body.i64_const(0);
+    body.local_get(low);
+    body.i64_sub();
+    body.local_set(carry);
+    body.i64_const(0);
+    body.local_get(high);
+    body.i64_sub();
+    body.local_get(low);
+    body.i64_eqz();
+    body.i64_extend_i32_unsigned();
+    body.i64_const(1);
+    body.i64_sub();
+    body.i64_add();
+    body.local_set(high);
+    body.local_get(carry);
+    body.local_set(low);
+    body.end();
+
+    body.local_get(divisor);
+    body.i64_const(0);
+    body.i64_lt_signed();
+    body.if_();
+    body.i32_const(1);
+    body.local_get(negative);
+    body.i32_sub();
+    body.local_set(negative);
+    body.i64_const(0);
+    body.local_get(divisor);
+    body.i64_sub();
+    body.local_set(divisor);
+    body.end();
+    body.end();
+
+    // A quotient this wide cannot be delivered: hardware raises `#DE` for
+    // exactly this, and it is the same condition — the high half alone is
+    // already at least as large as the divisor.
+    body.local_get(high);
+    body.local_get(divisor);
+    body.i64_ge_unsigned();
+    body.if_();
+    body.unreachable();
+    body.end();
+
+    body.i64_const(0);
+    body.local_set(quotient);
+    body.local_get(high);
+    body.local_set(remainder);
+
+    // The fast path: a dividend that fits in sixty-four bits is one wasm
+    // instruction, and is what all but a handful of divisions are.
+    body.local_get(high);
+    body.i64_eqz();
+    body.if_();
+    body.local_get(low);
+    body.local_get(divisor);
+    body.i64_div_unsigned();
+    body.local_set(quotient);
+    body.else_();
+
+    // Long division, most significant bit first. The invariant is that
+    // `remainder` is always less than the divisor, so doubling it and adding
+    // one bit needs sixty-five bits — `carry` is the sixty-fifth, and a set
+    // carry means the value is certainly at least the divisor without any
+    // comparison being possible in sixty-four bits.
+    body.i64_const(64);
+    body.local_set(bit);
+    body.block();
+    body.loop_();
+    body.local_get(bit);
+    body.i64_eqz();
+    body.branch_if(1);
+    body.local_get(bit);
+    body.i64_const(1);
+    body.i64_sub();
+    body.local_set(bit);
+
+    body.local_get(remainder);
+    body.i64_const(63);
+    body.i64_shr_unsigned();
+    body.local_set(carry);
+
+    body.local_get(remainder);
+    body.i64_const(1);
+    body.i64_shl();
+    body.local_get(low);
+    body.local_get(bit);
+    body.i64_shr_unsigned();
+    body.i64_const(1);
+    body.i64_and();
+    body.i64_or();
+    body.local_set(remainder);
+
+    body.local_get(carry);
+    body.i64_eqz();
+    body.i32_eqz();
+    body.local_get(remainder);
+    body.local_get(divisor);
+    body.i64_ge_unsigned();
+    body.i32_or();
+    body.if_();
+    body.local_get(remainder);
+    body.local_get(divisor);
+    body.i64_sub();
+    body.local_set(remainder);
+    body.local_get(quotient);
+    body.i64_const(1);
+    body.local_get(bit);
+    body.i64_shl();
+    body.i64_or();
+    body.local_set(quotient);
+    body.end();
+
+    body.branch(0);
+    body.end(); // loop
+    body.end(); // block
+    body.end(); // the fast path's `if`
+
+    // The sign, and the range check that goes with it. A negative quotient
+    // may be `-2^63` exactly; a positive one may not be `2^63`, which is the
+    // asymmetry two's complement has and hardware faults on.
+    body.local_get(negative);
+    body.if_();
+    body.local_get(quotient);
+    body.i64_const(i64::MIN);
+    body.i64_gt_unsigned();
+    body.if_();
+    body.unreachable();
+    body.end();
+    body.i64_const(0);
+    body.local_get(quotient);
+    body.i64_sub();
+    body.local_set(quotient);
+    body.else_();
+    body.local_get(SIGNED);
+    body.if_();
+    body.local_get(quotient);
+    body.i64_const(0);
+    body.i64_lt_signed();
+    body.if_();
+    body.unreachable();
+    body.end();
+    body.end();
+    body.end();
+
+    body.local_get(quotient);
+    body.finish()
+}
+
 fn build_refusal(wasm: &mut WasmObject, name: &str, report: FunctionReference) -> FunctionBody {
     let segment_index = wasm.data_segments.len() as u32;
     let bytes = name.as_bytes().to_vec();

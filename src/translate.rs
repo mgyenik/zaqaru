@@ -126,6 +126,18 @@ pub trait SymbolResolver {
         )
     }
 
+    /// The module's 128-by-64 division helper.
+    ///
+    /// Defaulted to a refusal for the same reason as the x87 helpers: only
+    /// the real symbol table can name it, and reaching this without one
+    /// means the scan and the declaration disagree.
+    fn wide_division(&self) -> Result<FunctionReference> {
+        bail!(
+            "a 128-bit division was translated but no helper was declared; \
+             the scan and the declaration disagree"
+        )
+    }
+
     /// The top of the stack the x87 helpers run on.
     ///
     /// Defaulted alongside [`Self::x87_helper`], and refused for the same
@@ -137,6 +149,23 @@ pub trait SymbolResolver {
              reserved; the scan and the declaration disagree"
         )
     }
+}
+
+/// Whether an instruction divides a 128-bit dividend, and so needs the
+/// module's wide-division helper.
+///
+/// Only the eight-byte forms do: every narrower `div` and `idiv` has a
+/// dividend that fits in an `i64` and is computed inline.
+pub fn divides_wide(instruction: &Instruction) -> bool {
+    if !matches!(instruction.mnemonic(), Mnemonic::Div | Mnemonic::Idiv) {
+        return false;
+    }
+    let bytes = match instruction.op_kind(0) {
+        OpKind::Register => instruction.op_register(0).size(),
+        OpKind::Memory => instruction.memory_size().size(),
+        _ => return false,
+    };
+    bytes == 8
 }
 
 /// How far a translated `syscall` moves `%rsp`: the 128-byte red zone it must
@@ -2836,13 +2865,13 @@ impl<'a> FunctionTranslator<'a> {
     /// accumulator registers, leaving the quotient in the accumulator and the
     /// remainder in the data register.
     ///
-    /// Widths up to four bytes are computed exactly in `i64`. The eight-byte
-    /// form's dividend is 128 bits wide, which `i64` cannot hold; the
-    /// translation handles the case compilers actually emit — a dividend
-    /// produced by `cqo` or by zeroing `rdx`, so that it fits in 64 bits — and
-    /// traps otherwise, where hardware would have divided successfully. That
-    /// is the one place division diverges from the machine, and it is why
-    /// full-width division fidelity is on the list of work after the MVP.
+    /// Widths up to four bytes are computed exactly in `i64`, dividend and
+    /// all. The eight-byte form's dividend is 128 bits wide, which no wasm
+    /// type holds, so it goes to the module's own helper — see
+    /// [`crate::transpile`]'s `x86_divide_128`. The remainder does not come
+    /// back from it and does not need to: `dividend - quotient * divisor` is
+    /// exact in the low sixty-four bits, because the true remainder is
+    /// smaller than the divisor and so has nothing above them.
     fn translate_divide(
         &mut self,
         body: &mut FunctionBodyBuilder,
@@ -2850,6 +2879,9 @@ impl<'a> FunctionTranslator<'a> {
         signed: bool,
     ) -> Result<()> {
         let width = self.operand_width(&lifted.instruction, 0)?;
+        if width == OperandWidth::QuadWord {
+            return self.translate_wide_divide(body, lifted, signed);
+        }
         let dividend = self.temporaries.take(body, ValueType::I64);
         let divisor = self.temporaries.take(body, ValueType::I64);
         let quotient = self.temporaries.take(body, ValueType::I64);
@@ -2904,27 +2936,57 @@ impl<'a> FunctionTranslator<'a> {
         Ok(())
     }
 
+    /// The eight-byte `div` and `idiv`, whose dividend is `rdx:rax` and so
+    /// twice as wide as anything wasm can hold.
+    ///
+    /// The helper answers with the quotient alone; the remainder is
+    /// recovered here as `rax - quotient * divisor`, in wrapping sixty-four
+    /// bit arithmetic. That is not an approximation: the remainder is
+    /// smaller in magnitude than the divisor, so every bit of it is already
+    /// in the low half, and whatever the high halves did cancels.
+    fn translate_wide_divide(
+        &mut self,
+        body: &mut FunctionBodyBuilder,
+        lifted: &LiftedInstruction,
+        signed: bool,
+    ) -> Result<()> {
+        let width = OperandWidth::QuadWord;
+        let helper = self.symbols.wide_division()?;
+        let divisor = self.temporaries.take(body, ValueType::I64);
+        let quotient = self.temporaries.take(body, ValueType::I64);
+        let low = self.temporaries.take(body, ValueType::I64);
+
+        self.read_operand(body, lifted, 0, width)?;
+        body.local_set(divisor);
+        self.state.read_register(body, accumulator(width));
+        body.local_set(low);
+
+        self.state.read_register(body, data_register(width));
+        body.local_get(low);
+        body.local_get(divisor);
+        body.i32_const(i32::from(signed));
+        body.call(helper);
+        body.local_set(quotient);
+
+        body.local_get(low);
+        body.local_get(quotient);
+        body.local_get(divisor);
+        body.i64_mul();
+        body.i64_sub();
+        self.state.write_register(body, remainder_register(width));
+
+        body.local_get(quotient);
+        self.state.write_register(body, accumulator(width));
+        Ok(())
+    }
+
     /// Pushes the double-width dividend as an `i64`.
     fn emit_dividend(&mut self, body: &mut FunctionBodyBuilder, width: OperandWidth, signed: bool) {
-        if width == OperandWidth::QuadWord {
-            // The dividend is `rdx:rax`. Only a dividend that fits in 64 bits
-            // can be handled; check that `rdx` holds nothing but the sign.
-            self.state.read_register(body, data_register(width));
-            if signed {
-                self.state.read_register(body, accumulator(width));
-                body.i64_const(63);
-                body.i64_shr_signed();
-                body.i64_ne();
-            } else {
-                body.i64_eqz();
-                body.i32_eqz();
-            }
-            body.if_();
-            body.unreachable();
-            body.end();
-            self.state.read_register(body, accumulator(width));
-            return;
-        }
+        debug_assert_ne!(
+            width,
+            OperandWidth::QuadWord,
+            "the eight-byte dividend is 128 bits wide and goes to the helper"
+        );
 
         // A byte-wide divide takes its whole dividend from `ax`; the wider
         // ones pair the data register with the accumulator.
