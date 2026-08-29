@@ -76,10 +76,13 @@ pub enum Witness {
     /// defines these to hold pointers to functions and the C runtime calls
     /// through them.
     InitialiserArray,
-    /// Named by the file itself: `e_entry`, or the addend of an
-    /// `R_X86_64_IRELATIVE` or `R_X86_64_RELATIVE` relocation. The kernel
-    /// transfers to the first; the startup code calls the second; the third
-    /// is a pointer the linker marked exactly.
+    /// Named by the file itself: `e_entry`; the `.init` and `.fini`
+    /// sections, which the ABI defines as holding the runtime's initialiser
+    /// and finaliser; or the addend of an `R_X86_64_IRELATIVE` or
+    /// `R_X86_64_RELATIVE` relocation. The kernel transfers to the first,
+    /// the loader calls the second through `DT_INIT`, the startup code
+    /// calls an ifunc resolver, and the last is a pointer the linker marked
+    /// exactly.
     FileStated,
     /// A direct call or jump from code already discovered.
     Transfer,
@@ -513,6 +516,37 @@ fn collect_functions(
         coverage.establish(sections, function);
     }
 
+    // `.init` and `.fini`, each of which the ABI defines as holding exactly
+    // one function beginning at its start — `_init` and `_fini`, the
+    // loader's `DT_INIT` and `DT_FINI`.
+    //
+    // Not a nicety. In a *stripped dynamic* executable `_init` has no
+    // symbol, and `crti.o`'s hand-written prologue carries no unwind entry
+    // either, so nothing else sees it at all — while the loader calls it
+    // before `main` on every run. Every stripped coreutil on this machine
+    // died at the first byte of its own `.init` before this existed.
+    if layout == Layout::Linked {
+        for (index, section) in sections.iter().enumerate() {
+            if !matches!(section.name.as_str(), ".init" | ".fini")
+                || section.role != SectionRole::Text
+                || section.bytes.is_empty()
+            {
+                continue;
+            }
+            coverage.establish(
+                sections,
+                Function {
+                    name: format!("{}.{:#x}", section.name.trim_start_matches('.'), section.address),
+                    symbol: None,
+                    section: index,
+                    offset: 0,
+                    size: section.bytes.len() as u64,
+                    witness: Witness::FileStated,
+                },
+            );
+        }
+    }
+
     // And the procedure linkage table, whose entries are functions that no
     // symbol names and no unwind entry describes.
     //
@@ -739,6 +773,36 @@ fn is_padding_at(sections: &[Section], section: usize, offset: u64) -> bool {
 /// as emits together in the ten- and eleven-byte forms — are counted rather
 /// than recursed through, so that a real instruction beginning with one is
 /// not mistaken for filler.
+/// Whether a whole run of bytes is filler, rather than whether one begins
+/// with it.
+///
+/// The alignment a linker inserts between functions: a single multi-byte
+/// `nop`, or several, or zero fill. Used where the question is "is there
+/// anything real between here and there" — see
+/// `SymbolTable::fall_out_target`.
+pub fn is_filler(bytes: &[u8]) -> bool {
+    if bytes.is_empty() {
+        return true;
+    }
+    let mut decoder = iced_x86::Decoder::new(64, bytes, iced_x86::DecoderOptions::NONE);
+    let mut instruction = iced_x86::Instruction::default();
+    while decoder.can_decode() {
+        decoder.decode_out(&mut instruction);
+        if instruction.is_invalid() {
+            return false;
+        }
+        if !matches!(
+            instruction.mnemonic(),
+            iced_x86::Mnemonic::Nop | iced_x86::Mnemonic::Int3
+        ) && !(instruction.mnemonic() == iced_x86::Mnemonic::Add
+            && bytes.iter().all(|byte| *byte == 0))
+        {
+            return false;
+        }
+    }
+    true
+}
+
 fn is_padding(bytes: &[u8]) -> bool {
     let Some(first) = bytes.first() else {
         return true;

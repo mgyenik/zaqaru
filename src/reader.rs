@@ -709,25 +709,44 @@ fn read_symbols(
 /// evidence rather than interpreting the file.
 fn harvest_relocation_targets(file: &object::read::File<'_>, base: u64) -> Vec<u64> {
     let mut targets = Vec::new();
+    let mut take = |relocation: &object::Relocation| {
+        let RelocationFlags::Elf { r_type } = relocation.flags() else {
+            return;
+        };
+        if !matches!(
+            r_type,
+            object::elf::R_X86_64_IRELATIVE | object::elf::R_X86_64_RELATIVE
+        ) {
+            return;
+        }
+        // The addend is the address for both: what the resolver is, or
+        // what the pointer points at. A negative one is not an address.
+        if let Ok(address) = u64::try_from(relocation.addend()) {
+            // Relative to the load base, in a file that has one: what a
+            // loader would write is `base + addend`, and that is the
+            // address the code will be at.
+            targets.push(address + base);
+        }
+    };
     for section in file.sections() {
         for (_, relocation) in section.relocations() {
-            let RelocationFlags::Elf { r_type } = relocation.flags() else {
-                continue;
-            };
-            if !matches!(
-                r_type,
-                object::elf::R_X86_64_IRELATIVE | object::elf::R_X86_64_RELATIVE
-            ) {
-                continue;
-            }
-            // The addend is the address for both: what the resolver is, or
-            // what the pointer points at. A negative one is not an address.
-            if let Ok(address) = u64::try_from(relocation.addend()) {
-                // Relative to the load base, in a file that has one: what a
-                // loader would write is `base + addend`, and that is the
-                // address the code will be at.
-                targets.push(address + base);
-            }
+            take(&relocation);
+        }
+    }
+    // And the *dynamic* relocations, which are a different table reached a
+    // different way — a linked file's `.rela.dyn` is not attached to a
+    // target section the way a relocatable object's `.rela.text` is, so the
+    // loop above sees none of it.
+    //
+    // Skipping them cost every position-independent file its best witness.
+    // A PIE embeds a `R_X86_64_RELATIVE` for every pointer it holds, which
+    // is exactly the set of addresses nothing in the instruction stream
+    // names: `main`, handed to `__libc_start_main` through a GOT slot, is
+    // the first one every program needs and the one whose absence stopped
+    // every stripped coreutil on this machine.
+    if let Some(relocations) = file.dynamic_relocations() {
+        for (_, relocation) in relocations {
+            take(&relocation);
         }
     }
     targets

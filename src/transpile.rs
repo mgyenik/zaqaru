@@ -147,6 +147,38 @@ impl SymbolResolver for SymbolTable<'_> {
             })
     }
 
+    /// Where control goes when a function runs off its end.
+    ///
+    /// The function beginning exactly there, or — when the bytes between are
+    /// filler — the next one after them. The gap is real and routine: a
+    /// linker aligns functions, so `__memcpy_chk` ends at `0xba96d`, a
+    /// three-byte `nop` follows, and `memcpy` starts at `0xba970`. glibc
+    /// really does fall the first into the second, and asking only about
+    /// `0xba96d` finds nothing and emits a trap where the program has a
+    /// path.
+    ///
+    /// The filler check is what keeps this honest rather than merely
+    /// permissive: skipping *code* to reach the next function would invent
+    /// control flow, and skipping `nop`s reproduces exactly what the
+    /// processor does with them.
+    fn fall_out_target(&self, section: usize, offset: u64) -> Option<FunctionReference> {
+        if let Some(exact) = self.functions_by_location.get(&(section, offset)) {
+            return Some(*exact);
+        }
+        let next = self
+            .object
+            .functions
+            .iter()
+            .filter(|function| function.section == section && function.offset > offset)
+            .map(|function| function.offset)
+            .min()?;
+        let bytes = self.object.sections[section]
+            .bytes
+            .get(offset as usize..next as usize)?;
+        crate::discover::is_filler(bytes).then_some(())?;
+        self.functions_by_location.get(&(section, next)).copied()
+    }
+
     fn table_slot_at(&self, section: usize, offset: u64) -> Result<TableReference> {
         self.slot_at(section, offset)
     }

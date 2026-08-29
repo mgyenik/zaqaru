@@ -43,6 +43,7 @@ pub mod number {
     pub const MREMAP: i64 = 25;
     pub const MSYNC: i64 = 26;
     pub const GETPID: i64 = 39;
+    pub const UNAME: i64 = 63;
     pub const CLONE: i64 = 56;
     pub const GETCWD: i64 = 79;
     pub const CHDIR: i64 = 80;
@@ -183,6 +184,7 @@ pub mod number {
             MREMAP => "mremap",
             MSYNC => "msync",
             GETPID => "getpid",
+            UNAME => "uname",
             CLONE => "clone",
             EXIT => "exit",
             ARCH_PRCTL => "arch_prctl",
@@ -663,6 +665,7 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             // first in its own namespace, which is what makes the answer a
             // constant rather than something to derive.
             number::GETPID | number::GETTID => Outcome::Done(PROCESS_ID),
+            number::UNAME => self.uname(arguments),
             number::SET_TID_ADDRESS => self.set_tid_address(arguments),
             number::SET_ROBUST_LIST => self.set_robust_list(arguments),
             number::PRLIMIT64 => self.prlimit64(arguments),
@@ -720,6 +723,49 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             return Outcome::Done(Errno::Invalid.as_result());
         }
         self.robust_list = arguments.get(0) as u64;
+        Outcome::Done(0)
+    }
+
+    /// `uname(2)`: what kind of machine this is.
+    ///
+    /// Fixed strings, and the fixity is the design rather than a shortcut: a
+    /// container's kernel is this one, and there is no host fact underneath
+    /// for it to report. The release is stated high enough that a libc's
+    /// "is this kernel new enough for X" tests answer yes, because every
+    /// syscall kisal implements it implements at its modern shape — there
+    /// is no old `stat` here to fall back to.
+    ///
+    /// The structure is six fixed-size fields with no length prefix, so a
+    /// short name is a name followed by zeros; writing the whole block as
+    /// zeros first is what makes that true rather than leaving whatever the
+    /// guest's buffer held.
+    fn uname(&mut self, arguments: Arguments) -> Outcome {
+        /// Each field of `struct utsname`, as Linux fixes it.
+        const FIELD: u64 = 65;
+        const FIELDS: [&[u8]; 6] = [
+            b"Linux",
+            b"container",
+            b"6.1.0",
+            b"#1 SMP kisal",
+            b"x86_64",
+            b"(none)",
+        ];
+        let at = arguments.get(0) as u64;
+        let memory = self.memory();
+        if memory.check(at, FIELD * FIELDS.len() as u64).is_err() {
+            return Outcome::Done(Errno::Fault.as_result());
+        }
+        // SAFETY: the whole structure was just bounds-checked.
+        unsafe {
+            if memory.fill(at, FIELD * FIELDS.len() as u64, 0).is_err() {
+                return Outcome::Done(Errno::Fault.as_result());
+            }
+            for (index, field) in FIELDS.iter().enumerate() {
+                if memory.write(at + index as u64 * FIELD, field).is_err() {
+                    return Outcome::Done(Errno::Fault.as_result());
+                }
+            }
+        }
         Outcome::Done(0)
     }
 

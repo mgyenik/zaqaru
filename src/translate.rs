@@ -50,6 +50,15 @@ pub trait SymbolResolver {
     /// itself, leaving no relocation behind, so a call target can be a bare
     /// offset rather than a symbol.
     fn function_at(&self, section: usize, offset: u64) -> Result<FunctionReference>;
+    /// Where control goes when a function runs off its end.
+    ///
+    /// Usually the function beginning exactly there — but a linker aligns
+    /// the next function, so "exactly there" can be a few bytes of `nop`
+    /// short of it. `None` when nothing follows, which is what a call that
+    /// never returns leaves behind.
+    fn fall_out_target(&self, section: usize, offset: u64) -> Option<FunctionReference> {
+        self.function_at(section, offset).ok()
+    }
     /// What a symbolic operand's value is: an address in linear memory, or a
     /// slot in the indirect function table.
     fn value(&self, elf_symbol: usize, addend: i64) -> Result<SymbolValue>;
@@ -489,12 +498,12 @@ impl<'a> FunctionTranslator<'a> {
     /// to that function, and then this one's return.
     pub fn emit_fall_out(&mut self, body: &mut FunctionBodyBuilder, into: u64) -> Result<()> {
         self.temporaries.reset();
-        // Nothing begins where this function ends, so control does not
-        // continue: the compiler emitted no path past a call that never
-        // returns, which is what `abort` and `exit` leave behind. A function
-        // whose last instruction is a call and which is followed by another
-        // function is the other case, and it is the one below.
-        let Ok(target) = self.symbols.function_at(self.section, into) else {
+        // Nothing follows this function, so control does not continue: the
+        // compiler emitted no path past a call that never returns, which is
+        // what `abort` and `exit` leave behind. A function whose last
+        // instruction is a call and which is followed by another function is
+        // the other case, and it is the one below.
+        let Some(target) = self.symbols.fall_out_target(self.section, into) else {
             body.unreachable();
             return Ok(());
         };
