@@ -76,6 +76,11 @@ pub enum Witness {
     /// defines these to hold pointers to functions and the C runtime calls
     /// through them.
     InitialiserArray,
+    /// Named by the file itself: `e_entry`, or the addend of an
+    /// `R_X86_64_IRELATIVE` or `R_X86_64_RELATIVE` relocation. The kernel
+    /// transfers to the first; the startup code calls the second; the third
+    /// is a pointer the linker marked exactly.
+    FileStated,
     /// A direct call or jump from code already discovered.
     Transfer,
     /// Cut out of a function that something branched into partway. The piece
@@ -96,7 +101,8 @@ impl Witness {
             Witness::Symbol
             | Witness::UnwindEntry
             | Witness::LinkageTable
-            | Witness::InitialiserArray => true,
+            | Witness::InitialiserArray
+            | Witness::FileStated => true,
             Witness::Transfer => false,
             // Not evidence of its own: a cut redistributes a function that
             // strong or weak evidence had already established, and the
@@ -267,6 +273,22 @@ impl Coverage {
     }
 }
 
+/// Evidence the ELF file states outright, harvested by the reader because
+/// only it holds the file.
+///
+/// Both are strong: the format defines what they mean, and neither is an
+/// inference about what code looks like.
+pub struct FileEvidence {
+    /// `e_entry` — the one address the kernel is defined to transfer to.
+    /// Normally `_start` is found through its symbol or its frame entry, and
+    /// a stripped binary with an unwind hole is obliged to provide neither.
+    pub entry: u64,
+    /// Addresses named by `R_X86_64_IRELATIVE` and `R_X86_64_RELATIVE`
+    /// relocations — an ifunc resolver, or a pointer the linker marked
+    /// exactly. See `harvest_relocation_targets` in `crate::reader`.
+    pub relocated: Vec<u64>,
+}
+
 /// The pipeline, in order. See `docs/code-discovery.md`.
 ///
 /// Strong witnesses first, so that everything they account for is covered
@@ -275,10 +297,27 @@ impl Coverage {
 /// arrives; run the other way round, a transfer target would establish a
 /// function whose extent runs over the constructor an initialiser array was
 /// about to name, and the array would then be refused as covered.
-pub fn discover(symbols: &[Symbol], sections: &[Section], layout: Layout) -> Result<Vec<Function>> {
+pub fn discover(
+    symbols: &[Symbol],
+    sections: &[Section],
+    layout: Layout,
+    evidence: &FileEvidence,
+) -> Result<Vec<Function>> {
     let mut coverage = Coverage::default();
     collect_functions(&mut coverage, symbols, sections, layout)?;
     if layout == Layout::Linked {
+        // The entry point and the relocation targets, which the file states
+        // outright. Cheap, and the only witness a stripped binary with no
+        // unwind entry for `_start` has.
+        let mut stated: std::collections::BTreeSet<u64> =
+            evidence.relocated.iter().copied().collect();
+        if evidence.entry != 0 {
+            stated.insert(evidence.entry);
+        }
+        for function in placements(&coverage, sections, &stated, Witness::FileStated) {
+            coverage.establish(function);
+        }
+
         let arrays = initialiser_array_targets(sections);
         for function in placements(&coverage, sections, &arrays, Witness::InitialiserArray) {
             coverage.establish(function);

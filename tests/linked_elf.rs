@@ -961,3 +961,98 @@ fn a_function_records_the_witness_that_found_it() {
          {strata:?}"
     );
 }
+
+/// An ifunc resolver a stripped binary names nowhere but in its relocations.
+///
+/// The mechanism survives static linking: the linker emits an
+/// `R_X86_64_IRELATIVE` relocation whose addend is the resolver, and startup
+/// code walks the relocations and calls each one. In a binary with no symbol
+/// table and no unwind tables that relocation is the *only* thing in the
+/// file that says the resolver exists — nothing calls it directly and no
+/// instruction names its address.
+///
+/// A static glibc does not demonstrate this, which is why the fixture is
+/// built the way it is: glibc ships with unwind tables, so its resolvers are
+/// already accounted for by their frame entries and would be found with the
+/// relocation harvest deleted. Here there is nothing else.
+#[test]
+fn an_ifunc_resolver_is_found_by_its_relocation_alone() {
+    use zaqaru::discover::Witness;
+
+    let workspace = WorkingDirectory::new("linked-ifunc");
+    let named = support::link_corpus_executable_with(
+        &workspace,
+        "ifunc.c",
+        "through_the_table",
+        "-O1",
+        support::Unwind::Omitted,
+        support::CodeModel::Absolute,
+    );
+    let stripped = support::strip(&workspace, &named);
+
+    // Where the resolver is, according to the file itself.
+    let bytes = std::fs::read(&stripped).expect("read the stripped executable");
+    let object = ObjectFile::parse(&bytes).expect("parse the stripped executable");
+    let resolver = {
+        let named = ObjectFile::parse(&std::fs::read(&named).expect("read")).expect("parse");
+        let function = named
+            .functions
+            .iter()
+            .find(|function| function.name == "resolve")
+            .expect("the resolver, which the unstripped binary names");
+        named.sections[function.section].address + function.offset
+    };
+
+    let found = object
+        .functions
+        .iter()
+        .find(|function| object.sections[function.section].address + function.offset == resolver)
+        .unwrap_or_else(|| {
+            panic!("nothing was discovered at the resolver's address {resolver:#x}")
+        });
+    assert_eq!(
+        found.witness,
+        Witness::FileStated,
+        "the resolver was found by {:?}, so this fixture is not testing the \
+         relocation harvest",
+        found.witness
+    );
+}
+
+/// A relocation type the pipeline does not model does not stop the read.
+///
+/// The harvest is gathering evidence, not interpreting the file, so anything
+/// it does not recognise is skipped. Refusing instead is a defect this
+/// project has already shipped once: it made a stripped busybox unopenable,
+/// because its `IRELATIVE` entries land on `.got` rather than on a section
+/// the reader happened to be skipping.
+///
+/// Opportunistic, on whatever stripped static binary the machine has, since
+/// the interesting inputs are the ones nobody in this repository built. A
+/// machine without one proves nothing here and says so rather than passing
+/// quietly.
+#[test]
+fn an_unmodelled_relocation_type_does_not_stop_the_read() {
+    let mut examined = 0;
+    for candidate in ["/usr/bin/busybox", "/bin/busybox"] {
+        let Ok(bytes) = std::fs::read(candidate) else {
+            continue;
+        };
+        // A path that happens to hold a shell script is not a candidate;
+        // one that holds an ELF is, and then the parse has to work.
+        if !bytes.starts_with(b"\x7fELF") {
+            continue;
+        }
+        let Ok(object) = ObjectFile::parse(&bytes) else {
+            panic!("{candidate} is an ELF that could not be read at all");
+        };
+        assert!(
+            !object.functions.is_empty(),
+            "{candidate} parsed but no functions were discovered in it"
+        );
+        examined += 1;
+    }
+    if examined == 0 {
+        eprintln!("no stripped system binary to read; this test checked nothing");
+    }
+}

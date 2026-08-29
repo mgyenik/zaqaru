@@ -295,7 +295,15 @@ impl ObjectFile {
                 }
             }
         }
-        let functions = crate::discover::discover(&symbols, &sections, layout)?;
+        let evidence = crate::discover::FileEvidence {
+            entry: if layout == Layout::Linked {
+                file.entry()
+            } else {
+                0
+            },
+            relocated: harvest_relocation_targets(&file),
+        };
+        let functions = crate::discover::discover(&symbols, &sections, layout, &evidence)?;
         let segments = read_segments(&file);
 
         Ok(Self {
@@ -461,6 +469,53 @@ fn read_symbols(
         );
     }
     Ok(symbols)
+}
+
+/// The addresses a linked file's dynamic relocations name, for discovery.
+///
+/// [`read_relocations`] reads relocations to *translate* them, which a linked
+/// executable does not need — the code is placed and an operand is the
+/// address it means. These say nothing about translation and a great deal
+/// about where the functions are:
+///
+/// - Every `R_X86_64_IRELATIVE` addend is an ifunc **resolver**, a real
+///   function that startup code calls through a pointer read out of
+///   relocation data. In a stripped static glibc the resolvers have no
+///   symbol, no unwind entry, and no instruction anywhere naming their
+///   address.
+/// - Every `R_X86_64_RELATIVE` addend is a code or data pointer the linker
+///   marked exactly. A non-PIE static executable has none; a static-PIE one
+///   has an entry for every pointer it embeds, which turns the hardest case
+///   in `docs/code-discovery.md` into a table walk.
+///
+/// Whether either lands in code is [`crate::discover`]'s question, not this
+/// one — this only harvests.
+///
+/// **Unmodelled types are skipped, never fatal.** This is a lesson the
+/// worklog records: refusing a relocation type the pipeline does not model
+/// made a stripped busybox unopenable, because the read is harvesting
+/// evidence rather than interpreting the file.
+fn harvest_relocation_targets(file: &object::read::File<'_>) -> Vec<u64> {
+    let mut targets = Vec::new();
+    for section in file.sections() {
+        for (_, relocation) in section.relocations() {
+            let RelocationFlags::Elf { r_type } = relocation.flags() else {
+                continue;
+            };
+            if !matches!(
+                r_type,
+                object::elf::R_X86_64_IRELATIVE | object::elf::R_X86_64_RELATIVE
+            ) {
+                continue;
+            }
+            // The addend is the address for both: what the resolver is, or
+            // what the pointer points at. A negative one is not an address.
+            if let Ok(address) = u64::try_from(relocation.addend()) {
+                targets.push(address);
+            }
+        }
+    }
+    targets
 }
 
 fn read_relocations(
