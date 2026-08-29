@@ -1829,8 +1829,34 @@ moves:
   partial hole; it is Go and Haskell binaries with no unwind information
   whatsoever, where the witnesses have almost nothing to work from and the
   saturated tier is the only thing that could make them run.
-- **The dynamic-PIE wall is upstream of all of it.** 97.7% of shipped
-  binaries never reach discovery. Whatever the reader does about that is a
-  bigger lever than any witness, and it is not in this document's scope —
-  which is worth saying out loud, because a plan that reads as "the road to
-  any binary" describes the last 2.3% of the journey.
+- **Dynamic PIE is upstream of all of it**, and calling it a "wall" — as
+  the first version of this entry did — was wrong on the facts. It is not
+  an unrecognised obstacle; it is a *sequenced* one, and the sequencing is
+  written down. `container-build-plan.md` lists dynamic linking under
+  "explicitly not in this plan, deferred to phase two with their designs
+  already written in the design doc", and says of glibc that it "is not
+  being dodged — it arrives with the dynamic tier, where the CPUID-curation
+  and shadow-GOT designs exist precisely to meet it — it is being
+  *sequenced*." `container-plan.md`'s "Dynamic linking and ld.so" section
+  then designs it: prelink at bake, the shadow GOT, `DF_1_NOW` so
+  `_dl_runtime_resolve` never runs, ld.so as ordinary transpiled guest
+  code. `reader.rs` even carries the comment saying `Dynamic` is left out
+  deliberately. I had read that file's mapping table, its x87 section and
+  its setjmp thorn, and not its ld.so section, and wrote "not in this
+  document's scope" about the thing it describes at greatest length.
+
+  What the sweep does add, which the plan does not have, is the size of the
+  tier. The plan's tier-one answer — build the image's binaries statically
+  — is correct for an image we build. For images we do not build, static is
+  **2.3%** of what ships. The dynamic tier is not an enhancement to the
+  static one; it is most of the target, and that is an argument about
+  sequencing rather than about scope.
+
+  The split, for whenever it is picked up. *Reading* a dynamic ELF is
+  small: accept `ET_DYN` as linked at a bake-assigned base, which is what
+  "prelink at bake" already specifies, and read `.dynsym` — `read_symbols`
+  takes `file.symbols()`, which is `.symtab` alone, and a stripped dynamic
+  binary still carries `.dynsym` because linking requires it. Those 1261
+  files are much less blind than a stripped static one, and D3's relocation
+  harvest pays off far better there besides. *Running* one is the phase-two
+  milestone as designed.
