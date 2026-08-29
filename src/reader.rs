@@ -283,7 +283,20 @@ impl ObjectFile {
         }
 
         let mut symbols = read_symbols(&file, &section_of_elf_index)?;
-        read_relocations(&file, &section_of_elf_index, &mut sections)?;
+        // Only a relocatable object has relocations this pipeline reads. A
+        // linked executable's are *dynamic* — `IRELATIVE` for its ifuncs,
+        // and whatever else a loader applies — and they say nothing about
+        // the translation, because the code has already been placed and a
+        // reference in it is the address it means. A static glibc program
+        // applies its own, walking `__rela_iplt_start` from `_start`, which
+        // is the guest's business and not the reader's.
+        //
+        // Reading them anyway was not harmless: a dynamic relocation type
+        // this does not model stopped the parse, so a stripped static
+        // busybox could not be opened at all.
+        if layout != Layout::Linked {
+            read_relocations(&file, &section_of_elf_index, &mut sections)?;
+        }
         if layout == Layout::Linked {
             // A symbol's address is a virtual address once something has
             // been placed. The rest of the pipeline works in offsets within
@@ -297,6 +310,9 @@ impl ObjectFile {
             }
         }
         let mut functions = collect_functions(&symbols, &sections, layout)?;
+        if layout == Layout::Linked {
+            discover_from_transfers(&sections, &mut functions)?;
+        }
         split_at_interior_entries(&sections, &mut functions)?;
         let segments = read_segments(&file);
 
@@ -774,6 +790,195 @@ fn next_boundary(
 /// Only instruction boundaries are cut at. A target *inside* an instruction
 /// is a second instruction stream, which is a different question — see
 /// `crate::cfg`'s handling of a branch past a `lock` prefix.
+/// The fourth witness: something transfers to it, or the runtime is told to
+/// call it, and nothing said it was there.
+///
+/// Symbols, unwind entries and linkage tables between them describe almost
+/// every function in a linked program, and "almost" is the problem. The crt
+/// fragments in `.init` and `.fini` carry no `.size`, no unwind entry and —
+/// in a stripped binary — no symbol either, and `_start` calls straight into
+/// them. A stripped busybox stops on its first call for exactly this reason.
+///
+/// So: whatever a discovered function transfers to, or whatever the C
+/// runtime is told to call through an initialiser array, that lands in code
+/// and that nothing already covers, is a function. It runs until the next
+/// thing that is known to begin, which is the bound [`symbol_boundaries`]
+/// gives a sizeless symbol and for the same reason — a function cannot run
+/// past whatever starts after it.
+///
+/// Both are direct evidence about a particular address: this instruction
+/// calls *here*, this array tells the runtime to call *here*. That is the
+/// line this pass does not cross. Scanning for prologues, or for the
+/// `endbr64` that marks some indirect-branch target, would find more
+/// functions and would also invent them — `endbr64` says an indirect branch
+/// may land at an address, which is true of a jump-table arm and a landing
+/// pad as much as of a function.
+///
+/// A function found this way transfers somewhere itself, so this repeats
+/// until nothing new appears — over what the previous round added, not over
+/// everything. Re-decoding every function every round is the difference
+/// between a second and a minute on a two-megabyte program.
+fn discover_from_transfers(sections: &[Section], functions: &mut Vec<Function>) -> Result<()> {
+    use std::collections::BTreeSet;
+
+    let mut wanted: BTreeSet<u64> = BTreeSet::new();
+    for section in sections {
+        // The initialiser arrays, which the ABI defines to hold pointers to
+        // functions and which the C runtime calls through. Modern glibc's
+        // `__libc_start_main` walks `__init_array_start`, so in a stripped
+        // binary the constructor it reaches has no symbol, no unwind entry,
+        // and no instruction anywhere that names its address.
+        //
+        // Matched by name because that is what this reader carries; the
+        // section *type* would be the stronger test, and these names are
+        // fixed by the ABI rather than by convention.
+        if !matches!(
+            section.name.as_str(),
+            ".init_array" | ".fini_array" | ".preinit_array"
+        ) {
+            continue;
+        }
+        for entry in section.bytes.chunks_exact(8) {
+            let address = u64::from_le_bytes(entry.try_into().expect("eight bytes"));
+            // A null entry is a slot the linker left empty, which each of
+            // these arrays is allowed to contain.
+            if address != 0 {
+                wanted.insert(address);
+            }
+        }
+    }
+
+    let mut examined = 0;
+    const ROUNDS: usize = 16;
+    for round in 0..=ROUNDS {
+        for function in &functions[examined..] {
+            collect_transfer_targets(sections, function, &mut wanted);
+        }
+        examined = functions.len();
+
+        let discovered = uncovered_functions(sections, functions, &wanted);
+        if discovered.is_empty() {
+            functions.sort_by_key(|function| (function.section, function.offset));
+            return Ok(());
+        }
+        if round == ROUNDS {
+            bail!(
+                "discovering functions from what calls them did not settle in \
+                 {ROUNDS} rounds"
+            );
+        }
+        functions.extend(discovered);
+    }
+    Ok(())
+}
+
+/// Every address one function transfers to directly.
+///
+/// The decoder runs with a section-relative program counter, so an operand
+/// is an offset into the *source's* section — which is why it has to be
+/// turned back into an address before it can be looked up: a call into
+/// another section arrives as an offset that has wrapped below zero, and
+/// `_start` calling `_init` is exactly that shape.
+fn collect_transfer_targets(
+    sections: &[Section],
+    function: &Function,
+    into: &mut std::collections::BTreeSet<u64>,
+) {
+    let section = &sections[function.section];
+    let from = function.offset as usize;
+    let to = from + function.size as usize;
+    if to > section.bytes.len() {
+        return;
+    }
+    let mut decoder = iced_x86::Decoder::with_ip(
+        64,
+        &section.bytes[from..to],
+        function.offset,
+        iced_x86::DecoderOptions::NONE,
+    );
+    while decoder.can_decode() {
+        let instruction = decoder.decode();
+        if instruction.op0_kind() != iced_x86::OpKind::NearBranch64 {
+            continue;
+        }
+        if !matches!(
+            instruction.flow_control(),
+            iced_x86::FlowControl::Call
+                | iced_x86::FlowControl::ConditionalBranch
+                | iced_x86::FlowControl::UnconditionalBranch
+        ) {
+            continue;
+        }
+        into.insert(section.address.wrapping_add(instruction.near_branch64()));
+    }
+}
+
+/// The wanted addresses that land in code nothing already covers, as the
+/// functions they imply.
+fn uncovered_functions(
+    sections: &[Section],
+    functions: &[Function],
+    wanted: &std::collections::BTreeSet<u64>,
+) -> Vec<Function> {
+    use std::collections::{BTreeSet, HashMap};
+
+    // Sorted once. Asking each address whether some function contains it by
+    // scanning all of them is what turns this pass quadratic, and a
+    // two-megabyte program has enough of both to notice.
+    let mut covered: HashMap<usize, Vec<(u64, u64)>> = HashMap::new();
+    let mut starts: HashMap<usize, BTreeSet<u64>> = HashMap::new();
+    for function in functions {
+        covered
+            .entry(function.section)
+            .or_default()
+            .push((function.offset, function.offset + function.size));
+        starts
+            .entry(function.section)
+            .or_default()
+            .insert(function.offset);
+    }
+    for ranges in covered.values_mut() {
+        ranges.sort_unstable();
+    }
+
+    let mut discovered = Vec::new();
+    for &address in wanted {
+        let Some((section, offset)) = section_holding(sections, address) else {
+            continue;
+        };
+        if sections[section].role != SectionRole::Text {
+            continue;
+        }
+        // Inside something already known is not a discovery: a transfer into
+        // the middle of a function is an interior entry, which is
+        // [`split_at_interior_entries`]'s question and not this one.
+        if let Some(ranges) = covered.get(&section) {
+            let at = ranges.partition_point(|(start, _)| *start <= offset);
+            if at > 0 && offset < ranges[at - 1].1 {
+                continue;
+            }
+        }
+        let known = starts.entry(section).or_default();
+        let end = known
+            .range(offset + 1..)
+            .next()
+            .copied()
+            .unwrap_or(sections[section].bytes.len() as u64);
+        if end <= offset {
+            continue;
+        }
+        known.insert(offset);
+        discovered.push(Function {
+            name: format!("fn.{address:#x}"),
+            symbol: None,
+            section,
+            offset,
+            size: end - offset,
+        });
+    }
+    discovered
+}
+
 fn split_at_interior_entries(sections: &[Section], functions: &mut Vec<Function>) -> Result<()> {
     // To a fixpoint, because a cut makes boundaries that were not there
     // before: a branch that stayed inside one function may cross two of its

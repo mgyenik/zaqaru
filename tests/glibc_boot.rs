@@ -154,9 +154,44 @@ int main(void) {
     );
 }
 
+/// A stripped binary whose constructor nothing names, calls, or unwinds.
+///
+/// Discovery normally has three witnesses — a symbol, an unwind entry, and
+/// where the next thing starts — and a constructor in a stripped binary has
+/// none of them. It has no symbol because stripping took it, no instruction
+/// anywhere names its address, and glibc reaches it by walking
+/// `__init_array_start` and calling through the pointer. The array is the
+/// only thing in the file that says it exists, and the ABI is what says the
+/// array holds functions.
+///
+/// Both halves are asserted, because the constructor running is the whole
+/// evidence that it was found: a translation that missed it would print only
+/// the second line, and a bake that refused it would trap instead.
+#[test]
+fn a_stripped_binary_runs_a_constructor_only_its_init_array_names() {
+    let program = "#include <stdio.h>\n\
+                   __attribute__((constructor)) static void first(void)\n\
+                   { puts(\"constructor\"); }\n\
+                   int main(void) { puts(\"main\"); return 0; }\n";
+    let out = run_static_glibc_stripped("glibc-constructor", program);
+    assert_eq!(
+        out, "constructor\nmain\n",
+        "the constructor did not run, so nothing found it"
+    );
+}
+
+/// The same as [`run_static_glibc`], with every symbol taken away first.
+fn run_static_glibc_stripped(name: &str, program: &str) -> String {
+    run_static_glibc_with(name, program, true)
+}
+
 /// Builds a static glibc program, translates it, bakes it into an image,
 /// boots it, and returns what it wrote to stdout.
 fn run_static_glibc(name: &str, program: &str) -> String {
+    run_static_glibc_with(name, program, false)
+}
+
+fn run_static_glibc_with(name: &str, program: &str, stripped: bool) -> String {
     let workspace = WorkingDirectory::new(name);
 
     // Built the way a distribution builds one, which is the point.
@@ -173,6 +208,11 @@ fn run_static_glibc(name: &str, program: &str) -> String {
         ],
     );
 
+    let elf = if stripped {
+        support::strip(&workspace, &elf)
+    } else {
+        elf
+    };
     let bytes = std::fs::read(&elf).expect("read the program");
     let object = zaqaru::reader::ObjectFile::parse(&bytes).expect("parse");
     let top = object
