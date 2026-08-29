@@ -198,7 +198,10 @@ fn main() -> Result<()> {
             translation.refused.len()
         );
         for refusal in &translation.refused {
-            eprintln!("  {}: {}", refusal.name, refusal.reason);
+            eprintln!(
+                "  {} (found by {:?}): {}",
+                refusal.name, refusal.witness, refusal.reason
+            );
         }
     }
 

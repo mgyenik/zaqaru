@@ -14,6 +14,7 @@
 pub mod abi;
 pub mod cfg;
 pub mod dump;
+pub mod discover;
 pub mod eh_frame;
 pub mod emitter;
 pub mod jump_table;

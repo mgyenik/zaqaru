@@ -891,3 +891,73 @@ fn a_call_to_a_weak_symbol_that_is_absent_traps_instead_of_refusing() {
         .expect("translating a function that calls an absent weak symbol");
     support::validate_wasm(&translated);
 }
+
+/// Every function says what found it.
+///
+/// Provenance is not decoration: discovery combines evidence of different
+/// strengths under a rule that only one of them may bound a function, and a
+/// refusal or a runtime exec-map miss that names its evidence — "reached
+/// `fn.0x511aa5`, discovered by transfer" — is diagnosable where an address
+/// alone is an afternoon. It is also what makes the rule checkable, which is
+/// what this test does: the strata are visible in the output rather than
+/// only inside the pass that produced them.
+///
+/// Stripping is what makes the second half meaningful. With the symbol table
+/// present every function in a `-nostdlib` executable is found by its
+/// symbol, and one stratum proves nothing about a design whose whole content
+/// is that there are several.
+#[test]
+fn a_function_records_the_witness_that_found_it() {
+    use zaqaru::discover::Witness;
+
+    let workspace = WorkingDirectory::new("linked-provenance");
+    let named = support::link_corpus_executable_with(
+        &workspace,
+        "switch_dispatch.c",
+        "classify",
+        "-O1",
+        support::Unwind::Present,
+        support::CodeModel::Absolute,
+    );
+    let object = ObjectFile::parse(&std::fs::read(&named).expect("read")).expect("parse");
+    let named_function = object
+        .functions
+        .iter()
+        .find(|function| function.name == "classify")
+        .expect("the entry the executable was linked around");
+    assert_eq!(
+        named_function.witness,
+        Witness::Symbol,
+        "a function the symbol table names should say so"
+    );
+    assert!(named_function.symbol.is_some());
+
+    // The same binary with its names taken away. Nothing can be found by a
+    // symbol any more, so every function reports the witness that actually
+    // found it — which is the point: the strata are what discovery has left
+    // when the easy evidence is gone.
+    let stripped = support::strip(&workspace, &named);
+    let object = ObjectFile::parse(&std::fs::read(&stripped).expect("read")).expect("parse");
+    assert!(
+        !object.functions.is_empty(),
+        "stripping left no functions at all"
+    );
+    for function in &object.functions {
+        assert_ne!(
+            function.witness,
+            Witness::Symbol,
+            "`{}` claims a symbol found it in a binary with no symbols",
+            function.name
+        );
+    }
+    let strata: std::collections::BTreeSet<Witness> = object
+        .functions
+        .iter()
+        .map(|function| function.witness)
+        .collect();
+    assert!(
+        strata.contains(&Witness::UnwindEntry),
+        "nothing was found by an unwind entry in a binary built with them: \
+         {strata:?}"
+    );
+}

@@ -566,6 +566,7 @@ impl<'a> Transpiler<'a> {
                 Err(error) if self.untranslatable == Untranslatable::Trap => {
                     refused.push(Refusal {
                         name: lifted.name.clone(),
+                        witness: self.object.functions[lifted.function].witness,
                         reason: format!("{error:#}"),
                     });
                     build_refusal(
@@ -1885,6 +1886,11 @@ pub enum Untranslatable {
 #[derive(Clone, Debug)]
 pub struct Refusal {
     pub name: String,
+    /// What said the function was there. A refusal for a function no symbol
+    /// named is a different kind of news from one for a function the symbol
+    /// table describes: the first may be discovery reaching too far, and the
+    /// second cannot be. See `crate::discover`.
+    pub witness: crate::discover::Witness,
     /// The translator's own message, kept whole: it names the instruction,
     /// which is what turns this list into a worklist.
     pub reason: String,
