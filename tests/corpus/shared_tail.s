@@ -61,4 +61,42 @@ hot_cold:
     ret
     .size   hot_cold, .-hot_cold
 
+/* The shape splitting makes at a piece's last instruction: a conditional
+ * branch out of the function, whose *untaken* path is the first byte of the
+ * function below.
+ *
+ * Both edges leave. The taken one is a tail call; not taking it runs off the
+ * end into the next function, which is a tail call too. A translation that
+ * assumed the untaken side stays inside refuses the whole function, and it
+ * refuses it in glibc's `memcpy`: the size check against the non-temporal
+ * threshold is the last instruction of one split piece and its fall-through
+ * is the first byte of the next. A 41-byte `puts` reaches it; a 5-byte one
+ * does not, which is why nothing here noticed for so long.
+ *
+ * `rdi` selects the path, `rsi` is carried through so the two answers differ.
+ */
+    .globl  leaves_or_falls_out
+    .type   leaves_or_falls_out, @function
+leaves_or_falls_out:
+    testq   %rdi, %rdi
+    jne     taken_side
+    .size   leaves_or_falls_out, .-leaves_or_falls_out
+
+/* Falling out of the function above lands exactly here. */
+    .globl  untaken_side
+    .type   untaken_side, @function
+untaken_side:
+    movq    %rsi, %rax
+    addq    $11, %rax
+    ret
+    .size   untaken_side, .-untaken_side
+
+    .globl  taken_side
+    .type   taken_side, @function
+taken_side:
+    movq    %rsi, %rax
+    imulq   $3, %rax, %rax
+    ret
+    .size   taken_side, .-taken_side
+
     .section .note.GNU-stack,"",@progbits

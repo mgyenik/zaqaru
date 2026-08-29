@@ -7,11 +7,16 @@
 //! CPUID means the reachable program selects one of them. What matters is
 //! the subset reachable from the entry point.
 //!
-//! Reachability here follows direct calls and jumps, and also any operand
-//! that names a function's first byte — the `lea` that hands `main` to
-//! `__libc_start_main` is the reason: following calls alone stops at
-//! `_start` and reports the whole program as unreachable, which is worse
-//! than useless because it reads as good news.
+//! Reachability here follows direct calls and jumps, any operand that names
+//! a function's first byte, and the edge from a function that runs off its
+//! end into the one beginning there.
+//!
+//! All three are load-bearing, and each was added because leaving it out
+//! made the number *look better*. Following calls alone stops at `_start`,
+//! because `main` is handed to `__libc_start_main` as a pointer. Leaving out
+//! the fall-out edge hides every piece a split function was cut into after
+//! the first, which is how this reported three reachable refusals for a
+//! program that trapped in a fourth.
 //!
 //! It is still a lower bound. A function reached only through a pointer
 //! computed at run time, or through a table this does not recognise, is
@@ -56,8 +61,13 @@ fn main() {
         // The decoder runs section-relative, which is what makes a branch
         // operand a section offset; adding the section's address turns it
         // back into the address the loader will use.
+        // A piece that can run off its end continues into whatever begins
+        // there. Splitting a function is what makes this edge, and no
+        // instruction stands for it.
+        let mut last = FlowControl::Next;
         let mut decoder = Decoder::with_ip(64, body, function.offset, DecoderOptions::NONE);
         for instruction in &mut decoder {
+            last = instruction.flow_control();
             let branches = matches!(
                 instruction.flow_control(),
                 FlowControl::Call
@@ -88,6 +98,16 @@ fn main() {
                 if let Some(&taken) = at.get(&candidate) {
                     worklist.push(taken);
                 }
+            }
+        }
+
+        if !matches!(
+            last,
+            FlowControl::Return | FlowControl::UnconditionalBranch | FlowControl::IndirectBranch
+        ) {
+            let after = section.address + function.offset + function.size;
+            if let Some(&next) = at.get(&after) {
+                worklist.push(next);
             }
         }
     }

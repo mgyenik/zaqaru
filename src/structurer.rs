@@ -325,6 +325,13 @@ fn emit_dispatcher(
                 emit_conditional_leave(body, translator, lifted, index, graph)?;
                 transfer(body, not_taken, 0)?;
             }
+            // Both edges leave: the branch tail-calls where it names, and
+            // not taking it runs off the end into the function below.
+            Terminator::ConditionalLeaveOrFallOut { into } => {
+                let into = *into;
+                emit_conditional_leave(body, translator, lifted, index, graph)?;
+                emit_falling_out(body, translator, into)?;
+            }
             Terminator::Leaves => emit_leaving(body, translator, lifted, index, graph)?,
             Terminator::FallsOut { into } => emit_falling_out(body, translator, *into)?,
             // The call the block ends with was already emitted as an
@@ -489,6 +496,10 @@ impl StructuredEmitter<'_> {
                 let destination = self.graph.block_at(*not_taken)?;
                 emit_conditional_leave(body, translator, self.lifted, block, self.graph)?;
                 self.emit_branch(body, translator, block, destination)
+            }
+            Terminator::ConditionalLeaveOrFallOut { into } => {
+                emit_conditional_leave(body, translator, self.lifted, block, self.graph)?;
+                emit_falling_out(body, translator, *into)
             }
             Terminator::Leaves => emit_leaving(body, translator, self.lifted, block, self.graph),
             Terminator::FallsOut { into } => emit_falling_out(body, translator, *into),

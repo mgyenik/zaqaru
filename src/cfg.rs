@@ -32,6 +32,18 @@ pub enum Terminator {
     /// the condition holds, which is how compilers reach a cold path split
     /// into a section of its own. Otherwise control continues at `not_taken`.
     ConditionalLeave { not_taken: u64 },
+    /// The same, for a block whose untaken path leaves as well: not taking
+    /// the branch runs off the end of the function into the one beginning
+    /// there.
+    ///
+    /// Splitting a function is what makes this shape. A piece cut in front
+    /// of another piece can end with a conditional branch, and then both
+    /// edges leave — the taken one to wherever it names, the untaken one
+    /// into the piece below. glibc's `memcpy` is the case that found it: a
+    /// size check against the non-temporal threshold is the last
+    /// instruction of one piece, and its fall-through is the first byte of
+    /// the next.
+    ConditionalLeaveOrFallOut { into: u64 },
     /// A `ret`, or a tail jump to another function — including an indirect
     /// one — which the translator turns into a call followed by a return.
     Leaves,
@@ -143,8 +155,10 @@ impl ControlFlowGraph {
                 .copied()
                 .into_iter()
                 .collect(),
-            // Neither continues inside this function.
-            Terminator::Unreachable | Terminator::FallsOut { .. } => Vec::new(),
+            // None of these continues inside this function.
+            Terminator::Unreachable
+            | Terminator::FallsOut { .. }
+            | Terminator::ConditionalLeaveOrFallOut { .. } => Vec::new(),
             Terminator::Branch { target, not_taken } => [target, not_taken]
                 .iter()
                 .filter_map(|offset| self.index_of_start.get(offset).copied())
@@ -220,9 +234,11 @@ impl ControlFlowGraph {
                     graph.block_at(*target)?;
                     graph.block_at(*not_taken)?;
                 }
-                // Neither names a block in this function: one stops, and
-                // the other leaves for the function below.
-                Terminator::Unreachable | Terminator::FallsOut { .. } => {}
+                // None of these names a block in this function: one stops,
+                // and the others leave for the function below.
+                Terminator::Unreachable
+                | Terminator::FallsOut { .. }
+                | Terminator::ConditionalLeaveOrFallOut { .. } => {}
                 Terminator::Switch { targets } => {
                     for target in targets.iter().filter(|target| function.contains(**target)) {
                         graph.block_at(*target)?;
@@ -676,11 +692,17 @@ fn classify_terminator(
         return Terminator::Leaves;
     }
     // A conditional branch that does not stay inside the function is a tail
-    // call made only when the condition holds.
+    // call made only when the condition holds. Where it continues when it is
+    // not taken decides which of the two shapes this is: usually the next
+    // block, but a branch that is the last instruction of a split piece
+    // falls out of the function instead.
     if instruction.flow_control() == FlowControl::ConditionalBranch {
-        return Terminator::ConditionalLeave {
-            not_taken: block_end,
-        };
+        if function.contains(block_end) {
+            return Terminator::ConditionalLeave {
+                not_taken: block_end,
+            };
+        }
+        return Terminator::ConditionalLeaveOrFallOut { into: block_end };
     }
     // An instruction that does not continue ends its block wherever it
     // stands. `hlt` halts the processor and `ud2` raises an exception, and

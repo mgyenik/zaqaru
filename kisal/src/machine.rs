@@ -23,6 +23,17 @@ pub trait Machine {
     fn stack_pointer(&self) -> i64;
     fn set_stack_pointer(&mut self, value: i64);
 
+    /// Puts the floating-point unit back the way `execve` leaves it.
+    ///
+    /// A fresh image gets a fresh FPU: `FNINIT` state, empty registers, the
+    /// default control word. Nothing else resets it, and the state is not in
+    /// the register file — it lives inside the `x87` crate — so the one
+    /// place that starts a new program has to say so.
+    ///
+    /// Fork and snapshot need nothing of the kind: that state is linear
+    /// memory, and a snapshot already carries it.
+    fn reset_floating_point(&mut self);
+
     /// One past the highest byte the guest can address. Every syscall that
     /// takes a pointer is bounded by this before it dereferences anything.
     fn memory_limit(&self) -> u64;
@@ -55,6 +66,10 @@ unsafe extern "C" {
     fn get_stack_pointer() -> i64;
     #[link_name = "x86_set_rsp"]
     fn set_stack_pointer(value: i64);
+    // Defined by the `x87` crate, which is in every container's link for
+    // the same reason kisal is.
+    #[link_name = "x87_reset"]
+    fn reset_floating_point();
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -73,6 +88,10 @@ impl Machine for GuestMachine {
 
     fn set_stack_pointer(&mut self, value: i64) {
         unsafe { set_stack_pointer(value) }
+    }
+
+    fn reset_floating_point(&mut self) {
+        unsafe { reset_floating_point() }
     }
 
     fn memory_limit(&self) -> u64 {
@@ -121,6 +140,10 @@ impl Machine for GuestMachine {
         unreachable!("the guest machine exists only inside the wasm module")
     }
 
+    fn reset_floating_point(&mut self) {
+        unreachable!("the guest machine exists only inside the wasm module")
+    }
+
     fn memory_limit(&self) -> u64 {
         unreachable!("the guest machine exists only inside the wasm module")
     }
@@ -143,6 +166,11 @@ pub struct Registers {
     /// the memory rows sets this to the end of the buffer it owns, so that
     /// every address the kernel hands out is one the test can actually read.
     pub ceiling: u64,
+    /// How many times the floating-point unit has been reset. There is no
+    /// unit here to reset, so the count is the whole of what a native test
+    /// can observe — and it is what makes "`execve` resets the FPU" a
+    /// statement a test can check rather than a comment.
+    pub floating_point_resets: usize,
 }
 
 impl Default for Registers {
@@ -152,6 +180,7 @@ impl Default for Registers {
             stack_pointer: 0,
             memory_limit: u64::MAX,
             ceiling: u64::MAX,
+            floating_point_resets: 0,
         }
     }
 }
@@ -171,6 +200,10 @@ impl Machine for Registers {
 
     fn set_stack_pointer(&mut self, value: i64) {
         self.stack_pointer = value;
+    }
+
+    fn reset_floating_point(&mut self) {
+        self.floating_point_resets += 1;
     }
 
     fn memory_limit(&self) -> u64 {

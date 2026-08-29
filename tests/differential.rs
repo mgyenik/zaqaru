@@ -3159,7 +3159,17 @@ fn functions_entered_at_a_shared_body_match_native() {
         inputs.push((generator.next_i64(), generator.next_i64()));
     }
 
-    for name in ["offset_by_count", "scaled", "hot"] {
+    // `leaves_or_falls_out` is the shape whose *untaken* edge leaves too:
+    // both entries have to be right, because the answers differ only by
+    // which one control reached.
+    for name in [
+        "offset_by_count",
+        "scaled",
+        "hot",
+        "leaves_or_falls_out",
+        "untaken_side",
+        "taken_side",
+    ] {
         let native = unsafe {
             native_function::<unsafe extern "C" fn(i64, i64) -> i64>(&fixture.native, name)
         };

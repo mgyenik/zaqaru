@@ -842,6 +842,11 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
                 })?;
         }
         self.machine.set_stack_pointer(built.stack_pointer as i64);
+        // A new program gets a new floating-point unit. Nothing else resets
+        // it, and its state does not live in the register file the rest of
+        // this function sets up — it is inside the `x87` crate, which is why
+        // this is a call rather than a store.
+        self.machine.reset_floating_point();
 
         // `/proc/self/exe` is a fact about the program that was started, and
         // this is the moment there is one.
