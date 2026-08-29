@@ -45,8 +45,15 @@ impl SectionRole {
 pub enum Layout {
     /// `gcc -c`: sections at address zero, relocations to resolve.
     Relocatable,
-    /// A complete static executable: sections at their virtual addresses,
-    /// nothing left to relocate.
+    /// A complete executable or shared object: sections at their virtual
+    /// addresses, and every internal reference already the number it
+    /// resolves to.
+    ///
+    /// A position-independent one carries those addresses relative to a base
+    /// of zero, and the base is chosen at bake time — see
+    /// [`ObjectFile::parse_at`]. Once it is chosen the two cases are the
+    /// same case, which is the whole reason prelinking is where the design
+    /// puts it.
     Linked,
 }
 
@@ -204,6 +211,30 @@ pub struct Relocation {
 
 pub use crate::discover::Function;
 
+/// One input ELF inside a (possibly merged) object.
+///
+/// A dynamic program is several ELFs — the executable, its interpreter, and
+/// every library between them — and every one of them has to be translated,
+/// with one exec map spanning the lot. [`ObjectFile::merge`] is what makes
+/// that one translation unit; this is what remembers which part of it came
+/// from where, which the bake needs to place each file's bytes and to route
+/// each patch back to the file it belongs to.
+#[derive(Clone, Debug)]
+pub struct Module {
+    /// How the module is named in diagnostics and in symbol names — its path
+    /// in the image, for a bake.
+    pub name: String,
+    /// The address its own addresses were translated at. Zero for a
+    /// fixed-address executable, which states its own.
+    pub base: u64,
+    /// Its ELF entry point, already at `base`.
+    pub entry: u64,
+    /// One past the highest address any of its segments occupies.
+    pub top: u64,
+    /// Which of the merged object's sections this module contributed.
+    pub sections: std::ops::Range<usize>,
+}
+
 pub struct ObjectFile {
     pub layout: Layout,
     /// The entry point's virtual address, for a linked executable.
@@ -216,10 +247,35 @@ pub struct ObjectFile {
     /// directly. Entries the reader does not model are still present.
     pub symbols: Vec<Symbol>,
     pub functions: Vec<Function>,
+    /// The inputs this object was built from, in order. Empty for a
+    /// relocatable object, which is not loaded and has no base; one entry
+    /// for a single linked file; one per file after [`ObjectFile::merge`].
+    pub modules: Vec<Module>,
 }
 
 impl ObjectFile {
+    /// Reads a file that states its own addresses, or has none to state.
     pub fn parse(bytes: &[u8]) -> Result<Self> {
+        Self::parse_at(bytes, 0)
+    }
+
+    /// Reads a linked file as though a loader had placed it at `base`.
+    ///
+    /// This is the whole of "prelink at bake" on the reading side. A
+    /// position-independent file — which nearly everything shipped is —
+    /// carries its addresses relative to zero and expects a loader to add a
+    /// base it chooses at run time. The design chooses it at bake time
+    /// instead, and translates the file *at* that base, so that every
+    /// internal reference is a concrete address exactly as a fixed-address
+    /// executable's is. Nothing downstream then has to know which of the two
+    /// it is looking at: there is no `module_base +` arithmetic anywhere,
+    /// because the arithmetic was done once, here.
+    ///
+    /// The base is added to everything the loader would have added it to —
+    /// allocated sections, segments, the entry point, and the addends of the
+    /// relocations discovery harvests — and to nothing else. `base` must be
+    /// zero for a relocatable object, which is not loaded at all.
+    pub fn parse_at(bytes: &[u8], base: u64) -> Result<Self> {
         let file =
             object::read::File::parse(bytes).context("parsing the input as an object file")?;
 
@@ -234,16 +290,40 @@ impl ObjectFile {
         }
         let layout = match file.kind() {
             object::ObjectKind::Relocatable => Layout::Relocatable,
-            // A complete static executable. `Dynamic` is deliberately not
-            // here: a shared object still has relocations and a `PT_INTERP`
-            // consumer, and translating one without a loader would produce a
-            // module whose imports nothing resolves.
-            object::ObjectKind::Executable => Layout::Linked,
+            // Both shapes of "already linked". A fixed-address executable
+            // states its own addresses and is read at a base of zero; a
+            // shared object or position-independent executable states them
+            // relative to zero and is read at the base the bake assigned it.
+            // The difference ends here.
+            object::ObjectKind::Executable | object::ObjectKind::Dynamic => Layout::Linked,
             other => bail!(
-                "expected a relocatable object (`gcc -c`) or a static \
-                 executable, found {other:?}"
+                "expected a relocatable object (`gcc -c`) or a linked \
+                 executable or shared object, found {other:?}"
             ),
         };
+        if base != 0 && layout != Layout::Linked {
+            bail!("a relocatable object has nothing to place, so it has no base");
+        }
+        // A position-independent file read at zero is not merely unplaced;
+        // its evidence is *worse*, and silently so. Its text begins a few
+        // kilobytes up, which is exactly where ordinary integer constants
+        // live, so every `mov $0x1770,%eax` in the program reads as an
+        // instruction taking the address of code. Measured on this
+        // machine's `ld-linux-x86-64.so.2`: eleven address-taken functions
+        // at base zero against three at a real base, and the eight extra
+        // ones shredded a region no strong witness covered into pieces that
+        // begin partway through real instructions.
+        //
+        // The design's answer is the base itself — "prelink at bake" exists
+        // partly for this — so reading one at zero is refused rather than
+        // answered with a function list that looks plausible and is not.
+        if base == 0 && file.kind() == object::ObjectKind::Dynamic {
+            bail!(
+                "a position-independent file has to be read at the base a bake \
+                 assigns it: at zero its text sits where ordinary integer \
+                 constants sit, and discovery cannot tell one from the other"
+            );
+        }
 
         // ELF section indices are one-based and sparse from our point of
         // view; map them onto our dense vector.
@@ -260,7 +340,14 @@ impl ObjectFile {
             sections.push(Section {
                 name,
                 role,
-                address: section.address(),
+                // Only what the loader places moves. A section with no
+                // `SHF_ALLOC` — a symbol table, debug information — has no
+                // address at all, and giving it one would make every address
+                // fall inside the first of them.
+                address: match allocated(&section) {
+                    true => section.address() + base,
+                    false => section.address(),
+                },
                 bytes,
                 size: section.size(),
                 alignment: section.align().max(1),
@@ -268,7 +355,7 @@ impl ObjectFile {
             });
         }
 
-        let mut symbols = read_symbols(&file, &section_of_elf_index)?;
+        let mut symbols = read_symbols(&file, &section_of_elf_index, layout)?;
         // Only a relocatable object has relocations this pipeline reads. A
         // linked executable's are *dynamic* — `IRELATIVE` for its ifuncs,
         // and whatever else a loader applies — and they say nothing about
@@ -291,33 +378,127 @@ impl ObjectFile {
             // one place rather than at every use.
             for symbol in &mut symbols {
                 if let Some(section) = symbol.section {
-                    symbol.offset = symbol.offset.saturating_sub(sections[section].address);
+                    symbol.offset = (symbol.offset + base).saturating_sub(sections[section].address);
                 }
             }
         }
+        let entry = match layout {
+            Layout::Linked => file.entry() + base,
+            Layout::Relocatable => 0,
+        };
         let evidence = crate::discover::FileEvidence {
-            entry: if layout == Layout::Linked {
-                file.entry()
-            } else {
-                0
-            },
-            relocated: harvest_relocation_targets(&file),
+            entry,
+            relocated: harvest_relocation_targets(&file, base),
         };
         let functions = crate::discover::discover(&symbols, &sections, layout, &evidence)?;
-        let segments = read_segments(&file);
+        let segments = read_segments(&file, base);
+
+        let modules = match layout {
+            Layout::Linked => vec![Module {
+                name: String::new(),
+                base,
+                entry,
+                top: segments
+                    .iter()
+                    .map(|segment| segment.address + segment.memory_size)
+                    .max()
+                    .unwrap_or(0),
+                sections: 0..sections.len(),
+            }],
+            Layout::Relocatable => Vec::new(),
+        };
 
         Ok(Self {
             layout,
-            entry: if layout == Layout::Linked {
-                file.entry()
-            } else {
-                0
-            },
+            entry,
             segments,
             sections,
             symbols,
             functions,
+            modules,
         })
+    }
+
+    /// One translation unit out of several linked files.
+    ///
+    /// A dynamic program is not one ELF. It is the executable, its
+    /// interpreter, and every library between them, and every one of them
+    /// has to be translated. They could be translated separately — but the
+    /// exec map could not be built separately, and the exec map is the
+    /// whole mechanism: in a linked file a function pointer is a virtual
+    /// address, so *every* indirect transfer, including every cross-module
+    /// call through a `GOT` slot the loader wrote, is a lookup in it. One
+    /// map means one sorted table, which means one object defining it.
+    ///
+    /// The merge is possible at all because prelinking already made the
+    /// addresses disjoint and concrete. Sections keep their own addresses,
+    /// so `section_at` still answers; functions keep their own extents;
+    /// nothing has to be renumbered but the indices this struct uses
+    /// internally.
+    ///
+    /// Names are qualified by module. Two libraries define `memcpy`, and
+    /// each defined function becomes a wasm symbol — so unqualified names
+    /// would collide at the link, loudly for the global ones and, worse,
+    /// silently in every diagnostic that says which function stopped.
+    pub fn merge(inputs: Vec<(String, ObjectFile)>) -> Result<Self> {
+        if inputs.is_empty() {
+            bail!("a merge needs at least one file");
+        }
+        let mut sections: Vec<Section> = Vec::new();
+        let mut symbols: Vec<Symbol> = Vec::new();
+        let mut functions: Vec<Function> = Vec::new();
+        let mut segments: Vec<Segment> = Vec::new();
+        let mut modules: Vec<Module> = Vec::new();
+        let mut entry = 0;
+
+        for (name, input) in inputs {
+            if input.layout != Layout::Linked {
+                bail!("`{name}` is not a linked file, so it cannot be placed beside one");
+            }
+            let [module] = &input.modules[..] else {
+                bail!("`{name}` is itself a merge, and merges do not nest");
+            };
+            if entry == 0 {
+                entry = input.entry;
+            }
+            let first_section = sections.len();
+            let first_symbol = symbols.len();
+            for mut function in input.functions {
+                if !name.is_empty() {
+                    function.name = format!("{name}!{}", function.name);
+                }
+                function.section += first_section;
+                function.symbol = function.symbol.map(|index| index + first_symbol);
+                functions.push(function);
+            }
+            modules.push(Module {
+                name,
+                base: module.base,
+                entry: module.entry,
+                top: module.top,
+                sections: first_section..first_section + input.sections.len(),
+            });
+            sections.extend(input.sections);
+            symbols.extend(input.symbols);
+            segments.extend(input.segments);
+        }
+
+        Ok(Self {
+            layout: Layout::Linked,
+            entry,
+            segments,
+            sections,
+            symbols,
+            functions,
+            modules,
+        })
+    }
+
+    /// Which module holds a virtual address.
+    pub fn module_at(&self, address: u64) -> Option<&Module> {
+        self.modules
+            .iter()
+            .find(|module| address >= module.base && address < module.top)
     }
 
     /// Which section holds a virtual address, and where in it.
@@ -402,15 +583,27 @@ fn classify_section(section: &object::read::Section<'_, '_>, name: &str) -> Sect
     }
 }
 
+/// Whether the loader places this section, which is what decides whether a
+/// base applies to its address.
+fn allocated(section: &object::read::Section<'_, '_>) -> bool {
+    match section.flags() {
+        object::SectionFlags::Elf { sh_flags, .. } => {
+            sh_flags.0 & u64::from(object::elf::SHF_ALLOC.0) != 0
+        }
+        _ => false,
+    }
+}
+
 fn read_symbols(
     file: &object::read::File<'_>,
     section_of_elf_index: &std::collections::HashMap<SectionIndex, usize>,
+    layout: Layout,
 ) -> Result<Vec<Symbol>> {
     // Relocations name symbols by their raw ELF symbol-table index, so the
     // vector must be indexed the same way — including the reserved null
     // symbol at index 0, which the `object` crate's iterator omits.
     let mut symbols: Vec<Symbol> = Vec::new();
-    let mut place = |index: usize, symbol: Symbol| {
+    fn place(symbols: &mut Vec<Symbol>, index: usize, symbol: Symbol) {
         if symbols.len() <= index {
             symbols.resize_with(index + 1, || Symbol {
                 name: String::new(),
@@ -424,9 +617,9 @@ fn read_symbols(
             });
         }
         symbols[index] = symbol;
-    };
+    }
 
-    for symbol in file.symbols() {
+    let convert = |symbol: &object::read::Symbol<'_, '_>| -> Symbol {
         let role = match symbol.kind() {
             object::SymbolKind::Text => SymbolRole::Function,
             object::SymbolKind::Data => SymbolRole::Data,
@@ -453,20 +646,42 @@ fn read_symbols(
                 .and_then(|section| section.name().ok().map(str::to_string))
                 .unwrap_or_default(),
         };
-        place(
-            symbol.index().0,
-            Symbol {
-                name,
-                role,
-                binding,
-                hidden: matches!(symbol.scope(), object::SymbolScope::Compilation)
-                    && !symbol.is_local(),
-                section,
-                offset: symbol.address(),
-                size: symbol.size(),
-                defined: symbol.is_definition() || matches!(role, SymbolRole::Section),
-            },
-        );
+        Symbol {
+            name,
+            role,
+            binding,
+            hidden: matches!(symbol.scope(), object::SymbolScope::Compilation)
+                && !symbol.is_local(),
+            section,
+            offset: symbol.address(),
+            size: symbol.size(),
+            defined: symbol.is_definition() || matches!(role, SymbolRole::Section),
+        }
+    };
+
+    for symbol in file.symbols() {
+        place(&mut symbols, symbol.index().0, convert(&symbol));
+    }
+
+    // `.dynsym` as well, for a linked file. The strong-witness argument is
+    // the same as `.symtab`'s — an `STT_FUNC` entry with a value and a size
+    // is the format saying a function starts there — and it is the *only*
+    // symbol table a stripped shared object has, because linking against one
+    // requires it. Nearly everything shipped is stripped and dynamic, so
+    // this is not a corner: it is where the symbols are.
+    //
+    // Appended past the static table rather than merged into it, because a
+    // dynamic symbol's index belongs to a different table and only
+    // `.symtab` indices are ever named by a relocation this reader reads —
+    // and it reads none at all for a linked file. Duplicate starts are the
+    // expected case, not an error: `discover` records the widest extent and
+    // moves on, exactly as it does for the alias pairs `.symtab` already
+    // carries.
+    if layout == Layout::Linked {
+        let first = symbols.len().max(1);
+        for symbol in file.dynamic_symbols() {
+            place(&mut symbols, first + symbol.index().0, convert(&symbol));
+        }
     }
     Ok(symbols)
 }
@@ -495,7 +710,7 @@ fn read_symbols(
 /// worklog records: refusing a relocation type the pipeline does not model
 /// made a stripped busybox unopenable, because the read is harvesting
 /// evidence rather than interpreting the file.
-fn harvest_relocation_targets(file: &object::read::File<'_>) -> Vec<u64> {
+fn harvest_relocation_targets(file: &object::read::File<'_>, base: u64) -> Vec<u64> {
     let mut targets = Vec::new();
     for section in file.sections() {
         for (_, relocation) in section.relocations() {
@@ -511,7 +726,10 @@ fn harvest_relocation_targets(file: &object::read::File<'_>) -> Vec<u64> {
             // The addend is the address for both: what the resolver is, or
             // what the pointer points at. A negative one is not an address.
             if let Ok(address) = u64::try_from(relocation.addend()) {
-                targets.push(address);
+                // Relative to the load base, in a file that has one: what a
+                // loader would write is `base + addend`, and that is the
+                // address the code will be at.
+                targets.push(address + base);
             }
         }
     }
@@ -562,7 +780,7 @@ fn read_relocations(
 }
 
 /// The `PT_LOAD` segments, in the order the program headers give them.
-fn read_segments(file: &object::read::File<'_>) -> Vec<Segment> {
+fn read_segments(file: &object::read::File<'_>, base: u64) -> Vec<Segment> {
     use object::read::ObjectSegment;
     file.segments()
         .map(|segment| {
@@ -572,7 +790,7 @@ fn read_segments(file: &object::read::File<'_>) -> Vec<Segment> {
             };
             let bytes = segment.data().unwrap_or(&[]).to_vec();
             Segment {
-                address: segment.address(),
+                address: segment.address() + base,
                 // `segment.size()` is the *memory* size; what is in the file
                 // is what `data` hands back, and the difference is `.bss` —
                 // which the loader zeroes rather than copies.

@@ -24,16 +24,47 @@
 //! or not it is ever called. That is the honest shape of the number and the
 //! reason the worklog quotes both columns rather than picking one.
 //!
-//! Usage: `cargo run --example refusals -- <linked-elf>`
+//! Usage: `cargo run --example refusals -- <elf>[@<hex base>] ...`
+//!
+//! Several files may be given, which is what a dynamic program is: the
+//! executable, its interpreter and its libraries, translated as one unit
+//! because they share one exec map. Reachability then starts at the *first*
+//! file's entry point, so name the one the kernel enters first.
 
 use std::collections::{HashMap, HashSet};
 
 use iced_x86::{Decoder, DecoderOptions, FlowControl, OpKind};
 
 fn main() {
-    let path = std::env::args().nth(1).expect("usage: refusals <elf>");
-    let bytes = std::fs::read(&path).expect("read the program");
-    let object = zaqaru::reader::ObjectFile::parse(&bytes).expect("parse");
+    let arguments: Vec<String> = std::env::args().skip(1).collect();
+    assert!(
+        !arguments.is_empty(),
+        "usage: refusals <elf>[@<hex base>] ..."
+    );
+    let mut inputs = Vec::new();
+    for argument in &arguments {
+        let (path, base) = match argument.split_once('@') {
+            Some((path, base)) => (
+                path,
+                u64::from_str_radix(base.trim_start_matches("0x"), 16)
+                    .expect("the base is hexadecimal"),
+            ),
+            None => (argument.as_str(), 0),
+        };
+        let bytes = std::fs::read(path).expect("read the program");
+        let name = std::path::Path::new(path)
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        inputs.push((
+            name,
+            zaqaru::reader::ObjectFile::parse_at(&bytes, base).expect("parse"),
+        ));
+    }
+    let object = match inputs.len() {
+        1 => inputs.pop().expect("just checked").1,
+        _ => zaqaru::reader::ObjectFile::merge(inputs).expect("merge"),
+    };
 
     let translation = zaqaru::transpile::Transpiler::new(&object)
         .with_untranslatable(zaqaru::transpile::Untranslatable::Trap)

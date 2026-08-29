@@ -125,6 +125,9 @@ pub enum Refused {
     AlreadyCovered,
     /// The address is not inside a section holding code.
     NotCode,
+    /// The bytes there are what a linker puts *between* functions, and
+    /// padding is never a function whatever named it.
+    Padding,
     /// The bound the next known start gives leaves no bytes.
     Empty,
 }
@@ -158,13 +161,16 @@ impl Coverage {
     /// The permission to *cut* an established function is what makes this
     /// door different from [`Self::fill`], and no witness exercises it
     /// today: the strong witnesses all state extents directly.
-    pub fn establish(&mut self, function: Function) -> bool {
+    pub fn establish(&mut self, sections: &[Section], function: Function) -> bool {
         debug_assert!(
             function.witness.is_strong(),
             "`{}` reached the strong door with the weak witness {:?}",
             function.name,
             function.witness
         );
+        if starts_on_padding(sections, &function) {
+            return false;
+        }
         self.insert(function)
     }
 
@@ -173,12 +179,15 @@ impl Coverage {
     /// Refused where anything already covers the address. That refusal is
     /// the invariant, and it is the type's job rather than the caller's
     /// because a convention is a bug each caller is invited to write.
-    pub fn fill(&mut self, function: Function) -> Result<(), Refused> {
+    pub fn fill(&mut self, sections: &[Section], function: Function) -> Result<(), Refused> {
         if self.covers(function.section, function.offset) {
             return Err(Refused::AlreadyCovered);
         }
         if function.size == 0 {
             return Err(Refused::Empty);
+        }
+        if starts_on_padding(sections, &function) {
+            return Err(Refused::Padding);
         }
         self.insert(function);
         Ok(())
@@ -319,12 +328,12 @@ pub fn discover(
             stated.insert(evidence.entry);
         }
         for function in placements(&coverage, sections, &stated, Witness::FileStated) {
-            coverage.establish(function);
+            coverage.establish(sections, function);
         }
 
         let arrays = initialiser_array_targets(sections);
         for function in placements(&coverage, sections, &arrays, Witness::InitialiserArray) {
-            coverage.establish(function);
+            coverage.establish(sections, function);
         }
         fill_from_transfers(&mut coverage, sections)?;
     }
@@ -418,7 +427,7 @@ fn collect_functions(
     }
     functions.sort_by_key(|function| (function.section, function.offset));
     for function in functions {
-        coverage.establish(function);
+        coverage.establish(sections, function);
     }
 
     // Whatever the symbols did not account for. A static function the
@@ -456,7 +465,7 @@ fn collect_functions(
         });
     }
     for function in discovered {
-        coverage.establish(function);
+        coverage.establish(sections, function);
     }
 
     // And the procedure linkage table, whose entries are functions that no
@@ -490,7 +499,7 @@ fn collect_functions(
                 );
             }
             for offset in (0..length).step_by(stride as usize) {
-                coverage.establish(Function {
+                coverage.establish(sections, Function {
                     name: format!("plt.{:#x}", section.address + offset),
                     symbol: None,
                     section: index,
@@ -632,28 +641,59 @@ fn addressed_placements(
     placements(coverage, sections, addressed, Witness::AddressTaken)
         .into_iter()
         .filter(|function| !claimed.contains(&(function.section, function.offset)))
-        .filter(|function| {
-            let section = &sections[function.section];
-            let start = function.offset as usize;
-            let end = (start + 16).min(section.bytes.len());
-            !is_padding(&section.bytes[start..end])
-        })
         .collect()
+}
+
+/// Whether a candidate function begins on bytes that are filler.
+///
+/// Applied at *both* doors, which is a deliberate departure from the first
+/// version of `docs/code-discovery.md`: it wrote the padding rule as a
+/// constraint on the weak witnesses alone, on the argument that a branch
+/// target never lands on padding. Real binaries say otherwise, and the two
+/// cases that say it are both in glibc:
+///
+/// - An address-taken operand landing on a ten-byte `cs nopw` — an integer
+///   that happens to equal a text address, which is the case the rule was
+///   written for.
+/// - **An `.eh_frame` FDE that deliberately starts one byte early.** The
+///   signal-return trampoline `__restore_rt` is covered by an FDE beginning
+///   at `restorer - 1`, so that unwinding a signal frame — whose return
+///   address *is* the trampoline's first byte — finds an entry covering
+///   `pc - 1`. It is not a mistake in the binary; it is the unwinder's
+///   convention, and it makes a strong witness name an address that is not
+///   an instruction boundary at all.
+///
+/// Accepting the second would translate the tail of a `nop` as though it
+/// were code — the silent failure this whole design is built to avoid —
+/// where rejecting it costs at most a loud miss on an address nothing in a
+/// kisal container ever transfers to. Loud beats silent, so the filter
+/// applies to every witness.
+fn starts_on_padding(sections: &[Section], function: &Function) -> bool {
+    is_padding_at(sections, function.section, function.offset)
+}
+
+/// The same question about an address that is not yet a function.
+fn is_padding_at(sections: &[Section], section: usize, offset: u64) -> bool {
+    let Some(section) = sections.get(section) else {
+        return false;
+    };
+    let start = offset as usize;
+    if start >= section.bytes.len() {
+        return false;
+    }
+    let end = (start + 16).min(section.bytes.len());
+    is_padding(&section.bytes[start..end])
 }
 
 /// Whether bytes are what a linker puts *between* functions.
 ///
-/// A negative witness, and the reason the weak witnesses can afford to be
-/// as free as they are. Branch targets never land on padding, so this
-/// constrains only the evidence that needs constraining: an immediate
-/// operand is a number, and `0x401000` landing on inter-function filler is
-/// an integer rather than a function.
-///
 /// The shapes are the ones a linker and an assembler emit: zero fill, the
 /// `int3` a linker uses to make a fall-through fault, and the single- and
-/// multi-byte `nop`s an assembler pads with. `0x66` prefixes lead the wide
-/// forms and are counted rather than recursed through, so that a real
-/// instruction beginning with one is not mistaken for filler.
+/// multi-byte `nop`s an assembler pads with. The prefixes that lead the wide
+/// forms — the operand-size `0x66` and the `cs` override `0x2e`, which GNU
+/// as emits together in the ten- and eleven-byte forms — are counted rather
+/// than recursed through, so that a real instruction beginning with one is
+/// not mistaken for filler.
 fn is_padding(bytes: &[u8]) -> bool {
     let Some(first) = bytes.first() else {
         return true;
@@ -661,7 +701,10 @@ fn is_padding(bytes: &[u8]) -> bool {
     if matches!(first, 0x00 | 0xcc | 0x90) {
         return true;
     }
-    let prefixes = bytes.iter().take_while(|byte| **byte == 0x66).count();
+    let prefixes = bytes
+        .iter()
+        .take_while(|byte| matches!(**byte, 0x66 | 0x2e))
+        .count();
     matches!(
         bytes.get(prefixes..),
         Some([0x0f, 0x1f, ..]) | Some([0x90, ..])
@@ -786,6 +829,16 @@ fn placements(
         if coverage.covers(section, offset) {
             continue;
         }
+        // Dropped here rather than at the door, because a candidate that is
+        // filler must not *bound* anything either. A padding candidate
+        // discarded after the extents were computed still leaves the
+        // function before it ending in the middle of a `nop` — an extent
+        // that cuts an instruction in half, which the lifter then refuses to
+        // decode. The one-line version: filler is not a candidate, so it
+        // never enters the batch the bounds are computed over.
+        if is_padding_at(sections, section, offset) {
+            continue;
+        }
         candidates
             .entry(section)
             .or_default()
@@ -843,6 +896,15 @@ fn fill_from_transfers(coverage: &mut Coverage, sections: &[Section]) -> Result<
     const ROUNDS: usize = 16;
     let mut targets = std::collections::BTreeSet::new();
     let mut addressed = std::collections::BTreeSet::new();
+    // Candidates a door refused for a reason that will not change. The
+    // loop's termination test is "nothing new was placed", so a candidate
+    // that is offered and refused every round never terminates — and
+    // whether that can happen depends on `placements` and `fill` agreeing
+    // about what is acceptable. This makes termination independent of that
+    // agreement, which is worth three lines: the failure it prevents is a
+    // hang, and the coupling it removes is the kind that breaks silently
+    // when a door learns a new refusal.
+    let mut declined: std::collections::BTreeSet<(usize, u64)> = std::collections::BTreeSet::new();
     let mut examined = 0;
     for round in 0..=ROUNDS {
         let known = coverage.functions().len();
@@ -865,6 +927,7 @@ fn fill_from_transfers(coverage: &mut Coverage, sections: &[Section]) -> Result<
         placed.extend(addressed_placements(
             coverage, sections, &addressed, &placed,
         ));
+        placed.retain(|function| !declined.contains(&(function.section, function.offset)));
         if placed.is_empty() {
             return Ok(());
         }
@@ -875,10 +938,18 @@ fn fill_from_transfers(coverage: &mut Coverage, sections: &[Section]) -> Result<
             );
         }
         for function in placed {
+            let where_it_was = (function.section, function.offset);
             // Refusals are the invariant doing its job, not an error: a
             // candidate that a later batch covered is one the strong
-            // witnesses already accounted for.
-            let _ = coverage.fill(function);
+            // witnesses already accounted for. `AlreadyCovered` needs no
+            // note, because coverage itself now answers for it; the others
+            // are permanent and are remembered so they are not re-offered.
+            match coverage.fill(sections, function) {
+                Ok(()) | Err(Refused::AlreadyCovered) => {}
+                Err(Refused::NotCode | Refused::Empty | Refused::Padding) => {
+                    declined.insert(where_it_was);
+                }
+            }
         }
     }
     Ok(())
@@ -1105,13 +1176,19 @@ fn unwind_extents(sections: &[Section]) -> Result<std::collections::BTreeMap<u64
 mod tests {
     use super::*;
 
+    /// A text section filled with `ret`.
+    ///
+    /// Not `nop`, which is what this used to be: `nop` *is* padding, and
+    /// padding is now refused at both doors, so a section of it is a
+    /// section in which no candidate can be placed. A fixture whose bytes
+    /// are filler cannot test where functions go.
     fn text(bytes: usize) -> Section {
         Section {
             name: ".text".to_string(),
             role: SectionRole::Text,
             address: 0x400000,
             size: bytes as u64,
-            bytes: vec![0x90; bytes],
+            bytes: vec![0xc3; bytes],
             alignment: 16,
             relocations: Vec::new(),
         }
@@ -1137,24 +1214,66 @@ mod tests {
     /// lives in the API where a caller cannot forget it.
     #[test]
     fn fill_is_refused_where_strong_evidence_has_spoken() {
+        let sections = [text(0x400)];
         let mut coverage = Coverage::default();
-        coverage.establish(function(0x100, 0x40, Witness::Symbol));
+        coverage.establish(&sections, function(0x100, 0x40, Witness::Symbol));
 
         // The start itself, and a byte in the middle: both are covered.
         assert_eq!(
-            coverage.fill(function(0x100, 0x10, Witness::Transfer)),
+            coverage.fill(&sections, function(0x100, 0x10, Witness::Transfer)),
             Err(Refused::AlreadyCovered)
         );
         assert_eq!(
-            coverage.fill(function(0x120, 0x10, Witness::Transfer)),
+            coverage.fill(&sections, function(0x120, 0x10, Witness::Transfer)),
             Err(Refused::AlreadyCovered)
         );
         // One byte past the end is not.
         assert_eq!(
-            coverage.fill(function(0x140, 0x10, Witness::Transfer)),
+            coverage.fill(&sections, function(0x140, 0x10, Witness::Transfer)),
             Ok(())
         );
         assert_eq!(coverage.functions().len(), 2);
+    }
+
+    /// Filler is refused at both doors, not only the weak one.
+    ///
+    /// The case that forced it is glibc's signal-return trampoline, whose
+    /// `.eh_frame` entry deliberately begins one byte before the function
+    /// so that unwinding a signal frame finds it. A strong witness naming
+    /// something that is not an instruction boundary is not hypothetical.
+    #[test]
+    fn padding_is_not_a_function_whatever_named_it() {
+        let mut sections = [text(0x400)];
+        // A ten-byte `cs nopw`, which is what an assembler pads with and
+        // what an earlier version of the filter did not recognise.
+        sections[0].bytes[0x100..0x10a]
+            .copy_from_slice(&[0x66, 0x2e, 0x0f, 0x1f, 0x84, 0, 0, 0, 0, 0]);
+        let mut coverage = Coverage::default();
+        assert!(!coverage.establish(&sections, function(0x100, 0x10, Witness::UnwindEntry)));
+        assert_eq!(
+            coverage.fill(&sections, function(0x100, 0x10, Witness::Transfer)),
+            Err(Refused::Padding)
+        );
+        assert!(coverage.functions().is_empty());
+    }
+
+    /// And filler may not *bound* anything either, which is the same rule
+    /// one step earlier: a padding candidate discarded after the extents
+    /// were computed still leaves the function before it ending in the
+    /// middle of a `nop`.
+    #[test]
+    fn a_padding_candidate_never_bounds_its_neighbour() {
+        let mut sections = [text(0x400)];
+        sections[0].bytes[0x180..0x18a]
+            .copy_from_slice(&[0x66, 0x2e, 0x0f, 0x1f, 0x84, 0, 0, 0, 0, 0]);
+        let coverage = Coverage::default();
+        let targets = std::collections::BTreeSet::from([0x400100, 0x400180]);
+        let placed = placements(&coverage, &sections, &targets, Witness::Transfer);
+        assert_eq!(placed.len(), 1, "the filler was placed as a function");
+        assert_eq!(
+            placed[0].size, 0x300,
+            "the filler bounded the function before it"
+        );
     }
 
     /// A weak witness may not bound a strong one either, which is the same
@@ -1164,7 +1283,7 @@ mod tests {
     fn a_filled_function_stops_where_the_next_known_start_begins() {
         let sections = [text(0x400)];
         let mut coverage = Coverage::default();
-        coverage.establish(function(0x200, 0x40, Witness::InitialiserArray));
+        coverage.establish(&sections, function(0x200, 0x40, Witness::InitialiserArray));
 
         let targets = std::collections::BTreeSet::from([0x400100]);
         let placed = placements(&coverage, &sections, &targets, Witness::Transfer);
@@ -1194,8 +1313,8 @@ mod tests {
     fn residue_is_every_range_no_function_covers() {
         let sections = [text(0x400)];
         let mut coverage = Coverage::default();
-        coverage.establish(function(0x100, 0x40, Witness::Symbol));
-        coverage.establish(function(0x200, 0x100, Witness::Symbol));
+        coverage.establish(&sections, function(0x100, 0x40, Witness::Symbol));
+        coverage.establish(&sections, function(0x200, 0x100, Witness::Symbol));
         assert_eq!(
             coverage.residue(&sections),
             vec![(0, 0..0x100), (0, 0x140..0x200), (0, 0x300..0x400)]
@@ -1207,8 +1326,9 @@ mod tests {
     /// byte may be uncovered.
     #[test]
     fn overlaps_sees_a_range_the_start_alone_would_miss() {
+        let sections = [text(0x400)];
         let mut coverage = Coverage::default();
-        coverage.establish(function(0x100, 0x40, Witness::Symbol));
+        coverage.establish(&sections, function(0x100, 0x40, Witness::Symbol));
         assert!(!coverage.covers(0, 0xc0));
         assert!(coverage.overlaps(0, 0xc0..0x110));
         assert!(!coverage.overlaps(0, 0xc0..0x100));
