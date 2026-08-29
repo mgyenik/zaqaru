@@ -275,6 +275,21 @@ impl FunctionBodyBuilder {
         );
     }
 
+    /// `return_call`: the caller's frame is replaced by the callee's.
+    ///
+    /// What a guest tail jump is, exactly. Modelling one as an ordinary call
+    /// leaves a frame the machine does not have, and the frame has to be
+    /// paid for somewhere — with a return-address slot the callee's `%rsp`
+    /// then points eight bytes below. This has no frame to pay for.
+    pub fn return_call(&mut self, function: FunctionReference) {
+        self.opcode(0x12);
+        self.relocatable_unsigned_immediate(
+            RelocationKind::FunctionIndexLeb,
+            function.symbol_index,
+            function.function_index,
+        );
+    }
+
     /// `call_indirect` through table 0, taking the slot number from the stack.
     ///
     /// The type immediate carries a relocation of its own: the linker merges
@@ -286,6 +301,19 @@ impl FunctionBodyBuilder {
         // A type index is not a symbol, so the relocation names the type
         // directly; the linking format spells that with symbol index = type
         // index.
+        self.relocations.push(Relocation {
+            kind: RelocationKind::TypeIndexLeb,
+            offset: self.code.len() as u32,
+            symbol_index: type_index,
+            addend: 0,
+        });
+        write_relocatable_unsigned_leb128(&mut self.code, type_index);
+        self.code.push(0x00); // table 0
+    }
+
+    /// `return_call_indirect`: the same replacement, through the table.
+    pub fn return_call_indirect(&mut self, type_index: u32) {
+        self.opcode(0x13);
         self.relocations.push(Relocation {
             kind: RelocationKind::TypeIndexLeb,
             offset: self.code.len() as u32,
@@ -563,6 +591,8 @@ impl FunctionBodyBuilder {
         i64x2_equal = 214, i64x2_greater_signed = 217,
         i8x16_shift_left = 107, i8x16_shift_right_signed = 108,
         i8x16_shift_right_unsigned = 109,
+        i8x16_narrow_i16x8_signed = 101, i8x16_narrow_i16x8_unsigned = 102,
+        i16x8_narrow_i32x4_signed = 133, i16x8_narrow_i32x4_unsigned = 134,
         i8x16_add = 110, i8x16_sub = 113,
         i8x16_add_saturating_signed = 111, i8x16_add_saturating_unsigned = 112,
         i8x16_sub_saturating_signed = 114, i8x16_sub_saturating_unsigned = 115,

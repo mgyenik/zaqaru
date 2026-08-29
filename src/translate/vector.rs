@@ -37,8 +37,8 @@ use FloatWidth::{Double, Single};
 use PackedOperation::{
     Add, AddSaturatingSigned, AddSaturatingUnsigned, ConvertFromSignedLanes, Equal, FloatAdd,
     FloatDivide, FloatMultiply, FloatSquareRoot, FloatSubtract, GreaterSigned, MaximumSigned,
-    MaximumUnsigned, MinimumSigned, MinimumUnsigned, Multiply, Subtract, SubtractSaturatingSigned,
-    SubtractSaturatingUnsigned,
+    MaximumUnsigned, MinimumSigned, MinimumUnsigned, Multiply, Narrow, Subtract,
+    SubtractSaturatingSigned, SubtractSaturatingUnsigned,
 };
 
 /// Whether the vector translation recognised an instruction, so that one that
@@ -316,6 +316,25 @@ impl FunctionTranslator<'_> {
             }
             Mnemonic::Psubusw => {
                 self.packed_binary(body, lifted, SubtractSaturatingUnsigned(LaneWidth::Word))?
+            }
+            // Halving the lane width. The operand order is the lane order:
+            // x86 puts the destination's lanes low and the source's high,
+            // and so does wasm, so the two agree without a shuffle.
+            //
+            // `packuswb` is what a `perror` costs. glibc's `strerror`
+            // machinery reaches it, so without this every error path in
+            // every program stops — which is how it was found.
+            Mnemonic::Packsswb => {
+                self.packed_binary(body, lifted, Narrow(LaneWidth::Byte, true))?
+            }
+            Mnemonic::Packuswb => {
+                self.packed_binary(body, lifted, Narrow(LaneWidth::Byte, false))?
+            }
+            Mnemonic::Packssdw => {
+                self.packed_binary(body, lifted, Narrow(LaneWidth::Word, true))?
+            }
+            Mnemonic::Packusdw => {
+                self.packed_binary(body, lifted, Narrow(LaneWidth::Word, false))?
             }
             Mnemonic::Pmullw => self.packed_binary(body, lifted, Multiply(LaneWidth::Word))?,
             Mnemonic::Pmulld => {
@@ -1601,6 +1620,14 @@ enum PackedOperation {
     GreaterSigned(LaneWidth),
     /// Lane-wise minimum and maximum, which x86 has only at byte and word
     /// grain and only in the signedness each mnemonic names.
+    /// Halving the lane width, saturating: the destination's lanes become
+    /// the low half of the result and the source's the high half.
+    ///
+    /// The signedness named is the *result's*. Every one of these reads its
+    /// input as signed — there is no unsigned-to-unsigned pack — so
+    /// `Narrow(LaneWidth::Byte, false)` is `packuswb`, which clamps a signed
+    /// word into an unsigned byte and turns anything negative into zero.
+    Narrow(LaneWidth, bool),
     /// Saturating add and subtract, which clamp at the lane's bound instead
     /// of wrapping. x86 has them at byte and word grain in both
     /// signednesses and nowhere else, and wasm has exactly the same eight.
@@ -1722,6 +1749,10 @@ fn emit_packed(
         PackedOperation::SubtractSaturatingUnsigned(LaneWidth::Word) => {
             body.i16x8_sub_saturating_unsigned()
         }
+        PackedOperation::Narrow(LaneWidth::Byte, true) => body.i8x16_narrow_i16x8_signed(),
+        PackedOperation::Narrow(LaneWidth::Byte, false) => body.i8x16_narrow_i16x8_unsigned(),
+        PackedOperation::Narrow(LaneWidth::Word, true) => body.i16x8_narrow_i32x4_signed(),
+        PackedOperation::Narrow(LaneWidth::Word, false) => body.i16x8_narrow_i32x4_unsigned(),
         PackedOperation::Equal(LaneWidth::Byte) => body.i8x16_equal(),
         PackedOperation::Equal(LaneWidth::Word) => body.i16x8_equal(),
         PackedOperation::Equal(LaneWidth::DoubleWord) => body.i32x4_equal(),
@@ -1761,7 +1792,8 @@ fn emit_packed(
         | PackedOperation::AddSaturatingSigned(lanes)
         | PackedOperation::AddSaturatingUnsigned(lanes)
         | PackedOperation::SubtractSaturatingSigned(lanes)
-        | PackedOperation::SubtractSaturatingUnsigned(lanes) => bail!(
+        | PackedOperation::SubtractSaturatingUnsigned(lanes)
+        | PackedOperation::Narrow(lanes, _) => bail!(
             "`{}` asks for a lane-wise extremum or saturating step at {} \
              bits, which x86 has no instruction for",
             crate::translate::render(instruction),

@@ -1991,6 +1991,11 @@ fn packed_lanes_match_native() {
         "lane_psubusb",
         "lane_psubusw",
         "lane_psubusb_memory",
+        "lane_packsswb",
+        "lane_packuswb",
+        "lane_packssdw",
+        "lane_packusdw",
+        "lane_packuswb_memory",
         "lane_pcmpeqb",
         "lane_pcmpeqw",
         "lane_pcmpeqd",
@@ -3182,6 +3187,55 @@ fn functions_entered_at_a_shared_body_match_native() {
                     "{name}({value}, {count}) disagreed with native in {variant}"
                 );
             }
+        }
+    }
+}
+
+/// A tail jump whose target reads the jumper's stack frame.
+///
+/// Every other fixture's tail-call target touches only registers, which is
+/// why this one exists: a translation that gives the callee a stack pointer
+/// eight bytes below the machine's is correct in all of them and wrong in
+/// every hot/cold split gcc emits. The cold fragment continues the hot
+/// half's frame — reads its locals, tears it down — so `%rsp` at the
+/// callee's first instruction has to be what the jumper left.
+///
+/// It was found in a static glibc `main`, split at its canary epilogue
+/// because the cold path rejoins it: the second piece read `0x48(%rsp)`
+/// expecting the canary, got the eight bytes below it, and
+/// `__stack_chk_fail` fired on a program that had overflowed nothing.
+#[test]
+fn a_tail_jump_leaves_the_stack_pointer_alone() {
+    let mut fixture = DifferentialFixture::build("tail-frame", &["tail_frame.s"]);
+    let native = unsafe {
+        native_function::<unsafe extern "C" fn(i64, i64) -> i64>(
+            &fixture.native,
+            "jumps_with_a_frame",
+        )
+    };
+    for value in [
+        0i64,
+        1,
+        -1,
+        0x1234,
+        i64::MIN,
+        i64::MAX,
+        0x0102_0304_0506_0708,
+    ] {
+        let expected = unsafe { native(value, 0) };
+        assert_eq!(
+            expected, value,
+            "the native run does not read back what it stored, so the \
+             fixture is wrong rather than the translation"
+        );
+        for (variant, module) in &mut fixture.transpiled {
+            assert_eq!(
+                module.call_guest("jumps_with_a_frame", [value, 0, 0, 0, 0, 0]),
+                expected,
+                "jumps_with_a_frame({value:#x}) disagreed with native in \
+                 {variant}: the callee read a different stack slot than the \
+                 jumper wrote"
+            );
         }
     }
 }

@@ -497,11 +497,30 @@ impl<'a> FunctionTranslator<'a> {
         // The same flush a tail jump does, and for the same reason: the
         // function below may branch on what this one compared.
         self.state.flush_flags(body);
-        self.reserve_return_address_at(body, into)?;
-        self.state.flush_written(body);
-        body.call(target);
-        self.state.reload(body);
-        self.emit_return(body);
+        // A wasm tail call, because that is what this is. The machine moves
+        // no stack pointer here — the two pieces share one frame, and the
+        // piece below reads the locals the piece above stored. Modelling it
+        // as an ordinary call would leave a frame the machine does not have,
+        // and that frame has to be paid for with a return-address slot the
+        // callee's `%rsp` then points eight bytes below.
+        //
+        // In a resume body it is an ordinary call for the reason given on
+        // [`Self::emit_tail_transfer`]: the two functions answer with
+        // different types, and it is the reservation rather than the wasm
+        // frame that was wrong.
+        if self.yield_on_return {
+            let cell = self.temporaries.take(body, ValueType::I64);
+            self.push_stack_pointer_address(body);
+            body.i64_load(OperandWidth::QuadWord.alignment_log2(), 0);
+            body.local_set(cell);
+            self.state.flush_written(body);
+            body.call(target);
+            body.local_get(cell);
+            body.return_();
+        } else {
+            self.state.flush_written(body);
+            body.return_call(target);
+        }
         Ok(())
     }
 
@@ -517,9 +536,81 @@ impl<'a> FunctionTranslator<'a> {
         // jumps between the halves, and the cold half can branch on what the
         // hot half compared.
         self.state.flush_flags(body);
-        self.emit_transfer(body, lifted)
+        self.emit_tail_transfer(body, lifted)
             .with_context(|| format!("translating `{}`", render(&lifted.instruction)))?;
-        self.emit_return(body);
+        Ok(())
+    }
+
+    /// A tail jump, direct or indirect: the callee replaces this frame.
+    ///
+    /// The difference from [`Self::emit_transfer`] is the whole of what a
+    /// tail jump means. `jmp` moves no stack pointer, so the callee is
+    /// entered with exactly the caller's — which matters because the callee
+    /// may be the same function's other half, reading the frame this one
+    /// built. There is no return-address slot to reserve, because the
+    /// callee's own `ret` pops the one *this* function's caller reserved,
+    /// and nothing runs here afterwards to pop anything else.
+    ///
+    /// It is also why nothing is reloaded after: there is no after.
+    ///
+    /// A resume body cannot use a wasm tail call, because it answers with
+    /// the resume ID of the frame above and the guest function it transfers
+    /// to answers with nothing — `return_call` requires the two to agree.
+    /// So there it is an ordinary call, which is still correct for `%rsp`:
+    /// what made the old translation wrong was the *reservation*, not the
+    /// wasm frame. The ID is read before the transfer because the callee's
+    /// own `ret` pops the slot holding it.
+    fn emit_tail_transfer(
+        &mut self,
+        body: &mut FunctionBodyBuilder,
+        lifted: &LiftedInstruction,
+    ) -> Result<()> {
+        let yielded = self.yield_on_return.then(|| {
+            let cell = self.temporaries.take(body, ValueType::I64);
+            self.push_stack_pointer_address(body);
+            body.i64_load(OperandWidth::QuadWord.alignment_log2(), 0);
+            body.local_set(cell);
+            cell
+        });
+
+        match self.call_target(lifted)? {
+            CallTarget::Direct(target) => {
+                self.state.flush_written(body);
+                match yielded {
+                    None => body.return_call(target),
+                    Some(_) => body.call(target),
+                }
+            }
+            CallTarget::Absent => {
+                body.unreachable();
+                return Ok(());
+            }
+            CallTarget::Indirect => {
+                // The table slot is read before anything else moves, for the
+                // same reason an ordinary indirect call reads it first: a
+                // call through a stack slot must not be read from an address
+                // that has since changed.
+                let slot = self.temporaries.take(body, ValueType::I64);
+                self.read_operand(body, lifted, 0, OperandWidth::QuadWord)?;
+                body.local_set(slot);
+                self.state.flush_written(body);
+                body.local_get(slot);
+                if self.symbols.linked() {
+                    body.call(self.symbols.exec_map()?);
+                } else {
+                    body.i32_wrap_i64();
+                }
+                match yielded {
+                    None => body.return_call_indirect(self.guest_type),
+                    Some(_) => body.call_indirect(self.guest_type),
+                }
+            }
+        }
+
+        if let Some(cell) = yielded {
+            body.local_get(cell);
+            body.return_();
+        }
         Ok(())
     }
 

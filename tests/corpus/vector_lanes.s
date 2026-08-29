@@ -120,6 +120,20 @@
 	lane_case	lane_psubusw, psubusw %xmm1, %xmm0
 	lane_case	lane_psubusb_memory, psubusb SWAPPED(%rsp), %xmm0
 
+/* Halving the lane width, saturating. The destination's lanes become the low
+ * half of the result and the source's the high half, so a translation that
+ * swapped the two operands returns the same bytes in the wrong order — which
+ * folding the whole register into one number is exactly able to see.
+ *
+ * The signedness named is the result's: every one of these reads its input
+ * as signed, and `packuswb` clamping a negative word to zero rather than to
+ * `0x80` is the difference between the two byte forms. */
+	lane_case	lane_packsswb, packsswb %xmm1, %xmm0
+	lane_case	lane_packuswb, packuswb %xmm1, %xmm0
+	lane_case	lane_packssdw, packssdw %xmm1, %xmm0
+	lane_case	lane_packusdw, packusdw %xmm1, %xmm0
+	lane_case	lane_packuswb_memory, packuswb SWAPPED(%rsp), %xmm0
+
 /* ---- packed comparisons -------------------------------------------------- */
 
 	lane_case	lane_pcmpeqb, pcmpeqb %xmm1, %xmm0
