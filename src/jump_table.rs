@@ -158,16 +158,32 @@ fn read_linked_entry(
 #[derive(Clone, Debug)]
 pub struct JumpTable {
     /// Section offsets of the blocks the dispatch can reach, in index order.
+    ///
+    /// This is the arm space of the dispatch's [`origin`](Self::origin), not
+    /// of this one table: where several tables measure from the same place
+    /// and a compiler merged their dispatches into one `jmp`, that jump can
+    /// receive an entry from any of them, so the `br_table` has to cover all
+    /// of them. See [`share_arm_spaces`].
     pub targets: Vec<u64>,
     /// Where the table lives.
     pub table_section: usize,
     pub table_offset: u64,
+    /// How many entries this table has of its own.
+    pub arms: u64,
+    /// Where this table's arms begin inside [`targets`](Self::targets).
+    pub arm_offset: u64,
     /// Bytes per entry, taken from the width of the entries' relocations.
     pub stride: u64,
     /// What an entry is a difference from, or `None` when it holds its
     /// target outright. See [`EntryForm::base`]; this is what decides how
     /// the entries are rewritten.
     pub base: Option<u64>,
+    /// The address the dispatch's arithmetic is measured from, and therefore
+    /// what it subtracts to get an arm number. The base for a table of
+    /// differences; the table's own address for one of whole addresses.
+    /// Meaningful for a linked input, where an address is a number; a
+    /// relocatable one names its table with a relocation instead.
+    pub origin: u64,
 }
 
 impl JumpTable {
@@ -177,14 +193,13 @@ impl JumpTable {
     }
 
     pub fn byte_length(&self) -> u64 {
-        self.targets.len() as u64 * self.stride
+        self.arms * self.stride
     }
 
     /// The `(section, offset)` of every entry. Their original relocations are
     /// replaced rather than translated: they name code, which has no address.
     pub fn entries(&self) -> impl Iterator<Item = (usize, u64)> + '_ {
-        (0..self.targets.len() as u64)
-            .map(move |index| (self.table_section, self.table_offset + index * self.stride))
+        (0..self.arms).map(move |index| (self.table_section, self.table_offset + index * self.stride))
     }
 }
 
@@ -258,6 +273,10 @@ pub fn recover_all(object: &ObjectFile, functions: &mut [LiftedFunction]) -> Res
             .insert(candidate.position, table);
     }
 
+    for function in functions.iter_mut() {
+        share_arm_spaces(function);
+    }
+
     for function in functions.iter() {
         for (position, lifted) in function.instructions.iter().enumerate() {
             if lifted.instruction.flow_control() == FlowControl::IndirectBranch
@@ -268,6 +287,63 @@ pub fn recover_all(object: &ObjectFile, functions: &mut [LiftedFunction]) -> Res
         }
     }
     Ok(())
+}
+
+/// Gives every dispatch measuring from the same place the same arm space.
+///
+/// The problem this solves is a compiler optimisation, not a corner case.
+/// `gcc -O2` merges identical tails, and the tail of a computed goto is
+/// `jmp *%rax` — so a function with six dispatch tables can end up with one
+/// jump reached from six paths, each having loaded a *different* table into
+/// the register. glibc's `__vfprintf_internal` is exactly that: six
+/// thirty-two-entry tables, all measured from one label, and twenty-nine
+/// jumps between them.
+///
+/// A backward scan cannot attribute a table to such a jump, because there is
+/// no single right answer — and the failure is not loud. Guessing the
+/// nearest table makes the dispatch subtract the wrong address, so the arm
+/// number comes out wrong: sometimes outside the table, where it falls back
+/// to the exec map and reports a miss on an address that was never a
+/// function; sometimes *inside* it, where it branches to the wrong arm and
+/// says nothing at all.
+///
+/// So the arm space is a property of the origin rather than of a table.
+/// Every table measuring from the same place contributes its arms to one
+/// list, each dispatch branches over the whole list, and each table's
+/// entries are rewritten to index into it. Which table a given jump was
+/// handed then stops mattering — any of them names an arm of the same
+/// space, which is precisely what the hardware was doing.
+fn share_arm_spaces(function: &mut LiftedFunction) {
+    use std::collections::BTreeMap;
+
+    // Distinct tables per origin, in address order so the arm numbering is
+    // deterministic across bakes.
+    let mut tables: BTreeMap<u64, BTreeMap<(usize, u64), Vec<u64>>> = BTreeMap::new();
+    for table in function.jump_tables.values() {
+        tables
+            .entry(table.origin)
+            .or_default()
+            .insert((table.table_section, table.table_offset), table.targets.clone());
+    }
+
+    let mut spaces: BTreeMap<u64, (Vec<u64>, BTreeMap<(usize, u64), u64>)> = BTreeMap::new();
+    for (origin, by_table) in tables {
+        let mut targets = Vec::new();
+        let mut offsets = BTreeMap::new();
+        for (where_it_is, arms) in by_table {
+            offsets.insert(where_it_is, targets.len() as u64);
+            targets.extend(arms);
+        }
+        spaces.insert(origin, (targets, offsets));
+    }
+
+    for table in function.jump_tables.values_mut() {
+        let Some((targets, offsets)) = spaces.get(&table.origin) else {
+            continue;
+        };
+        table.arm_offset = offsets[&(table.table_section, table.table_offset)];
+        table.targets = targets.clone();
+    }
 }
 
 /// The nearest data location the dispatch could be reading its table from.
@@ -469,16 +545,19 @@ fn read_table(
     if targets.is_empty() {
         return None;
     }
+    let table_address =
+        object.sections[candidate.table_section].address + candidate.table_offset;
     Some(JumpTable {
+        arms: targets.len() as u64,
+        arm_offset: 0,
         targets,
         table_section: candidate.table_section,
         table_offset: candidate.table_offset,
         stride,
         // A relocatable input's relative entries are always differences
         // from the table's own address; the relocations say so.
-        base: relative.then(|| {
-            object.sections[candidate.table_section].address + candidate.table_offset
-        }),
+        base: relative.then_some(table_address),
+        origin: table_address,
     })
 }
 
@@ -518,12 +597,17 @@ fn read_linked_table(
     // One entry is a coincidence waiting to happen when the evidence is
     // bytes rather than a relocation: a single word that happens to land on
     // an instruction boundary is not a dispatch table. Two in a row is.
+    let table_address =
+        object.sections[candidate.table_section].address + candidate.table_offset;
     (targets.len() >= 2).then(|| JumpTable {
+        arms: targets.len() as u64,
+        arm_offset: 0,
         targets,
         table_section: candidate.table_section,
         table_offset: candidate.table_offset,
         stride: form.stride,
         base: form.base,
+        origin: form.base.unwrap_or(table_address),
     })
 }
 

@@ -66,6 +66,65 @@ fn a_dynamic_program_reaches_libc_data_through_its_relocations() {
     assert_eq!(out, "42 through the plt\n");
 }
 
+/// A program that uses the library rather than merely calling into it.
+///
+/// `qsort` through a callback is the piece that matters most: the comparison
+/// function is a pointer from the *executable* handed to a function in
+/// `libc`, called back across the module boundary through the exec map, and
+/// nothing about that works unless both files' functions are in one map at
+/// the addresses the loader believes.
+///
+/// The rest is breadth on purpose — an allocator, formatted output through
+/// `__printf_chk`'s dispatch tables, a libm call, and a file written and
+/// read back through the overlay — because the failures this tier produces
+/// are not near the entry point. They are wherever the first unrecovered
+/// dispatch or unmapped library happens to be.
+#[test]
+fn a_dynamic_program_uses_the_library_it_linked_against() {
+    let out = run_dynamic(
+        "dynamic-exercise",
+        r#"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+
+static int by_value(const void *a, const void *b) {
+    return *(const int *)a - *(const int *)b;
+}
+
+int main(void) {
+    int *v = malloc(8 * sizeof(int));
+    for (int i = 0; i < 8; i++) v[i] = (i * 37) % 11;
+    qsort(v, 8, sizeof(int), by_value);
+    for (int i = 0; i < 8; i++) printf("%d", v[i]);
+    putchar('\n');
+    free(v);
+
+    char buf[64];
+    snprintf(buf, sizeof buf, "%s/%d/%.3f", "path", 42, sqrt(2.0));
+    printf("%s len=%zu\n", buf, strlen(buf));
+
+    FILE *f = fopen("/tmp/probe.txt", "w");
+    if (!f) { perror("fopen"); return 1; }
+    fprintf(f, "written\n");
+    fclose(f);
+    f = fopen("/tmp/probe.txt", "r");
+    if (!f) { perror("reopen"); return 1; }
+    char back[32] = {0};
+    if (!fgets(back, sizeof back, f)) { perror("fgets"); return 1; }
+    fclose(f);
+    printf("read back: %s", back);
+    return 0;
+}
+"#,
+    );
+    assert_eq!(out, "01245689
+path/42/1.414 len=13
+read back: written
+");
+}
+
 /// Builds a dynamic program the way a distribution builds one, bakes it with
 /// everything it loads, and runs it.
 fn run_dynamic(name: &str, program: &str) -> String {
@@ -82,6 +141,7 @@ fn run_dynamic(name: &str, program: &str) -> String {
             &source.to_string_lossy(),
             "-o",
             &elf.to_string_lossy(),
+            "-lm",
         ],
     );
 
@@ -89,7 +149,11 @@ fn run_dynamic(name: &str, program: &str) -> String {
     // is put there by the bake, which is the point — the loader will find
     // its libraries at the paths it looks in because the bake placed them
     // at those paths.
-    let baked = baker::bake::container(&elf, std::path::Path::new("/"), baker::tree::Tree::new())
+    // A directory to write into. The overlay makes it writable; it has to
+    // exist first, exactly as it would in any image.
+    let mut tree = baker::tree::Tree::new();
+    tree.resolve_or_create(b"/tmp").expect("a /tmp in the image");
+    let baked = baker::bake::container(&elf, std::path::Path::new("/"), tree)
         .expect("bake the program and what it loads");
     assert!(
         baked.placed.len() >= 3,

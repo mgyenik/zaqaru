@@ -374,10 +374,10 @@ impl<'a> FunctionTranslator<'a> {
     /// Pushes the arm a recovered `switch` selects.
     ///
     /// The dispatch's own address arithmetic has already run, and the entries
-    /// were rewritten so that whatever it computed equals the table's address
-    /// plus the arm's index — so the index is what is left after taking the
-    /// table's address back out. Nothing about how the guest got there needs
-    /// to be understood.
+    /// were rewritten so that whatever it computed equals the dispatch's
+    /// origin plus the arm's index — so the index is what is left after
+    /// taking the origin back out. Nothing about how the guest got there
+    /// needs to be understood.
     pub fn emit_switch_index(
         &mut self,
         body: &mut FunctionBodyBuilder,
@@ -389,14 +389,18 @@ impl<'a> FunctionTranslator<'a> {
             .with_context(|| format!("translating `{}`", render(&lifted.instruction)))?;
         body.i32_wrap_i64();
         if self.symbols.linked() {
-            // The table is at its virtual address, because that is where the
-            // loader puts the segment holding it and linear memory is the
+            // Everything in a linked input is at a virtual address, because
+            // that is where the loader puts it and linear memory is the
             // address space. So the subtraction is a constant rather than a
             // symbol the linker will fill in.
-            body.i32_const(
-                self.symbols
-                    .jump_table_at(table.table_section, table.table_offset)? as i32,
-            );
+            //
+            // What is subtracted is the dispatch's *origin* — what its own
+            // arithmetic measures from — which is the table's address only
+            // when the entries are whole addresses or differences from the
+            // table itself. A computed goto measures from a code label, and
+            // several of its tables may feed one merged jump; see
+            // `jump_table::share_arm_spaces`.
+            body.i32_const(table.origin as i32);
         } else {
             let address = self
                 .symbols

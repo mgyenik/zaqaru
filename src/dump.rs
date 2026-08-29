@@ -110,15 +110,14 @@ fn dump_function(output: &mut String, object: &ObjectFile, function: &LiftedFunc
         for table in function.jump_tables.values() {
             writeln!(
                 output,
-                "  jump table at {}+{:#x}: {} arms, {}-byte {} entries",
+                "  jump table at {}+{:#x}: {} arms, {}-byte entries {}",
                 object.sections[table.table_section].name,
                 table.table_offset,
                 table.targets.len(),
                 table.stride,
-                if table.relative() {
-                    "relative"
-                } else {
-                    "absolute"
+                match table.base {
+                    Some(base) => std::format!("measured from {base:#x}"),
+                    None => "holding whole addresses".to_string(),
                 },
             )
             .unwrap();

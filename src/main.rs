@@ -108,6 +108,17 @@ struct Arguments {
     #[arg(long)]
     dump: bool,
 
+    /// Read a position-independent input as though a loader had placed it at
+    /// this address.
+    ///
+    /// A shared object states its addresses relative to zero and a bake
+    /// assigns it a base; this is how to look at one the way the bake will.
+    /// It matters for more than tidiness — read at zero, a library's text
+    /// sits where its own integer constants sit, and discovery cannot tell
+    /// an address from a number.
+    #[arg(long, value_parser = parse_base)]
+    at: Option<u64>,
+
     /// Print the translated module as WebAssembly text after transpiling.
     #[arg(long)]
     print: bool,
@@ -115,6 +126,11 @@ struct Arguments {
     /// How to express the control-flow graph in wasm.
     #[arg(long, value_enum, default_value = "structured")]
     control_flow: ControlFlow,
+}
+
+fn parse_base(text: &str) -> Result<u64, String> {
+    let digits = text.trim_start_matches("0x");
+    u64::from_str_radix(digits, 16).map_err(|error| format!("`{text}` is not a hex address: {error}"))
 }
 
 fn read_object(path: &std::path::Path) -> Result<Vec<u8>> {
@@ -146,7 +162,7 @@ fn main() -> Result<()> {
     };
 
     let bytes = read_object(input)?;
-    let object = reader::ObjectFile::parse(&bytes)
+    let object = reader::ObjectFile::parse_at(&bytes, arguments.at.unwrap_or(0))
         .with_context(|| format!("reading {}", input.display()))?;
 
     if arguments.dump {
