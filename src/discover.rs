@@ -961,13 +961,39 @@ fn split_once(sections: &[Section], functions: &mut Vec<Function>) -> Result<boo
         starts.insert(index, boundaries);
     }
 
+    // Each function's neighbours, sorted by where they start, with a
+    // running maximum of how far anything up to that point reaches.
+    //
+    // This is what keeps the pass from being quadratic. Asking "which
+    // function contains this target" by scanning every function, for every
+    // target, is fine on a corpus fixture and fatal on a real program:
+    // CPython has enough of both that a single round did not finish in two
+    // and a half minutes. The prefix maximum is what makes the search
+    // exact rather than merely fast — a target is contained only by
+    // functions starting at or before it, and the walk backwards can stop
+    // as soon as nothing earlier reaches far enough.
+    let mut by_section: HashMap<usize, Vec<(u64, u64, usize)>> = HashMap::new();
+    for (index, function) in functions.iter().enumerate() {
+        by_section.entry(function.section).or_default().push((
+            function.offset,
+            function.offset + function.size,
+            index,
+        ));
+    }
+    for placed in by_section.values_mut() {
+        placed.sort_unstable();
+        let mut reach = 0u64;
+        for entry in placed.iter_mut() {
+            reach = reach.max(entry.1);
+            entry.1 = reach;
+        }
+    }
+
     // A target that lands inside a function but not at its start is an entry
     // the symbol table did not describe.
     let mut cuts: HashMap<usize, BTreeSet<u64>> = HashMap::new();
-    for (index, function) in functions.iter().enumerate() {
-        let (Some(section_targets), Some(boundaries)) =
-            (targets.get(&function.section), starts.get(&index))
-        else {
+    for (section, section_targets) in &targets {
+        let Some(placed) = by_section.get(section) else {
             continue;
         };
         for (target, from) in section_targets {
@@ -981,9 +1007,19 @@ fn split_once(sections: &[Section], functions: &mut Vec<Function>) -> Result<boo
             if (source.offset..source.offset + source.size).contains(target) {
                 continue;
             }
-            let interior = (function.offset + 1..function.offset + function.size).contains(target);
-            if interior && boundaries.contains(target) {
-                cuts.entry(index).or_default().insert(*target);
+            let mut at = placed.partition_point(|(offset, _, _)| *offset <= *target);
+            while at > 0 {
+                let (_, reach, index) = placed[at - 1];
+                if reach <= *target {
+                    break;
+                }
+                at -= 1;
+                let function = &functions[index];
+                let interior =
+                    (function.offset + 1..function.offset + function.size).contains(target);
+                if interior && starts.get(&index).is_some_and(|b| b.contains(target)) {
+                    cuts.entry(index).or_default().insert(*target);
+                }
             }
         }
     }

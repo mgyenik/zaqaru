@@ -1739,3 +1739,98 @@ One correction to the previous entry: it put the hole's start at
 comparing against `0x5a8858`, which is `.fini` — `.text` does end one byte
 below it, so the conclusion held, but by luck rather than by measurement.
 `examples/frames` exists so the next such number comes from a tool.
+
+## 2026-08-29 — what the population actually looks like
+
+D1–D4 were built and validated against two binaries: `/usr/bin/busybox`,
+and a family of `gcc -static -O2` programs I compiled myself, which are one
+binary with different `main`s. The worklog already carries a correction
+from the previous day saying two programs is two programs. This is the same
+error, made again, one day later.
+
+So: every ELF in `/usr/bin`, once, through the reader and discovery.
+`examples/survey` is the tool, and its header says plainly that it is not a
+test and must not become one — it is for the handful of moments when the
+question is about the *population* of binaries rather than about a change.
+Expect it to be archived once the population questions are settled.
+
+### The finding that dwarfs the others
+
+**1261 of 1291 ELF files — 97.7% — do not parse at all.** One error, every
+time: *"expected a relocatable object (`gcc -c`) or a static executable,
+found Dynamic"*. Nearly everything shipped is a dynamic PIE, and the reader
+refuses it at the door.
+
+That is the real distance to "the target is any binary", and no amount of
+discovery work closes it. It was invisible from a sample of one static
+binary and one static program I built myself.
+
+### Among the 29 that do parse
+
+All 29 are stripped. 26 carry `.eh_frame_hdr` and 3 do not, so busybox
+lacking one is unusual — the D1 caveat was pointing at something real.
+
+FDE coverage of `.text`, though, is bimodal rather than merely variable:
+
+| | coverage |
+| --- | --- |
+| median | 97.9% |
+| 25th percentile | 96% |
+| **6 of 29** | **below 62%** |
+
+And the six are the interesting part:
+
+| coverage | binary | text | functions found |
+| --- | --- | --- | --- |
+| 0.0% | `containerd-shim-runc-v2` | 3.7 MB | 1170 |
+| 0.0% | `gh` | 15.7 MB | 1259 |
+| 0.0% | `glab` | 18.6 MB | 1339 |
+| 0.1% | `ubuntu-report` | 3.4 MB | 1187 |
+| 1.0% | `shellcheck` | 17.1 MB | 10483 |
+| 61.8% | `busybox` | 1.7 MB | 3587 |
+
+The first four are Go, which emits no `.eh_frame` at all — it carries its
+own tables in `.gopclntab`. The fifth is GHC. **busybox is the mildest case
+in the group, not the extreme one**, and the conclusion I drew from it —
+"a 631 KiB hole is unusual, D5 is confirmed necessary" — was right about
+the necessity and wrong about the reason. `gh` finds 1259 functions in
+15.7 MB of text: one per twelve kilobytes, which is not a discovery result,
+it is a discovery failure that nothing reported.
+
+### A quadratic the sweep found immediately
+
+`split_once` asked, for every function, about every branch target in its
+section — a cross product. Fine on a corpus fixture; fatal on a real
+program. `/usr/bin/python3.12`, which `docs/code-discovery.md` names as the
+milestone target, **did not finish a single round in two and a half
+minutes**. `arm-none-eabi-lto-dump` did not finish in three.
+
+D4 is what tipped it over: tripling busybox's function count tripled one
+side of the product.
+
+The fix is the standard one — index the functions per section by start,
+with a running maximum of how far anything up to that point reaches, and
+walk back from the target only while something can still reach it. Exact,
+not approximate: a target is contained only by functions starting at or
+before it, and the walk stops as soon as nothing earlier is long enough.
+
+    python3.12   never finished  →  0.78s
+    busybox            0.47s     →  0.20s
+    /usr/bin sweep   ~20 min+     →  17s for all 1291
+
+The function lists for busybox and the static glibc hello are unchanged.
+
+### What this changes about the plan
+
+`docs/code-discovery.md`'s milestones stay right, and their *justification*
+moves:
+
+- **D5 and D6 are more necessary, not less.** The case is not busybox's
+  partial hole; it is Go and Haskell binaries with no unwind information
+  whatsoever, where the witnesses have almost nothing to work from and the
+  saturated tier is the only thing that could make them run.
+- **The dynamic-PIE wall is upstream of all of it.** 97.7% of shipped
+  binaries never reach discovery. Whatever the reader does about that is a
+  bigger lever than any witness, and it is not in this document's scope —
+  which is worth saying out loud, because a plan that reads as "the road to
+  any binary" describes the last 2.3% of the journey.
