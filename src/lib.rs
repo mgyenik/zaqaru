@@ -17,6 +17,7 @@ pub mod dump;
 pub mod discover;
 pub mod eh_frame;
 pub mod emitter;
+pub mod frontend;
 pub mod jump_table;
 pub mod lifter;
 pub mod machine;

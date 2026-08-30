@@ -406,7 +406,7 @@ impl ObjectFile {
             Layout::Relocatable => Vec::new(),
         };
 
-        Ok(Self {
+        let mut object = Self {
             layout,
             entry,
             segments,
@@ -414,7 +414,20 @@ impl ObjectFile {
             symbols,
             functions,
             modules,
-        })
+        };
+        // Discovery is not finished until the passes downstream of it stop
+        // producing evidence it needed. Run here, at the one place an object
+        // comes into existence, because a function list that a later pass
+        // would still revise must never be observable — see
+        // [`crate::frontend::settle`].
+        //
+        // A merge needs none of its own: it concatenates modules whose
+        // sections stay distinct, and a jump table's arms are instruction
+        // boundaries *in the dispatching function's own section*
+        // (`read_linked_table`), so no arm can cross a module boundary and
+        // nothing a merge does can strand one.
+        crate::frontend::settle(&mut object)?;
+        Ok(object)
     }
 
     /// One translation unit out of several linked files.

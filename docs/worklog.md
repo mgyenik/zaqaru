@@ -2329,3 +2329,97 @@ invariants", which everyone knows; it is that a linear scan over sections is
 was fifteen — and merging three modules into one translation unit multiplied
 it by six without any of those call sites changing. A merge changes the cost
 of every question asked per section.
+
+## 2026-08-30 — D7: the front end becomes a fixpoint, and CPython starts running bytecode
+
+`docs/code-discovery.md`'s D7 as designed, plus one premise of that design
+that measurement contradicted.
+
+### What it is
+
+Discovery decides where functions begin, lifting decodes them, jump-table
+recovery reads the dispatches out of what was decoded — and the last pass
+produces evidence the first one needed. An arm of a recovered `switch` that
+lies outside the piece dispatching to it has to be a function, because a
+`br_table` cannot branch into another function's interior; but an arm is an
+*indirect* target, so nothing knows it is an arm until after the cutting is
+done. `_Py_HashBytes` is siphash, its tail is `switch (len & 7)`, two of its
+eight arms are past a cut, and CPython trapped on the first string it hashed.
+
+`src/frontend.rs` owns the loop now, and `ObjectFile::parse_at` calls it —
+so a function list a later pass would still revise is never observable.
+`discover::cut_at_switch_arms` is the only door, cutting at transfer-target
+grade with `Witness::SwitchArm` recording what made each piece. Bounded at
+eight rounds, loud on non-settlement.
+
+Measured, per module:
+
+| | rounds | functions | arms fed back |
+| --- | --- | --- | --- |
+| `/usr/bin/python3.12` | 3 | 73,124 → 74,300 | 1,073, then 9 |
+| `libc.so.6` | 2 | 4,596 → 4,605 | 9 |
+| the other four modules | 1 | unchanged | none |
+
+The whole bake goes 2.7 s → 3.2 s and the refusal count does not move.
+
+### Witness collection is not re-run, and that is a fact rather than a saving
+
+The design says the loop is over discover → lift → recover. What is actually
+re-run is the *splitting* phase, because an arm can never establish a
+function: `read_linked_table` refuses to read a table whose entries are not
+already instruction boundaries of discovered functions, so an arm always
+lands inside something and cutting is the only act available. Re-running the
+strong and weak witnesses would produce the same functions — and after
+`ObjectFile::merge` it could not be done correctly anyway, since
+`data_array_targets` needs one base per module and a merged object no longer
+separates them. Settling therefore happens in `parse_at`, per module, before
+any merge; arms cannot cross a module because `read_linked_table` requires
+them to be boundaries *in the dispatching function's own section*.
+
+### The premise that was wrong
+
+D7's safety argument said the feedback set stays empty for the case that
+matters because "`_PyEval_EvalFrameDefault`'s 256 computed-goto labels are
+all inside the dispatching piece (nothing ever split the eval loop)".
+
+Measured on `/usr/bin/python3.12`: the eval loop is **779 pieces**, every
+one of them cut by a direct branch, before any of this runs — and its cold
+half is a second body of 293 more, found by an unwind entry and named by no
+symbol. Nothing about the eval loop is unsplit.
+
+What actually keeps it safe is the invariant the document already states,
+which is about *establishment*: a data value equal to a covered function's
+interior address never mints a function. Cutting is a different act — the
+pieces tile the same bytes, and the transfers between them are explicit tail
+calls. CPython's eval loop has been tiled that way since the first day a
+linked binary was read here. The correction is folded into
+`code-discovery.md`; the general lesson is the one this log keeps recording,
+which is that a safety argument resting on a property of a binary needs the
+binary measured, not described.
+
+### The acceptance, and the fixture proven able to fail
+
+`tests/corpus/split_switch.s` is the shape reduced to something a test can
+reason about: one `switch` over four arms, a direct jump into the body's
+middle from outside, two arms past the cut. It runs in a container and is
+compared byte for byte and status for status against the same ELF executed
+by Linux. `dispatch` states its own size, so what an arm cuts is a *stated*
+extent — the evidence-grade claim made into something that fails if it is
+retracted.
+
+Checked by breaking it: with the feedback set forced empty, both positive
+tests fail and the program dies where predicted, in `dispatch_guest`'s
+`unreachable`. The third test — that a `switch` nothing split feeds nothing
+back — correctly keeps passing under that break, which is what it is for.
+
+The trap-closed assertion is on the feedback *set* rather than on output
+bytes. An empty set says the fixpoint provably changed nothing; byte
+identity would only say that it did not.
+
+### Where it stops now
+
+Past `_Py_HashBytes`, into CPython's own bytecode evaluation: 82 syscalls
+in, through `Py_InitializeFromConfig` → frozen-module import →
+`PyEval_EvalCode` → `_PyEval_EvalFrameDefault`. It stops there on
+`kisal: 0x5d6760 is not the address of any translated function`, and that is
+a different defect, diagnosed below rather than guessed at.

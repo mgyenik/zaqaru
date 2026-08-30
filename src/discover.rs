@@ -139,6 +139,12 @@ pub enum Witness {
     /// Cut out of a function that something branched into partway. The piece
     /// before it keeps its original witness.
     InteriorEntry,
+    /// Cut out of a function because a *recovered* jump table dispatches
+    /// there from outside it. Evidence of the same grade as a direct branch
+    /// — the rewritten table means the dispatch provably transfers here —
+    /// but it arrives a pass later, after lifting, which is why the front
+    /// end is a fixpoint. See `docs/code-discovery.md`, D7.
+    SwitchArm,
 }
 
 impl Witness {
@@ -160,7 +166,7 @@ impl Witness {
             // Not evidence of its own: a cut redistributes a function that
             // strong or weak evidence had already established, and the
             // pieces inherit whatever standing it had.
-            Witness::InteriorEntry => false,
+            Witness::InteriorEntry | Witness::SwitchArm => false,
         }
     }
 }
@@ -428,7 +434,17 @@ pub fn discover(
         offsets.sort_unstable();
         offsets.dedup();
     }
-    split_at_interior_entries(sections, layout, &revisable_by_section, &mut functions)?;
+    // No forced entries on the first pass: the evidence that produces them
+    // does not exist until something has been lifted. See
+    // `crate::frontend::settle`.
+    let forced = std::collections::HashMap::new();
+    split_at_interior_entries(
+        sections,
+        layout,
+        &revisable_by_section,
+        &forced,
+        &mut functions,
+    )?;
     make_names_unique(sections, &mut functions);
     Ok(functions)
 }
@@ -1307,10 +1323,56 @@ fn fill_from_transfers(
     Ok(addressed)
 }
 
+/// Cuts the function list at addresses a *later* pass proved are entries.
+///
+/// The one door the front-end fixpoint uses. Jump-table recovery runs after
+/// lifting, which runs after discovery — so an arm that lies outside the
+/// piece that dispatches is evidence discovery could not have had, and there
+/// is nowhere for it to arrive except here, one round later.
+///
+/// It cuts at transfer-target grade, stated extents included, and that is
+/// not the invariant being relaxed. A recovered table's arm is not an
+/// observation that code appears to be at an address: the dispatch provably
+/// transfers there, exactly as the direct branches this pass already cuts on
+/// do. What defends `_PyEval_EvalFrameDefault` from its own opcode table is
+/// not this rule but the *feedback set* — an arm inside the dispatching
+/// piece is a `br_table` arm and never reaches here. See
+/// `crate::frontend::settle`, which is what decides that.
+///
+/// `entries` are virtual addresses. Reports whether anything was cut.
+pub fn cut_at_switch_arms(
+    sections: &[Section],
+    layout: Layout,
+    entries: &std::collections::BTreeSet<u64>,
+    functions: &mut Vec<Function>,
+) -> Result<bool> {
+    let mut forced: std::collections::HashMap<usize, Vec<u64>> =
+        std::collections::HashMap::new();
+    for address in entries {
+        if let Some((section, offset)) = section_holding(sections, *address) {
+            forced.entry(section).or_default().push(offset);
+        }
+    }
+    for offsets in forced.values_mut() {
+        offsets.sort_unstable();
+        offsets.dedup();
+    }
+    let before = functions.len();
+    // The weak-evidence set is deliberately not carried across rounds. Its
+    // cuts are already in the list; a forced cut subdivides a piece and so
+    // cannot make a target interior that was not interior before, which is
+    // the only way a weak cut could newly apply.
+    let empty = std::collections::HashMap::new();
+    split_at_interior_entries(sections, layout, &empty, &forced, functions)?;
+    make_names_unique(sections, functions);
+    Ok(functions.len() != before)
+}
+
 fn split_at_interior_entries(
     sections: &[Section],
     layout: Layout,
     revisable: &std::collections::HashMap<usize, Vec<u64>>,
+    forced: &std::collections::HashMap<usize, Vec<u64>>,
     functions: &mut Vec<Function>,
 ) -> Result<()> {
     // To a fixpoint, because a cut makes boundaries that were not there
@@ -1320,7 +1382,7 @@ fn split_at_interior_entries(
     // branch into the tail, which exposes another.
     const ROUNDS: usize = 16;
     for round in 0..=ROUNDS {
-        if !split_once(sections, layout, revisable, functions)? {
+        if !split_once(sections, layout, revisable, forced, functions)? {
             return Ok(());
         }
         if round == ROUNDS {
@@ -1339,9 +1401,10 @@ fn split_once(
     sections: &[Section],
     layout: Layout,
     revisable: &std::collections::HashMap<usize, Vec<u64>>,
+    forced: &std::collections::HashMap<usize, Vec<u64>>,
     functions: &mut Vec<Function>,
 ) -> Result<bool> {
-    use std::collections::{BTreeSet, HashMap};
+    use std::collections::{BTreeMap, BTreeSet, HashMap};
 
     // Where each function's instructions begin, and everywhere anything
     // branches to. One decode pass over the text answers both.
@@ -1425,7 +1488,10 @@ fn split_once(
 
     // A target that lands inside a function but not at its start is an entry
     // the symbol table did not describe.
-    let mut cuts: HashMap<usize, BTreeSet<u64>> = HashMap::new();
+    // Keyed by where the cut lands, valued by what proved it is an entry —
+    // which becomes the new piece's witness, so a refusal or a runtime miss
+    // names the evidence rather than only the address.
+    let mut cuts: HashMap<usize, BTreeMap<u64, Witness>> = HashMap::new();
     for (section, section_targets) in &targets {
         let Some(placed) = by_section.get(section) else {
             continue;
@@ -1471,7 +1537,36 @@ fn split_once(
                 let interior =
                     (function.offset + 1..function.offset + function.size).contains(target);
                 if interior && starts.get(&index).is_some_and(|b| b.contains(target)) {
-                    cuts.entry(index).or_default().insert(*target);
+                    cuts.entry(index)
+                        .or_default()
+                        .insert(*target, Witness::InteriorEntry);
+                }
+            }
+        }
+    }
+    // The arms a recovered dispatch reaches from outside the piece it sits
+    // in, fed back from a later pass. Transfer-target grade, so no extent
+    // check: see `cut_at_switch_arms`, which is also where the feedback set
+    // is decided and where the eval-loop trap stays closed.
+    for (section, offsets) in forced {
+        let Some(placed) = by_section.get(section) else {
+            continue;
+        };
+        for offset in offsets {
+            let mut at = placed.partition_point(|(start, _, _)| start <= offset);
+            while at > 0 {
+                let (_, reach, index) = placed[at - 1];
+                if reach <= *offset {
+                    break;
+                }
+                at -= 1;
+                let function = &functions[index];
+                let interior =
+                    (function.offset + 1..function.offset + function.size).contains(offset);
+                if interior && starts.get(&index).is_some_and(|b| b.contains(offset)) {
+                    cuts.entry(index)
+                        .or_default()
+                        .insert(*offset, Witness::SwitchArm);
                 }
             }
         }
@@ -1503,7 +1598,9 @@ fn split_once(
                 let interior =
                     (function.offset + 1..function.offset + function.size).contains(offset);
                 if interior && starts.get(&index).is_some_and(|b| b.contains(offset)) {
-                    cuts.entry(index).or_default().insert(*offset);
+                    cuts.entry(index)
+                        .or_default()
+                        .insert(*offset, Witness::InteriorEntry);
                 }
             }
         }
@@ -1521,7 +1618,7 @@ fn split_once(
         };
         let mut start = function.offset;
         let end = function.offset + function.size;
-        for point in points.iter().copied().chain(std::iter::once(end)) {
+        for point in points.keys().copied().chain(std::iter::once(end)) {
             split.push(Function {
                 // The first piece keeps the symbol and the name; the rest
                 // are named after where they begin, because nothing named
@@ -1544,11 +1641,12 @@ fn split_once(
                 size: point - start,
                 // The first piece is the function that was cut and keeps
                 // whatever found it; the rest exist because something
-                // branched into them.
+                // transferred into them, and carry which kind of evidence
+                // that was.
                 witness: if start == function.offset {
                     function.witness
                 } else {
-                    Witness::InteriorEntry
+                    points.get(&start).copied().unwrap_or(Witness::InteriorEntry)
                 },
                 // Every piece remembers the body it came out of, which is
                 // what jump-table recovery asks about.
@@ -1755,7 +1853,8 @@ mod tests {
         let mut functions = std::vec![stated, guessed];
 
         let inside = std::collections::HashMap::from([(0usize, std::vec![0x140u64, 0x240])]);
-        split_at_interior_entries(&sections, Layout::Linked, &inside, &mut functions)
+        let nothing = std::collections::HashMap::new();
+        split_at_interior_entries(&sections, Layout::Linked, &inside, &nothing, &mut functions)
             .expect("split");
 
         let starts: Vec<u64> = functions.iter().map(|function| function.offset).collect();
@@ -1770,6 +1869,38 @@ mod tests {
     }
 
     /// What is left over, which is what the saturated tier is built on.
+    /// The other half of the same rule, and the one D7 rests on: a
+    /// *recovered* arm is not weak evidence. The dispatch provably transfers
+    /// there, which is the standing a direct branch has, so it may cut what
+    /// the file stated — and the piece it makes says which evidence made it.
+    #[test]
+    fn a_recovered_arm_may_cut_a_stated_extent() {
+        let sections = [text(0x400)];
+        let mut stated = function(0x100, 0x100, Witness::Symbol);
+        stated.extent = Extent::Stated;
+        let mut functions = std::vec![stated];
+
+        let arms = std::collections::BTreeSet::from([0x400000 + 0x140u64]);
+        assert!(
+            cut_at_switch_arms(&sections, Layout::Linked, &arms, &mut functions).expect("cut"),
+            "a recovered arm did not cut a stated extent"
+        );
+
+        let cut = functions
+            .iter()
+            .find(|function| function.offset == 0x140)
+            .expect("no function begins at the arm");
+        assert_eq!(
+            cut.witness,
+            Witness::SwitchArm,
+            "the piece does not name the evidence that made it"
+        );
+        // And the extent it inherits is still the stated one: cutting
+        // redistributes a body, it does not weaken what the file said about
+        // the bytes.
+        assert_eq!(cut.extent, Extent::Stated);
+    }
+
     #[test]
     fn residue_is_every_range_no_function_covers() {
         let sections = [text(0x400)];

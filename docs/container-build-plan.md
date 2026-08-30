@@ -1743,11 +1743,15 @@ The pieces, and where they live:
   from a new index region. Mapping an *untranslated* file executable is the
   loud error the design names.
 
-**Not built, and not blocking:** the shadow GOT; `dlopen` (untried; baked
-libraries should work by the same path); `/etc/ld.so.cache` regeneration
-(nothing needed it, since the loader finds the files at the paths the bake
-placed them). **Not measured:** breadth. Three dynamic files read closely
-and fifteen more through a parse spike is not a population.
+**Not built, and not blocking:** the shadow GOT; `/etc/ld.so.cache`
+regeneration (nothing needed it, since the loader finds the files at the
+paths the bake placed them). **`dlopen` — untried, and it turned out to
+be blocking after all**: baked libraries should work by the same path,
+but "baked" assumes a bake policy that does not exist yet, and the first
+ordinary import of any Python script needs it — see the Python
+appendix's dlopen item, which carries the measurement and the spike.
+**Not measured:** breadth. Three dynamic files read closely and fifteen
+more through a parse spike is not a population.
 
 ## Appendix — M6's second checkpoint: what Python still needs (appended 2026-08-29)
 
@@ -1829,6 +1833,15 @@ indistinguishable from the data alone. What separates them is whether the
 enclosing body was split, which is a fact about discovery's output rather
 than about the table.
 
+**The design is now written: `docs/code-discovery.md`'s D7**, which is
+route (a) sharpened into the front-end fixpoint — the precise feedback
+set (out-of-piece arms only, which is what keeps the eval loop whole),
+cuts through the coverage type's doors at transfer-target grade, and a
+monotonicity guard that turns the re-splitting risk named above into a
+loud build-time error instead of a silent runtime miss. Route (b) is
+recorded there as the answer to a *different* problem — interior
+addresses computed at run time — and stays in the drawer.
+
 ### 2. The standard library — untested
 
 `python -c 'print(1)'` imports `encodings` before it runs anything, so the
@@ -1837,22 +1850,102 @@ that has none. Nothing here has baked an image of that size, and two things
 about it are unmeasured rather than expected to fail — bake time and the
 engine's compile time for a module that large.
 
-Two pieces of work fall out of it:
+Three pieces of work fall out of it:
 
-- **The bake records `argv` and does not record `envp`.** `PYTHONHOME` and
-  `PYTHONPATH` are how an interpreter is told where its library is, and
-  there is currently no way to say so. The command-line region of the image
-  index is the obvious place, and it was built to hold exactly this.
+- **`/proc/self/exe` should be set at boot, and may make the environment
+  question moot.** The design records that nothing sets it until `execve`
+  knows the answer — but the *boot* path knows the answer, and CPython's
+  `getpath` locates its prefix through `/proc/self/exe` plus the
+  `lib/python3.12/os.py` landmark. With the distribution's real layout
+  baked (`/usr/bin/python3.12` beside `/usr/lib/python3.12`) and the
+  symlink truthful, Python needs no `PYTHONHOME` at all — and the native
+  strace matches without a fabricated variable. This is the smaller,
+  more honest fix, and it comes first.
+- **The bake records `argv` and does not record `envp`.** Still worth
+  building, and not for Python: an OCI image config carries `Env` beside
+  `Cmd`, so recording environment is baker fidelity for *any* image —
+  Python merely stops being its justification if the item above holds.
+  The command-line region of the image index is the obvious place, and
+  it was built to hold exactly this.
 - **`LD_BIND_NOW=1` is injected into the environment**, which is the lesser
   of the two mechanisms this plan's design doc names. It works and it is
   visible to the guest, where `DF_1_NOW` in each module's `.dynamic` would
   not be — and M6's acceptance is a diff against a native `strace`, in which
   a fabricated environment variable is a divergence. Setting `DF_1_NOW` at
-  bake is the replacement.
+  bake is the replacement — it is also the *stronger* mechanism, since the
+  refused `_dl_runtime_resolve` trio is only guaranteed dead under NOW
+  binding, and an environment variable is one `unsetenv` from not being
+  there. One edge: a module whose `.dynamic` carries no `DT_FLAGS_1` entry
+  gets a spare trailing `DT_NULL` overwritten with `DT_BIND_NOW`, and a
+  module with neither room nor entry is a loud refusal, not a quiet
+  fallback to the env var.
 
-### 3. Everything after that is unknown, and the instrument exists now
+### 3. dlopen — resequenced: it is the rung after the checkpoint
 
-Beyond the two items above, what CPython needs is not predictable from here
+The dynamic-tier appendix filed `dlopen` under "not blocking". Measured
+on the target interpreter, it is blocking for everything past the
+checkpoint itself: `python3 -c 'print(1)'` dlopens nothing — Ubuntu
+builds the startup-critical C modules into the binary — but
+`import json`, the first line of any real script, dlopens
+`lib-dynload/_json.cpython-312-x86_64-linux-gnu.so`. There are **47
+shared objects in `lib-dynload/`**; the standard library is not only
+the 54 MB of Python files above, it is also these, arriving through a
+path never yet exercised. So `print("hello")` needs none of this, and
+any script one import later needs all of it.
+
+The mechanism is already designed and mostly built — `dlopen` is ld.so's
+own translated code, and kisal's `mmap` answers a translated inode with
+its prelink base (`kisal/src/mmap.rs`) — but two gaps and two untested
+paths stand between here and `import json`:
+
+- **The bake gap, and it is the real one**: `baker::dynamic` walks the
+  `PT_INTERP` + `DT_NEEDED` closure, and an extension module is in
+  nobody's closure. The design doc now states the policy outright — the
+  unit of translation is the image tree, every ELF swept, translated,
+  and merged into the one exec map — and this is where it gets built.
+  The known cost to re-measure: merging multiplied per-section costs
+  once already (the D5 entry), and a whole-image merge multiplies them
+  again.
+- **The forced-placement hardening**: a dlopen-only module's prelink
+  range sits empty from boot until the import, and kisal's placement
+  rewrite is `MAP_FIXED` — atomic replacement. The design doc now
+  requires `MAP_FIXED_NOREPLACE` semantics there: refuse loudly if the
+  range is occupied, so the impossible-by-construction claim is
+  asserted rather than narrated.
+- **Dynamic TLS**: a dlopen'ed module with `__thread` takes the
+  DTV-growth path through `__tls_get_addr` — guest code that has never
+  run, because boot-time libraries get static TLS.
+- **The error path lands on the setjmp/longjmp thorn**:
+  `_dl_catch_exception` leaves by `longjmp` on failure, presenting as
+  an exec-map miss on the sentinel — recorded in the design doc so the
+  first real hit is recognized, and triggered once deliberately by the
+  spike.
+
+The spike is a ladder, one question per rung, differential where a
+native oracle exists: **(0)** the existing dynamic-boot image re-baked
+under the sweep policy with an extra unreferenced `.so` — output
+byte-identical, the policy inert when unused; **(1)** a C program
+dlopens a baked `.so`, `dlsym`, calls, checks — the happy path;
+**(2)** the `.so` gains an `init_array` constructor, a `__thread`
+variable, a `malloc`, and a callback pointer into the main program —
+scopes both directions, dynamic TLS, exec-map discrimination of a
+program address handed to library code; **(3)** negative controls — a
+missing path (characterize the longjmp shape), `mmap(PROT_EXEC)` of an
+untranslated `.so` (the named fault, which exists and has no
+dlopen-shaped test), and the occupied-prelink-range refusal once built;
+**(4)** `python3 -c 'import json; print(json.dumps({"a": 1}))'` against
+native — which is not spike scaffolding but the next rung of this
+milestone's ladder.
+
+One consequence worth a test of its own, later: `ctypes` lets Python
+code dlopen arbitrary names. Under this design that works exactly when
+the library was in the image at bake and produces the named mmap fault
+when it was not — the AOT deal surfacing all the way up to Python
+source, behaving as documented.
+
+### 4. Everything after that is unknown, and the instrument exists now
+
+Beyond the items above, what CPython needs is not predictable from here
 and should not be guessed at: the last four failures were each diagnosed
 wrongly by inspection and correctly by measurement. `zaqaru-run --trace`
 writes a syscall log in `strace`'s shape, with path arguments rendered as

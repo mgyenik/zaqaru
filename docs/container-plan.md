@@ -994,7 +994,30 @@ the same address every run, and its `MAP_FIXED` carving lands where
 the bake assumed. This makes the **exec map fully static** — the
 address → function-table-slot table for every module is built at bake;
 `dlopen`/`dlclose` flip a live bit, nothing moves. It also makes load
-addresses deterministic, feeding the record/replay story. Costs, named
+addresses deterministic, feeding the record/replay story.
+
+"Every ELF in the image" means the **tree, not the executable's
+`DT_NEEDED` closure**, and the difference is load-bearing: `dlopen`
+names files no closure reaches — an extension module is linked *from*
+by nobody — and a distribution CPython's `lib-dynload/` is 47 of them
+before the first third-party package. So the bake sweeps the image for
+ELFs, translates each at its assigned base, and merges all of them into
+the one translation unit, because the exec map must span anything a
+function pointer can ever name. The unit of translation is the image.
+(The built tier walks the closure only; the sweep is the recorded gap,
+in the build plan's Python appendix.)
+
+One hardening the forced placement owes. Kisal answers the loader's
+"anywhere" by rewriting the request to `MAP_FIXED` at the prelink base
+— and a `dlopen`-only module's range sits *empty from boot until the
+import*, potentially the whole run. `MAP_FIXED` is atomic replacement,
+so anything that had wandered into the range would be silently paved
+over. The layout makes that impossible by construction (the arenas are
+carved above everything the bake placed), but "by construction" is a
+claim to assert, not narrate: the rewrite must carry
+`MAP_FIXED_NOREPLACE` semantics — refuse loudly if the prelink range is
+occupied — so the failure mode is a named error instead of memory
+corruption. Costs, named
 plainly: no ASLR (we are not pretending to be a hardened kernel), and
 each DSO loads at most once per process — true of ld.so anyway;
 `dlmopen` namespaces are a loud out-of-scope.
@@ -1051,7 +1074,12 @@ Two glibc landmines are defused deliberately rather than survived:
 The rest rides existing machinery. TLS: `TPOFF` values are fs-relative
 offsets consumed by the `x86_fs_base` translation; ld.so's static-TLS
 layout computation and `__tls_get_addr` are ordinary transpiled code;
-TLSDESC's call-through-GOT is another shadow-GOT customer. Process
+TLSDESC's call-through-GOT is another shadow-GOT customer. One honest
+caveat on "ordinary": the *dynamic*-TLS half — DTV growth when a
+`dlopen`ed module carries `__thread` — is the same guest code down a
+path nothing has yet executed, since the boot-time libraries get static
+TLS. The dlopen corpus includes a `__thread` variable in the loaded
+module for exactly that reason. Process
 start: kisal builds auxv (`AT_PHDR`, `AT_ENTRY`, `AT_BASE`, no vDSO,
 `AT_RANDOM`) and enters ld.so at its entry — a known table slot in a
 prelinked module, so the "jump" is a `call_indirect` with fabricated
@@ -1067,6 +1095,16 @@ arrived at runtime — `pip install` fetching a native wheel — hits
 `mmap(PROT_EXEC)` on a non-`EXEC_TRANSPILED` inode: loud error.
 Pure-Python installs are just files and work fine; native extensions
 must be baked. That is the AOT deal.
+
+One failure shape worth knowing before it is met in anger: `dlopen`'s
+*error* path leaves by `longjmp` (`_dl_catch_exception`), which is the
+parked setjmp/longjmp thorn — so a `dlopen` that fails inside ld.so (a
+missing `DT_NEEDED` of an extension module, say) will present as an
+exec-map miss on the sentinel value, not as a `dlerror`. The happy path
+never longjmps — the `setjmp` on entry is save-only, and save works —
+so this blocks nothing; it makes one class of failure maximally
+misleading until the thorn's third-arm design exists, and the dlopen
+corpus triggers it once deliberately so the shape is on record.
 
 And the labeled grind: transpiling ld.so and glibc themselves —
 hand-written entry asm, self-relocation, jump-table-rich string

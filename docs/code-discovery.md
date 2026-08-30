@@ -2,7 +2,7 @@
 
 Status: **active** — the design authority for how the linked-ELF front end
 decides where functions are. What is built today is marked built; the
-milestones D1–D6 at the end are the remaining work, in order. Where this
+milestones D1–D7 at the end are the remaining work, in order. Where this
 document and `src/reader.rs` disagree, this document wins and the code gets
 corrected.
 
@@ -318,7 +318,11 @@ ones adopted:
 - **A jump table's arms are not functions.** Any run or target already
   consumed by jump-table recovery (`src/jump_table.rs`) is excluded;
   the cluster rule above covers the case where the owning function is
-  itself undiscovered.
+  itself undiscovered. This governs *establishment* — an arm address
+  never mints a function through the weak door. It says nothing about
+  *cutting*: a recovered table's out-of-piece arm may cut the piece
+  that contains it, which is D7's fixpoint below, a different act
+  through a different door.
 - **A string is not a pointer array.** Overlap with a plausible string
   rejects the source.
 
@@ -548,6 +552,109 @@ it: "reached `fn.0x511aa5`, discovered by data-array scan, bounded by the
 FDE at `0x511b40`" is a diagnosable message where an address alone is an
 afternoon.
 
+Once D7 lands, this whole list runs inside a larger loop: the front end
+is a fixpoint over discover → lift → recover, and the list above is one
+round of its discovery phase.
+
+## Recovered arms are transfer targets: the front-end fixpoint (D7)
+
+The case that forces this is CPython, and it blocks the build plan's
+second checkpoint. `_Py_HashBytes` is siphash; its tail is
+`switch (len & 7)`. The table is recovered correctly — eight arms,
+eight-byte entries — but two arms lie outside the piece that dispatches,
+because the body was split at a direct branch into its middle.
+`emit_switch` emits an out-of-piece arm as a tail call
+(`src/structurer.rs:128`), which requires a function to begin exactly at
+the arm; `emit_fall_out` finds none and emits `unreachable`
+(`src/translate.rs:506`). The program traps on the first string it
+hashes.
+
+The shape of the problem is ordering. Jump-table recovery needs decoded
+instructions, so it runs after lifting; lifting runs after discovery;
+and discovery is what decides where functions begin. An arm cannot be a
+cut point because nothing knows it is an arm until the cutting is done.
+
+**The resolution is to state what was always true: discovery is not
+finished until the evidence the later passes produce stops arriving.**
+The front end becomes one fixpoint over discover → lift → recover — the
+same shape as the two fixpoints already inside it (the poisoned-offset
+decode loop in `src/lifter.rs`, the transfer-target rounds in
+`src/discover.rs`), drawn around the whole instead of around each part.
+This is also the shape the surveyed field says the problem has: evidence
+propagated to a fixed point, not a stratified one-way pipeline. The
+stratified pipeline is what has been generating this family of ordering
+bugs.
+
+The pieces, each load-bearing:
+
+- **The evidence grade.** A *recovered* table's arm is not a heuristic:
+  the rewritten table means the dispatch provably transfers there. That
+  is evidence of exactly the same grade as the direct branch targets
+  `split_at_interior_entries` already cuts on — the ones that created
+  the pieces in the first place. So an arm may cut where a direct branch
+  may cut, stated extents included, and the invariant is untouched: this
+  is not a weak witness gaining a permission, it is a proven transfer
+  acquiring the standing proven transfers already have.
+- **The feedback set, precisely.** Only arms that are *outside the piece
+  that dispatches* and *not already a function start* feed back — which
+  is exactly the set `emit_switch` would otherwise mis-emit, and nothing
+  more. A compiled `switch` nothing has split therefore contributes
+  nothing at all: its arms are `br_table` arms, and the fixpoint's first
+  round is today's pipeline. The safety of the scheme rests on this line,
+  so it is a stated rule and not an implementation accident.
+
+  **What this line does *not* say, corrected by measurement.** An earlier
+  version of it added "`_PyEval_EvalFrameDefault`'s 256 computed-goto
+  labels are all inside the dispatching piece (nothing ever split the
+  eval loop)". That is false about the binary this document names as its
+  target: in `/usr/bin/python3.12` the eval loop is **already 779
+  pieces**, cut by direct branches between opcode handlers, before any
+  of this runs — and its cold half is a second body of 293 more under an
+  unwind entry with no symbol. So the eval loop is not protected by
+  being unsplit. It is protected by the invariant the trap section
+  actually states, which is about *establishment*: a data value that
+  equals a covered function's interior address never mints a function.
+  Cutting is a different act — pieces tile the same bytes and the
+  transfers between them are explicit — and CPython's eval loop has been
+  tiled that way from the first day a linked binary was read.
+- **Cuts go through the same door.** Fed-back arms enter discovery as
+  transfer-target evidence through `Coverage`'s API and the existing
+  splitter — never a private cut pass bolted on after `recover_all`.
+  This is the same temptation pitfall 8 names for D6's region sweep,
+  one pass earlier: evidence that bypasses the splitter leaves the
+  splitter wrong about the world.
+- **The monotonicity guard.** The pathological case: a new cut lands
+  between another dispatch's `lea` and its `jmp`, so a table recovered
+  in round N is unrecoverable in round N+1 — which would silently
+  degrade that dispatch to an exec-map lookup and a runtime miss. The
+  guard: **the set of recovered tables may never shrink between
+  rounds**; if it does, bail loudly naming the dispatch. That converts
+  the pathological case into a build-time error. Rounds are bounded like
+  every fixpoint here, with non-settlement equally loud.
+- **The loop needs one owner.** Today `discover()` runs inside
+  `ObjectFile::parse` (`src/reader.rs:391`) and `lift_object` inside
+  transpile — the fixpoint crosses that boundary. Parse keeps harvesting
+  `FileEvidence`; a front-end driver owns the loop over it. What must
+  not happen is a `refine()` grafted onto `ObjectFile` that re-enters
+  discovery from outside its doors.
+
+**The alternative, rejected for this problem and kept for a different
+one.** A resume body is a dispatcher enterable at any of its blocks, so
+an out-of-piece arm *could* become a call into the sibling piece's
+resume body at that block. That is real machinery — it is the designed
+answer for interior addresses that only **materialize at run time**
+(the guessed-extent extension recorded after `busybox ls -l`, and D6's
+cousin). Using it for statically recovered arms would patch a static
+fact with a runtime mechanism: `_Py_HashBytes` would pay a
+call-plus-dispatcher hop per hash, and discovery would stay dishonest
+about evidence it holds at bake time. It stays in the drawer until a
+binary presents a runtime-computed interior target that blocks; none
+does today.
+
+Cost: the whole 80k-function CPython bake is 2.7 s, and a second round
+roughly doubles the front end. Fine. Scoping the re-lift to affected
+functions is an optimisation a measurement has to ask for first.
+
 ## The shape of the code, which D2 changes
 
 The plan is not purely additive. Discovery today is ~600 lines of free
@@ -717,6 +824,56 @@ the caller who cannot be asked to opt in.
   gate: the arbitrary-image guarantee demonstrated on the binary that
   posed the question.
 
+**D7 — The front-end fixpoint.** *Built.* The design is the section
+above. `src/frontend.rs` owns the loop and `ObjectFile::parse_at` calls
+it, so a function list a later pass would still revise is never
+observable; `discover::cut_at_switch_arms` is the door, cutting at
+transfer-target grade with `Witness::SwitchArm` recording what made each
+piece; `still_recovered` is the monotonicity guard; rounds are bounded
+at eight and non-settlement is loud.
+
+Measured on the target: `/usr/bin/python3.12` settles in three rounds
+(73,124 → 74,300 functions, 1,073 stranded arms then 9 then none) and
+`libc.so.6` in two, for **1,082** arm-cut pieces across the image and
+about half a second on a 2.7 s bake. The refusal count does not move.
+The witness collection is deliberately *not* re-run, and that is a fact
+rather than a saving: an arm can never establish a function, because
+`read_linked_table` will not read a table whose entries are not already
+instruction boundaries of discovered functions — so an arm always lands
+inside something and cutting is the only act available.
+
+*Acceptance, as met (`tests/switch_arms.rs`, `tests/corpus/split_switch.s`):*
+
+- `split_switch.s` is the shape, hand-written because a compiler will
+  not oblige: one `switch` over a table of four, a direct jump into the
+  body's middle from outside it, and two arms past the cut. It runs in a
+  container and is compared byte for byte and status for status against
+  the same ELF executed by Linux. The negative control was run rather
+  than described — with the feedback set forced empty, the two positive
+  tests fail and the program dies exactly where predicted, in
+  `dispatch_guest`'s `unreachable`.
+- The trap staying closed is asserted on the *feedback set* rather than
+  on the bytes: a compiled `switch` nothing has split
+  (`switch_dispatch.c`, `-O1` and `-O2`) strands no arm and produces no
+  `SwitchArm` piece. That is the stronger statement, because it says
+  why: an empty feedback set means the fixpoint provably changed
+  nothing.
+- The standing suite is unmoved — the differential backbone and the
+  snapshots, which are byte-exact by construction, and the busybox,
+  static-glibc and dynamic-tier container tests.
+- The monotonicity guard is unit-tested where it decides
+  (`frontend::still_recovered`): a round that loses a dispatch is
+  refused, and the refusal names its address. The hand-built input that
+  would provoke it in anger — an arm of one dispatch landing between
+  another's table load and its jump, which needs two dispatches sharing
+  a table — is not built; the guard is what makes not building it safe,
+  since the case turns into a named build-time error rather than a
+  silent runtime miss.
+- The gate that motivated it: with D7 in, `/usr/bin/python3.12` is past
+  `_Py_HashBytes` and runs into CPython's own bytecode evaluation. What
+  it meets there is the next item, not this one — see the build plan's
+  Python appendix.
+
 ## Pitfalls index
 
 1. A data value that equals a covered function's interior address is not
@@ -755,7 +912,16 @@ the caller who cannot be asked to opt in.
 10. A piece's resume body cannot `return_call` a sibling — the yield
     types disagree, the same rule as `src/translate.rs:556`. Ordinary
     body: `return_call`; resume body: plain call (D6).
-11. Do not emit one piece per region. 150k `br_table` arms in one
+11. A recovered arm inside the dispatching piece must never be fed back.
+    It is a `br_table` arm; feeding it back would cut the piece at its own
+    arms for no reason, and it is the line that keeps the fixpoint from
+    shredding anything (D7).
+12. Witness collection is not re-run per round, and must not be. An arm
+    cannot establish a function — `read_linked_table` only reads a table
+    whose entries are already instruction boundaries of discovered
+    functions — and after a merge the per-module bases the strong
+    witnesses need are no longer separable (D7).
+13. Do not emit one piece per region. 150k `br_table` arms in one
     function is untested engine territory; the cap comes from the
     S-gate's measurements, not from optimism (D6, step 0).
 
