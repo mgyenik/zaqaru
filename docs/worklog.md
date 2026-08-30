@@ -2183,3 +2183,98 @@ it passed. The worklog records this exact pattern from the day before: **a
 tool call that is stopped is not evidence that its effects were not
 applied.** Twice now, and both times the recovery was cheap only because
 something else printed the truth.
+
+## 2026-08-29 — the applet table, and what a guessed extent is worth
+
+`busybox echo`, `busybox cat` and `busybox ls` run, on the distribution's own
+stripped static binary. That is the first rung of M6's acceptance ladder, and
+`tests/applet_multiplexer.rs` keeps it.
+
+Getting there took three syscall rows, one design refinement, and a defect
+whose fix had already been written down and then cancelled three lines above
+itself.
+
+### `prctl` is sixty syscalls, and busybox wants one
+
+The ledger named `prctl` as what blocked busybox, which made it sound like an
+API to implement. Measured instead: busybox issues exactly `PR_GET_NAME`,
+once per applet. So there is one row, and every other option faults *naming
+the option* — a worklist entry rather than a dead end. Not `EINVAL`, which is
+what Linux answers for an option it does not know: indistinguishable from
+Linux for a program that probes, and silently wrong for the commoner one that
+asks the kernel to do something and is told, in effect, that it did.
+
+**The real blocker was argv**, which the ledger did not name at all. busybox
+picks its applet from `argv[0]` and the bake hardcoded `/init`. The command
+line is now a region of the image index — a fact about the container rather
+than a file in its filesystem, the same argument the design makes about
+`/iso` — written by `zaqaru-bake <program> -- <argv>...`.
+
+### A call cannot split its own extent
+
+`fn.0x5110e7` called `0x511147`, `0x60` bytes inside itself, and the
+translator refused: a call into the middle of a function has no spelling.
+
+D4 had written the rule that fixes it — "compilers do not call into the
+interior of a function they emitted, so a call that appears to is evidence
+that the extent, not the call, is wrong" — and the self-branch exemption
+three lines above cancelled it. Where a weak witness guesses an extent across
+an unwind hole, the function it swallowed *and* the call reaching that
+function land inside the same guess, so the call looks internal.
+
+The first fix broke every relocatable object, and the suite said so in three
+seconds: a call's displacement there is a placeholder a relocation will fill,
+so it decodes as a branch to the next instruction — inside its own body,
+every time. Linked mode only.
+
+### The half of D5 that mattered was not the scan
+
+`cat` and `ls` then died at addresses inside `fn.0x554e47+0x1f584+0x48a0` —
+busybox's applet table naming functions inside an extent a transfer target
+had guessed across a 631 KiB unwind hole.
+
+The scan itself is what the design specifies. What the design got wrong is
+which axis the permission to cut turns on. It said *witness strength*, and
+the two come apart: a symbol is a strong witness, but a symbol with no size
+states a **start**, and its extent is then whatever begins next — a bound,
+not a fact. So a function now carries where its extent came from, Stated or
+Guessed, and weak evidence may cut a guessed extent and never a stated one.
+
+That is the invariant refined rather than relaxed, and both halves are load
+bearing. Refusing to cut a stated extent is what keeps a computed goto's 256
+labels from shredding `_PyEval_EvalFrameDefault`, whose symbol states its
+size. Allowing a guessed one to be cut is what lets 278 applet pointers name
+functions inside a span nothing ever stated the length of — and without it a
+gap-only witness finds *none of them*, because they are not in a gap.
+
+Measured, and it corrected the document twice more. The applet table is 278
+bare pointers at stride eight, where the design predicted structs and its
+pitfall index said a stride-eight scan would miss it; so the scan is stride
+eight, and the generalisation waits for a binary that needs it rather than
+for a guess about one.
+
+### Implemented rather than refused
+
+`sendfile` would have "worked" as `ENOSYS`: busybox tries it and falls back
+when a kernel lacks it. It is implemented anyway, because it is a call that
+moves data, and a kernel answering "I do not have that" to something it could
+do will be believed by the next program that has no fallback. The
+distinction against `rseq`, which *is* refused for real: there is nothing
+behind `rseq`.
+
+It needed the one thing the write path lacked — a way to write bytes the
+kernel is holding, since every other write moves bytes from guest memory.
+
+### Where it stops
+
+`busybox ls -l` misses at an address that appears in no data section as
+either four or eight bytes, so it is computed at run time. That is neither
+D5's business nor — as `docs/code-discovery.md` has it — D6's, because it
+lands inside a covered extent. The obvious extension, now that extents carry
+their standing, is that the saturated tier could serve instruction starts
+inside *guessed* extents as well as residue. Written down, not built.
+
+### The suite
+
+Seven targets in 20 seconds, having gained two. It was 105 for five this
+morning; the entry above records why.
