@@ -155,15 +155,39 @@ const CONSOLE_RDEV: u64 = (5 << 8) | 1;
 /// one file, so these have to be distinct from each other and from the image.
 const CONSOLE_INODE_BASE: u64 = 0xffff_ff00;
 
+/// Whether a `dirfd` argument names the working directory.
+///
+/// **A descriptor is an `int`, whatever width the register carrying it has,
+/// and this is the one place that has to remember it.** The syscall ABI
+/// hands every argument over in a 64-bit register, and a caller that writes
+/// only the low half leaves the top half zero: glibc's `openat` wrapper sets
+/// `edi`, so `AT_FDCWD` arrives as `0x0000_0000_ffff_ff9c` and not as −100.
+/// Linux reads the low 32 bits as an `int`, so a comparison at 64 bits sees
+/// a number that is not `AT_FDCWD` and not a descriptor either.
+///
+/// Measured cost of getting it wrong: every *relative* path through the
+/// `…at` family answered `EBADF`. Absolute ones did not, because an absolute
+/// path never looks at the descriptor at all — which is why the whole
+/// dynamic tier, `ld.so` and all, ran for a day without noticing. CPython
+/// noticed on the first thing it looks for that is not absolute:
+/// `openat(AT_FDCWD, "pyvenv.cfg")`, three lines into `getpath`.
+///
+/// The truncation is not merely the fix, it is the conformant answer: a
+/// descriptor argument of `0x1_0000_0005` is descriptor 5 on Linux, because
+/// the top half was never part of the number.
+fn names_working_directory(dirfd: i64) -> bool {
+    dirfd as i32 == at::FDCWD as i32
+}
+
 impl<S: Store, M: Machine> Kernel<'_, S, M> {
     // ---- resolution helpers ------------------------------------------
 
     /// Where a path in the `…at` family starts from.
     pub(crate) fn start_directory(&self, dirfd: i64) -> Result<Vnode, Errno> {
-        if dirfd == at::FDCWD {
+        if names_working_directory(dirfd) {
             return Ok(self.vfs.working_directory());
         }
-        let fd = i32::try_from(dirfd).map_err(|_| Errno::BadFile)?;
+        let fd = dirfd as i32;
         let Backing::Image(inode) = self.files.description(fd)?.backing else {
             return Err(Errno::NotDir);
         };
@@ -185,11 +209,10 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
     /// flag were drifting apart, and a descriptor's meaning cannot be
     /// allowed to depend on which syscall asked.
     fn empty_path_target(&self, dirfd: i64) -> Result<Backing, Errno> {
-        if dirfd == at::FDCWD {
+        if names_working_directory(dirfd) {
             return Ok(Backing::Image(self.vfs.working_directory()));
         }
-        let fd = i32::try_from(dirfd).map_err(|_| Errno::BadFile)?;
-        Ok(self.files.description(fd)?.backing)
+        Ok(self.files.description(dirfd as i32)?.backing)
     }
 
     /// The image inode a descriptor names, for the rows that only make sense
@@ -1333,8 +1356,7 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
     fn xattr_inode(&self, call: i64, first: i64) -> Result<Option<Vnode>, Errno> {
         match call {
             number::FGETXATTR | number::FLISTXATTR => {
-                let fd = i32::try_from(first).map_err(|_| Errno::BadFile)?;
-                match self.files.description(fd)?.backing {
+                match self.files.description(first as i32)?.backing {
                     Backing::Image(inode) => Ok(Some(inode)),
                     Backing::Console(_) => Ok(None),
                 }

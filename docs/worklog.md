@@ -2423,3 +2423,93 @@ in, through `Py_InitializeFromConfig` → frozen-module import →
 `PyEval_EvalCode` → `_PyEval_EvalFrameDefault`. It stops there on
 `kisal: 0x5d6760 is not the address of any translated function`, and that is
 a different defect, diagnosed below rather than guessed at.
+
+## 2026-08-30 — CPython runs bytecode: two defects between there and here
+
+Both found by running the thing and reading the trace, which is the M6
+appendix's own instruction and the only method that has worked on this
+program.
+
+### A dispatch table's arms land in two bodies
+
+With D7 in, python got past `_Py_HashBytes` and stopped inside
+`_PyEval_EvalFrameDefault` on `kisal: 0x5d6760 is not the address of any
+translated function`. The eval loop's own computed goto —
+`mov rax,[rax*8+0x7846e0]; jmp rax`, five copies in the one piece — was not
+recovered at all, so it translated as an ordinary indirect transfer and
+missed the exec map on an interior address the first time a bytecode ran.
+
+Measured rather than guessed at. `opcode_targets[]` is 256 absolute
+eight-byte entries at `0x7846e0` in `.rodata`. **181 of them are inside
+`_PyEval_EvalFrameDefault` and 75 are inside a second body at
+`0x494c2a`** — its cold twin, found by an unwind entry and named by no
+symbol — and entry *zero* is one of the 75. `holds_block_addresses` asked
+whether the **first two** entries name blocks inside the dispatching body,
+so the answer was no on entry zero and the table was never read.
+
+The rule is right and its operationalisation was too narrow: a function
+pointer names a function's start and a table entry names a block inside the
+body that dispatches, but gcc splits a function's cold blocks into a body of
+their own, so the arms of one dispatch are spread across two — and which
+arms end up where is a property of the numbering, not of the table. The test
+is now that *two entries anywhere in the run* name blocks inside the body,
+scanning while the entries continue to be instruction boundaries and
+stopping as soon as it has its two. A real table costs a handful of reads; a
+run of unrelated data costs one.
+
+Two smaller things came with it. An entry equal to the *body's* start is now
+excluded as well as one equal to the piece's, because an array holding the
+dispatching function's own address is the function-pointer array being told
+apart. And the old rule was quietly unstable under D7: it compares against
+`function.offset`, which moves when a piece is cut, so a dispatching piece
+that came to begin at one of its own arms would have lost its table between
+rounds. The monotonicity guard would have caught it; the wider window makes
+it not arise.
+
+`cold_switch.s` is the shape — entry zero in a cold body, the rest inside
+the dispatching one — run in a container against the same ELF executed by
+Linux, and checked by restoring the old rule, which fails it.
+
+### A descriptor is an `int`
+
+Then CPython ran `getpath`, which is Python bytecode, all the way through —
+and died on `OSError: [Errno 9] Bad file descriptor` at
+`openat(AT_FDCWD, "pyvenv.cfg")`.
+
+The trace made it one line, with the dirfd rendered as it arrived:
+`0xffffff9c`. That is −100 in an `int`, zero-extended into a sixty-four bit
+register, which is what a caller that writes `edi` leaves behind — and glibc's
+`openat` wrapper writes `edi`. kisal compared it against `AT_FDCWD` at
+sixty-four bits, saw a number that was neither `AT_FDCWD` nor a descriptor,
+and answered `EBADF`.
+
+Every `…at` row was affected, and **only for relative paths**: an absolute
+path never looks at the descriptor, deliberately and with a comment saying
+so. That is why the whole dynamic tier, `ld.so` and glibc and three shipped
+coreutils, ran without noticing. Every existing test wrote `at::FDCWD` as a
+Rust `i64`, which sign-extends, so no fixture ever produced the shape a real
+caller produces — the M1 lesson exactly: an assertion that cannot tell the
+right answer from the default one.
+
+The narrowing is not merely the fix, it is the conformant answer: a
+descriptor argument of `0x1_0000_0005` is descriptor 5 on Linux, because the
+top half was never part of the number. One predicate now owns it, and the
+one place `i32::try_from` was used on a plain descriptor was changed to the
+truncating cast every other row already used.
+
+### Where it stands
+
+`python3.12` now boots through `ld.so`, initialises CPython, runs the frozen
+`getpath` module as bytecode, computes its full path configuration —
+
+    stdlib dir = '/usr/lib/python3.12'
+    sys.prefix = '/usr'
+    sys.path = ['/usr/lib/python312.zip', '/usr/lib/python3.12',
+                '/usr/lib/python3.12/lib-dynload']
+
+— and stops on `ModuleNotFoundError: No module named 'encodings'`, 252
+syscalls in, because the image holds the interpreter and none of its library.
+That is the build plan's Python appendix item 2, reached rather than
+predicted. Worth noting against that appendix: it found its `stdlib dir`
+from the compiled-in prefix without `PYTHONHOME`, so the environment
+question really is secondary to placing the tree.

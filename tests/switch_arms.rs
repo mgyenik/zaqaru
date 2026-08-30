@@ -26,12 +26,93 @@ fn path(segments: &[&[u8]]) -> Vec<Vec<u8>> {
     segments.iter().map(|segment| segment.to_vec()).collect()
 }
 
-/// The fixture, read the way a bake reads it.
-fn split_switch(workspace: &WorkingDirectory) -> (Vec<u8>, ObjectFile) {
-    let elf = support::link_corpus_executable(workspace, "split_switch.s", "_start", "-O1");
+/// A fixture, read the way a bake reads it.
+fn read(workspace: &WorkingDirectory, source: &str) -> (std::path::PathBuf, Vec<u8>, ObjectFile) {
+    let elf = support::link_corpus_executable(workspace, source, "_start", "-O1");
     let bytes = std::fs::read(&elf).expect("read the program");
     let object = ObjectFile::parse(&bytes).expect("parse the program");
-    (bytes, object)
+    (elf, bytes, object)
+}
+
+/// Runs a fixture both ways and requires the two to agree: the same ELF
+/// executed by Linux, and the same ELF baked into a container.
+///
+/// Comparing the bytes as well as the status matters here — an arm that went
+/// to the wrong place can still add up to the same total, and the six bytes
+/// say in which order the arms were reached.
+fn agrees_with_native(workspace: &WorkingDirectory, source: &str, label: &str, expected: i32) {
+    let (elf, bytes, object) = read(workspace, source);
+
+    let native = std::process::Command::new(&elf)
+        .env_clear()
+        .output()
+        .expect("run the program natively");
+    let native_status = native.status.code().expect("a native exit status");
+    assert_eq!(
+        native_status, expected,
+        "natively the program no longer visits every arm; it wrote {:?}",
+        native.stdout
+    );
+
+    let top = object
+        .segments
+        .iter()
+        .map(|segment| segment.address + segment.memory_size)
+        .max()
+        .expect("a linked program has segments");
+    let translation = zaqaru::transpile::Transpiler::new(&object)
+        .translate()
+        .expect("translate the program");
+    let guest = workspace.write(&format!("{label}.wasm.o"), &translation.module);
+
+    let root = workspace.path().join("image");
+    std::fs::create_dir_all(&root).expect("create the image tree");
+    let mut placed = bytes.clone();
+    baker::program::apply(&mut placed, &translation.patches).expect("apply the patches");
+    std::fs::write(root.join(PROGRAM), &placed).expect("place the program");
+    let image = baker::object::emit(&baker::bake_directory(&root).expect("bake"))
+        .expect("emit the image object");
+
+    let module = support::link_container_for_program(
+        workspace,
+        std::slice::from_ref(&guest),
+        &image,
+        label,
+        Some(top),
+    );
+    let mut container = runner::Container::instantiate(
+        &std::fs::read(&module).expect("read the container"),
+        support::mounts_seeded(&[0x33; 32]),
+    )
+    .expect("instantiate the container");
+
+    let status = container.boot().unwrap_or_else(|error| {
+        let log = container
+            .mounts()
+            .read(&path(&[b"iso", b"log", b"error"]))
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        panic!(
+            "the container did not finish: {error:?}\nkernel log: {}",
+            String::from_utf8_lossy(&log)
+        )
+    });
+
+    let written = container
+        .mounts()
+        .read(&path(&[b"iso", b"console", b"stdout"]))
+        .expect("the console mount failed")
+        .unwrap_or_default();
+    assert_eq!(
+        written, native.stdout,
+        "the transpiled program reached different arms than the native one"
+    );
+    assert_eq!(
+        i64::from(status),
+        i64::from(native_status),
+        "the transpiled program's arms summed differently"
+    );
 }
 
 /// A function begins at every arm that needed one, and says why it does.
@@ -44,7 +125,7 @@ fn split_switch(workspace: &WorkingDirectory) -> (Vec<u8>, ObjectFile) {
 #[test]
 fn an_arm_in_a_sibling_piece_becomes_a_function() {
     let workspace = WorkingDirectory::new("switch-arms-cut");
-    let (_, object) = split_switch(&workspace);
+    let (_, _, object) = read(&workspace, "split_switch.s");
 
     // The fixture has to be the shape it claims to be: one recovered table,
     // whose arms are not all inside the piece that dispatches.
@@ -119,79 +200,71 @@ fn an_arm_in_a_sibling_piece_becomes_a_function() {
 #[test]
 fn a_program_whose_switch_arms_were_split_away_runs() {
     let workspace = WorkingDirectory::new("switch-arms-run");
-    let (bytes, object) = split_switch(&workspace);
-    let elf = support::link_corpus_executable(&workspace, "split_switch.s", "_start", "-O1");
+    agrees_with_native(&workspace, "split_switch.s", "switch-arms", 63);
+}
 
-    let native = std::process::Command::new(&elf)
-        .env_clear()
-        .output()
-        .expect("run the program natively");
-    let native_status = native.status.code().expect("a native exit status");
-    assert_eq!(
-        native_status, 63,
-        "natively the program no longer visits every arm; it wrote {:?}",
-        native.stdout
-    );
+/// A table whose *first* entry is in the cold body is still a table.
+///
+/// The discriminator between a dispatch table and an array of function
+/// pointers is where the entries land — a function pointer names a
+/// function's start, a table entry names a block inside the body that
+/// dispatches. That was written as "the first two entries", and gcc says the
+/// arms of one dispatch land in two bodies, because it splits cold blocks
+/// out into a body of their own. CPython's `opcode_targets[]` has 181 of its
+/// 256 entries inside `_PyEval_EvalFrameDefault` and 75 inside its cold
+/// twin, and entry zero is one of the 75 — so the hottest dispatch in the
+/// milestone target was not recognised at all, and translated as an indirect
+/// transfer that missed the first time a bytecode ran.
+#[test]
+fn a_table_whose_first_arm_is_in_the_cold_body_is_still_recovered() {
+    let workspace = WorkingDirectory::new("switch-arms-cold");
+    let (_, _, object) = read(&workspace, "cold_switch.s");
 
-    let top = object
-        .segments
+    let lifted = zaqaru::lifter::lift_object(&object).expect("lift");
+    let tables: Vec<_> = lifted
         .iter()
-        .map(|segment| segment.address + segment.memory_size)
-        .max()
-        .expect("a linked program has segments");
-    let translation = zaqaru::transpile::Transpiler::new(&object)
-        .translate()
-        .expect("translate the program");
-    let guest = workspace.write("split_switch.wasm.o", &translation.module);
-
-    let root = workspace.path().join("image");
-    std::fs::create_dir_all(&root).expect("create the image tree");
-    let mut placed = bytes.clone();
-    baker::program::apply(&mut placed, &translation.patches).expect("apply the patches");
-    std::fs::write(root.join(PROGRAM), &placed).expect("place the program");
-    let image = baker::object::emit(&baker::bake_directory(&root).expect("bake"))
-        .expect("emit the image object");
-
-    let module = support::link_container_for_program(
-        &workspace,
-        std::slice::from_ref(&guest),
-        &image,
-        "switch-arms",
-        Some(top),
-    );
-    let mut container = runner::Container::instantiate(
-        &std::fs::read(&module).expect("read the container"),
-        support::mounts_seeded(&[0x33; 32]),
-    )
-    .expect("instantiate the container");
-
-    let status = container.boot().unwrap_or_else(|error| {
-        let log = container
-            .mounts()
-            .read(&path(&[b"iso", b"log", b"error"]))
-            .ok()
-            .flatten()
-            .unwrap_or_default();
-        panic!(
-            "the container did not finish: {error:?}\nkernel log: {}",
-            String::from_utf8_lossy(&log)
-        )
-    });
-
-    let written = container
-        .mounts()
-        .read(&path(&[b"iso", b"console", b"stdout"]))
-        .expect("the console mount failed")
-        .unwrap_or_default();
+        .flat_map(|function| function.jump_tables.values())
+        .collect();
     assert_eq!(
-        written, native.stdout,
-        "the transpiled program reached different arms than the native one"
+        tables.len(),
+        1,
+        "the dispatch was not recovered, so its first entry is still deciding"
     );
-    assert_eq!(
-        i64::from(status),
-        i64::from(native_status),
-        "the transpiled program's arms summed differently"
+
+    // The fixture is the shape it claims to be: the first entry is outside
+    // the body that dispatches, and the ones after it are inside.
+    let dispatch = object
+        .functions
+        .iter()
+        .find(|function| function.name == "dispatch")
+        .expect("the fixture defines `dispatch`");
+    let arms = &tables[0].targets;
+    assert!(
+        !dispatch.whole.contains(&arms[0]),
+        "the first arm is inside the dispatching body, so this proves nothing"
     );
+    assert!(
+        arms[1..]
+            .iter()
+            .all(|arm| dispatch.whole.contains(arm)),
+        "the later arms are not inside the dispatching body"
+    );
+
+    // And the arm in the cold body became a function, since nothing else
+    // begins there — the fixpoint's work, on a body it does not dispatch
+    // from.
+    let cut = object
+        .functions
+        .iter()
+        .find(|function| function.witness == Witness::SwitchArm)
+        .expect("the cold arm did not become a function");
+    assert_eq!(cut.offset, arms[0], "the piece does not begin at the arm");
+}
+
+#[test]
+fn a_program_dispatching_into_its_cold_body_runs() {
+    let workspace = WorkingDirectory::new("switch-arms-cold-run");
+    agrees_with_native(&workspace, "cold_switch.s", "cold-switch", 31);
 }
 
 /// The trap this design exists to leave closed.

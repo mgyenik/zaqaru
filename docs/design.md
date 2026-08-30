@@ -474,12 +474,24 @@ nothing suppressed. What must be recognised is only *which* table a jump
 reads, which comes from relocations.
 
 Two rules keep that honest. A table is told from a vtable by where its
-relocations land — a function pointer names a function's *start*, a table
-entry names a block inside the dispatching function. And a table's extent
-comes from its relocation run bounded by the next table's start, computed
-across the whole object, because tables abut one another routinely and in the
-relative form reading one as another's yields *wrong* targets rather than
-surplus ones.
+entries land — a function pointer names a function's *start*, a table entry
+names a block inside the dispatching function. And a table's extent comes
+from its entry run bounded by the next table's start, computed across the
+whole object, because tables abut one another routinely and in the relative
+form reading one as another's yields *wrong* targets rather than surplus
+ones.
+
+The first rule needs one qualification that only a real binary supplies:
+**the arms of one dispatch land in two bodies.** gcc splits a function's cold
+blocks out into a fragment of its own, so some arms are inside the
+dispatching body and the rest are inside its cold twin — and which are which
+is a property of the numbering rather than of the table. So the test is that
+*two* entries anywhere in the run name blocks inside the dispatching body,
+not that the first two do. Asking about the first two rejected CPython's
+`opcode_targets[]`, whose entry zero is one of the 75 (of 256) that live in
+`_PyEval_EvalFrameDefault`'s cold twin — after which the hottest dispatch in
+the interpreter translated as an ordinary indirect transfer and missed the
+exec map the first time a bytecode ran.
 
 An indirect jump that reads no table is an indirect tail call. One that reads
 something table-shaped whose entries cannot be read is an error, never a
@@ -731,6 +743,7 @@ here so the reasons do not have to be rediscovered.
 | Indirect calls | One `call_indirect` type for the whole program | Every translated function is `() -> ()`, so signature agreement — normally the hard part — cannot fail | Selective ABI lifting introduces real signatures |
 | Jump tables | Rewrite the entries rather than recover the index | Compilers emit at least four dispatch shapes across two compilers, two code models and the optimisation levels; entry contents are ours to choose, instruction shapes are not | A compiler computes the target in a way that is not `table + entry` |
 | Table extent | Relocation run, bounded by the next table, computed object-wide | Tables abut; a per-function bound reads one table's entries as another's, which in the relative form gives wrong targets, not surplus ones | — |
+| Table vs. vtable | Two entries *anywhere in the run* name blocks inside the dispatching body | gcc's hot/cold split puts some of one dispatch's arms in a second body, and which ones is a property of the numbering; asking about the first two rejected CPython's opcode table on its entry zero | An array of function pointers is found holding two interior addresses of the function that dispatches through it |
 | Global offset table | A load through a slot is rewritten as the address computation it stands for | There is no such table in the output, and the relaxable relocation types exist precisely to license this | — |
 | Conditional tail calls | A branch out of the function becomes `if (cond) { call; return }` | `-O2` splits cold paths into `.text.unlikely` and reaches them with `jcc` | — |
 

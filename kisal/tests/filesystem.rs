@@ -1371,6 +1371,63 @@ fn an_absolute_path_ignores_the_directory_descriptor() {
     );
 }
 
+/// A descriptor is an `int`, and the register carrying it is sixty-four bits
+/// wide.
+///
+/// Every other test here writes `AT_FDCWD` as a Rust `i64`, which
+/// sign-extends — and a guest does not. glibc's `openat` wrapper sets `edi`,
+/// so the value that reaches the kernel is `0x0000_0000_ffff_ff9c`: the same
+/// `int`, a different sixty-four-bit number. Comparing at the wider width
+/// answered `EBADF` to every relative path in the `…at` family, and answered
+/// it *only* to relative ones, because an absolute path never looks at the
+/// descriptor. CPython found it on `openat(AT_FDCWD, "pyvenv.cfg")`.
+///
+/// The two halves are both asserted: the zero-extended `AT_FDCWD` resolves,
+/// and a descriptor with rubbish in its top half is the descriptor its low
+/// half names, which is what Linux does with one.
+#[test]
+fn a_descriptor_argument_is_read_as_the_int_it_is() {
+    let mut fixture = fixture("openat-narrow");
+    let relative = fixture.arena.path("etc/hosts");
+    let absolute = fixture.arena.path("/etc/hosts");
+
+    // What a guest that wrote `edi` leaves in `rdi`.
+    let zero_extended = i64::from(at::FDCWD as u32);
+    assert_ne!(zero_extended, at::FDCWD, "the fixture is not testing anything");
+    let fd = fixture.call(
+        number::OPENAT,
+        [zero_extended, relative, open_flags::READ_ONLY as i64, 0, 0, 0],
+    );
+    assert!(
+        fd >= 0,
+        "openat({zero_extended:#x}, \"etc/hosts\") failed with {fd}; a \
+         zero-extended AT_FDCWD is AT_FDCWD"
+    );
+
+    // And a real descriptor keeps its meaning with the top half dirtied.
+    let directory = fixture.opened("/etc");
+    let name = fixture.arena.path("hosts");
+    let dirtied = directory | 0x7fff_ffff_0000_0000u64 as i64;
+    let fd = fixture.call(
+        number::OPENAT,
+        [dirtied, name, open_flags::READ_ONLY as i64, 0, 0, 0],
+    );
+    assert!(
+        fd >= 0,
+        "openat({dirtied:#x}, \"hosts\") failed with {fd}; the top half of a \
+         descriptor argument was never part of the number"
+    );
+
+    // The control: absolute paths were always fine, which is exactly why
+    // this went unnoticed for as long as it did.
+    assert!(
+        fixture.call(
+            number::OPENAT,
+            [zero_extended, absolute, open_flags::READ_ONLY as i64, 0, 0, 0]
+        ) >= 0
+    );
+}
+
 /// A trailing slash forces the final symlink to be followed, even under
 /// `O_NOFOLLOW`. `/lib`, `/bin` and `/sbin` are symlinks in every modern base
 /// image, so `stat("/lib/")` is an ordinary thing to do.

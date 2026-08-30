@@ -478,30 +478,58 @@ fn holds_block_addresses(
     boundaries: &std::collections::HashMap<usize, std::collections::BTreeSet<u64>>,
 ) -> bool {
     if object.layout == Layout::Linked {
-        // Two entries in a row naming blocks inside the body this function
-        // was cut from, and neither of them its start: that is a dispatch
-        // table and not a function pointer, whichever form the entries turn
-        // out to be in.
+        // Two entries naming blocks inside the body this function was cut
+        // from, neither of them a start: that is a dispatch table and not an
+        // array of function pointers, whichever form the entries turn out to
+        // be in. A function pointer names a function's *start*; only a
+        // dispatch names the interior of the body dispatching.
         //
         // *The body it was cut from*, not the piece. A `switch` whose arms
         // are entered from elsewhere gets split at each of them, and then
         // every arm is in a sibling piece — so asking about the piece finds
-        // nothing and the table is not recognised at all. What keeps the
-        // distinction from a vtable is unchanged: an array of function
-        // pointers names other functions' starts, which are outside this
-        // body whether or not it was cut.
+        // nothing and the table is not recognised at all.
+        //
+        // *Two anywhere in the run*, not the first two, and that is a
+        // correction a real binary forced. gcc splits a function's cold
+        // blocks into a body of their own, so a dispatch's arms land in two
+        // bodies — and which particular arms land in which is a property of
+        // the numbering, not of the table. CPython's `opcode_targets[]` is
+        // 256 entries of which 181 are in `_PyEval_EvalFrameDefault` and 75
+        // in its cold twin, and **entry zero is one of the 75**: asking
+        // about the first two rejected the hottest dispatch in the
+        // milestone target, which then translated as an indirect transfer
+        // and missed in the exec map at run time.
+        //
+        // The scan stops where the entries stop being instruction
+        // boundaries — the same bound `read_linked_table` uses — and as soon
+        // as it has its two, so a real table costs a handful of reads and a
+        // run of unrelated data costs one.
         let whole = &object.functions[function.function].whole;
         let table_address = object.sections[section].address + offset;
         let starts = boundaries.get(&function.section);
         return entry_forms(table_address, bases).iter().any(|form| {
-            (0..2).all(|index| {
-                read_linked_entry(object, section, offset + index * form.stride, *form)
-                    .is_some_and(|target| {
-                        target != function.offset
-                            && whole.contains(&target)
-                            && starts.is_some_and(|starts| starts.contains(&target))
-                    })
-            })
+            let mut inside = 0;
+            for index in 0.. {
+                let Some(target) =
+                    read_linked_entry(object, section, offset + index * form.stride, *form)
+                else {
+                    return false;
+                };
+                if !starts.is_some_and(|starts| starts.contains(&target)) {
+                    return false;
+                }
+                // Not the piece's own start, and not the body's: an array
+                // holding the dispatching function's own address is a
+                // function-pointer array, which is the thing being told
+                // apart.
+                if target != function.offset && target != whole.start && whole.contains(&target) {
+                    inside += 1;
+                    if inside == 2 {
+                        return true;
+                    }
+                }
+            }
+            false
         });
     }
     let Some(relocation) = relocation_at(object, section, offset) else {
