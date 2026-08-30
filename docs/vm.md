@@ -497,17 +497,45 @@ processes as well as threads — stays a pure function of execution.
 native run of the same bytes, and against the container's own rule where
 the host is not the oracle.
 
-**What is not built is the fd hoisting**, and it is not built because
-there is nothing yet to hoist: every descriptor a container can open today
-is a file in the image or a console, and both are safely *copied* into a
-child — an image file is read-only and a console has no offset the two
-processes fight over. The hoisting design earns its keep the moment a
-descriptor has shared mutable state behind it, which is `pipe`, `socketpair`
-and `accept`. So the order is: pipes, then hoisting, then the prefork
-shapes that need it — and the AOT design's rule that hoisting happens
-*before* the snapshot is the reason this is stated here rather than
-discovered later, because a fork that copies a pipe's ring cannot be fixed
-after the fact.
+**And the fd hoisting is built, structurally.** Until pipes, every
+descriptor a container could open was safe to *copy* into a child: an image
+file is read-only and a console has no offset the two processes fight over.
+A pipe is the first that is neither, and it is what the plan's hoisting
+analysis is about.
+
+What the interpreter changes here too is where the shared thing lives.
+`kisal/src/pipe.rs` holds every ring in one arena that the whole process
+tree shares — an `Rc` on the kernel, cloned by `fork` and kept by `execve`
+— and a descriptor holds an *index* into it. So the descriptor table is
+copied (the numbers, the flags, the close-on-exec bits: all per-process,
+all POSIX-correct by construction) and the buffer is shared, which is
+exactly the split hoisting exists to produce. The plan's ordering rule —
+hoist *before* the snapshot — is satisfied by there being nothing to
+snapshot: the bytes were never in either address space.
+
+The accounting is where it can go wrong, and it goes wrong by hanging
+rather than by being wrong: a reader sees end-of-file when the last
+*writer* descriptor closes and a writer gets `EPIPE` when the last reader
+does, so a fork raises both counts once per copied descriptor and every
+`dup`, `dup2`, `dup3`, `close` and `execve` moves them. Rather than five
+call sites each remembering the right direction, the table is censused
+before and after and the difference applied.
+
+A transfer that cannot finish parks *as a record* on the thread rather
+than as a syscall to re-run, and `write` is why: a write of more than the
+64 KiB a pipe holds moves in pieces, and POSIX says the caller sees one
+count at the end. It is completed on the parked process's own turn, never
+on the turn of whoever woke it, for the same reason `wait4` is — a guest
+address means this process's bytes only while this process is current.
+Which also means "no thread here can run" stopped being a deadlock: it is
+a question about the container, so `Process` reports `Idle` and only
+`System`, which can see every process, calls it.
+
+**What is left is `poll`, `epoll` and sockets.** `subprocess.run` with
+`capture_output` needs the first two, because CPython's `selectors` picks
+`epoll` on Linux at import time; a socket is the next thing after that
+whose state two processes share, and it hoists the same way a pipe does
+because the arena is already the shape for it.
 
 The `vfork`/`posix_spawn` fast path is unchanged and is still the case
 that matters: no snapshot at all, the child instantiated fresh from the

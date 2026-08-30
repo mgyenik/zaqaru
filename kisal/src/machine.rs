@@ -75,6 +75,16 @@ pub trait Machine {
         0
     }
 
+    /// Parks this thread part-way through a pipe transfer.
+    ///
+    /// Nothing to park on a machine with one thread and no scheduler, and
+    /// that is why a pipe read on the ahead-of-time path would hang rather
+    /// than wait — which is a thing to know about that path, not a gap in
+    /// this one.
+    fn park_on_transfer(&mut self, _transfer: crate::pipe::Transfer) -> bool {
+        false
+    }
+
     /// Marks a signal pending on some thread that has not blocked it.
     ///
     /// What a *process*-directed signal means: `kill(2)` names a process,
@@ -490,6 +500,11 @@ impl Machine for Interpreted {
 
     fn park(&mut self, word: u64, bitset: u32) -> bool {
         self.threads.current_mut().state = crate::thread::State::Waiting { word, bitset };
+        true
+    }
+
+    fn park_on_transfer(&mut self, transfer: crate::pipe::Transfer) -> bool {
+        self.threads.current_mut().state = crate::thread::State::Transferring(transfer);
         true
     }
 

@@ -38,6 +38,13 @@ pub enum State {
     /// is written where the caller asked and the thread becomes runnable
     /// again, rather than the syscall being re-run.
     WaitingForChild { wanted: i32, status_at: u64 },
+    /// It is part-way through a transfer on a pipe that could not finish.
+    ///
+    /// A record rather than a syscall to re-run, and `write` is why: a write
+    /// of more than a pipe holds moves in pieces, and POSIX says the caller
+    /// sees one count at the end. Re-running would move the first piece
+    /// twice.
+    Transferring(crate::pipe::Transfer),
     /// It called `exit`. Its control block is kept until something reaps
     /// the identifier, because a thread that has ended is still a thread
     /// that existed.

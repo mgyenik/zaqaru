@@ -1271,3 +1271,186 @@ int main(void) {
         "child 4, orphan 1 exited 5\nand then 1\n"
     );
 }
+
+/// **A pipe inside one process.**
+///
+/// The buffer, the two ends, and end-of-file when the writer closes — which
+/// is the part a program depends on to stop reading, and the part that fails
+/// silently by hanging rather than loudly by being wrong.
+#[test]
+fn a_pipe_carries_bytes_and_ends() {
+    agrees_with_native(
+        "pipe",
+        r#"
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+
+int main(void) {
+    int ends[2];
+    if (pipe(ends) != 0) { perror("pipe"); return 1; }
+    const char *message = "through the pipe";
+    write(ends[1], message, strlen(message));
+
+    char buffer[64] = {0};
+    ssize_t got = read(ends[0], buffer, sizeof buffer);
+    printf("read %zd: %s\n", got, buffer);
+
+    /* The reader keeps going until the last writer closes. */
+    close(ends[1]);
+    printf("eof %zd\n", read(ends[0], buffer, sizeof buffer));
+    close(ends[0]);
+    return 0;
+}
+"#,
+        Linkage::Dynamic,
+    );
+}
+
+/// **A pipe across a fork**, which is what a pipe is for.
+///
+/// Everything a container could open before this was safe to *copy* into a
+/// child: an image file is read-only and a console has no position. A pipe
+/// is neither, and this is the test that says so — the child writes into a
+/// buffer the parent reads, so it fails if the fork copied the ring instead
+/// of sharing it, and it fails if the counts are wrong, because then the
+/// parent's read either never ends or ends too early.
+#[test]
+fn a_pipe_carries_bytes_between_processes() {
+    agrees_with_native(
+        "pipe-fork",
+        r#"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+int main(void) {
+    int ends[2];
+    if (pipe(ends) != 0) { perror("pipe"); return 1; }
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        close(ends[0]);
+        for (int index = 0; index < 4; index++) {
+            char line[32];
+            int length = snprintf(line, sizeof line, "line %d\n", index);
+            write(ends[1], line, length);
+        }
+        close(ends[1]);
+        _exit(0);
+    }
+    /* The parent must close its own write end, or the read never ends:
+       there would always be a writer, and that writer would be itself. */
+    close(ends[1]);
+    char buffer[256];
+    size_t total = 0;
+    ssize_t got;
+    while ((got = read(ends[0], buffer + total, sizeof buffer - total)) > 0) {
+        total += (size_t)got;
+    }
+    buffer[total] = 0;
+    close(ends[0]);
+    waitpid(child, 0, 0);
+    printf("got %zu bytes:\n%s", total, buffer);
+    return 0;
+}
+"#,
+        Linkage::Dynamic,
+    );
+}
+
+/// **A write with nobody reading**, which is `EPIPE` and `SIGPIPE`.
+///
+/// The other direction of the same accounting: a reader sees end-of-file
+/// when the last writer goes, and a writer is told the same fact as an
+/// error. A program that ignores `SIGPIPE` — every one that writes to a pipe
+/// it might outlive — sees the errno, which is why the signal has to go
+/// through the disposition table rather than straight to the exit.
+#[test]
+fn a_write_to_a_closed_pipe_is_epipe() {
+    agrees_with_native(
+        "pipe-broken",
+        r#"
+#include <errno.h>
+#include <signal.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+
+int main(void) {
+    signal(SIGPIPE, SIG_IGN);
+    int ends[2];
+    pipe(ends);
+    close(ends[0]);
+    ssize_t wrote = write(ends[1], "nobody is listening", 19);
+    printf("wrote %zd, errno %d\n", wrote, wrote < 0 ? errno : 0);
+    close(ends[1]);
+    return 0;
+}
+"#,
+        Linkage::Dynamic,
+    );
+}
+
+/// **More than the pipe holds**, which is where a writer parks mid-transfer.
+///
+/// A pipe is 64 KiB, so a quarter-megabyte write cannot finish in one go: it
+/// moves what fits, parks with a count already on it, and finishes across
+/// however many turns the reader needs. That is the case the transfer is a
+/// *record* for rather than a syscall to re-run — re-running would move the
+/// first piece twice, and the caller would be told the last piece was the
+/// whole.
+///
+/// It fails on a lost byte, a duplicated one, or a count that is not the
+/// number written.
+#[test]
+fn a_write_larger_than_the_pipe_finishes_in_pieces() {
+    agrees_with_native(
+        "pipe-large",
+        r#"
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#define TOTAL (256 * 1024)
+
+int main(void) {
+    static unsigned char sent[TOTAL];
+    static unsigned char got[TOTAL];
+    for (int index = 0; index < TOTAL; index++) {
+        sent[index] = (unsigned char)(index * 31 + (index >> 8));
+    }
+    int ends[2];
+    pipe(ends);
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        close(ends[0]);
+        ssize_t wrote = write(ends[1], sent, TOTAL);
+        close(ends[1]);
+        _exit(wrote == TOTAL ? 0 : 1);
+    }
+    close(ends[1]);
+    size_t total = 0;
+    ssize_t piece;
+    while (total < TOTAL && (piece = read(ends[0], got + total, TOTAL - total)) > 0) {
+        total += (size_t)piece;
+    }
+    close(ends[0]);
+    int status = 0;
+    waitpid(child, &status, 0);
+    int same = total == TOTAL;
+    for (size_t index = 0; same && index < total; index++) {
+        same = got[index] == sent[index];
+    }
+    printf("read %zu, identical %d, writer exited %d\n",
+           total, same, WEXITSTATUS(status));
+    return 0;
+}
+"#,
+        Linkage::Dynamic,
+    );
+}

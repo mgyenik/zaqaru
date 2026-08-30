@@ -324,6 +324,10 @@ impl<'a, S: Store + Clone> System<'a, S> {
                 // processes as well as threads, is a function of how many
                 // instructions have retired.
                 Progress::Preempted => true,
+                // This process is waiting for something only another one can
+                // do. Give somebody else a turn; if nobody can take it, the
+                // loop below is what says so.
+                Progress::Idle => true,
                 Progress::Requested(request) => {
                     self.answer(request);
                     false
@@ -337,7 +341,10 @@ impl<'a, S: Store + Clone> System<'a, S> {
             };
             if !self.schedule(rotate) {
                 // Nothing runnable anywhere. Either everything has ended, or
-                // everything is waiting for something that will not come.
+                // every process is waiting for something no process will
+                // ever do — a futex nothing will post, a pipe nothing will
+                // write. Reporting it beats spinning, because spinning looks
+                // exactly like working.
                 return match self.containers.first().and_then(|first| first.status) {
                     Some(status) => Exit::Status(status),
                     None => Exit::Deadlocked,

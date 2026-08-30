@@ -51,6 +51,15 @@ pub enum Progress {
     /// moment a *process* scheduler takes its turn — the same instant the
     /// thread scheduler does, and for the same reason.
     Preempted,
+    /// No thread in this process can run.
+    ///
+    /// Not a verdict, which is the point: every thread here is parked on
+    /// something, and whether that something will ever happen is a question
+    /// about the *container* — a process reading a pipe is waiting for a
+    /// process that has not been given a turn yet. Only
+    /// [`crate::system::System`], which can see every process, can call it a
+    /// deadlock.
+    Idle,
     Finished(Exit),
     /// The process needs something only the system can do.
     Requested(crate::syscall::Request),
@@ -264,6 +273,21 @@ impl<'a, S: Store> Process<'a, S> {
         // and a partly-advanced program counter that are not a machine.
         // Linux delivers on the way back to userspace, which is strictly
         // coarser, so nothing observable is lost.
+        // Before anything else this turn: a thread parked on a pipe that
+        // has since been written to is runnable again, and it has to be so
+        // *before* the scheduler is asked what to run.
+        self.resume_transfers();
+        // A process can be given the processor back with its current thread
+        // still parked: `Progress::Idle` hands the turn away without
+        // choosing a successor, because at that moment there was none. So
+        // the choice happens here, on the way in, and a process that still
+        // has nothing to run hands the turn straight back rather than
+        // interpreting a thread that is in the middle of a syscall.
+        if !self.kernel.machine.threads.current().is_runnable()
+            && !self.kernel.machine.threads.schedule()
+        {
+            return Progress::Idle;
+        }
         if let Some(signal) = self.kernel.machine.threads.current().deliverable()
             && let Some(exit) = self.raise(signal, crate::signal::Cause {
                 code: crate::signal::code::TKILL,
@@ -318,11 +342,9 @@ impl<'a, S: Store> Process<'a, S> {
             return Progress::Finished(exit);
         }
         if reschedule && !self.kernel.machine.threads.schedule() {
-            // Nothing can run. Every thread is parked on a futex nothing
-            // will wake, which is a deadlock in the guest — and reporting it
-            // is better than spinning, because spinning looks the same as
-            // working.
-            return Progress::Finished(Exit::Deadlocked);
+            // Nothing here can run. Whether that is a deadlock depends on
+            // what the other processes are doing, which this does not know.
+            return Progress::Idle;
         }
         match preempted {
             true => Progress::Preempted,
@@ -331,13 +353,62 @@ impl<'a, S: Store> Process<'a, S> {
     }
 
     /// Whether any of this process's threads could run now.
+    ///
+    /// Including one parked mid-transfer on a pipe whose other end has since
+    /// moved — that thread is not runnable *yet*, but it will be the moment
+    /// it is looked at, which is a reason to look at it. The check reaches
+    /// the shared pipe table through this process's own kernel, so a
+    /// container never needs a scheduler that knows what a pipe is.
     pub fn runnable(&self) -> bool {
-        self.kernel
+        let pipes = self.kernel.pipes.borrow();
+        self.kernel.machine.threads.all().iter().any(|thread| {
+            match thread.state {
+                crate::thread::State::Transferring(transfer) => transfer.ready(&pipes),
+                _ => thread.is_runnable(),
+            }
+        })
+    }
+
+    /// Moves every parked transfer that can move, and wakes the ones that
+    /// finish.
+    ///
+    /// **In the transferring process's own turn**, which is the rule the
+    /// whole process table is built around: the buffer is a guest address,
+    /// and a guest address means this process's bytes only while this
+    /// process is the one at the guest's addresses. A writer that filled a
+    /// pipe cannot complete the reader's `read` on its way past, however
+    /// convenient that would be.
+    fn resume_transfers(&mut self) {
+        let parked: Vec<(usize, crate::pipe::Transfer)> = self
+            .kernel
             .machine
             .threads
             .all()
             .iter()
-            .any(crate::thread::Thread::is_runnable)
+            .enumerate()
+            .filter_map(|(slot, thread)| match thread.state {
+                crate::thread::State::Transferring(transfer) => Some((slot, transfer)),
+                _ => None,
+            })
+            .collect();
+        for (slot, transfer) in parked {
+            if !transfer.ready(&self.kernel.pipes.borrow()) {
+                continue;
+            }
+            match self.kernel.advance_transfer(transfer) {
+                crate::pipe::Progress::Done(answer) => {
+                    let thread = &mut self.kernel.machine.threads.all_mut()[slot];
+                    thread.state = crate::thread::State::Runnable;
+                    thread.tcb.registers[0] = answer as u64;
+                }
+                // It moved some and still cannot finish, which is a large
+                // write against a reader that is keeping up slowly.
+                crate::pipe::Progress::Waiting(rest) => {
+                    self.kernel.machine.threads.all_mut()[slot].state =
+                        crate::thread::State::Transferring(rest);
+                }
+            }
+        }
     }
 
     /// Serves one syscall.

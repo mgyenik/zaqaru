@@ -30,6 +30,8 @@ pub mod open_flags {
     pub const TRUNCATE: i32 = 0o1000;
     pub const APPEND: i32 = 0o2000;
     pub const NONBLOCK: i32 = 0o4000;
+    /// On a pipe: packet mode. On a file: bypass the page cache.
+    pub const DIRECT: i32 = 0o40000;
     pub const DIRECTORY: i32 = 0o200000;
     pub const NOFOLLOW: i32 = 0o400000;
     pub const CLOEXEC: i32 = 0o2000000;
@@ -225,7 +227,7 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
     fn image_inode(&self, fd: i32, not_a_file: Errno) -> Result<Vnode, Errno> {
         match self.files.description(fd)?.backing {
             Backing::Image(inode) => Ok(inode),
-            Backing::Console(_) => Err(not_a_file),
+            Backing::Console(_) | Backing::Pipe { .. } => Err(not_a_file),
         }
     }
 
@@ -460,13 +462,18 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
         let held = match self.files.description(fd) {
             Ok(file) => match file.backing {
                 Backing::Image(vnode) => Some(vnode),
-                Backing::Console(_) => None,
+                Backing::Console(_) | Backing::Pipe { .. } => None,
             },
             Err(_) => None,
         };
+        // A pipe end is counted in descriptors, and this may be the last
+        // one — which is what turns a reader's next `read` into end-of-file
+        // and a writer's next `write` into `EPIPE`.
+        let before = self.pipe_census();
         let result = self.files.close(fd);
         if result.is_ok() {
             self.reclaim_after_close(held);
+            self.reconcile_pipes(&before);
         }
         Outcome::Done(match result {
             Ok(()) => 0,
@@ -479,6 +486,15 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
         let count = arguments.get(2);
         if count < 0 {
             return Outcome::Done(Errno::Invalid.as_result());
+        }
+        // Before anything that keeps an offset, because a pipe has none and
+        // because a pipe read can park — which `read_at`'s signature has no
+        // way to say.
+        if let Some((pipe, end, flags)) = self.pipe_of(fd) {
+            if end == crate::pipe::End::Write {
+                return Outcome::Done(Errno::BadFile.as_result());
+            }
+            return self.transfer_pipe(pipe, end, flags, arguments.get(1) as u64, count as u64);
         }
         let offset = match self.files.description(fd) {
             Ok(file) => file.offset,
@@ -537,6 +553,11 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
                 return self.read_console_input(buffer, count, offset);
             }
             Backing::Console(_) => return Err(Errno::BadFile),
+            // `read` never arrives here — its row answers a pipe before
+            // reaching this, because a pipe read can *park* and a
+            // `Result<u64, Errno>` has nowhere to say so. What does arrive
+            // is `pread`, and a pipe has no position to read at.
+            Backing::Pipe { .. } => return Err(Errno::NotSeekable),
         };
         // An `O_PATH` descriptor refers to a file without opening it, so
         // there is nothing to read from.
@@ -844,7 +865,25 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
             Ok(file) => match file.backing {
                 Backing::Image(inode) => self.write_stat(inode, arguments.get(1)),
                 Backing::Console(stream) => self.write_console_stat(stream, arguments.get(1)),
+                Backing::Pipe { pipe, .. } => self.write_pipe_stat(pipe, arguments.get(1)),
             },
+            Err(errno) => Outcome::Done(errno.as_result()),
+        }
+    }
+
+    /// `fstat` on a pipe.
+    ///
+    /// `S_IFIFO`, and `st_size` is what is queued — which is not decoration:
+    /// a program that stats a descriptor to decide how to read it must see a
+    /// fifo rather than a regular file, because the difference is whether
+    /// seeking is allowed and whether a short read means end of file.
+    fn write_pipe_stat(&mut self, pipe: u32, destination: i64) -> Outcome {
+        let mut buffer = [0u8; STAT_SIZE];
+        let queued = self.pipes.borrow().queued(pipe) as u64;
+        encode_pipe_stat(&mut buffer, pipe, queued);
+        // SAFETY: bounds-checked against the guest's memory.
+        match unsafe { self.memory_mut().write(destination as u64, &buffer) } {
+            Ok(()) => Outcome::Done(0),
             Err(errno) => Outcome::Done(errno.as_result()),
         }
     }
@@ -879,6 +918,7 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
             return match self.empty_path_target(arguments.get(0)) {
                 Ok(Backing::Image(inode)) => self.write_stat(inode, arguments.get(2)),
                 Ok(Backing::Console(stream)) => self.write_console_stat(stream, arguments.get(2)),
+                Ok(Backing::Pipe { pipe, .. }) => self.write_pipe_stat(pipe, arguments.get(2)),
                 Err(errno) => Outcome::Done(errno.as_result()),
             };
         }
@@ -924,6 +964,18 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
         let vnode = if path.is_empty() && flags & at::EMPTY_PATH != 0 {
             match self.empty_path_target(arguments.get(0)) {
                 Ok(Backing::Image(vnode)) => vnode,
+                Ok(Backing::Pipe { pipe, .. }) => {
+                    let mut buffer = [0u8; STATX_SIZE];
+                    let queued = self.pipes.borrow().queued(pipe) as u64;
+                    encode_pipe_statx(&mut buffer, pipe, queued);
+                    // SAFETY: bounds-checked against guest memory.
+                    return match unsafe {
+                        self.memory_mut().write(arguments.get(4) as u64, &buffer)
+                    } {
+                        Ok(()) => Outcome::Done(0),
+                        Err(errno) => Outcome::Done(errno.as_result()),
+                    };
+                }
                 Ok(Backing::Console(stream)) => {
                     let mut buffer = [0u8; STATX_SIZE];
                     encode_console_statx(&mut buffer, stream);
@@ -1200,7 +1252,9 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
                 // A console stream is not a symlink, and neither is the
                 // working directory; both fall out as `EINVAL` below.
                 Ok(Backing::Image(vnode)) => vnode,
-                Ok(Backing::Console(_)) => return Outcome::Done(Errno::Invalid.as_result()),
+                Ok(Backing::Console(_)) | Ok(Backing::Pipe { .. }) => {
+                    return Outcome::Done(Errno::Invalid.as_result());
+                }
                 Err(errno) => return Outcome::Done(errno.as_result()),
             }
         } else {
@@ -1299,6 +1353,11 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
                 Ok(Backing::Console(stream)) => {
                     return Outcome::Done(console_access(stream, mode));
                 }
+                // A pipe end may be read or written by direction, and never
+                // executed.
+                Ok(Backing::Pipe { end, .. }) => {
+                    return Outcome::Done(pipe_access(end, mode));
+                }
                 Err(errno) => return Outcome::Done(errno.as_result()),
             }
         } else {
@@ -1379,7 +1438,7 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
             number::FGETXATTR | number::FLISTXATTR => {
                 match self.files.description(first as i32)?.backing {
                     Backing::Image(inode) => Ok(Some(inode)),
-                    Backing::Console(_) => Ok(None),
+                    Backing::Console(_) | Backing::Pipe { .. } => Ok(None),
                 }
             }
             number::LGETXATTR | number::LLISTXATTR => self
@@ -1613,12 +1672,48 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
     }
 
     pub(crate) fn dup(&mut self, arguments: Arguments) -> Outcome {
-        Outcome::Done(
-            match self.files.duplicate(arguments.get(0) as i32, 0, false) {
-                Ok(fd) => fd as i64,
-                Err(errno) => errno.as_result(),
-            },
-        )
+        let before = self.pipe_census();
+        let answer = match self.files.duplicate(arguments.get(0) as i32, 0, false) {
+            Ok(fd) => fd as i64,
+            Err(errno) => errno.as_result(),
+        };
+        self.reconcile_pipes(&before);
+        Outcome::Done(answer)
+    }
+
+    /// Every pipe end this process's descriptors hold, once per descriptor.
+    pub(crate) fn pipe_census(&self) -> Vec<(u32, crate::pipe::End)> {
+        self.files.pipe_ends().collect()
+    }
+
+    /// Moves the pipe reference counts to match a descriptor table that has
+    /// just changed.
+    ///
+    /// A pipe's readers and writers are counted in descriptors, so `dup`,
+    /// `dup2` and `dup3` all change them — `dup2` in both directions at
+    /// once, since it closes whatever the target was first. Four call sites
+    /// each remembering to adjust the right count in the right direction is
+    /// four places to get it wrong, and getting it wrong does not corrupt
+    /// anything: it hangs, or it reports end-of-file to a reader whose
+    /// writer is still there. So it is a difference of two censuses instead.
+    pub(crate) fn reconcile_pipes(&mut self, before: &[(u32, crate::pipe::End)]) {
+        let after = self.pipe_census();
+        let mut pipes = self.pipes.borrow_mut();
+        let mut seen: Vec<(u32, crate::pipe::End)> = Vec::new();
+        for held in before.iter().chain(after.iter()).copied() {
+            if seen.contains(&held) {
+                continue;
+            }
+            seen.push(held);
+            let was = before.iter().filter(|&&end| end == held).count();
+            let now = after.iter().filter(|&&end| end == held).count();
+            for _ in was..now {
+                pipes.acquire(held.0, held.1);
+            }
+            for _ in now..was {
+                pipes.release(held.0, held.1);
+            }
+        }
     }
 
     pub(crate) fn dup2(&mut self, arguments: Arguments) -> Outcome {
@@ -1632,10 +1727,13 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
                 Errno::BadFile.as_result()
             });
         }
-        Outcome::Done(match self.files.duplicate_to(old, new, false) {
+        let before = self.pipe_census();
+        let answer = match self.files.duplicate_to(old, new, false) {
             Ok(fd) => fd as i64,
             Err(errno) => errno.as_result(),
-        })
+        };
+        self.reconcile_pipes(&before);
+        Outcome::Done(answer)
     }
 
     pub(crate) fn dup3(&mut self, arguments: Arguments) -> Outcome {
@@ -1651,15 +1749,16 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
         if flags & !open_flags::CLOEXEC != 0 {
             return Outcome::Done(Errno::Invalid.as_result());
         }
-        Outcome::Done(
-            match self
-                .files
-                .duplicate_to(old, new, flags & open_flags::CLOEXEC != 0)
-            {
-                Ok(fd) => fd as i64,
-                Err(errno) => errno.as_result(),
-            },
-        )
+        let before = self.pipe_census();
+        let answer = match self
+            .files
+            .duplicate_to(old, new, flags & open_flags::CLOEXEC != 0)
+        {
+            Ok(fd) => fd as i64,
+            Err(errno) => errno.as_result(),
+        };
+        self.reconcile_pipes(&before);
+        Outcome::Done(answer)
     }
 
     pub(crate) fn getcwd(&mut self, arguments: Arguments) -> Outcome {
@@ -1767,6 +1866,53 @@ fn encode_stat(into: &mut [u8; STAT_SIZE], device: u64, number: u32, inode: &Ino
 }
 
 /// A console stream's `struct stat`: a character device, as it is.
+/// The device every pipe reports, and the base its inode numbers come from.
+///
+/// Distinct from the console's and from the image's, because two files with
+/// the same device and inode are the *same file* to anything that compares
+/// them — and a program that opens two pipes and stats both would otherwise
+/// be told they are one.
+const PIPE_DEVICE: u64 = 0xc;
+const PIPE_INODE_BASE: u64 = 0x9000_0000;
+
+fn encode_pipe_stat(into: &mut [u8; STAT_SIZE], pipe: u32, queued: u64) {
+    let number = PIPE_INODE_BASE + u64::from(pipe);
+    into[0..8].copy_from_slice(&PIPE_DEVICE.to_le_bytes());
+    into[8..16].copy_from_slice(&number.to_le_bytes());
+    into[16..24].copy_from_slice(&1u64.to_le_bytes());
+    into[24..28].copy_from_slice(&(file_type::FIFO | 0o600).to_le_bytes());
+    into[48..56].copy_from_slice(&queued.to_le_bytes());
+    into[56..64].copy_from_slice(&BLOCK_SIZE.to_le_bytes());
+}
+
+fn encode_pipe_statx(into: &mut [u8; STATX_SIZE], pipe: u32, queued: u64) {
+    let number = PIPE_INODE_BASE + u64::from(pipe);
+    into[0..4].copy_from_slice(&STATX_BASIC_STATS.to_le_bytes());
+    into[4..8].copy_from_slice(&(BLOCK_SIZE as u32).to_le_bytes());
+    into[16..20].copy_from_slice(&1u32.to_le_bytes());
+    into[28..30].copy_from_slice(&((file_type::FIFO | 0o600) as u16).to_le_bytes());
+    into[32..40].copy_from_slice(&number.to_le_bytes());
+    into[40..48].copy_from_slice(&queued.to_le_bytes());
+    let (major, minor) = split_device(PIPE_DEVICE);
+    into[136..140].copy_from_slice(&major.to_le_bytes());
+    into[140..144].copy_from_slice(&minor.to_le_bytes());
+}
+
+/// What `faccessok` answers for a pipe end.
+fn pipe_access(end: crate::pipe::End, mode: i32) -> i64 {
+    let readable = end == crate::pipe::End::Read;
+    if mode & access_mode::READ != 0 && !readable {
+        return Errno::Access.as_result();
+    }
+    if mode & access_mode::WRITE != 0 && readable {
+        return Errno::Access.as_result();
+    }
+    if mode & access_mode::EXECUTE != 0 {
+        return Errno::Access.as_result();
+    }
+    0
+}
+
 fn encode_console_stat(into: &mut [u8; STAT_SIZE], stream: Console) {
     let number = CONSOLE_INODE_BASE + stream as u64;
     into[0..8].copy_from_slice(&CONSOLE_DEVICE.to_le_bytes());

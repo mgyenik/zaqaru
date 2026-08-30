@@ -29,11 +29,11 @@ pub enum Console {
 
 /// What sits behind a descriptor.
 ///
-/// Two kinds, because there are two: a file in the baked image, and a console
-/// stream that crosses to the host. Every row that takes a descriptor
-/// dispatches on this rather than assuming an inode — which is what makes
-/// `write` go where the descriptor points instead of where its *number*
-/// suggests.
+/// Three kinds, because there are three: a file in the baked image, a
+/// console stream that crosses to the host, and a pipe. Every row that takes
+/// a descriptor dispatches on this rather than assuming an inode — which is
+/// what makes `write` go where the descriptor points instead of where its
+/// *number* suggests.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Backing {
     /// A file in a mounted filesystem. Resolution happened once, at open;
@@ -43,6 +43,14 @@ pub enum Backing {
     /// file in a different filesystem.
     Image(Vnode),
     Console(Console),
+    /// One end of a pipe, named by its index in the arena the whole process
+    /// tree shares. An index and not a pointer, so the descriptor stays
+    /// `Copy` and a forked table is still a memcpy — the sharing lives in
+    /// one place, which is [`crate::pipe::Shared`].
+    Pipe {
+        pipe: u32,
+        end: crate::pipe::End,
+    },
 }
 
 /// What `dup` and friends share.
@@ -218,6 +226,34 @@ impl FdTable {
     pub fn description_mut(&mut self, fd: i32) -> Result<&mut OpenFile, Errno> {
         let index = self.descriptor(fd)?.description;
         self.descriptions[index].as_mut().ok_or(Errno::BadFile)
+    }
+
+    /// Every pipe end the table holds, once per *descriptor*.
+    ///
+    /// What a fork has to raise the counts by, and what an `execve` has to
+    /// lower them by for the descriptors it closes: a pipe's readers and
+    /// writers are counted in descriptors, so a table that is copied doubles
+    /// them.
+    pub fn pipe_ends(&self) -> impl Iterator<Item = (u32, crate::pipe::End)> + '_ {
+        self.descriptors
+            .iter()
+            .flatten()
+            .filter_map(|descriptor| self.descriptions[descriptor.description].as_ref())
+            .filter_map(|file| match file.backing {
+                Backing::Pipe { pipe, end } => Some((pipe, end)),
+                _ => None,
+            })
+    }
+
+    /// How many descriptors in this table are on one end of one pipe.
+    ///
+    /// Asked after a close, to decide whether the *process* has let go of
+    /// that end — a `dup`ed pipe end is two descriptors and one of them
+    /// going does not close anything.
+    pub fn holds_pipe(&self, pipe: u32, end: crate::pipe::End) -> usize {
+        self.pipe_ends()
+            .filter(|&(held, side)| held == pipe && side == end)
+            .count()
     }
 
     /// Closes every descriptor marked close-on-exec.

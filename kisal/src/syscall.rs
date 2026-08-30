@@ -27,6 +27,7 @@ pub mod number {
     pub const LSEEK: i64 = 8;
     pub const PREAD64: i64 = 17;
     pub const ACCESS: i64 = 21;
+    pub const PIPE: i64 = 22;
     pub const DUP: i64 = 32;
     pub const DUP2: i64 = 33;
     pub const MMAP: i64 = 9;
@@ -83,6 +84,7 @@ pub mod number {
     pub const READLINKAT: i64 = 267;
     pub const FACCESSAT: i64 = 269;
     pub const DUP3: i64 = 292;
+    pub const PIPE2: i64 = 293;
     pub const GETRANDOM: i64 = 318;
     pub const STATX: i64 = 332;
     pub const RSEQ: i64 = 334;
@@ -176,6 +178,8 @@ pub mod number {
             LSEEK => "lseek",
             PREAD64 => "pread64",
             ACCESS => "access",
+            PIPE => "pipe",
+            PIPE2 => "pipe2",
             DUP => "dup",
             DUP2 => "dup2",
             DUP3 => "dup3",
@@ -497,6 +501,16 @@ pub struct Kernel<'a, S: Store, M: Machine> {
     pub vfs: crate::vfs::Vfs<'a>,
     /// The descriptor table, and the open file descriptions under it.
     pub files: crate::fd::FdTable,
+    /// Every pipe in the container, **shared** with every other process in
+    /// it rather than copied into each.
+    ///
+    /// The one piece of kernel state a fork must not duplicate, and the
+    /// sharing is in the type rather than in a rule somebody has to
+    /// remember: a pipe whose buffer was copied into the child is a pipe
+    /// nobody is reading. See [`crate::pipe`], which is where the whole of
+    /// `container-plan.md`'s fd hoisting lands once the shared thing lives
+    /// somewhere both processes can reach.
+    pub pipes: crate::pipe::Shared,
     /// The counter new timestamps come from. See `Kernel::now`.
     pub clock: i64,
     /// The status the process finished with, once something has finished.
@@ -697,6 +711,7 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             executable: String::new(),
             vfs: crate::vfs::Vfs::new(image),
             files: crate::fd::FdTable::with_standard_streams(),
+            pipes: crate::pipe::Shared::default(),
             clock: 1,
             status: None,
             pages,
@@ -982,6 +997,16 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
     where
         S: Clone,
     {
+        // The hoisting step, and it is one loop because the shared thing
+        // already lives somewhere both processes reach. A pipe's readers and
+        // writers are counted in *descriptors*, and the child is about to
+        // have a copy of every one of them.
+        {
+            let mut pipes = self.pipes.borrow_mut();
+            for (pipe, end) in self.files.pipe_ends() {
+                pipes.acquire(pipe, end);
+            }
+        }
         Self {
             // The host boundary, which both processes reach. Sharing it is
             // the point: a child's `write` to the console has to arrive on
@@ -1008,6 +1033,9 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             // *exec*, so a plain fork carries cloexec-marked descriptors
             // into a child that may never exec.
             files: self.files.clone(),
+            // Shared, not copied — see the field. The counts were raised
+            // above, once per descriptor the copied table holds.
+            pipes: crate::pipe::Shared::clone(&self.pipes),
             clock: self.clock,
             // The child has not finished and is not going anywhere.
             status: None,
@@ -1061,6 +1089,27 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
         // The one moment `O_CLOEXEC` means anything. A fork carries marked
         // descriptors into the child untouched; this is where they go.
         files.close_marked();
+        // And a pipe end that went with them is one fewer, which is what
+        // makes the classic wiring work: a shell dups a pipe onto a child's
+        // standard output, marks the original close-on-exec, and the reader
+        // sees end-of-file when the child finishes rather than never.
+        {
+            let mut pipes = self.pipes.borrow_mut();
+            // Once per descriptor lost, not once per end: a `dup`ed pipe end
+            // is two references and closing one of them closes nothing.
+            let mut seen: Vec<(u32, crate::pipe::End)> = Vec::new();
+            for held in self.files.pipe_ends() {
+                if seen.contains(&held) {
+                    continue;
+                }
+                seen.push(held);
+                let (pipe, end) = held;
+                let lost = self.files.holds_pipe(pipe, end) - files.holds_pipe(pipe, end);
+                for _ in 0..lost {
+                    pipes.release(pipe, end);
+                }
+            }
+        }
         Self {
             store: self.store.clone(),
             machine,
@@ -1076,6 +1125,10 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             // survives.
             vfs: self.vfs.clone(),
             files,
+            // Kept, which is the entire reason `dup2` before an `execve` is
+            // how every shell wires a pipeline: the descriptors survive and
+            // so must what is behind them.
+            pipes: crate::pipe::Shared::clone(&self.pipes),
             clock: self.clock,
             status: None,
             continuation: None,
@@ -1778,6 +1831,7 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
                 })
             }
             number::FCNTL => self.fcntl(arguments),
+            number::PIPE | number::PIPE2 => self.make_pipe(number, arguments),
             number::DUP => self.dup(arguments),
             number::DUP2 => self.dup2(arguments),
             number::DUP3 => self.dup3(arguments),
@@ -2692,6 +2746,14 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
         if count < 0 {
             return Outcome::Done(Errno::Invalid.as_result());
         }
+        // Before the console and the filesystem, because a pipe write can
+        // *park* and the paths below it answer with a value or an errno.
+        if let Some((pipe, end, flags)) = self.pipe_of(descriptor) {
+            if end == crate::pipe::End::Read {
+                return Outcome::Done(Errno::BadFile.as_result());
+            }
+            return self.transfer_pipe(pipe, end, flags, buffer, count as u64);
+        }
         let path = match file.backing {
             crate::fd::Backing::Console(crate::fd::Console::Output) => paths::CONSOLE_STDOUT,
             crate::fd::Backing::Console(crate::fd::Console::Error) => paths::CONSOLE_STDERR,
@@ -2701,6 +2763,10 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             // that asked for write access.
             crate::fd::Backing::Console(crate::fd::Console::Input) => {
                 return Outcome::Done(Errno::BadFile.as_result());
+            }
+            // Answered before this row is reached; see `write_pipe`.
+            crate::fd::Backing::Pipe { .. } => {
+                return Outcome::Done(Errno::NotSeekable.as_result());
             }
             crate::fd::Backing::Image(vnode) => {
                 return Outcome::Done(
