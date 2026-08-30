@@ -749,11 +749,51 @@ mnemonics. The wasm tax measures 1.7×, at the top of the 1.3–1.7× band
 G1 predicted. The section-11 discount can stop being an estimate: the
 working estimate was 40–80 MIPS and the answer is 50 native, 29 in wasm.
 
-What does *not* exist yet, and so is not claimed: threads, signal
-*delivery* (an unhandled fault ends the process, which is already more
-than the ahead-of-time path can do), tier 1, and the strace diff against
-a native run that V2's acceptance asks for — the trace itself is wired
-through the loop, but nothing has diffed it. G3 is untouched.
+**V3 is built (2026-08-30): threads, preemption, signals.**
+
+A thread is a control block with `%rsp` and `%rip` set, and a context
+switch is choosing a different index — which is the sentence this design
+made about threads, now a `clone3` row. `futex` has both halves, `exit`
+ends a thread where `exit_group` ends the process, and the word
+`set_tid_address` named is cleared and woken on the way out, which is the
+whole of how `pthread_join` returns. `fork` is refused by name rather than
+deferred: a second address space is a thing this machine does not have.
+
+Preemption is the quantum, and it is what section 7 promised. Two threads
+spinning on words the other writes finish, which a scheduler that switches
+only at syscalls cannot manage; and the same container racing on an
+unlocked counter produces the *same total twice*, which no real machine
+can offer, because there the switch is a wall clock. Deterministic and
+preemptive at once.
+
+Signals collapse into the loop exactly as section 7 said they would.
+Delivery is at block boundaries — strictly finer than Linux's
+return-to-userspace precision — and the frame is Linux's `rt_sigframe`
+byte for byte, because the guest reads it: `sigreturn` is glibc's own code
+reading back what the kernel wrote. What is left of M10 is its
+dispositions table and its routing rules. There is no reserved table slot,
+no resume-body signature, no splice-versus-call rule and no chain surgery,
+because a handler is a program counter.
+
+**And a fault is a signal a handler can catch**, which
+`container-plan.md` documents as impossible on the other path. A null
+dereference there reads whatever is at address zero and carries on. Here
+the address space refused the access, the loop turns the refusal into
+`SIGSEGV` with a faithful `si_addr` and an `si_code` that says which kind
+of refusal it was, and the program counter stays on the faulting
+instruction so a handler that fixes the mapping and returns re-runs it.
+A stack overflow is caught on the alternate stack — the case
+`sigaltstack` exists for, and one that could not arise at all until the
+address space had page permissions.
+
+CPython runs four threads under a lock and gets the right total, and
+`signal.signal` with `os.kill` reaches its handler.
+
+What does *not* exist yet, and so is not claimed: tier 1, the timed futex
+wait (a timeout needs a clock to expire against, and it is a named fault),
+and the strace diff against a native run that V2's acceptance asks for —
+the trace is wired through the loop, but nothing has diffed it. G3 is
+untouched.
 
 **V2 — the boot ladder, again, on the floor.** kisal linked under the
 interpreter with the direct-call seam; the bake's engine+image link path.

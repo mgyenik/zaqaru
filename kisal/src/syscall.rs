@@ -62,6 +62,9 @@ pub mod number {
     pub const FUTEX: i64 = 202;
     pub const GETDENTS64: i64 = 217;
     pub const SET_TID_ADDRESS: i64 = 218;
+    pub const KILL: i64 = 62;
+    pub const RT_SIGRETURN: i64 = 15;
+    pub const SIGALTSTACK: i64 = 131;
     pub const SOCKET: i64 = 41;
     pub const SCHED_GETAFFINITY: i64 = 204;
     pub const MBIND: i64 = 237;
@@ -147,6 +150,9 @@ pub mod number {
     /// number prints as its number, never as a guess.
     pub fn name(number: i64) -> Option<&'static str> {
         Some(match number {
+            KILL => "kill",
+            RT_SIGRETURN => "rt_sigreturn",
+            SIGALTSTACK => "sigaltstack",
             SOCKET => "socket",
             SCHED_GETAFFINITY => "sched_getaffinity",
             MBIND => "mbind",
@@ -506,6 +512,31 @@ pub struct Kernel<'a, S: Store, M: Machine> {
     /// questions a program can ask before then — what is this signal set to,
     /// and what happens when I raise it at myself.
     dispositions: [Disposition; 64],
+}
+
+/// What happened when a signal was offered to its handler.
+///
+/// Four outcomes, and only the first two are ordinary. `NotCaught` is the
+/// program's own decision — the signal has no handler, and the default
+/// action applies. The rest are the kernel unable to deliver something the
+/// program *did* ask to catch, and each has a different cause and a
+/// different fix, which is why they are not one `false`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Delivery {
+    /// The handler is now running.
+    Ran,
+    /// `SIG_DFL` or `SIG_IGN`.
+    NotCaught,
+    /// The disposition named no restorer, so the handler would have nowhere
+    /// to return to.
+    NoRestorer,
+    /// The frame could not be written: the stack the handler would run on is
+    /// not there. Which is the stack overflow `sigaltstack` exists for, when
+    /// no alternate stack was given.
+    NoStack { at: u64 },
+    /// This machine keeps its registers somewhere a frame cannot be built
+    /// from — the ahead-of-time world.
+    NoControlBlock,
 }
 
 /// Which way a vectored transfer moves.
@@ -869,6 +900,237 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
     //
     // OpenBLAS asks, on the way to allocating its buffers, and takes the
     // refusal as "no NUMA here" and carries on.
+    /// `kill(2)`: a signal at a *process* rather than at a thread.
+    ///
+    /// Which is the difference `tgkill` exists to make, and it shows up the
+    /// moment there is more than one thread: a process-directed signal goes
+    /// to whichever thread has not blocked it, and a thread-directed one
+    /// goes where it was sent. Python's `os.kill` is this call, so a program
+    /// that installs a handler and raises at itself arrives here.
+    ///
+    /// A zero process id means "this process group", which for a container
+    /// with one process is the same process.
+    fn kill(&mut self, arguments: Arguments) -> Outcome {
+        let target = arguments.get(0);
+        let signal = arguments.get(1);
+        if target != PROCESS_ID && target != 0 {
+            return Outcome::Done(Errno::NoProcess.as_result());
+        }
+        if !(0..=64).contains(&signal) {
+            return Outcome::Done(Errno::Invalid.as_result());
+        }
+        // Signal zero asks whether the process exists and sends nothing,
+        // which is how every `kill -0` liveness check works.
+        if signal == 0 {
+            return Outcome::Done(0);
+        }
+        self.raise_at_process(signal, number::KILL, arguments)
+    }
+
+    /// The half `kill` and `tgkill` share: what a signal *does* to a process
+    /// that is willing to take it.
+    fn raise_at_process(&mut self, signal: i64, number: i64, arguments: Arguments) -> Outcome {
+        match self.dispositions[(signal - 1) as usize].handler {
+            SIG_IGN => return Outcome::Done(0),
+            SIG_DFL => {}
+            _ => {
+                // Caught. Pending until the run loop reaches a block
+                // boundary, which is strictly finer than Linux's
+                // return-to-userspace precision.
+                self.machine.raise_process(signal as i32);
+                return Outcome::Done(0);
+            }
+        }
+        if terminates(signal) {
+            return Outcome::Exit(128 + signal as i32);
+        }
+        let _ = (number, arguments);
+        Outcome::Done(0)
+    }
+
+    /// Runs `signal`'s handler on top of whatever this thread was doing.
+    ///
+    /// The whole of delivery, and it is a page: build the frame Linux
+    /// builds, write it to the guest's stack, point `%rip` at the handler
+    /// and the argument registers at the frame, widen the blocked mask.
+    /// Interpretation continues, and the handler is ordinary guest code
+    /// running like any other. Nothing is spliced, nothing is unwound, and
+    /// nothing knows a handler is running except the frame on the stack.
+    ///
+    /// Answers why, when it did not, because "the handler did not run" has
+    /// four causes and three of them are bugs.
+    pub fn deliver(&mut self, signal: i32, cause: crate::signal::Cause) -> Delivery {
+        use crate::signal::{self, Altstack};
+        /// `SA_ONSTACK`, `SA_RESTORER`, `SA_NODEFER`, `SA_RESETHAND`.
+        const ONSTACK: u64 = 0x0800_0000;
+        const RESTORER: u64 = 0x0400_0000;
+        const NODEFER: u64 = 0x4000_0000;
+        const RESETHAND: u64 = 0x8000_0000;
+
+        let index = (signal - 1) as usize;
+        let disposition = self.dispositions[index];
+        if matches!(disposition.handler, SIG_DFL | SIG_IGN) {
+            return Delivery::NotCaught;
+        }
+        if disposition.flags & RESTORER == 0 {
+            // Linux kills the process here, because there is nowhere for the
+            // handler to return to. Every libc passes one; a caller that did
+            // not is a caller built against something else.
+            return Delivery::NoRestorer;
+        }
+
+        let before = self.machine.owned().blocked_signals;
+        let altstack = self.machine.owned().altstack;
+        let on_altstack = self.machine.owned().on_altstack;
+        let Some(thread) = self.machine.tcb() else {
+            return Delivery::NoControlBlock;
+        };
+        // Where the frame goes. The alternate stack when the disposition
+        // asked for one and we are not already on it; otherwise below the
+        // current stack pointer, past the red zone the ABI lets a leaf
+        // function use without saying so.
+        let use_altstack =
+            disposition.flags & ONSTACK != 0 && altstack.is_enabled() && !on_altstack;
+        let top = match use_altstack {
+            true => altstack.base + altstack.size,
+            false => thread.stack_pointer().saturating_sub(128),
+        };
+        // Sixteen-byte aligned and then eight below, so that the handler
+        // starts with the stack alignment a `call` would have left — which
+        // is what every compiled function assumes.
+        let at = (top.saturating_sub(signal::FRAME as u64) & !15).wrapping_sub(8);
+
+        let mut bytes = signal::frame(
+            thread,
+            signal,
+            cause,
+            disposition.restorer,
+            before,
+        );
+        signal::record_altstack(
+            &mut bytes,
+            match on_altstack {
+                true => Altstack {
+                    flags: altstack.flags | Altstack::ON,
+                    ..altstack
+                },
+                false => altstack,
+            },
+        );
+        if self.pages.write(at, &bytes).is_err() {
+            // The stack the handler would run on is not writable — a stack
+            // overflow with no alternate stack, which is the case
+            // `sigaltstack` exists for. Linux kills the process.
+            return Delivery::NoStack { at };
+        }
+
+        let handler = disposition.handler;
+        let thread = self.machine.tcb().expect("the machine has a control block");
+        thread.set_stack_pointer(at);
+        thread.rip = handler;
+        // The three arguments a `SA_SIGINFO` handler takes, and the first of
+        // which a plain one takes.
+        thread.registers[7] = i64::from(signal) as u64;
+        thread.registers[6] = at + signal::SIGINFO as u64;
+        thread.registers[2] = at + signal::UCONTEXT as u64;
+        thread.registers[0] = 0;
+
+        let mut mask = before | disposition.mask;
+        if disposition.flags & NODEFER == 0 {
+            mask |= signal_bit(i64::from(signal));
+        }
+        let owned = self.machine.owned();
+        owned.blocked_signals = mask;
+        owned.pending_signals &= !signal_bit(i64::from(signal));
+        owned.interrupted_mask = before;
+        if use_altstack {
+            owned.on_altstack = true;
+        }
+        if disposition.flags & RESETHAND != 0 {
+            self.dispositions[index] = Disposition::DEFAULT;
+        }
+        Delivery::Ran
+    }
+
+    /// `rt_sigreturn(2)`: the handler is done.
+    ///
+    /// Every register comes back out of the frame, which is what makes
+    /// `siglongjmp` out of a handler work without anything here knowing what
+    /// `siglongjmp` is: the frame the handler jumped away from is simply
+    /// never read.
+    fn signal_return(&mut self, arguments: Arguments) -> Outcome {
+        use crate::signal;
+        let Some(thread) = self.machine.tcb() else {
+            return Outcome::Fault(Fault::detailed(
+                number::RT_SIGRETURN,
+                arguments,
+                "returning from a handler on a machine with no control block",
+            ));
+        };
+        // The handler returned through its restorer, which popped the
+        // frame's first word — so the stack pointer is eight past the frame.
+        let at = thread.stack_pointer().wrapping_sub(8);
+        let mut bytes = [0u8; signal::FRAME];
+        if self.pages.read(at, &mut bytes).is_err() {
+            return Outcome::Done(Errno::Fault.as_result());
+        }
+        let thread = self.machine.tcb().expect("the machine has a control block");
+        let mask = signal::restore(thread, &bytes);
+        // Whatever the interrupted code had in `%rax`. Returned as the
+        // syscall's result so that the caller writing it back writes the
+        // same value — `rt_sigreturn` does not have a return value of its
+        // own, it has the one it restored.
+        let restored = thread.registers[0] as i64;
+        let owned = self.machine.owned();
+        owned.blocked_signals = mask;
+        owned.on_altstack = false;
+        Outcome::Done(restored)
+    }
+
+    /// `sigaltstack(2)`: where a handler runs when its own stack cannot be
+    /// used.
+    fn sigaltstack(&mut self, arguments: Arguments) -> Outcome {
+        use crate::signal::Altstack;
+        let new = arguments.get(0) as u64;
+        let old = arguments.get(1) as u64;
+        if old != 0 {
+            let mut current = self.machine.owned().altstack;
+            if self.machine.owned().on_altstack {
+                current.flags |= Altstack::ON;
+            }
+            let bytes = current.to_bytes();
+            // SAFETY: bounds-checked by the write.
+            if let Err(errno) = unsafe { self.memory_mut().write(old, &bytes) } {
+                return Outcome::Done(errno.as_result());
+            }
+        }
+        if new == 0 {
+            return Outcome::Done(0);
+        }
+        if self.machine.owned().on_altstack {
+            // Changing the stack a handler is standing on would move the
+            // ground under it.
+            return Outcome::Done(Errno::Perm.as_result());
+        }
+        let mut raw = [0u8; 24];
+        // SAFETY: read through the address space, which bounds-checks.
+        match unsafe { self.memory().slice(new, 24) } {
+            Ok(bytes) => raw.copy_from_slice(bytes),
+            Err(errno) => return Outcome::Done(errno.as_result()),
+        }
+        let wanted = Altstack::from_bytes(&raw);
+        /// The smallest stack Linux will accept, `MINSIGSTKSZ`.
+        const MINIMUM: u64 = 2048;
+        if wanted.flags & !Altstack::DISABLE != 0 {
+            return Outcome::Done(Errno::Invalid.as_result());
+        }
+        if wanted.flags & Altstack::DISABLE == 0 && wanted.size < MINIMUM {
+            return Outcome::Done(Errno::NoMemory.as_result());
+        }
+        self.machine.owned().altstack = wanted;
+        Outcome::Done(0)
+    }
+
     /// `clone(2)`: a thread, and only a thread.
     ///
     /// **`fork` is refused by name.** A new *process* means a second address
@@ -1252,6 +1514,9 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             // the process. Once there are threads they part company —
             // `exit` will end one and `exit_group` all of them — and the
             // difference belongs there, not in a status code.
+            number::KILL => self.kill(arguments),
+            number::RT_SIGRETURN => self.signal_return(arguments),
+            number::SIGALTSTACK => self.sigaltstack(arguments),
             number::CLONE => self.clone_thread(arguments),
             number::CLONE3 => self.clone3(arguments),
             number::EXIT => self.exit_thread(arguments),
@@ -1761,9 +2026,15 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
         let group = arguments.get(0);
         let thread = arguments.get(1);
         let signal = arguments.get(2);
-        if group != PROCESS_ID || thread != PROCESS_ID {
-            // The only thread there is. Anything else names a thread that
-            // does not exist.
+        if group != PROCESS_ID {
+            return Outcome::Done(Errno::NoProcess.as_result());
+        }
+        // Signals go to a *thread*, and once there is more than one the
+        // difference is observable: `pthread_kill` names one, and a handler
+        // runs on the stack of the thread it was sent to.
+        if i32::try_from(thread).is_err()
+            || self.machine.current_tid() != thread as i32
+        {
             return Outcome::Done(Errno::NoProcess.as_result());
         }
         if !(1..=64).contains(&signal) {
@@ -1776,13 +2047,13 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
         match self.dispositions[(signal - 1) as usize].handler {
             SIG_IGN => return Outcome::Done(0),
             SIG_DFL => {}
+            // Caught. Recorded as pending; the run loop delivers it at the
+            // next block boundary, which is strictly finer than Linux's
+            // return-to-userspace precision — so nothing observable is lost
+            // by not delivering it here.
             _ => {
-                return Outcome::Fault(Fault::detailed(
-                    number::TGKILL,
-                    arguments,
-                    "raising a signal that has a handler installed — delivery \
-                     is M10's chain surgery, and the disposition is recorded",
-                ));
+                self.machine.owned().pending_signals |= signal_bit(signal);
+                return Outcome::Done(0);
             }
         }
         if terminates(signal) {

@@ -133,7 +133,11 @@ fn describe(exit: &Exit, into: &mut String) {
             crate::push_hex(into, unsupported.address);
         }
         Exit::Deadlocked => {
-            into.push_str("a syscall blocked and there is no other thread to run");
+            into.push_str("every thread is parked on a futex nothing will wake");
         }
+        // Never returned from `run`: the loop consumes it and goes round
+        // again. Named rather than caught by a wildcard, so that a variant
+        // added later has to be thought about here.
+        Exit::Delivered => into.push_str("a signal was delivered"),
     }
 }

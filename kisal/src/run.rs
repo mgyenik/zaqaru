@@ -27,7 +27,7 @@ use targum::state::Tcb;
 use targum::{Engine, Outcome as Step, QUANTUM};
 
 use crate::abi::Store;
-use crate::machine::Interpreted;
+use crate::machine::{Interpreted, Machine};
 use crate::syscall::{Arguments, Fault, Kernel, Outcome};
 
 /// Where a syscall's arguments come from, in the order Linux puts them.
@@ -69,6 +69,10 @@ pub enum Exit {
     Unsupported(targum::exec::Unsupported),
     /// Every thread is parked on a futex nothing will wake.
     Deadlocked,
+    /// Not an ending at all: the trap became a signal and a handler is
+    /// running. Never returned from [`Process::run`]; it exists so that
+    /// [`Process::fault`] can answer one type.
+    Delivered,
 }
 
 /// One process: a kernel, the blocks decoded out of its address space, and
@@ -219,6 +223,21 @@ impl<'a, S: Store> Process<'a, S> {
     /// time, and so that the thing a scheduler will call is already a
     /// function rather than the middle of a loop body.
     pub fn advance(&mut self, quantum: u64) -> Option<Exit> {
+        // Before anything runs, and therefore *between blocks*: the control
+        // block is consistent exactly at retirement boundaries, and a frame
+        // built from a half-executed block would carry a lazy-flag record
+        // and a partly-advanced program counter that are not a machine.
+        // Linux delivers on the way back to userspace, which is strictly
+        // coarser, so nothing observable is lost.
+        if let Some(signal) = self.kernel.machine.threads.current().deliverable()
+            && let Some(exit) = self.raise(signal, crate::signal::Cause {
+                code: crate::signal::code::TKILL,
+                address: 0,
+            })
+        {
+            return Some(exit);
+        }
+
         // Three disjoint fields of one owner, which is what makes the
         // engine able to hold no state of its own.
         let outcome = Engine::run(
@@ -245,7 +264,12 @@ impl<'a, S: Store> Process<'a, S> {
                 let runnable = self.kernel.machine.threads.current().is_runnable();
                 (finished, !runnable)
             }
-            Step::Trap(trap) => (Some(self.fault(trap)), false),
+            Step::Trap(trap) => match self.fault(trap) {
+                // Caught: the thread is now in a handler and the loop goes
+                // round again.
+                Exit::Delivered => (None, false),
+                ending => (Some(ending), false),
+            },
         };
         if finished.is_some() {
             return finished;
@@ -311,13 +335,42 @@ impl<'a, S: Store> Process<'a, S> {
         crate::trace(&mut self.kernel, &line);
     }
 
+    /// Delivers a signal, or reports what its default action does.
+    ///
+    /// `None` means the thread is now running a handler and the loop should
+    /// carry on; `Some` means nothing caught it and the process is over.
+    fn raise(&mut self, signal: i32, cause: crate::signal::Cause) -> Option<Exit> {
+        let delivery = self.kernel.deliver(signal, cause);
+        if delivery == crate::syscall::Delivery::Ran {
+            return None;
+        }
+        self.declined(signal, delivery);
+        self.kernel.machine.owned().pending_signals &= !(1u64 << (signal - 1));
+        // Nothing caught it. What a shell reports for a process killed by a
+        // signal is 128 plus the number.
+        Some(Exit::Signalled {
+            signal,
+            address: cause.address,
+            rip: self.kernel.machine.thread().rip,
+            access: None,
+        })
+    }
+
     /// Turns a trap into what the guest sees.
     ///
-    /// Signal *delivery* is not built yet, so an unhandled fault ends the
-    /// process the way an unhandled fault ends one on Linux — which is
-    /// already more than the ahead-of-time path can do, where a null
-    /// dereference reads whatever happens to be at address zero and carries
-    /// on. What is missing is the handler path, not the fault.
+    /// **A fault is a signal now, and a handler can catch it.** That is the
+    /// fidelity class the ahead-of-time design documents as impossible: a
+    /// null dereference there reads whatever is at address zero and carries
+    /// on, guard pages cannot be enforced, and a stack overflow corrupts
+    /// silently. Here the address space refused the access, the loop turns
+    /// the refusal into `SIGSEGV` with a faithful `si_addr`, and a guest
+    /// that installed a handler runs it — on its alternate stack, if the
+    /// reason its own stack cannot be used is that the stack is what
+    /// overflowed.
+    ///
+    /// The program counter is left on the faulting instruction, so a handler
+    /// that fixes the mapping and returns re-runs it, which is how a
+    /// copy-on-write page or a guard page is made to work at all.
     fn fault(&mut self, trap: Trap) -> Exit {
         let rip = self.kernel.machine.thread().rip;
         /// The numbers a shell reports and a `siginfo` carries.
@@ -325,38 +378,97 @@ impl<'a, S: Store> Process<'a, S> {
         const SIGTRAP: i32 = 5;
         const SIGFPE: i32 = 8;
         const SIGSEGV: i32 = 11;
-        match trap {
-            Trap::Fault(fault) => Exit::Signalled {
-                signal: SIGSEGV,
-                address: fault.address,
-                rip,
-                access: Some(fault.access),
-            },
-            Trap::Privileged { address } | Trap::Misaligned { address } => Exit::Signalled {
-                signal: SIGSEGV,
-                address,
-                rip,
-                access: None,
-            },
-            Trap::Undefined { address } => Exit::Signalled {
-                signal: SIGILL,
-                address,
-                rip,
-                access: None,
-            },
-            Trap::DivideError { address } => Exit::Signalled {
-                signal: SIGFPE,
-                address,
-                rip,
-                access: None,
-            },
-            Trap::Breakpoint { address } => Exit::Signalled {
-                signal: SIGTRAP,
-                address,
-                rip,
-                access: None,
-            },
-            Trap::Unsupported(unsupported) => Exit::Unsupported(unsupported),
+        use crate::signal::{Cause, code};
+        let (signal, cause, access) = match trap {
+            Trap::Fault(fault) => (
+                SIGSEGV,
+                Cause {
+                    // Which kind of refusal it was, which a handler reads to
+                    // decide what to do: a page that is not there can be
+                    // mapped, a page that refused the access cannot.
+                    code: match fault.access {
+                        targum::space::Access::Write => code::ACCERR,
+                        _ => code::MAPERR,
+                    },
+                    address: fault.address,
+                },
+                Some(fault.access),
+            ),
+            Trap::Privileged { address } | Trap::Misaligned { address } => (
+                SIGSEGV,
+                Cause {
+                    code: code::ACCERR,
+                    address,
+                },
+                None,
+            ),
+            Trap::Undefined { address } => (
+                SIGILL,
+                Cause {
+                    code: code::ILLOPN,
+                    address,
+                },
+                None,
+            ),
+            Trap::DivideError { address } => (
+                SIGFPE,
+                Cause {
+                    code: code::INTDIV,
+                    address,
+                },
+                None,
+            ),
+            Trap::Breakpoint { address } => (
+                SIGTRAP,
+                Cause {
+                    code: code::BRKPT,
+                    address,
+                },
+                None,
+            ),
+            // Not a guest-visible condition. The engine is incomplete, and
+            // no handler the guest installed has anything to say about that.
+            Trap::Unsupported(unsupported) => return Exit::Unsupported(unsupported),
+        };
+        let delivery = self.kernel.deliver(signal, cause);
+        if delivery == crate::syscall::Delivery::Ran {
+            return Exit::Delivered;
         }
+        self.declined(signal, delivery);
+        Exit::Signalled {
+            signal,
+            address: cause.address,
+            rip,
+            access,
+        }
+    }
+
+    /// Says why a signal the program asked to catch was not delivered.
+    ///
+    /// `NotCaught` is silent, because it is the program's own decision. The
+    /// rest are the kernel failing to do something it *was* asked to, and a
+    /// process that dies of a signal it installed a handler for should not
+    /// have to be debugged from the outside.
+    fn declined(&mut self, signal: i32, delivery: crate::syscall::Delivery) {
+        use crate::syscall::Delivery;
+        if delivery == Delivery::NotCaught {
+            return;
+        }
+        let mut message = String::from("kisal: signal ");
+        crate::push_decimal(&mut message, i64::from(signal));
+        message.push_str(match delivery {
+            Delivery::NoRestorer => " has a handler whose disposition named no restorer",
+            Delivery::NoStack { .. } => {
+                " has a handler, and the stack it would run on is not writable"
+            }
+            Delivery::NoControlBlock => " has a handler, and this machine has no control block",
+            _ => " was not delivered",
+        });
+        if let Delivery::NoStack { at } = delivery {
+            message.push_str(" at ");
+            crate::push_hex(&mut message, at);
+        }
+        message.push('\n');
+        crate::report_to(&mut self.kernel, &message);
     }
 }

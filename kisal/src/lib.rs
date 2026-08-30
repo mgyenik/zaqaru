@@ -33,6 +33,7 @@ pub mod mount;
 pub mod overlay;
 pub mod paths;
 pub mod random;
+pub mod signal;
 pub mod run;
 pub mod vm;
 pub mod space;

@@ -75,12 +75,40 @@ pub trait Machine {
         0
     }
 
+    /// Marks a signal pending on some thread that has not blocked it.
+    ///
+    /// What a *process*-directed signal means: `kill(2)` names a process,
+    /// and Linux hands the signal to whichever of its threads is willing to
+    /// take it. Answers false when every thread has it blocked, in which
+    /// case it stays pending on the process and nothing runs — which is also
+    /// what Linux does.
+    fn raise_process(&mut self, signal: i32) -> bool {
+        let bit = 1u64 << (signal - 1);
+        let owned = self.owned();
+        if owned.blocked_signals & bit != 0 {
+            return false;
+        }
+        owned.pending_signals |= bit;
+        true
+    }
+
     /// Ends this thread, and answers how many are left.
     ///
     /// Zero from the default: the one thread ending *is* the process ending,
     /// which is what the caller reads it as.
     fn exit_current(&mut self, _status: i32) -> usize {
         0
+    }
+
+    /// This thread's registers, where the world keeps them in a control
+    /// block it can hand out.
+    ///
+    /// `None` for the ahead-of-time machine, whose registers are wasm
+    /// globals: there is no block, and building a signal frame out of them
+    /// is the chain surgery that world's design calls M10. The rows that
+    /// need one say so loudly rather than pretending.
+    fn tcb(&mut self) -> Option<&mut targum::state::Tcb> {
+        None
     }
 
     /// Makes the address space reach at least `to`, and reports whether it
@@ -335,6 +363,10 @@ impl Machine for Interpreted {
         self.threads.current().tid
     }
 
+    fn tcb(&mut self) -> Option<&mut targum::state::Tcb> {
+        Some(self.thread_mut())
+    }
+
     /// A thread is a control block with `%rsp` and `%rip` set.
     ///
     /// That sentence is the design's whole claim about threads, and this is
@@ -373,6 +405,24 @@ impl Machine for Interpreted {
     fn exit_current(&mut self, status: i32) -> usize {
         self.threads.current_mut().state = crate::thread::State::Exited { status };
         self.threads.live()
+    }
+
+    /// The current thread first, so a program that raises a signal at itself
+    /// sees it on the thread that raised it — which is what every `raise(3)`
+    /// expects, and what a `SIGSEGV` handler debugging its own thread needs.
+    fn raise_process(&mut self, signal: i32) -> bool {
+        let bit = 1u64 << (signal - 1);
+        if self.threads.current().owned.blocked_signals & bit == 0 {
+            self.threads.current_mut().owned.pending_signals |= bit;
+            return true;
+        }
+        for thread in self.threads.all_mut() {
+            if thread.owned.blocked_signals & bit == 0 {
+                thread.owned.pending_signals |= bit;
+                return true;
+            }
+        }
+        false
     }
 
     fn segment_base(&self) -> i64 {

@@ -60,6 +60,19 @@ pub struct Owned {
     pub blocked_signals: u64,
     /// Signals raised at this thread and not yet delivered.
     pub pending_signals: u64,
+    /// The stack a handler runs on when its disposition asks for one.
+    ///
+    /// The whole reason `sigaltstack` exists is the case where the ordinary
+    /// stack cannot be used — a stack overflow, whose `SIGSEGV` would fault
+    /// again the moment a frame was pushed. That case only became reachable
+    /// here when the address space gained page permissions.
+    pub altstack: crate::signal::Altstack,
+    /// Whether a handler is currently running on it, which `sigaltstack`
+    /// reports and which stops a nested delivery from restarting the stack
+    /// under the handler already using it.
+    pub on_altstack: bool,
+    /// What the frame the current handler is running on says the mask was.
+    pub interrupted_mask: u64,
 }
 
 /// One thread.
@@ -147,6 +160,10 @@ impl Threads {
 
     pub fn all(&self) -> &[Thread] {
         &self.threads
+    }
+
+    pub fn all_mut(&mut self) -> &mut [Thread] {
+        &mut self.threads
     }
 
     pub fn find_mut(&mut self, tid: i32) -> Option<&mut Thread> {

@@ -748,3 +748,143 @@ int main(void) {
         "the threads did not actually race: {total}"
     );
 }
+
+/// A handler, run and returned from.
+///
+/// The simplest case and the one everything else rests on: `raise` makes the
+/// signal pending, the loop delivers it at the next block boundary, the
+/// handler runs as ordinary guest code, and `sigreturn` puts every register
+/// back so the interrupted code carries on as if nothing happened.
+#[test]
+fn a_signal_handler_runs_and_returns() {
+    agrees_with_native(
+        "handler",
+        r#"
+#include <signal.h>
+#include <stdio.h>
+
+static volatile sig_atomic_t caught;
+
+static void handler(int signal) { caught = signal; }
+
+int main(void) {
+    signal(SIGUSR1, handler);
+    /* A value the handler must not disturb: `sigreturn` restores every
+       register, and a handler that clobbers one is a program whose caller
+       silently loses a value. */
+    long keep = 0x1234;
+    raise(SIGUSR1);
+    printf("caught %d keep %ld\n", (int)caught, keep);
+    return 0;
+}
+"#,
+        Linkage::Dynamic,
+    );
+}
+
+/// **A `SIGSEGV` a handler catches** — the fidelity class the ahead-of-time
+/// design documents as impossible.
+///
+/// There a null dereference reads whatever happens to be at address zero and
+/// carries on. Here the address space refused the access, the loop turned
+/// the refusal into a signal with a faithful `si_addr`, and the handler runs
+/// and can say which address it was. Compared against a native run, so what
+/// is asserted is that Linux and this agree about the number *and* the
+/// address.
+#[test]
+fn a_segmentation_fault_reaches_its_handler() {
+    agrees_with_native(
+        "sigsegv",
+        r#"
+#define _GNU_SOURCE
+#include <signal.h>
+#include <setjmp.h>
+#include <stdio.h>
+
+static sigjmp_buf recover;
+static volatile void *seen;
+
+static void handler(int signal, siginfo_t *info, void *context) {
+    (void)signal;
+    (void)context;
+    seen = info->si_addr;
+    /* Out of the handler and back to a known point — the handler cannot
+       simply return, because returning would re-run the instruction that
+       faulted and fault again. */
+    siglongjmp(recover, 1);
+}
+
+int main(void) {
+    struct sigaction action = {0};
+    action.sa_sigaction = handler;
+    action.sa_flags = SA_SIGINFO;
+    sigaction(SIGSEGV, &action, 0);
+
+    if (sigsetjmp(recover, 1) == 0) {
+        volatile int *nowhere = (int *)0x10;
+        *nowhere = 1;
+        printf("the store did not fault\n");
+        return 1;
+    }
+    printf("si_addr %p\n", (void *)seen);
+    return 0;
+}
+"#,
+        Linkage::Dynamic,
+    );
+}
+
+/// A stack overflow, caught on the alternate stack.
+///
+/// The case `sigaltstack` exists for and the one that could not arise before
+/// the address space had page permissions: the ordinary stack is what
+/// overflowed, so a frame pushed onto it would fault again. The handler runs
+/// on a stack of its own.
+#[test]
+fn a_stack_overflow_is_caught_on_the_alternate_stack() {
+    agrees_with_native(
+        "overflow",
+        r#"
+#define _GNU_SOURCE
+#include <signal.h>
+#include <setjmp.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+static sigjmp_buf recover;
+
+static void handler(int signal) {
+    (void)signal;
+    siglongjmp(recover, 1);
+}
+
+/* Not tail-recursive and not foldable: each frame has to be a frame. */
+static long deeper(long depth) {
+    volatile char padding[4096];
+    padding[0] = (char)depth;
+    if (depth > 100000000L) return depth;
+    return deeper(depth + 1) + padding[0];
+}
+
+int main(void) {
+    static char alternate[64 * 1024];
+    stack_t stack = { .ss_sp = alternate, .ss_size = sizeof alternate, .ss_flags = 0 };
+    sigaltstack(&stack, 0);
+
+    struct sigaction action = {0};
+    action.sa_handler = handler;
+    action.sa_flags = SA_ONSTACK | SA_NODEFER;
+    sigaction(SIGSEGV, &action, 0);
+
+    if (sigsetjmp(recover, 1) == 0) {
+        deeper(0);
+        printf("no overflow\n");
+        return 1;
+    }
+    printf("caught the overflow\n");
+    return 0;
+}
+"#,
+        Linkage::Dynamic,
+    );
+}
