@@ -44,7 +44,7 @@ pub enum State {
     /// of more than a pipe holds moves in pieces, and POSIX says the caller
     /// sees one count at the end. Re-running would move the first piece
     /// twice.
-    Transferring(crate::pipe::Transfer),
+    Transferring(crate::ring::Transfer),
     /// It is in `poll` or `epoll_wait`, waiting for a descriptor to become
     /// ready or for a deadline to pass.
     Watching(Watching),

@@ -34,6 +34,7 @@ pub mod overlay;
 pub mod paths;
 pub mod pipe;
 pub mod poll;
+pub mod ring;
 pub mod random;
 pub mod signal;
 pub mod run;

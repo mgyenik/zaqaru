@@ -43,13 +43,14 @@ pub enum Backing {
     /// file in a different filesystem.
     Image(Vnode),
     Console(Console),
-    /// One end of a pipe, named by its index in the arena the whole process
-    /// tree shares. An index and not a pointer, so the descriptor stays
-    /// `Copy` and a forked table is still a memcpy — the sharing lives in
-    /// one place, which is [`crate::pipe::Shared`].
+    /// One end of a pipe: an index into the ring arena the whole process
+    /// tree shares, and which side of it this descriptor holds. An index and
+    /// not a pointer, so the descriptor stays `Copy` and a forked table is
+    /// still a memcpy — the sharing lives in one place, which is
+    /// [`crate::ring::Shared`].
     Pipe {
-        pipe: u32,
-        end: crate::pipe::End,
+        ring: u32,
+        end: crate::ring::End,
     },
     /// An `epoll` instance, named the same way and shared for the same
     /// reason. A descriptor that *is* a set rather than a file is the whole
@@ -271,13 +272,13 @@ impl FdTable {
     /// lower them by for the descriptors it closes: a pipe's readers and
     /// writers are counted in descriptors, so a table that is copied doubles
     /// them.
-    pub fn pipe_ends(&self) -> impl Iterator<Item = (u32, crate::pipe::End)> + '_ {
+    pub fn pipe_ends(&self) -> impl Iterator<Item = (u32, crate::ring::End)> + '_ {
         self.descriptors
             .iter()
             .flatten()
             .filter_map(|descriptor| self.descriptions[descriptor.description].as_ref())
             .filter_map(|file| match file.backing {
-                Backing::Pipe { pipe, end } => Some((pipe, end)),
+                Backing::Pipe { ring, end } => Some((ring, end)),
                 _ => None,
             })
     }
@@ -299,7 +300,7 @@ impl FdTable {
     /// Asked after a close, to decide whether the *process* has let go of
     /// that end — a `dup`ed pipe end is two descriptors and one of them
     /// going does not close anything.
-    pub fn holds_pipe(&self, pipe: u32, end: crate::pipe::End) -> usize {
+    pub fn holds_pipe(&self, pipe: u32, end: crate::ring::End) -> usize {
         self.pipe_ends()
             .filter(|&(held, side)| held == pipe && side == end)
             .count()
@@ -318,7 +319,7 @@ impl FdTable {
                 let what = match file.backing {
                     Backing::Image(vnode) => format!("file:{}", vnode.inode),
                     Backing::Console(stream) => format!("console:{stream:?}"),
-                    Backing::Pipe { pipe, end } => format!("pipe{pipe}:{end:?}"),
+                    Backing::Pipe { ring, end } => format!("pipe{ring}:{end:?}"),
                     Backing::Epoll(id) => format!("epoll{id}"),
                 };
                 Some((fd, what))

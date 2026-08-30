@@ -362,10 +362,10 @@ impl<'a, S: Store> Process<'a, S> {
     /// the shared pipe table through this process's own kernel, so a
     /// container never needs a scheduler that knows what a pipe is.
     pub fn runnable(&self) -> bool {
-        let pipes = self.kernel.pipes.borrow();
+        let rings = self.kernel.rings.borrow();
         self.kernel.machine.threads.all().iter().any(|thread| {
             match thread.state {
-                crate::thread::State::Transferring(transfer) => transfer.ready(&pipes),
+                crate::thread::State::Transferring(transfer) => transfer.ready(&rings),
                 // A wait with a deadline is always worth a turn, because the
                 // only way to find out whether the deadline has passed is to
                 // look at the clock — and looking at the clock crosses the
@@ -444,7 +444,7 @@ impl<'a, S: Store> Process<'a, S> {
     }
 
     fn resume_transfers(&mut self) {
-        let parked: Vec<(usize, crate::pipe::Transfer)> = self
+        let parked: Vec<(usize, crate::ring::Transfer)> = self
             .kernel
             .machine
             .threads
@@ -457,18 +457,18 @@ impl<'a, S: Store> Process<'a, S> {
             })
             .collect();
         for (slot, transfer) in parked {
-            if !transfer.ready(&self.kernel.pipes.borrow()) {
+            if !transfer.ready(&self.kernel.rings.borrow()) {
                 continue;
             }
             match self.kernel.advance_transfer(transfer) {
-                crate::pipe::Progress::Done(answer) => {
+                crate::ring::Progress::Done(answer) => {
                     let thread = &mut self.kernel.machine.threads.all_mut()[slot];
                     thread.state = crate::thread::State::Runnable;
                     thread.tcb.registers[0] = answer as u64;
                 }
                 // It moved some and still cannot finish, which is a large
                 // write against a reader that is keeping up slowly.
-                crate::pipe::Progress::Waiting(rest) => {
+                crate::ring::Progress::Waiting(rest) => {
                     self.kernel.machine.threads.all_mut()[slot].state =
                         crate::thread::State::Transferring(rest);
                 }

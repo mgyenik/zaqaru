@@ -496,10 +496,10 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
         // because a pipe read can park — which `read_at`'s signature has no
         // way to say.
         if let Some((pipe, end, flags)) = self.pipe_of(fd) {
-            if end == crate::pipe::End::Write {
+            if end == crate::ring::End::Write {
                 return Outcome::Done(Errno::BadFile.as_result());
             }
-            return self.transfer_pipe(pipe, end, flags, arguments.get(1) as u64, count as u64);
+            return self.transfer_ring(pipe, end, flags, arguments.get(1) as u64, count as u64);
         }
         let offset = match self.files.description(fd) {
             Ok(file) => file.offset,
@@ -873,7 +873,7 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
             Ok(file) => match file.backing {
                 Backing::Image(inode) => self.write_stat(inode, arguments.get(1)),
                 Backing::Console(stream) => self.write_console_stat(stream, arguments.get(1)),
-                Backing::Pipe { pipe, .. } => self.write_pipe_stat(pipe, arguments.get(1)),
+                Backing::Pipe { ring, .. } => self.write_pipe_stat(ring, arguments.get(1)),
                 Backing::Epoll(id) => self.write_epoll_stat(id, arguments.get(1)),
             },
             Err(errno) => Outcome::Done(errno.as_result()),
@@ -886,10 +886,10 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
     /// a program that stats a descriptor to decide how to read it must see a
     /// fifo rather than a regular file, because the difference is whether
     /// seeking is allowed and whether a short read means end of file.
-    fn write_pipe_stat(&mut self, pipe: u32, destination: i64) -> Outcome {
+    fn write_pipe_stat(&mut self, ring: u32, destination: i64) -> Outcome {
         let mut buffer = [0u8; STAT_SIZE];
-        let queued = self.pipes.borrow().queued(pipe) as u64;
-        encode_pipe_stat(&mut buffer, pipe, queued);
+        let queued = self.rings.borrow().queued(ring) as u64;
+        encode_pipe_stat(&mut buffer, ring, queued);
         // SAFETY: bounds-checked against the guest's memory.
         match unsafe { self.memory_mut().write(destination as u64, &buffer) } {
             Ok(()) => Outcome::Done(0),
@@ -949,7 +949,7 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
             return match self.empty_path_target(arguments.get(0)) {
                 Ok(Backing::Image(inode)) => self.write_stat(inode, arguments.get(2)),
                 Ok(Backing::Console(stream)) => self.write_console_stat(stream, arguments.get(2)),
-                Ok(Backing::Pipe { pipe, .. }) => self.write_pipe_stat(pipe, arguments.get(2)),
+                Ok(Backing::Pipe { ring, .. }) => self.write_pipe_stat(ring, arguments.get(2)),
                 Ok(Backing::Epoll(id)) => self.write_epoll_stat(id, arguments.get(2)),
                 Err(errno) => Outcome::Done(errno.as_result()),
             };
@@ -1015,10 +1015,10 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
                         Err(errno) => Outcome::Done(errno.as_result()),
                     };
                 }
-                Ok(Backing::Pipe { pipe, .. }) => {
+                Ok(Backing::Pipe { ring, .. }) => {
                     let mut buffer = [0u8; STATX_SIZE];
-                    let queued = self.pipes.borrow().queued(pipe) as u64;
-                    encode_pipe_statx(&mut buffer, pipe, queued);
+                    let queued = self.rings.borrow().queued(ring) as u64;
+                    encode_pipe_statx(&mut buffer, ring, queued);
                     // SAFETY: bounds-checked against guest memory.
                     return match unsafe {
                         self.memory_mut().write(arguments.get(4) as u64, &buffer)
@@ -1980,15 +1980,15 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
     pub(crate) fn reconcile_shared(&mut self, before: &Census) {
         let after = self.shared_census();
         {
-            let mut pipes = self.pipes.borrow_mut();
+            let mut rings = self.rings.borrow_mut();
             for held in distinct(&before.pipes, &after.pipes) {
                 let was = count(&before.pipes, &held);
                 let now = count(&after.pipes, &held);
                 for _ in was..now {
-                    pipes.acquire(held.0, held.1);
+                    rings.acquire(held.0, held.1);
                 }
                 for _ in now..was {
-                    pipes.release(held.0, held.1);
+                    rings.release(held.0, held.1);
                 }
             }
         }
@@ -2184,7 +2184,7 @@ const EPOLL_INODE_BASE: u64 = 0x9100_0000;
 /// neither allocates. What is per-process is handled where it happens; see
 /// [`crate::syscall::Kernel::forget_description`].
 pub struct Census {
-    pipes: Vec<(u32, crate::pipe::End)>,
+    pipes: Vec<(u32, crate::ring::End)>,
     epolls: Vec<u32>,
 }
 
@@ -2203,8 +2203,8 @@ pub(crate) fn count<T: PartialEq>(list: &[T], value: &T) -> usize {
     list.iter().filter(|held| *held == value).count()
 }
 
-fn encode_pipe_stat(into: &mut [u8; STAT_SIZE], pipe: u32, queued: u64) {
-    let number = PIPE_INODE_BASE + u64::from(pipe);
+fn encode_pipe_stat(into: &mut [u8; STAT_SIZE], ring: u32, queued: u64) {
+    let number = PIPE_INODE_BASE + u64::from(ring);
     into[0..8].copy_from_slice(&PIPE_DEVICE.to_le_bytes());
     into[8..16].copy_from_slice(&number.to_le_bytes());
     into[16..24].copy_from_slice(&1u64.to_le_bytes());
@@ -2213,8 +2213,8 @@ fn encode_pipe_stat(into: &mut [u8; STAT_SIZE], pipe: u32, queued: u64) {
     into[56..64].copy_from_slice(&BLOCK_SIZE.to_le_bytes());
 }
 
-fn encode_pipe_statx(into: &mut [u8; STATX_SIZE], pipe: u32, queued: u64) {
-    let number = PIPE_INODE_BASE + u64::from(pipe);
+fn encode_pipe_statx(into: &mut [u8; STATX_SIZE], ring: u32, queued: u64) {
+    let number = PIPE_INODE_BASE + u64::from(ring);
     into[0..4].copy_from_slice(&STATX_BASIC_STATS.to_le_bytes());
     into[4..8].copy_from_slice(&(BLOCK_SIZE as u32).to_le_bytes());
     into[16..20].copy_from_slice(&1u32.to_le_bytes());
@@ -2227,8 +2227,8 @@ fn encode_pipe_statx(into: &mut [u8; STATX_SIZE], pipe: u32, queued: u64) {
 }
 
 /// What `faccessok` answers for a pipe end.
-fn pipe_access(end: crate::pipe::End, mode: i32) -> i64 {
-    let readable = end == crate::pipe::End::Read;
+fn pipe_access(end: crate::ring::End, mode: i32) -> i64 {
+    let readable = end == crate::ring::End::Read;
     if mode & access_mode::READ != 0 && !readable {
         return Errno::Access.as_result();
     }

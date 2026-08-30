@@ -99,7 +99,7 @@ pub struct EpollSet {
 
 /// Every `epoll` instance in one process.
 ///
-/// **Per process, unlike [`crate::pipe::Pipes`]**, and the reason is
+/// **Per process, unlike [`crate::ring::Rings`]**, and the reason is
 /// structural rather than a preference: a registration names an open file
 /// *description*, and a description is an index into a table each process
 /// has its own copy of. An arena shared across the tree keyed by those
@@ -204,7 +204,7 @@ impl Epolls {
 
 /// A borrow-checker convenience, not a sharing one: the kernel reaches its
 /// own `epoll` sets while holding a borrow of its descriptor table, which a
-/// plain field would forbid. Contrast [`crate::pipe::Shared`], which is an
+/// plain field would forbid. Contrast [`crate::ring::Shared`], which is an
 /// `Rc` because the pipes genuinely *are* shared.
 pub type Held = std::cell::RefCell<Epolls>;
 
@@ -235,30 +235,30 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
             return event::NVAL;
         };
         let ready = match file.backing {
-            Backing::Pipe { pipe, end } => {
-                let pipes = self.pipes.borrow();
+            Backing::Pipe { ring, end } => {
+                let rings = self.rings.borrow();
                 match end {
-                    crate::pipe::End::Read => {
+                    crate::ring::End::Read => {
                         let mut bits = 0;
-                        if pipes.queued(pipe) > 0 {
+                        if rings.queued(ring) > 0 {
                             bits |= event::IN | event::RDNORM;
                         }
                         // The writer is gone and nothing more will arrive.
                         // Reported alongside `POLLIN` when bytes are still
                         // queued, because both are true.
-                        if pipes.writers(pipe) == 0 {
+                        if rings.writers(ring) == 0 {
                             bits |= event::HUP;
                         }
                         bits
                     }
-                    crate::pipe::End::Write => {
+                    crate::ring::End::Write => {
                         let mut bits = 0;
-                        if pipes.room(pipe) > 0 {
+                        if rings.room(ring) > 0 {
                             bits |= event::OUT | event::WRNORM;
                         }
                         // Nobody will ever read it, which is the writer's
                         // half of the same fact.
-                        if pipes.readers(pipe) == 0 {
+                        if rings.readers(ring) == 0 {
                             bits |= event::ERR;
                         }
                         bits

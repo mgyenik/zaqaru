@@ -81,7 +81,7 @@ pub trait Machine {
     /// that is why a pipe read on the ahead-of-time path would hang rather
     /// than wait — which is a thing to know about that path, not a gap in
     /// this one.
-    fn park_on_transfer(&mut self, _transfer: crate::pipe::Transfer) -> bool {
+    fn park_on_transfer(&mut self, _transfer: crate::ring::Transfer) -> bool {
         false
     }
 
@@ -587,7 +587,7 @@ impl Machine for Interpreted {
         true
     }
 
-    fn park_on_transfer(&mut self, transfer: crate::pipe::Transfer) -> bool {
+    fn park_on_transfer(&mut self, transfer: crate::ring::Transfer) -> bool {
         self.threads.current_mut().state = crate::thread::State::Transferring(transfer);
         true
     }

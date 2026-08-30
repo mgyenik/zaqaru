@@ -398,17 +398,17 @@ impl<'a, S: Store + Clone> System<'a, S> {
                         let _ = write!(&mut into, "waiting for child {wanted}");
                     }
                     crate::thread::State::Transferring(transfer) => {
-                        let pipes = container.process.kernel.pipes.borrow();
+                        let rings = container.process.kernel.rings.borrow();
                         let _ = write!(
                             &mut into,
                             "{:?} on pipe {} ({} of {} bytes; {} queued, {} readers, {} writers)",
                             transfer.end,
-                            transfer.pipe,
+                            transfer.ring,
                             transfer.done,
                             transfer.length,
-                            pipes.queued(transfer.pipe),
-                            pipes.readers(transfer.pipe),
-                            pipes.writers(transfer.pipe),
+                            rings.queued(transfer.ring),
+                            rings.readers(transfer.ring),
+                            rings.writers(transfer.ring),
                         );
                     }
                     crate::thread::State::Watching(watching) => {

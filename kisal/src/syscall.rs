@@ -548,7 +548,7 @@ pub struct Kernel<'a, S: Store, M: Machine> {
     /// nobody is reading. See [`crate::pipe`], which is where the whole of
     /// `container-plan.md`'s fd hoisting lands once the shared thing lives
     /// somewhere both processes can reach.
-    pub pipes: crate::pipe::Shared,
+    pub rings: crate::ring::Shared,
     /// Every `epoll` instance in *this* process. See [`crate::poll::Epolls`]
     /// for why this one is not shared where the pipes are.
     pub epolls: crate::poll::Held,
@@ -757,7 +757,7 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             // namespace — which is exactly this case.
             parent: 0,
             files: crate::fd::FdTable::with_standard_streams(),
-            pipes: crate::pipe::Shared::default(),
+            rings: crate::ring::Shared::default(),
             epolls: crate::poll::Held::default(),
             clock: 1,
             status: None,
@@ -1034,12 +1034,14 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
     /// What this does *not* yet do is `container-plan.md`'s fd hoisting.
     /// The fd table is copied, which is right for everything whose state is
     /// genuinely private — a regular file's content, the cwd, the flags —
-    /// and wrong for the things POSIX shares across a fork: a pipe's ring,
-    /// a file's offset cell, a listening socket. That is the fork tax, it is
-    /// specified in the plan, and none of it is reachable yet because this
-    /// container has no pipes and no sockets. When they arrive, they arrive
-    /// with the hoisting, and the ordering rule is the plan's: hoist, then
-    /// copy.
+    /// and wrong for the things POSIX shares across a fork. Those live in
+    /// the ring arena instead, which the child shares rather than copies:
+    /// see [`crate::ring::Shared`]. That is `container-plan.md`'s fd
+    /// hoisting, made structural, and its ordering rule — hoist, *then*
+    /// copy — is satisfied by there being nothing to copy, because the
+    /// bytes were never in either address space. What remains uncopied and
+    /// unshared is a file's offset cell, which two processes reading one
+    /// description are supposed to share and here do not.
     pub fn fork(&self, machine: M) -> Self
     where
         S: Clone,
@@ -1049,9 +1051,9 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
         // writers are counted in *descriptors*, and the child is about to
         // have a copy of every one of them.
         {
-            let mut pipes = self.pipes.borrow_mut();
+            let mut rings = self.rings.borrow_mut();
             for (pipe, end) in self.files.pipe_ends() {
-                pipes.acquire(pipe, end);
+                rings.acquire(pipe, end);
             }
             let mut epolls = self.epolls.borrow_mut();
             for id in self.files.epoll_sets() {
@@ -1093,7 +1095,7 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             files: self.files.clone(),
             // Shared, not copied — see the field. The counts were raised
             // above, once per descriptor the copied table holds.
-            pipes: crate::pipe::Shared::clone(&self.pipes),
+            rings: crate::ring::Shared::clone(&self.rings),
             // Copied, and marked: a registration names a description, and
             // a description is an index into a table the child has its own
             // copy of. See [`crate::poll::Epolls`].
@@ -1162,13 +1164,13 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
         {
             // Once per descriptor lost, not once per pipe: a `dup`ed end is
             // two references and closing one of them closes nothing.
-            let mut pipes = self.pipes.borrow_mut();
+            let mut rings = self.rings.borrow_mut();
             let before: Vec<_> = self.files.pipe_ends().collect();
             let after: Vec<_> = files.pipe_ends().collect();
             for held in crate::file::distinct(&before, &after) {
                 let lost = crate::file::count(&before, &held) - crate::file::count(&after, &held);
                 for _ in 0..lost {
-                    pipes.release(held.0, held.1);
+                    rings.release(held.0, held.1);
                 }
             }
             let mut epolls = self.epolls.borrow_mut();
@@ -1204,7 +1206,7 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             // Kept, which is the entire reason `dup2` before an `execve` is
             // how every shell wires a pipeline: the descriptors survive and
             // so must what is behind them.
-            pipes: crate::pipe::Shared::clone(&self.pipes),
+            rings: crate::ring::Shared::clone(&self.rings),
             // The same process, so not inherited: `execve` keeps the
             // descriptor table it did not close, and the indices with it.
             epolls: crate::poll::Held::new(self.epolls.borrow().clone()),
@@ -2904,10 +2906,10 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
         // Before the console and the filesystem, because a pipe write can
         // *park* and the paths below it answer with a value or an errno.
         if let Some((pipe, end, flags)) = self.pipe_of(descriptor) {
-            if end == crate::pipe::End::Read {
+            if end == crate::ring::End::Read {
                 return Outcome::Done(Errno::BadFile.as_result());
             }
-            return self.transfer_pipe(pipe, end, flags, buffer, count as u64);
+            return self.transfer_ring(pipe, end, flags, buffer, count as u64);
         }
         let path = match file.backing {
             crate::fd::Backing::Console(crate::fd::Console::Output) => paths::CONSOLE_STDOUT,
