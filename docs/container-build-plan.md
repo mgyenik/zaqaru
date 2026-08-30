@@ -1944,7 +1944,62 @@ Three pieces of work fall out of it:
   module with neither room nor entry is a loud refusal, not a quiet
   fallback to the env var.
 
-### 3. dlopen — resequenced: it is the rung after the checkpoint
+### 3. dlopen — resequenced, and **built** (2026-08-30)
+
+`import json` runs, output identical to native. The bake gap was the whole
+of it: `baker::dynamic::sweep` now walks the image for ELFs and translates
+every one beside the closure, because the unit of translation is the image
+and a `dlopen`ed module is in nobody's closure.
+
+Measured, against the same bake with the closure alone:
+
+| | closure only | whole image |
+| --- | --- | --- |
+| modules | 6 | 58 |
+| functions | 81,714 | 111,652 |
+| bake | 4.0 s | 4.5 s |
+| refusals | 371 | 375 |
+
+The cost this section warned about — a merge multiplying every per-section
+question — did not materialise at this scale, and is recorded as measured
+rather than argued.
+
+`tests/dlopen.rs` is the ladder: a library nothing links against is swept
+and loaded; its constructor, its `__thread` variable (the dynamic-TLS path,
+which boot-time libraries never take), an allocation crossing back into the
+program's libc, and a callback into the program all work, compared against
+the same program and library run by Linux; and a bake whose image holds
+nothing to sweep is byte-identical to itself, so the policy is inert rather
+than absent.
+
+Two things it found, both recorded rather than swept:
+
+- **The failure path is the setjmp/longjmp thorn, as predicted.** `dlopen`
+  of an absent library leaves `ld.so` by `longjmp` out of
+  `_dl_catch_exception`, and `longjmp` jumps to the return address `setjmp`
+  saved — which in a translated program is
+  `RETURN_ADDRESS_SENTINEL`, so the jump becomes an exec-map lookup on
+  `0x7a61716172750000`. `a_failed_dlopen_stops_on_the_longjmp_thorn` asserts
+  that *shape*, so the day the thorn is designed away the test says so. It
+  is now the top blocker with real consumers: every `dlopen` that fails,
+  which real Python does routinely while probing.
+- **The container pipeline does not build with `--resume`**, though this
+  document says it always does (M6's front-end section). Nothing has needed
+  it — but a resume ID in the slot is precisely what the thorn's sketched
+  third arm needs, so the two questions are one question.
+
+And one finding beyond it: `libcrypto.so.3` refuses to translate at all —
+`undecodable bytes in fn.0x100b66c0 at offset 0x16c4`. Diagnosed rather
+than named: OpenSSL's hand-written asm puts constant tables *inside*
+`.text`, and the table at `0xb7d8d` lies inside a **guessed** extent
+belonging to a symbolless function between `AES_cbc_encrypt` (which ends at
+`0xb66b3`) and `AES_cfb128_encrypt`. The shape of the answer is the one the
+guessed/stated distinction already gives: undecodable bytes inside a
+*guessed* extent should truncate it rather than fail the bake, because a
+guess that runs into data is a guess that ran too long. Unbuilt. It blocks
+`hashlib`, `ssl`, and everything downstream of them.
+
+### 3 (as written). dlopen — resequenced: it is the rung after the checkpoint
 
 The dynamic-tier appendix filed `dlopen` under "not blocking". Measured
 on the target interpreter, it is blocking for everything past the

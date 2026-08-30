@@ -182,6 +182,17 @@ pub enum Role {
     Executable,
     Interpreter,
     Library,
+    /// An ELF found by sweeping the image, in nobody's closure.
+    ///
+    /// `dlopen` names files no closure reaches: an extension module is
+    /// linked *from* by nobody, so walking `PT_INTERP` and `DT_NEEDED` from
+    /// the executable will never find one. A distribution CPython's
+    /// `lib-dynload/` holds 47 of them before the first third-party package,
+    /// and `import json` needs one on the first line of any real script.
+    ///
+    /// So the unit of translation is the image, not the executable's
+    /// closure. See `container-plan.md`'s "Dynamic linking and ld.so".
+    Swept,
 }
 
 /// The whole set of files a program loads, in load order: the executable
@@ -264,6 +275,124 @@ pub fn closure(program: &Path, root: &Path) -> Result<Vec<Module>> {
         pending = next;
     }
     Ok(modules)
+}
+
+/// Whether these bytes are an ELF this pipeline can place and translate.
+///
+/// Deliberately a header test rather than a full parse: the sweep looks at
+/// every regular file in the image, most of which are not ELFs at all, and
+/// the question at that point is only "should this be parsed". What it does
+/// *not* do is guess — a file that answers yes here and then fails to parse
+/// is a bake error naming it, because an ELF in the image that nothing
+/// translated is a `dlopen` that fails at run time for a reason the bake
+/// already knew.
+fn is_linked_elf(bytes: &[u8]) -> bool {
+    const CLASS_64: u8 = 2;
+    const LITTLE_ENDIAN: u8 = 1;
+    const ET_EXEC: u16 = 2;
+    const ET_DYN: u16 = 3;
+    const EM_X86_64: u16 = 62;
+
+    if bytes.len() < 20 || &bytes[..4] != b"\x7fELF" {
+        return false;
+    }
+    if bytes[4] != CLASS_64 || bytes[5] != LITTLE_ENDIAN {
+        return false;
+    }
+    let kind = u16::from_le_bytes([bytes[16], bytes[17]]);
+    let machine = u16::from_le_bytes([bytes[18], bytes[19]]);
+    // A relocatable object (`ET_REL`) is not something a loader maps, and a
+    // core file is not code. Only the two shapes that get loaded.
+    matches!(kind, ET_EXEC | ET_DYN) && machine == EM_X86_64
+}
+
+/// Every ELF in the image that the closure did not already name.
+///
+/// The closure answers "what does this program load at start-up". This
+/// answers the question `dlopen` asks, which no closure can: *what code is
+/// in this image at all*. They are different questions and the second one
+/// contains the first, so the sweep runs over the tree and the closure's own
+/// files are subtracted from it by name.
+///
+/// A file with several names in the tree — a hardlink, or the symlink farm a
+/// libc arrives as — is one module, because it is one file. Deduplicating by
+/// node rather than by path is what makes that true: two names for one
+/// inode must be one translation at one base, or the same code exists twice
+/// at two addresses and the exec map disagrees with itself.
+pub fn sweep(tree: &crate::tree::Tree, already: &[Module]) -> Result<Vec<Module>> {
+    use std::collections::HashMap;
+
+    let claimed: BTreeSet<&str> = already
+        .iter()
+        .flat_map(|module| {
+            std::iter::once(module.path.as_str()).chain(module.aliases.iter().map(String::as_str))
+        })
+        .collect();
+
+    // Path order, so that a bake is reproducible and its module list reads
+    // like the tree.
+    let mut names: HashMap<crate::tree::NodeId, Vec<String>> = HashMap::new();
+    let mut order: Vec<crate::tree::NodeId> = Vec::new();
+    walk(tree, crate::tree::ROOT, &mut String::new(), &mut |node, path| {
+        if !matches!(tree.node(node).body, crate::tree::Body::Regular(_)) {
+            return;
+        }
+        let entry = names.entry(node).or_insert_with(|| {
+            order.push(node);
+            Vec::new()
+        });
+        entry.push(path.to_string());
+    });
+
+    let mut swept = Vec::new();
+    for node in order {
+        let crate::tree::Body::Regular(bytes) = &tree.node(node).body else {
+            continue;
+        };
+        if !is_linked_elf(bytes) {
+            continue;
+        }
+        let mut paths = names.remove(&node).unwrap_or_default();
+        paths.sort();
+        if paths.iter().any(|path| claimed.contains(path.as_str())) {
+            // The closure already owns this file under one of its names, and
+            // owns it with the role and the aliases the loader's own search
+            // produced.
+            continue;
+        }
+        let (path, aliases) = paths.split_first().expect("a node reached by no name");
+        swept.push(Module {
+            path: path.clone(),
+            aliases: aliases.to_vec(),
+            bytes: bytes.clone(),
+            role: Role::Swept,
+        });
+    }
+    Ok(swept)
+}
+
+/// Every path in the tree, depth-first in name order.
+fn walk(
+    tree: &crate::tree::Tree,
+    node: crate::tree::NodeId,
+    path: &mut String,
+    each: &mut impl FnMut(crate::tree::NodeId, &str),
+) {
+    match &tree.node(node).body {
+        crate::tree::Body::Directory(entries) => {
+            for (name, child) in entries {
+                let length = path.len();
+                path.push('/');
+                path.push_str(&String::from_utf8_lossy(name));
+                // A directory cannot be its own ancestor — POSIX forbids
+                // hard links to one — so this terminates without a visited
+                // set.
+                walk(tree, *child, path, each);
+                path.truncate(length);
+            }
+        }
+        _ => each(node, path),
+    }
 }
 
 /// Reads a guest-absolute path out of a root, following symlinks *within*

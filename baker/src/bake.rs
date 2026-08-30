@@ -77,8 +77,16 @@ pub fn container_with_invocation(
     argv: &[Vec<u8>],
     envp: &[Vec<u8>],
 ) -> Result<Bake> {
-    let modules = crate::dynamic::closure(program, search)
+    let mut modules = crate::dynamic::closure(program, search)
         .with_context(|| format!("finding what {} loads", program.display()))?;
+    // And every other ELF in the image, because `dlopen` names files no
+    // closure reaches. The unit of translation is the image, not the
+    // executable's closure: an extension module is linked *from* by nobody,
+    // so `PT_INTERP` and `DT_NEEDED` will never lead to one, and `import
+    // json` needs one on the first line of any real script.
+    modules.extend(
+        crate::dynamic::sweep(&tree, &modules).context("sweeping the image for ELFs")?,
+    );
     let bases = crate::dynamic::assign_bases(&modules).context("placing the modules")?;
 
     let mut inputs = Vec::new();
@@ -179,6 +187,32 @@ fn place(
     let base = u32::try_from(base).with_context(|| {
         format!("{path} was placed at an address outside a 32-bit linear memory")
     })?;
+
+    // A file the image already holds is updated where it is, rather than
+    // replaced by a new node under the same name. The difference is not
+    // bookkeeping: a swept module is *found* in the tree, and a library
+    // routinely has several names there — a hardlink, or the symlink farm a
+    // libc arrives as. Linking one name to a fresh node would leave the
+    // others pointing at the old one, which is then a second copy of the
+    // same library, unpatched, untranslated, and reachable by name.
+    //
+    // A *regular file* only. `Tree::resolve` walks entries without following
+    // symlinks, and a closure module is routinely named through one — an
+    // executable's `PT_INTERP` says `/lib64/ld-linux-x86-64.so.2`, which on
+    // every modern distribution is a link into `/lib/x86_64-linux-gnu`.
+    // Overwriting that node's body leaves its *mode* saying symlink, so the
+    // image holds an inode of one type carrying another's contents and the
+    // loader looks for a file it cannot find. A symlink falls through to the
+    // path below, which replaces the name outright, as it always did.
+    if let Some(existing) = tree.resolve(path.as_bytes())
+        && matches!(tree.node(existing).body, crate::tree::Body::Regular(_))
+    {
+        let node = tree.node_mut(existing);
+        node.body = crate::tree::Body::Regular(bytes);
+        node.meta.prelink_base = Some(base);
+        return Ok(());
+    }
+
     let meta = crate::tree::Meta {
         mode: kisal::image::file_type::REGULAR | 0o755,
         prelink_base: Some(base),

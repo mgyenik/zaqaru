@@ -2650,3 +2650,87 @@ fault, exactly where the build plan's dlopen appendix says it will:
     module
 
 That is the next rung, and its design and spike ladder are already written.
+
+## 2026-08-30 — `import json`: the unit of translation is the image
+
+The rung after the checkpoint, and the bake gap was the whole of it.
+
+A `dlopen`ed library is in nobody's closure — the executable does not link
+against it, so walking `PT_INTERP` and `DT_NEEDED` from the program never
+reaches one. `baker::dynamic::sweep` walks the image tree for ELFs and
+translates every one beside the closure. Python's tree has 52 shared objects
+in it; the bake goes from 6 modules and 81,714 functions to 58 and 111,652,
+and from 4.0 s to 4.5 s. The per-section cost this was warned about did not
+materialise at that scale.
+
+    $ zaqaru-run pyjson.wasm
+    {"a": 1, "b": [2, 3]}
+
+Identical to native. So is `math`, `cmath`, `re`, `collections`,
+`itertools`, `functools`.
+
+### Two defects in the placement, both mine and both from the same hour
+
+**A file already in the tree was being orphaned.** `place` added a new node
+and linked the module's name to it. For a closure module read from outside
+the tree that is right; for a *swept* one, which was found in the tree, it
+leaves every other name for that file — a hardlink, or the symlink farm a
+libc arrives as — pointing at the old node, which is then a second copy of
+the same library, unpatched and untranslated and reachable by name. A file
+the image already holds is updated where it is now.
+
+**And then the first version of that overwrote a symlink's body while
+leaving its mode saying symlink.** `Tree::resolve` walks entries without
+following links, and an executable's `PT_INTERP` says
+`/lib64/ld-linux-x86-64.so.2`, which on every modern distribution is a link
+into `/lib/x86_64-linux-gnu`. The image ended up holding an inode of one
+type carrying another's contents, and the container died with "the dynamic
+loader its `PT_INTERP` names is not in the image" — which was true, and
+said so, one layer away from the cause. Only a regular file is updated in
+place; anything else falls through to replacing the name.
+
+### The thorn, met on purpose
+
+`dlopen` of something absent leaves `ld.so` by `longjmp` out of
+`_dl_catch_exception`, and `longjmp` jumps to the return address `setjmp`
+saved — the sentinel. `container-plan.md` predicted exactly this and asked
+for the corpus to trigger it once so the shape is on record;
+`a_failed_dlopen_stops_on_the_longjmp_thorn` does, and asserts the shape
+rather than the bug, so it fails the day the thorn is designed away.
+
+It is now the top blocker with real consumers rather than a parked
+curiosity: every `dlopen` that fails is one, and real Python probes several
+paths before it finds a module. `import hashlib` failed this way too, for
+the same reason — its `libcrypto` was not in the tree.
+
+Beside it, a discrepancy worth naming: the build plan says the container
+pipeline always builds with `--resume`, and `baker::bake` does not pass it.
+Nothing has needed it — and a resume ID in the slot is exactly what the
+thorn's sketched third arm needs, so the two are one question.
+
+### A test that was wrong about C rather than about the translation
+
+The dlopen fixture printed `thread_local_(1)` and `thread_local_(2)` as two
+arguments to one `printf` and expected `8 10`. It got `10 9`, because C
+leaves argument evaluation order unspecified and gcc goes right to left.
+The container and the native run had already agreed exactly — the
+comparison against native passed and only the hand-written expectation
+failed, which is the differential doing its job and the expectation doing
+the opposite. The fixture sequences the two calls now.
+
+### What is beyond it
+
+`libcrypto.so.3` does not translate: *undecodable bytes in
+`fn.0x100b66c0` at offset `0x16c4`*. Diagnosed rather than filed:
+OpenSSL's hand-written asm puts constant tables inside `.text`, and this one
+sits at `0xb7d8d`, inside a **guessed** extent belonging to a symbolless
+function between `AES_cbc_encrypt` (which states its size and ends at
+`0xb66b3`) and `AES_cfb128_encrypt`. Nothing names the table's start, so
+nothing cuts the guess, and the decode walks into it.
+
+The answer's shape is the one the stated/guessed distinction already gives:
+undecodable bytes inside a *guessed* extent should truncate it rather than
+refuse the bake, because a guess that runs into data is a guess that ran too
+long, and code lost that way was undecodable anyway — anything that reaches
+it gets a loud exec-map miss. Unbuilt. It blocks `hashlib`, `ssl` and
+everything under them.
