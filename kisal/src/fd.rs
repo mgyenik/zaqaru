@@ -89,6 +89,7 @@ struct Descriptor {
 }
 
 #[derive(Default)]
+#[derive(Clone)]
 pub struct FdTable {
     descriptors: Vec<Option<Descriptor>>,
     /// The last name each directory scan returned, parallel to
@@ -217,6 +218,21 @@ impl FdTable {
     pub fn description_mut(&mut self, fd: i32) -> Result<&mut OpenFile, Errno> {
         let index = self.descriptor(fd)?.description;
         self.descriptions[index].as_mut().ok_or(Errno::BadFile)
+    }
+
+    /// Closes every descriptor marked close-on-exec.
+    ///
+    /// The moment the flag is named for, and the only one: a `fork` carries
+    /// marked descriptors into the child untouched, because the flag says
+    /// *exec* and a child that never execs keeps them. Which is why this is
+    /// a separate call and not part of duplicating the table.
+    pub fn close_marked(&mut self) {
+        let marked: Vec<i32> = (0..self.descriptors.len() as i32)
+            .filter(|&fd| self.close_on_exec(fd).unwrap_or(false))
+            .collect();
+        for fd in marked {
+            let _ = self.close(fd);
+        }
     }
 
     pub fn close_on_exec(&self, fd: i32) -> Result<bool, Errno> {

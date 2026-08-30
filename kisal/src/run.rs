@@ -24,7 +24,7 @@
 use targum::block::BlockCache;
 use targum::exec::Trap;
 use targum::state::Tcb;
-use targum::{Engine, Outcome as Step, QUANTUM};
+use targum::{Engine, Outcome as Step};
 
 use crate::abi::Store;
 use crate::machine::{Interpreted, Machine};
@@ -41,6 +41,27 @@ const ARGUMENTS: [usize; 6] = [7, 6, 2, 10, 8, 9];
 
 /// The register a syscall's number arrives in and its result leaves in.
 const NUMBER: usize = 0;
+
+/// What one turn of the loop did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Progress {
+    /// Nothing to decide; go round again with the same process.
+    Running,
+    /// The quantum expired. The thread is still runnable, and this is the
+    /// moment a *process* scheduler takes its turn — the same instant the
+    /// thread scheduler does, and for the same reason.
+    Preempted,
+    Finished(Exit),
+    /// The process needs something only the system can do.
+    Requested(crate::syscall::Request),
+}
+
+/// What serving one syscall did — the same three answers, one level down.
+enum Served {
+    Returned,
+    Finished(Exit),
+    Requested(crate::syscall::Request),
+}
 
 /// How a process finished.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -70,7 +91,8 @@ pub enum Exit {
     /// Every thread is parked on a futex nothing will wake.
     Deadlocked,
     /// Not an ending at all: the trap became a signal and a handler is
-    /// running. Never returned from [`Process::run`]; it exists so that
+    /// running. Never returned from [`crate::system::System::run`]; it exists
+    /// so that
     /// [`Process::fault`] can answer one type.
     Delivered,
 }
@@ -152,6 +174,23 @@ impl<'a, S: Store> Process<'a, S> {
         // already holds, and the interpreter executes it. Injecting a
         // variable the guest can read, to avoid an instruction the engine
         // can execute, would be a divergence bought for nothing.
+        Self::enter(kernel, path, argv, envp)
+    }
+
+    /// Loads a program into a kernel that already has an address space
+    /// reserved, and leaves the thread ready to enter it.
+    ///
+    /// This is `execve(2)` exactly: the path is used as written. No `PATH`
+    /// search, because that is `execvp`'s job and doing it here would make
+    /// `execve("python3", ...)` succeed where Linux answers `ENOENT` — a
+    /// difference the guest can see, from a library that is trying to
+    /// implement the search itself.
+    pub fn enter(
+        mut kernel: Kernel<'a, S, Interpreted>,
+        path: &[u8],
+        argv: &[&[u8]],
+        envp: &[&[u8]],
+    ) -> Result<Self, crate::exec::Error> {
         let entry = kernel.exec(path, argv, envp)?;
         // `exec` already wrote the stack pointer and reset the unit through
         // the machine, which in this world *is* the control block — so the
@@ -159,6 +198,8 @@ impl<'a, S: Store> Process<'a, S> {
         kernel.machine.thread_mut().rip = entry;
         Ok(Self {
             kernel,
+            // Nothing decoded here is worth anything to the new program: the
+            // bytes at every address just changed.
             cache: BlockCache::new(),
         })
     }
@@ -207,22 +248,16 @@ impl<'a, S: Store> Process<'a, S> {
         ))
     }
 
-    /// Runs until the process finishes.
-    pub fn run(&mut self) -> Exit {
-        loop {
-            match self.advance(QUANTUM) {
-                Some(exit) => return exit,
-                None => continue,
-            }
-        }
-    }
-
     /// One turn of the loop: run a quantum, then decide what stopped it.
     ///
-    /// Separate from [`Process::run`] so that a test can take one turn at a
-    /// time, and so that the thing a scheduler will call is already a
-    /// function rather than the middle of a loop body.
-    pub fn advance(&mut self, quantum: u64) -> Option<Exit> {
+    /// A turn, and not a run: what drives a container to completion is
+    /// [`crate::system::System`], because a `fork` needs the table of every
+    /// process and a process is not that. There is deliberately no
+    /// `Process::run` — one would be a loop that turns every fork into an
+    /// error, which is the shape of refusal this engine spent a section of
+    /// `docs/vm.md` getting rid of.
+    /// The same, saying what it needs when it needs something.
+    pub fn step(&mut self, quantum: u64) -> Progress {
         // Before anything runs, and therefore *between blocks*: the control
         // block is consistent exactly at retirement boundaries, and a frame
         // built from a half-executed block would carry a lazy-flag record
@@ -235,7 +270,7 @@ impl<'a, S: Store> Process<'a, S> {
                 address: 0,
             })
         {
-            return Some(exit);
+            return Progress::Finished(exit);
         }
 
         // Three disjoint fields of one owner, which is what makes the
@@ -246,6 +281,7 @@ impl<'a, S: Store> Process<'a, S> {
             &mut self.cache,
             quantum,
         );
+        let preempted = matches!(outcome, Step::Preempted);
         let (finished, reschedule) = match outcome {
             // The quantum ran out with the thread still runnable, which is
             // the only reason this loop ever takes a thread off the
@@ -255,7 +291,14 @@ impl<'a, S: Store> Process<'a, S> {
             // at once, which a wall-clock quantum could not be.
             Step::Preempted => (None, true),
             Step::Syscall => {
-                let finished = self.serve();
+                let served = self.serve();
+                if let Served::Requested(request) = served {
+                    return Progress::Requested(request);
+                }
+                let finished = match served {
+                    Served::Finished(exit) => Some(exit),
+                    _ => None,
+                };
                 // A syscall that parked or ended the thread leaves it not
                 // runnable, and somebody else has to be chosen. One that
                 // returned normally does not: switching on every syscall
@@ -271,21 +314,34 @@ impl<'a, S: Store> Process<'a, S> {
                 ending => (Some(ending), false),
             },
         };
-        if finished.is_some() {
-            return finished;
+        if let Some(exit) = finished {
+            return Progress::Finished(exit);
         }
         if reschedule && !self.kernel.machine.threads.schedule() {
             // Nothing can run. Every thread is parked on a futex nothing
             // will wake, which is a deadlock in the guest — and reporting it
             // is better than spinning, because spinning looks the same as
             // working.
-            return Some(Exit::Deadlocked);
+            return Progress::Finished(Exit::Deadlocked);
         }
-        None
+        match preempted {
+            true => Progress::Preempted,
+            false => Progress::Running,
+        }
+    }
+
+    /// Whether any of this process's threads could run now.
+    pub fn runnable(&self) -> bool {
+        self.kernel
+            .machine
+            .threads
+            .all()
+            .iter()
+            .any(crate::thread::Thread::is_runnable)
     }
 
     /// Serves one syscall.
-    fn serve(&mut self) -> Option<Exit> {
+    fn serve(&mut self) -> Served {
         // Whatever the host placed in guest memory for the previous call is
         // dead now. The arena's lifetime is one call, and that is what stops
         // the boundary leaking — the ahead-of-time seam does this at the top
@@ -303,15 +359,22 @@ impl<'a, S: Store> Process<'a, S> {
         match answer {
             Outcome::Done(value) => {
                 self.kernel.machine.thread_mut().registers[NUMBER] = value as u64;
-                None
+                Served::Returned
             }
-            Outcome::Exit(status) => Some(Exit::Status(status)),
-            Outcome::Fault(fault) => Some(Exit::Unimplemented(fault)),
+            Outcome::Exit(status) => Served::Finished(Exit::Status(status)),
+            Outcome::Fault(fault) => Served::Finished(Exit::Unimplemented(fault)),
             // The thread parked on a futex, or ended. Either way it is not
             // runnable and the caller picks somebody else; there is nothing
             // to write back, because a parked thread has not returned yet.
-            Outcome::Blocked => None,
+            Outcome::Blocked => Served::Returned,
+            Outcome::Process(request) => Served::Requested(request),
         }
+    }
+
+    /// Writes a syscall's answer into the thread that asked, for the
+    /// requests the system completes on the kernel's behalf.
+    pub fn answer(&mut self, value: i64) {
+        self.kernel.machine.thread_mut().registers[NUMBER] = value as u64;
     }
 
     /// Writes one line of syscall trace, if a trace was asked for.
@@ -329,6 +392,7 @@ impl<'a, S: Store> Process<'a, S> {
             Outcome::Done(value) => value.to_string(),
             Outcome::Fault(_) => String::from("<fault>"),
             Outcome::Blocked => String::from("<blocked>"),
+            Outcome::Process(_) => String::from("<process>"),
             Outcome::Exit(status) => format!("<exit {status}>"),
         };
         let line = crate::traced(&mut self.kernel, number, arguments, &rendered);
@@ -346,6 +410,14 @@ impl<'a, S: Store> Process<'a, S> {
         }
         self.declined(signal, delivery);
         self.kernel.machine.owned().pending_signals &= !(1u64 << (signal - 1));
+        // Pending, and by the time it was reached no longer caught — the
+        // program changed the disposition between the two moments, which is
+        // exactly what a `SIGCHLD` handler that deinstalls itself does. The
+        // default action decides, and for this handful of signals the
+        // default action is to do nothing.
+        if !crate::syscall::terminates(i64::from(signal)) {
+            return None;
+        }
         // Nothing caught it. What a shell reports for a process killed by a
         // signal is 128 plus the number.
         Some(Exit::Signalled {

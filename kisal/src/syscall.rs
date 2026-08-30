@@ -62,6 +62,10 @@ pub mod number {
     pub const FUTEX: i64 = 202;
     pub const GETDENTS64: i64 = 217;
     pub const SET_TID_ADDRESS: i64 = 218;
+    pub const FORK: i64 = 57;
+    pub const VFORK: i64 = 58;
+    pub const EXECVE: i64 = 59;
+    pub const WAIT4: i64 = 61;
     pub const KILL: i64 = 62;
     pub const RT_SIGRETURN: i64 = 15;
     pub const SIGALTSTACK: i64 = 131;
@@ -150,6 +154,10 @@ pub mod number {
     /// number prints as its number, never as a guess.
     pub fn name(number: i64) -> Option<&'static str> {
         Some(match number {
+            FORK => "fork",
+            VFORK => "vfork",
+            EXECVE => "execve",
+            WAIT4 => "wait4",
             KILL => "kill",
             RT_SIGRETURN => "rt_sigreturn",
             SIGALTSTACK => "sigaltstack",
@@ -360,6 +368,34 @@ pub enum Outcome {
     /// Something the kernel does not implement, named. Never an errno: a
     /// silent `ENOSYS` here is a hang somewhere else later.
     Fault(Fault),
+    /// Something only the thing that owns *every* process can do.
+    ///
+    /// A kernel is one process's kernel — that is what makes inheritance
+    /// across a fork correct by construction — so it cannot create a second
+    /// one or look at another's status. It says what it needs instead, and
+    /// [`crate::system::System`] does it. The same shape as `Exit` and
+    /// `Blocked`: an answer the loop above completes.
+    Process(Request),
+}
+
+/// What a syscall needs from the layer that owns every process.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Request {
+    /// A copy of this process, with the caller's thread in it.
+    Fork,
+    /// Wait for a child. `status` is where to write it, or zero.
+    Wait {
+        pid: i32,
+        status: u64,
+        options: i32,
+    },
+    /// This process, running a different program. The strings are owned
+    /// because the memory they were read from is what `exec` replaces.
+    Execute {
+        path: Vec<u8>,
+        argv: Vec<Vec<u8>>,
+        envp: Vec<Vec<u8>>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -652,9 +688,7 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
         // bytes, with the guest's `brk` memory and the kernel's heap
         // silently the same. Growing to the ceiling now puts every later
         // kernel allocation above it, permanently.
-        let space_start = machine.memory_limit();
-        let space_ceiling = space_start.saturating_add(GUEST_ADDRESS_SPACE);
-        let reserved = machine.grow(space_ceiling);
+        let (space, pages) = Self::reserve_space(&mut machine);
         let image_working_directory = image.working_directory().to_vec();
         let mut kernel = Self {
             store,
@@ -665,33 +699,56 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             files: crate::fd::FdTable::with_standard_streams(),
             clock: 1,
             status: None,
-            pages: targum::space::Space::new(0),
+            pages,
             enforcement,
             tracing: None,
             image_working_directory,
             continuation: None,
             dispositions: [Disposition::DEFAULT; 64],
-            // Carved from the top of whatever the module already occupies:
-            // the linker's data, the shadow stack, and anything the
-            // kernel's own allocator has taken. Everything the guest is
-            // given comes from there up.
-            space: if reserved {
-                crate::space::Space::within(space_start, space_ceiling)
-            } else {
-                // The reservation always succeeds inside a module, where
-                // memory grows on request. It fails only in a native test,
-                // whose address space is a buffer it allocated — and there
-                // the bound has nothing to do, because the thing it keeps
-                // the guest away from is a kernel allocator that native
-                // tests do not share memory with.
-                crate::space::Space::new(space_start)
-            },
+            space,
         };
-        kernel.pages.set_limit(kernel.machine.memory_limit());
         kernel.flatten(0);
         kernel.seed_random();
         kernel.mount_synthetics();
         kernel
+    }
+
+    /// Gives a machine with no address space one, and answers the two
+    /// descriptions of it: the tree of what is mapped, and the table of what
+    /// each page allows.
+    ///
+    /// Called at boot and again at `execve`, which are exactly the two
+    /// moments a process acquires an address space — and shared between them
+    /// so that a program reached through `exec` gets the same one a program
+    /// reached through boot does. Written out twice they would drift, and
+    /// the drift would be a container where the second program has a
+    /// slightly different world from the first.
+    fn reserve_space(machine: &mut M) -> (crate::space::Space, targum::space::Space) {
+        // The guest's arenas are a block reserved once, here, and not
+        // whatever happens to lie above the module. They have to be: the
+        // kernel's own allocator takes its pages from the end of linear
+        // memory, and so would the arenas — two claimants on the same
+        // bytes, with the guest's `brk` memory and the kernel's heap
+        // silently the same. Growing to the ceiling now puts every later
+        // kernel allocation above it, permanently.
+        let start = machine.memory_limit();
+        let ceiling = start.saturating_add(GUEST_ADDRESS_SPACE);
+        let reserved = machine.grow(ceiling);
+        // Carved from the top of whatever the module already occupies: the
+        // linker's data, the shadow stack, and anything the kernel's own
+        // allocator has taken. Everything the guest is given comes from
+        // there up.
+        let space = match reserved {
+            true => crate::space::Space::within(start, ceiling),
+            // The reservation always succeeds inside a module, where memory
+            // grows on request. It fails only in a native test, whose
+            // address space is a buffer it allocated — and there the bound
+            // has nothing to do, because the thing it keeps the guest away
+            // from is a kernel allocator that native tests do not share
+            // memory with.
+            false => crate::space::Space::new(start),
+        };
+        (space, targum::space::Space::new(machine.memory_limit()))
     }
 
     /// Under [`Enforcement::Flat`], marks everything below the limit
@@ -900,6 +957,228 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
     //
     // OpenBLAS asks, on the way to allocating its buffers, and takes the
     // refusal as "no NUMA here" and carries on.
+    /// The kernel a forked child starts with.
+    ///
+    /// **Written out field by field on purpose.** What a child inherits is
+    /// not "a copy of the parent" — it is a list of POSIX statements, and
+    /// each one is a decision. A `derive(Clone)` would make every future
+    /// field inherit silently, which is exactly how a kernel acquires a
+    /// piece of state that should not have crossed a fork.
+    ///
+    /// The address space arrives separately, in `machine`, because copying
+    /// it is not this crate's operation: it is a duplicate of the whole
+    /// linear memory and the world decides how.
+    ///
+    /// What this does *not* yet do is `container-plan.md`'s fd hoisting.
+    /// The fd table is copied, which is right for everything whose state is
+    /// genuinely private — a regular file's content, the cwd, the flags —
+    /// and wrong for the things POSIX shares across a fork: a pipe's ring,
+    /// a file's offset cell, a listening socket. That is the fork tax, it is
+    /// specified in the plan, and none of it is reachable yet because this
+    /// container has no pipes and no sockets. When they arrive, they arrive
+    /// with the hoisting, and the ordering rule is the plan's: hoist, then
+    /// copy.
+    pub fn fork(&self, machine: M) -> Self
+    where
+        S: Clone,
+    {
+        Self {
+            // The host boundary, which both processes reach. Sharing it is
+            // the point: a child's `write` to the console has to arrive on
+            // the same console.
+            store: self.store.clone(),
+            machine,
+            // Inherited, and a stated divergence: Linux's entropy comes from
+            // a pool the kernel keeps advancing, so a parent and child that
+            // both read it get different bytes. Here the generator is seeded
+            // once at boot and copying it gives both the same stream. glibc
+            // reseeds `arc4random` on fork and CPython reseeds its hash, so
+            // nothing yet observes it — but it is a divergence and not a
+            // detail, and it is the reason `/iso/random` will have to be
+            // asked again in the child rather than copied.
+            random: self.random.clone(),
+            // The same program, until the child execs.
+            executable: self.executable.clone(),
+            // The working directory and the writable layer both come along,
+            // and both are *copies*: what the child writes afterwards is the
+            // child's, which is what fork means.
+            vfs: self.vfs.clone(),
+            // Every open descriptor, with its flags — including
+            // close-on-exec, which does not help here: cloexec clears at
+            // *exec*, so a plain fork carries cloexec-marked descriptors
+            // into a child that may never exec.
+            files: self.files.clone(),
+            clock: self.clock,
+            // The child has not finished and is not going anywhere.
+            status: None,
+            continuation: None,
+            // The mappings, and the page table under them. Copied rather
+            // than shared: the bytes were copied, so the description of them
+            // has to be too.
+            space: self.space.clone(),
+            pages: self.pages.clone(),
+            // POSIX: handlers are inherited across fork and reset across
+            // exec. This is the fork half.
+            dispositions: self.dispositions,
+            tracing: self.tracing,
+            enforcement: self.enforcement,
+            image_working_directory: self.image_working_directory.clone(),
+        }
+    }
+
+    /// What survives an `execve`: the same process, with a new program in
+    /// it.
+    ///
+    /// The mirror of [`Kernel::fork`], and worth writing the same way —
+    /// field by field, with the reason beside each — because the two lists
+    /// are nearly complements and every difference between them is a rule
+    /// somebody has to get right. Fork copies the address space and keeps
+    /// the program; exec keeps the descriptors and replaces the address
+    /// space.
+    pub fn execed(&self, mut machine: M) -> Self
+    where
+        S: Clone,
+    {
+        let (space, pages) = Self::reserve_space(&mut machine);
+        let mut files = self.files.clone();
+        // The one moment `O_CLOEXEC` means anything. A fork carries marked
+        // descriptors into the child untouched; this is where they go.
+        files.close_marked();
+        Self {
+            store: self.store.clone(),
+            machine,
+            // The same process, so the same generator: `execve` does not
+            // reseed anything on Linux either, and the auxiliary vector's
+            // `AT_RANDOM` is drawn from it a moment from now.
+            random: self.random.clone(),
+            // Overwritten by `exec` with the program it actually loads,
+            // which is what `/proc/self/exe` has to answer afterwards.
+            executable: String::new(),
+            // The working directory, the root, and the writable layer: all
+            // properties of the process, and the process is the thing that
+            // survives.
+            vfs: self.vfs.clone(),
+            files,
+            clock: self.clock,
+            status: None,
+            continuation: None,
+            // Emphatically *not* inherited. A new program gets a new address
+            // space, and both of these describe the old one — carrying
+            // either across would leave the loader placing segments around
+            // mappings that no longer exist.
+            space,
+            pages,
+            // POSIX: handlers are inherited across fork and reset across
+            // exec. This is the exec half — a handler is an address in a
+            // program that is no longer there, so every caught signal goes
+            // back to its default. Dispositions of `SIG_IGN` survive,
+            // because ignoring is a decision about the *process* and needs
+            // no code to carry it out.
+            dispositions: core::array::from_fn(|index| match self.dispositions[index].handler {
+                SIG_IGN => Disposition {
+                    handler: SIG_IGN,
+                    ..Disposition::DEFAULT
+                },
+                _ => Disposition::DEFAULT,
+            }),
+            tracing: self.tracing,
+            enforcement: self.enforcement,
+            // Consumed at boot and not again: the image's `WORKDIR` applies
+            // to the container's first program, and an `execve` inside it is
+            // the guest changing programs, not the container starting.
+            image_working_directory: Vec::new(),
+        }
+    }
+
+    /// `fork(2)` and `vfork(2)`.
+    ///
+    /// `clone` reaches here too, when its flags say a process rather than a
+    /// thread — which is what the flags mean and what it used to be refused
+    /// for. `container-plan.md` specifies this in detail and treats it as
+    /// critical; the earlier refusal was reading a milestone boundary as a
+    /// policy.
+    ///
+    /// `vfork` is `fork` here, deliberately and conservatively: its promise
+    /// is that the parent is suspended until the child execs or exits and
+    /// that they share memory until then. A real copy keeps every guarantee
+    /// vfork makes and drops only its performance argument — where the
+    /// plan's no-snapshot fast path belongs, and that path wants the
+    /// exec-side machinery it names. Giving a caller a *copy* where it
+    /// expected sharing is safe; the reverse is not.
+    fn fork_process(&mut self) -> Outcome {
+        Outcome::Process(Request::Fork)
+    }
+
+    /// `execve(2)`: this process, running a different program.
+    ///
+    /// The other half of `fork`, and the half that makes it useful: a
+    /// `fork` on its own covers a daemon that splits off a copy of itself,
+    /// and `fork` plus `exec` is every subprocess anything actually
+    /// launches — `subprocess.run`, a shell's `$(...)`, a build system's
+    /// compiler. `container-plan.md` treats the pair together for that
+    /// reason.
+    ///
+    /// The arguments are read *here*, out of the address space that is about
+    /// to stop existing, and carried across as owned bytes. That is not a
+    /// convenience: `argv` points into the caller's memory, and the caller's
+    /// memory is exactly what the new program replaces.
+    fn execute(&mut self, arguments: Arguments) -> Outcome {
+        let path = match self.path_at(arguments.get(0)) {
+            Ok(path) => path.to_vec(),
+            Err(errno) => return Outcome::Done(errno.as_result()),
+        };
+        let argv = match self.strings_at(arguments.get(1) as u64) {
+            Ok(strings) => strings,
+            Err(errno) => return Outcome::Done(errno.as_result()),
+        };
+        let envp = match self.strings_at(arguments.get(2) as u64) {
+            Ok(strings) => strings,
+            Err(errno) => return Outcome::Done(errno.as_result()),
+        };
+        Outcome::Process(Request::Execute { path, argv, envp })
+    }
+
+    /// Reads a null-terminated array of C strings out of guest memory.
+    ///
+    /// Bounded in both directions — how many strings, and how long each one
+    /// is — because the array is the guest's: one with no terminator has to
+    /// end as `E2BIG` rather than as a walk to the top of the address space.
+    fn strings_at(&self, address: u64) -> Result<Vec<Vec<u8>>, Errno> {
+        /// What Linux allows, as `MAX_ARG_STRINGS`.
+        const LIMIT: u64 = 0x7fff;
+        let mut collected = Vec::new();
+        if address == 0 {
+            return Ok(collected);
+        }
+        for index in 0..LIMIT {
+            let at = address + index * 8;
+            // SAFETY: bounds-checked against the guest's memory, and the
+            // slice is consumed before anything can write there.
+            let word = unsafe { self.memory().slice(at, 8)? };
+            let pointer = u64::from_le_bytes(word.try_into().expect("eight bytes"));
+            if pointer == 0 {
+                return Ok(collected);
+            }
+            collected.push(self.path_at(pointer as i64)?.to_vec());
+        }
+        Err(Errno::ArgumentsTooLong)
+    }
+
+    /// `wait4(2)`: what happened to a child.
+    fn wait_for_child(&mut self, arguments: Arguments) -> Outcome {
+        let pid = arguments.get(0) as i32;
+        let status = arguments.get(1) as u64;
+        let options = arguments.get(2) as i32;
+        if status != 0 && let Err(errno) = self.memory().check(status, 4) {
+            return Outcome::Done(errno.as_result());
+        }
+        Outcome::Process(Request::Wait {
+            pid,
+            status,
+            options,
+        })
+    }
+
     /// `kill(2)`: a signal at a *process* rather than at a thread.
     ///
     /// Which is the difference `tgkill` exists to make, and it shows up the
@@ -946,6 +1225,29 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
         }
         let _ = (number, arguments);
         Outcome::Done(0)
+    }
+
+    /// Sends a signal to this process from *outside* it.
+    ///
+    /// `raise_at_process` is the same decision reached through a syscall, and
+    /// this is the same decision reached through something that happened —
+    /// a child exiting, which is the first sender that is not the guest
+    /// itself. Answers whether the default action ends the process, because
+    /// the caller is the process table and killing is its to do.
+    ///
+    /// The disposition is consulted *here*, at the sending moment, and not
+    /// at delivery: a signal whose default is to be ignored leaves nothing
+    /// pending at all, which is what keeps a run loop from waking on every
+    /// `SIGCHLD` a program never asked about.
+    pub fn signal_process(&mut self, signal: i32) -> bool {
+        match self.dispositions[(signal - 1) as usize].handler {
+            SIG_IGN => false,
+            SIG_DFL => terminates(i64::from(signal)),
+            _ => {
+                self.machine.raise_process(signal);
+                false
+            }
+        }
     }
 
     /// Runs `signal`'s handler on top of whatever this thread was doing.
@@ -1202,12 +1504,12 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
         use clone_flag as flag;
         const THREAD: u64 = flag::VM | flag::THREAD;
         if flags & THREAD != THREAD {
-            return Outcome::Fault(Fault::detailed(
-                number::CLONE,
-                arguments,
-                "a new process rather than a thread — this machine has one \
-                 address space, so `fork` has nothing to copy it into",
-            ));
+            // Not a thread: a process. Which is a fork, and the flags that
+            // distinguish `fork` from `vfork` from `clone(SIGCHLD)` are
+            // about *sharing*, and a copy shares nothing — so the
+            // conservative answer serves all of them.
+            let _ = (stack, parent_tid, child_tid, tls);
+            return self.fork_process();
         }
         let known = THREAD
             | flag::SHARED
@@ -1517,6 +1819,9 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             number::KILL => self.kill(arguments),
             number::RT_SIGRETURN => self.signal_return(arguments),
             number::SIGALTSTACK => self.sigaltstack(arguments),
+            number::FORK | number::VFORK => self.fork_process(),
+            number::EXECVE => self.execute(arguments),
+            number::WAIT4 => self.wait_for_child(arguments),
             number::CLONE => self.clone_thread(arguments),
             number::CLONE3 => self.clone3(arguments),
             number::EXIT => self.exit_thread(arguments),
@@ -2649,7 +2954,7 @@ fn signal_bit(signal: i64) -> u64 {
 /// ignore or to stop. Getting this backwards for one signal would mean a
 /// program that raises it either dies when it should not or keeps running
 /// when it should not, so it is written out rather than approximated.
-fn terminates(signal: i64) -> bool {
+pub(crate) fn terminates(signal: i64) -> bool {
     const SIGCHLD: i64 = 17;
     const SIGCONT: i64 = 18;
     const SIGTSTP: i64 = 20;

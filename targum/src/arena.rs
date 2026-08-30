@@ -22,7 +22,6 @@
 //! Rust frame — where the design needs a signal delivered to the guest.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard};
 
 use crate::space::{CEILING, PAGE_SIZE};
 
@@ -203,27 +202,36 @@ impl Drop for Arena {
 /// `Machine::grow` differs between the two worlds in one line rather than
 /// in a policy.
 ///
-/// The committed prefix only ever grows, exactly as linear memory does.
-/// Everything past it stays `PROT_NONE`, so an engine defect that computes
-/// an address past the limit faults at once instead of landing in whatever
-/// the host allocator put there.
+/// # Why the bytes live in a file
+///
+/// A guest address *is* a host address, so at most one address space can be
+/// at the guest's addresses at a time. That is not a limitation to work
+/// around — it is the same fact that makes a process an instance in the
+/// module world — but it does mean a second process's memory has to exist
+/// *somewhere else* while it is not running.
+///
+/// So each address space is an anonymous file, and making one current is
+/// one `MAP_FIXED` mapping of it over the guest's range: a page-table swap,
+/// which is what a real kernel does at exactly this moment. Nothing is
+/// copied on a switch. What *is* copied is a fork, which is the file, which
+/// is the design's "a snapshot is a memcpy" with the kernel doing the copy.
 pub struct LinearMemory {
+    /// The backing file. Its length is the committed size.
+    file: std::fs::File,
     limit: u64,
-    /// Held for as long as this memory exists.
+    /// Held while this memory is the one at the guest's addresses.
     ///
-    /// A guest address *is* a host address, so there is exactly one place a
-    /// guest's memory can be and two guests cannot both be there. Inside the
-    /// module that is not a rule anyone can break — an instance has one
-    /// linear memory and that is the end of it — and this is what makes it
-    /// equally unbreakable here, rather than a sentence in a comment that a
-    /// test running beside another test will ignore. Six programs booted in
-    /// parallel silently overwriting each other's address space is how this
-    /// was found.
-    _exclusive: MutexGuard<'static, ()>,
+    /// A lock rather than a flag because the invariant is not "one at a time
+    /// within a container" but "one at a time in this *process*": two guests
+    /// running in one host process — two tests, say — would otherwise map
+    /// their bytes at the same addresses and read each other's. Taking it on
+    /// `activate` makes a switch a handoff, and makes a second container
+    /// wait rather than corrupt.
+    current: Option<std::sync::MutexGuard<'static, ()>>,
 }
 
-/// See [`LinearMemory`].
-static SINGLE_GUEST: Mutex<()> = Mutex::new(());
+/// See [`LinearMemory::current`].
+static ADDRESSES: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 impl Default for LinearMemory {
     fn default() -> Self {
@@ -232,24 +240,79 @@ impl Default for LinearMemory {
 }
 
 impl LinearMemory {
-    /// An address space with nothing committed. Page zero is never
-    /// committed and never will be: a null dereference is a fault here for
-    /// the same reason it is one in a real process.
-    /// Waits for whatever guest is running to finish, then takes the
-    /// address space.
+    /// An address space with nothing committed, and not current.
+    ///
+    /// Page zero is never committed and never will be: a null dereference is
+    /// a fault here for the same reason it is one in a real process.
     pub fn new() -> Self {
-        let exclusive = SINGLE_GUEST
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
         reserve();
+        // SAFETY: creating an anonymous file, which touches nothing else.
+        let raw = unsafe {
+            libc::memfd_create(c"targum-guest".as_ptr(), libc::MFD_CLOEXEC)
+        };
+        assert!(
+            raw >= 0,
+            "creating an address space failed: {}",
+            std::io::Error::last_os_error()
+        );
+        // SAFETY: a descriptor this call just produced and nothing else
+        // holds.
+        let file = unsafe { <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(raw) };
         Self {
+            file,
             limit: FLOOR,
-            _exclusive: exclusive,
+            current: None,
         }
     }
 
     pub fn limit(&self) -> u64 {
         self.limit
+    }
+
+    pub fn is_current(&self) -> bool {
+        self.current.is_some()
+    }
+
+    /// Puts this address space at the guest's addresses.
+    ///
+    /// The caller must have taken the previous one down first, which the
+    /// assertion below turns from a rule into a check.
+    pub fn activate(&mut self) {
+        if self.current.is_some() {
+            return;
+        }
+        let held = ADDRESSES
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        self.current = Some(held);
+        self.map();
+    }
+
+    /// Takes it down, leaving the range unreadable.
+    ///
+    /// Not merely tidy: a pointer into a process that is not running must
+    /// fault rather than read the process that is.
+    pub fn deactivate(&mut self) {
+        if self.current.is_none() {
+            return;
+        }
+        if self.limit > FLOOR {
+            // SAFETY: restoring exactly the range this memory occupied.
+            unsafe {
+                libc::mmap(
+                    FLOOR as usize as *mut libc::c_void,
+                    (self.limit - FLOOR) as usize,
+                    libc::PROT_NONE,
+                    libc::MAP_PRIVATE
+                        | libc::MAP_ANONYMOUS
+                        | libc::MAP_NORESERVE
+                        | libc::MAP_FIXED,
+                    -1,
+                    0,
+                );
+            }
+        }
+        self.current = None;
     }
 
     /// Commits up to `to`, and answers whether the memory now reaches it.
@@ -265,50 +328,89 @@ impl LinearMemory {
             return false;
         }
         let to = to.next_multiple_of(PAGE_SIZE);
-        // SAFETY: the range is inside this process's own reservation, and
-        // `MAP_FIXED` over it is the commit.
-        let mapped = unsafe {
-            libc::mmap(
-                self.limit as usize as *mut libc::c_void,
-                (to - self.limit) as usize,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE | libc::MAP_FIXED,
-                -1,
-                0,
-            )
-        };
-        if mapped == libc::MAP_FAILED {
+        if self.file.set_len(to - FLOOR).is_err() {
             return false;
         }
         self.limit = to;
+        if self.current.is_some() {
+            self.map();
+        }
         true
     }
-}
 
-impl Drop for LinearMemory {
-    /// Gives the address space back, uncommitted.
+    /// A copy of this address space, not current — which is a fork.
     ///
-    /// Not merely tidiness: the next guest must not find the last one's
-    /// bytes, and an address it has not committed must fault rather than
-    /// read as whatever was there.
-    fn drop(&mut self) {
+    /// The copy is the kernel's, through the page cache, rather than a loop
+    /// here: the two files are the same size and the bytes go straight
+    /// across.
+    pub fn duplicate(&self) -> Option<Self> {
+        let mut child = Self::new();
+        let length = self.limit - FLOOR;
+        if child.file.set_len(length).is_err() {
+            return None;
+        }
+        child.limit = self.limit;
+        let mut copied = 0i64;
+        while (copied as u64) < length {
+            let mut from = copied;
+            let mut into = copied;
+            // SAFETY: two descriptors this process owns, with offsets and a
+            // length inside both files.
+            let moved = unsafe {
+                libc::copy_file_range(
+                    std::os::fd::AsRawFd::as_raw_fd(&self.file),
+                    &raw mut from,
+                    std::os::fd::AsRawFd::as_raw_fd(&child.file),
+                    &raw mut into,
+                    (length - copied as u64) as usize,
+                    0,
+                )
+            };
+            if moved <= 0 {
+                return None;
+            }
+            copied += moved as i64;
+        }
+        Some(child)
+    }
+
+    /// Maps the file over the guest's range.
+    ///
+    /// Nothing to do for an address space with nothing committed: an
+    /// address space that has not grown yet is a process that has not
+    /// started, and a zero-length mapping is an error rather than a no-op.
+    fn map(&self) {
         if self.limit <= FLOOR {
             return;
         }
-        // SAFETY: restoring exactly the range this memory committed.
-        unsafe {
+        // `MAP_SHARED`, so that what the guest writes lands in the file and
+        // survives being taken down and put back.
+        //
+        // SAFETY: the range is inside this process's own reservation, and
+        // `MAP_FIXED` over it is the switch.
+        let mapped = unsafe {
             libc::mmap(
                 FLOOR as usize as *mut libc::c_void,
                 (self.limit - FLOOR) as usize,
-                libc::PROT_NONE,
-                libc::MAP_PRIVATE
-                    | libc::MAP_ANONYMOUS
-                    | libc::MAP_NORESERVE
-                    | libc::MAP_FIXED,
-                -1,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED | libc::MAP_FIXED,
+                std::os::fd::AsRawFd::as_raw_fd(&self.file),
                 0,
-            );
-        }
+            )
+        };
+        assert_ne!(
+            mapped,
+            libc::MAP_FAILED,
+            "mapping an address space at the guest's addresses failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+}
+
+impl Drop for LinearMemory {
+    fn drop(&mut self) {
+        self.deactivate();
     }
 }
 
@@ -368,20 +470,124 @@ mod tests {
         );
     }
 
+    /// The address space is one place, so these run one at a time.
+    fn exclusively<R>(body: impl FnOnce() -> R) -> R {
+        use std::sync::Mutex;
+        static ONE: Mutex<()> = Mutex::new(());
+        let _held = ONE.lock().unwrap_or_else(|poison| poison.into_inner());
+        body()
+    }
+
+    fn byte(at: u64) -> u8 {
+        // SAFETY: callers only read committed, current memory.
+        unsafe { (at as usize as *const u8).read_volatile() }
+    }
+
+    fn set(at: u64, value: u8) {
+        // SAFETY: as above.
+        unsafe { (at as usize as *mut u8).write_volatile(value) }
+    }
+
     #[test]
     fn linear_memory_grows_and_never_shrinks() {
-        let mut memory = LinearMemory::new();
-        assert_eq!(memory.limit(), FLOOR);
-        assert!(memory.grow(FLOOR + 0x1000));
-        assert_eq!(memory.limit(), FLOOR + 0x1000);
-        // SAFETY: the range was just committed.
-        unsafe {
-            (FLOOR as usize as *mut u8).write_volatile(0x5a);
-            assert_eq!((FLOOR as usize as *const u8).read_volatile(), 0x5a);
-        }
-        assert!(memory.grow(FLOOR), "a smaller request is already satisfied");
-        assert_eq!(memory.limit(), FLOOR + 0x1000);
-        assert!(!memory.grow(GUEST_CEILING + 1), "past the guest's half");
+        exclusively(|| {
+            let mut memory = LinearMemory::new();
+            memory.activate();
+            assert_eq!(memory.limit(), FLOOR);
+            assert!(memory.grow(FLOOR + 0x1000));
+            assert_eq!(memory.limit(), FLOOR + 0x1000);
+            set(FLOOR, 0x5a);
+            assert_eq!(byte(FLOOR), 0x5a);
+            assert!(memory.grow(FLOOR), "a smaller request is already satisfied");
+            assert_eq!(memory.limit(), FLOOR + 0x1000);
+            assert!(!memory.grow(GUEST_CEILING + 1), "past the guest's half");
+        });
+    }
+
+    /// Two address spaces, one set of addresses: the switch is what makes a
+    /// second process possible at all, and it must carry the bytes.
+    #[test]
+    fn switching_address_spaces_swaps_what_is_there() {
+        exclusively(|| {
+            let mut first = LinearMemory::new();
+            first.activate();
+            assert!(first.grow(FLOOR + 0x1000));
+            set(FLOOR, 1);
+
+            let mut second = LinearMemory::new();
+            first.deactivate();
+            second.activate();
+            assert!(second.grow(FLOOR + 0x1000));
+            assert_eq!(byte(FLOOR), 0, "a fresh address space is zeros");
+            set(FLOOR, 2);
+
+            second.deactivate();
+            first.activate();
+            assert_eq!(byte(FLOOR), 1, "and the first one kept its own");
+        });
+    }
+
+    /// A fork: the child starts with the parent's bytes and then diverges.
+    #[test]
+    fn a_duplicate_carries_the_bytes_and_then_diverges() {
+        exclusively(|| {
+            let mut parent = LinearMemory::new();
+            parent.activate();
+            assert!(parent.grow(FLOOR + 0x2000));
+            set(FLOOR, 0x11);
+            set(FLOOR + 0x1000, 0x22);
+
+            let mut child = parent.duplicate().expect("duplicate");
+            assert_eq!(child.limit(), parent.limit());
+            parent.deactivate();
+            child.activate();
+            assert_eq!(byte(FLOOR), 0x11, "the child inherited");
+            assert_eq!(byte(FLOOR + 0x1000), 0x22);
+            set(FLOOR, 0x33);
+
+            child.deactivate();
+            parent.activate();
+            assert_eq!(byte(FLOOR), 0x11, "and the parent is untouched");
+        });
+    }
+
+    /// An address space that is not current must not be readable through the
+    /// guest's addresses — otherwise a stale pointer in one process reads
+    /// another's memory, which is the whole failure this arrangement exists
+    /// to prevent.
+    #[test]
+    fn a_dormant_address_space_is_not_readable() {
+        exclusively(|| {
+            let mut memory = LinearMemory::new();
+            memory.activate();
+            assert!(memory.grow(FLOOR + 0x1000));
+            set(FLOOR, 0x7e);
+            memory.deactivate();
+
+            // SAFETY: `fork` here does nothing between the fork and the read
+            // that is not async-signal-safe. The child exists to die.
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0, "fork");
+            if pid == 0 {
+                unsafe {
+                    let none = libc::rlimit {
+                        rlim_cur: 0,
+                        rlim_max: 0,
+                    };
+                    libc::setrlimit(libc::RLIMIT_CORE, &none);
+                    libc::prctl(libc::PR_SET_DUMPABLE, 0);
+                    let value = (FLOOR as usize as *const u8).read_volatile();
+                    libc::_exit(i32::from(value));
+                }
+            }
+            let mut status = 0;
+            // SAFETY: waiting on a child of this process.
+            unsafe { libc::waitpid(pid, &raw mut status, 0) };
+            assert!(
+                libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGSEGV,
+                "reading a dormant address space did not fault (status {status:#x})"
+            );
+        });
     }
 
     #[test]

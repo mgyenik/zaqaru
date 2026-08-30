@@ -177,8 +177,57 @@ pub trait Store {
     }
 }
 
+/// A store several processes reach.
+///
+/// A container is a process *tree* and the host boundary is the container's:
+/// a child's `write` to the console has to arrive on the same console its
+/// parent writes to. The kernel is replicated per process — which is what
+/// makes inheritance across a fork correct by construction — and the store
+/// is the one thing that must not be.
+///
+/// Interior mutability rather than a borrow because the processes outlive
+/// each other in no particular order, and a lifetime saying otherwise would
+/// be saying something untrue.
+pub struct Shared<S>(std::rc::Rc<std::cell::RefCell<S>>);
+
+impl<S> Clone for Shared<S> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+impl<S> Shared<S> {
+    pub fn new(store: S) -> Self {
+        Self(std::rc::Rc::new(std::cell::RefCell::new(store)))
+    }
+
+    /// The store itself, for a host reading back what the container wrote.
+    pub fn borrow(&self) -> std::cell::Ref<'_, S> {
+        self.0.borrow()
+    }
+}
+
+impl<S: Store> Store for Shared<S> {
+    fn read(&mut self, path: &[&[u8]], into: &mut Vec<u8>) -> StoreOutcome {
+        self.0.borrow_mut().read(path, into)
+    }
+
+    fn write(&mut self, path: &[&[u8]], data: &[u8]) -> StoreOutcome {
+        self.0.borrow_mut().write(path, data)
+    }
+
+    fn last_error(&self, into: &mut Vec<u8>) {
+        self.0.borrow().last_error(into);
+    }
+}
+
 /// The real store: the two imports, called through the canonical lowering.
-#[derive(Default)]
+///
+/// `Clone` because a fork clones it, and there is nothing here to copy: the
+/// imports are module-level functions and a child calling them reaches the
+/// same host the parent does, which is what a forked process expects of its
+/// descriptors.
+#[derive(Default, Clone)]
 pub struct HostStore {
     /// Read only by the wasm implementation; the native one has no host to
     /// have failed.

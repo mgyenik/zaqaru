@@ -415,10 +415,106 @@ all still host-testable native Rust. What M7 loses is everything that was
 hard: no fabricated resume chains on new stacks (a new thread is a TCB
 with `rip` and `rsp` set), no first-genuine-unwind milestone risk, no
 sustained-suspension dispatcher stress — a suspended thread is a struct
-the loop is not advancing. `fork` stays out of scope exactly as before,
-but the door moves: with a sub-megabyte engine and the image sharable
-between instances, an instance-per-process router stops being absurd on
-size grounds; that is an observation for phase two, not a plan.
+the loop is not advancing. `fork` is section 7a, and it is
+*cheaper* here rather than out of scope — this sentence used to defer it
+and the deferral was read as a policy, which it was never entitled to be.
+
+### 7a. Fork, which the interpreter makes cheaper rather than harder
+
+`container-plan.md` specifies fork in detail and treats it as critical:
+`/iso/proc/spawn`, a host-side router, type-graduated fd hoisting, the
+`vfork`/`posix_spawn` fast path. **None of that analysis is superseded
+here.** It is about POSIX — that a pipe's ring is genuinely shared, that
+`{ read a; cat; } < file` shares one offset cell, that a prefork server's
+workers all `accept` one listener — and POSIX does not change because the
+CPU did. The hoisting design, its type grading, and its ordering rule
+(hoist, *then* snapshot) carry over unchanged.
+
+What changes is the price, and it changes in this design's favour.
+
+**The structural constraint is the same, for the same reason.** A guest
+address is a linear-memory offset, so two live processes cannot share one
+memory: the child needs the parent's addresses. Process is still an
+instance; a thread is still a control block inside one. The kernel is
+still replicated per process, and that is still a feature at fork time —
+the fd table, the VMA tree and the signal dispositions are copied with
+everything else, so inheritance is POSIX-correct by construction.
+
+**What the interpreter deletes is the resume half.** Under the transpiler
+a fork is a snapshot *plus a way back into the frames it was taken from*:
+resume IDs threaded through the guest stack, resume bodies for every
+function, a driver that walks the chain re-entering each frame at its
+post-call block. `tests/fork_resume.rs` exists to prove that walk
+reconstructs the parent's stack without re-executing it, and the resume
+bodies are the 211 MB → 317 MB bill measured on 2026-08-30.
+
+Here there is nothing to reconstruct. The child's machine state is a
+`Tcb`; its address space is bytes. A fork is:
+
+1. hoist whatever is genuinely shared (the AOT design's analysis, verbatim);
+2. copy the parent's mapped pages and clone the kernel's structures;
+3. in the child, `%rax = 0`, and `%rip` is already past the `syscall`.
+
+The child resumes by *being interpreted*, which is the only thing the
+loop ever does. No resume IDs, no resume bodies, no chain walk, no
+shadow-stack restoration — and therefore no doubled code section, because
+there is no code section. The snapshot is a `memcpy` and the entry is a
+field assignment, which is the same sentence section 3 makes about
+context switches, applied to a second process.
+
+**And the module is shared.** Under the transpiler each process's module
+*is* its program, so a second process means instantiating a second
+enormous module. Here every process runs the same engine + image module,
+compiled once by the host and instantiated many times. Instance-per-process
+stops being a size argument at all.
+
+**Two ways to make a process's memory current, one kernel above them.**
+The switch is "put this process's linear memory at the guest's addresses",
+and the two worlds answer it differently: in the module the instance *is*
+the memory, so the router switches by calling into a different instance;
+natively each process's memory is a `memfd` and the switch is one
+`MAP_FIXED` mapping of it over the guest range — a page-table swap, which
+is what a real kernel does at the same moment. Everything above that seam
+— pid allocation, `wait4`, `SIGCHLD` routing, the fd hoisting — is
+ordinary Rust and is tested natively, which is what makes the native
+answer worth having rather than a stand-in.
+
+**Built, as of 2026-08-30.** `kisal/src/system.rs` is the process table:
+`fork`/`vfork`/`clone`-with-process-flags duplicate the address space
+(`copy_file_range` between two `memfd`s) and the kernel's structures field
+by field; the child returns zero from a `%rip` already past the `syscall`.
+`execve` replaces an address space in place, keeping the descriptors, the
+working directory and the ignored dispositions, and resetting the caught
+ones. `wait4` parks and is completed *after* the switch back to the
+waiter, because a process's bytes exist at the guest's addresses only
+while it is current. `SIGCHLD` is raised at the parent through the same
+disposition check a `kill` goes through, and an exiting process's children
+are reparented to the container's first process, which is what `init` is.
+Processes are scheduled round-robin on the same retired-instruction
+quantum the threads inside them use, so the whole interleaving — across
+processes as well as threads — stays a pure function of execution.
+`kisal/tests/interpreted.rs` runs a guest through each of these against a
+native run of the same bytes, and against the container's own rule where
+the host is not the oracle.
+
+**What is not built is the fd hoisting**, and it is not built because
+there is nothing yet to hoist: every descriptor a container can open today
+is a file in the image or a console, and both are safely *copied* into a
+child — an image file is read-only and a console has no offset the two
+processes fight over. The hoisting design earns its keep the moment a
+descriptor has shared mutable state behind it, which is `pipe`, `socketpair`
+and `accept`. So the order is: pipes, then hoisting, then the prefork
+shapes that need it — and the AOT design's rule that hoisting happens
+*before* the snapshot is the reason this is stated here rather than
+discovered later, because a fork that copies a pipe's ring cannot be fixed
+after the fact.
+
+The `vfork`/`posix_spawn` fast path is unchanged and is still the case
+that matters: no snapshot at all, the child instantiated fresh from the
+image with fd dispositions applied. The AOT design's note that this is
+what real code overwhelmingly does — the traced application's only
+fork-shaped call was a `CLONE_VFORK` — is if anything stronger here,
+because instantiating fresh is now instantiating the same module again.
 
 **Signals collapse into the loop.** Delivery points are block boundaries
 and syscall completion — strictly finer than Linux's

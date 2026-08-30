@@ -299,7 +299,7 @@ pub struct Interpreted {
     /// committed prefix. One line of difference, which is what the design
     /// asked for.
     #[cfg(not(target_arch = "wasm32"))]
-    memory: targum::arena::LinearMemory,
+    pub(crate) memory: targum::arena::LinearMemory,
 }
 
 impl Default for Interpreted {
@@ -340,6 +340,11 @@ impl Interpreted {
         #[cfg(not(target_arch = "wasm32"))]
         let memory = {
             let mut memory = targum::arena::LinearMemory::new();
+            // A process that is being built is the process that is running:
+            // `exec` writes the program's segments into it, and there is
+            // nowhere for those bytes to go until the address space is at
+            // the guest's addresses.
+            memory.activate();
             assert!(
                 memory.grow(PROGRAM_REGION),
                 "reserving the program's region failed"

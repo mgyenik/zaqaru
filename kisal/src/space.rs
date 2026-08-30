@@ -181,6 +181,7 @@ pub struct Fill {
     pub length: u64,
 }
 
+#[derive(Clone)]
 pub struct Space {
     /// The `brk` arena: contiguous, bump-allocated, with a ceiling.
     brk_start: u64,

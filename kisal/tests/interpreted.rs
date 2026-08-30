@@ -20,11 +20,12 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use kisal::abi::{Store, StoreOutcome};
+use kisal::abi::{Shared, Store, StoreOutcome};
 use kisal::image::Image;
 use kisal::machine::Interpreted;
 use kisal::run::{Exit, Process};
 use kisal::syscall::{Enforcement, Kernel};
+use kisal::system::System;
 
 /// A directory that removes itself.
 struct Tree {
@@ -156,9 +157,39 @@ fn copy_libraries(root: &Path, program: &Path, required: bool) {
 /// A shared object built into the image beside the program.
 struct Plugin {
     /// Where it lands, as an absolute path inside the image — which is the
-    /// path the program will hand to `dlopen`.
+    /// path the program will hand to `dlopen`, or `execve`.
     path: &'static str,
     source: &'static str,
+    /// What to build it as.
+    form: Form,
+}
+
+/// A companion file is either something to load into the running program or
+/// something to run instead of it, and the two are compiled differently.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Form {
+    /// A shared object, for `dlopen`.
+    Library,
+    /// A program, for `execve`.
+    Program(Linkage),
+    /// Not compiled at all: the source is the file's contents, and it is
+    /// marked executable. For the one case that needs a file that *is*
+    /// there, *may* be run, and is not a program — which is `ENOEXEC`, and
+    /// which nothing else in the tree is.
+    Data,
+    /// A real program with its executable bits cleared, which is the other
+    /// thing `execvp` has to step over while walking `PATH`.
+    Unmarked,
+}
+
+impl Form {
+    fn flags(self) -> &'static [&'static str] {
+        match self {
+            Form::Library => &["-shared", "-fPIC"],
+            Form::Program(linkage) => linkage.flags(),
+            Form::Data | Form::Unmarked => &[],
+        }
+    }
 }
 
 /// Compiles `source` and bakes it into an image as `/init`.
@@ -204,13 +235,20 @@ fn image_with(
     // Leaked because the kernel borrows the image for its whole life, and a
     // test's kernel lives as long as the test.
     for plugin in plugins {
-        let file = tree.root.join("plugin.c");
-        std::fs::write(&file, plugin.source).expect("write the plugin source");
         let destination = tree.root.join(plugin.path.trim_start_matches('/'));
         std::fs::create_dir_all(destination.parent().expect("a parent")).expect("mkdir");
+        if plugin.form == Form::Data {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::write(&destination, plugin.source).expect("write the data file");
+            std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o755))
+                .expect("mark it executable");
+            continue;
+        }
+        let file = tree.root.join("plugin.c");
+        std::fs::write(&file, plugin.source).expect("write the plugin source");
         let outcome = Command::new("gcc")
             .arg(&file)
-            .args(["-shared", "-fPIC"])
+            .args(plugin.form.flags())
             .args(COMMON)
             .arg("-o")
             .arg(&destination)
@@ -225,6 +263,11 @@ fn image_with(
         std::fs::remove_file(&file).expect("the source is not part of the image");
         // A plugin may need nothing the program has not already brought.
         copy_libraries(&tree.root, &destination, false);
+        if plugin.form == Form::Unmarked {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o644))
+                .expect("clear the executable bits");
+        }
     }
 
     let baked: &'static baker::Image =
@@ -232,7 +275,7 @@ fn image_with(
     (tree, baked)
 }
 
-fn boot(label: &str, image: Image<'static>) -> Process<'static, Console> {
+fn boot(label: &str, image: Image<'static>) -> System<'static, Shared<Console>> {
     boot_with(label, image, &[b"/init"])
 }
 
@@ -240,9 +283,9 @@ fn boot_with(
     label: &str,
     image: Image<'static>,
     argv: &[&[u8]],
-) -> Process<'static, Console> {
+) -> System<'static, Shared<Console>> {
     let kernel = Kernel::with_enforcement(
-        Console::default(),
+        Shared::new(Console::default()),
         Interpreted::new(),
         image,
         // The interpreter's world: a page is reachable because something
@@ -250,7 +293,7 @@ fn boot_with(
         Enforcement::Mapped,
     );
     match Process::boot(kernel, b"/init", argv, &[]) {
-        Ok(process) => process,
+        Ok(process) => System::new(process),
         Err(error) => {
             let mut message = String::new();
             error.message(&mut message);
@@ -261,7 +304,8 @@ fn boot_with(
 
 /// What a failure needs to be diagnosable: where the guest was, and what its
 /// address space looked like when it got there.
-fn report(label: &str, exit: &Exit, process: &mut Process<'static, Console>) {
+fn report(label: &str, exit: &Exit, system: &mut System<'static, Shared<Console>>) {
+    let process = system.current();
     if matches!(exit, Exit::Status(_)) {
         return;
     }
@@ -286,8 +330,18 @@ fn report(label: &str, exit: &Exit, process: &mut Process<'static, Console>) {
 /// The native binary is the same bytes the interpreter is executing, so
 /// what this compares is exactly what it claims to.
 fn agrees_with_native(label: &str, source: &str, linkage: Linkage) {
-    let (tree, baked) = image_of(label, source, linkage);
+    agrees_with_native_beside(label, source, linkage, &[]);
+}
+
+/// The same, with companion files in the image.
+fn agrees_with_native_beside(label: &str, source: &str, linkage: Linkage, plugins: &[Plugin]) {
+    let (tree, baked) = image_with(label, source, linkage, plugins);
     let native = Command::new(tree.root.join("init"))
+        // The tree *is* the guest's root, and the guest starts in it. Which
+        // matters the moment a program names a relative path: `./helper`
+        // has to mean the same file on both sides for the comparison to be
+        // about the engine.
+        .current_dir(&tree.root)
         .output()
         .expect("run the program natively");
     assert!(
@@ -312,22 +366,46 @@ fn agrees_with_native(label: &str, source: &str, linkage: Linkage) {
         }
     );
 
+    let out = interpreted_output(label, baked);
+    assert_eq!(out, expected, "{label}: interpreted output differs");
+}
+
+/// Runs a baked image to completion and answers what it printed, requiring
+/// it to have exited cleanly.
+///
+/// For the handful of properties a native run is *not* the oracle for. An
+/// orphan is the example: Linux reparents one to the system's `init`, and a
+/// container's `init` is its own first process — so the two worlds disagree
+/// by design, and comparing them would be comparing this container against
+/// the machine it happens to be running on.
+fn interpreted_output(label: &str, baked: &'static baker::Image) -> String {
     let image = Image::parse(&baked.index, &baked.blob).expect("parse the image");
-    let mut process = boot(label, image);
-    let exit = process.run();
-    report(label, &exit, &mut process);
-    let complaints =
-        String::from_utf8_lossy(&process.kernel.store.contents(kisal::paths::CONSOLE_STDERR))
-            .into_owned();
+    let mut system = boot(label, image);
+    let exit = system.run();
+    report(label, &exit, &mut system);
+    let complaints = String::from_utf8_lossy(
+        &system
+            .current()
+            .kernel
+            .store
+            .borrow()
+            .contents(kisal::paths::CONSOLE_STDERR),
+    )
+    .into_owned();
     assert_eq!(
         exit,
         Exit::Status(0),
         "{label} did not exit cleanly; it wrote to stderr:\n{complaints}"
     );
-    let out =
-        String::from_utf8(process.kernel.store.contents(kisal::paths::CONSOLE_STDOUT))
-            .expect("utf-8");
-    assert_eq!(out, expected, "{label}: interpreted output differs");
+    String::from_utf8(
+        system
+            .current()
+            .kernel
+            .store
+            .borrow()
+            .contents(kisal::paths::CONSOLE_STDOUT),
+    )
+    .expect("utf-8")
 }
 
 /// The floor, demonstrated: a program nobody translated, running.
@@ -521,6 +599,7 @@ int main(int argc, char **argv) {
 "#,
         Linkage::Dynamic,
         &[Plugin {
+            form: Form::Library,
             path: "/plugin.so",
             source: r#"
 int answer(int value) { return value * 7; }
@@ -543,14 +622,14 @@ int answer(int value) { return value * 7; }
     let exit = process.run();
     report(label, &exit, &mut process);
     let complaints =
-        String::from_utf8_lossy(&process.kernel.store.contents(kisal::paths::CONSOLE_STDERR))
+        String::from_utf8_lossy(&process.current().kernel.store.borrow().contents(kisal::paths::CONSOLE_STDERR))
             .into_owned();
     assert_eq!(
         exit,
         Exit::Status(0),
         "{label} did not exit cleanly; it wrote to stderr:\n{complaints}"
     );
-    let out = String::from_utf8(process.kernel.store.contents(kisal::paths::CONSOLE_STDOUT))
+    let out = String::from_utf8(process.current().kernel.store.borrow().contents(kisal::paths::CONSOLE_STDOUT))
         .expect("utf-8");
     assert_eq!(out, expected);
 }
@@ -733,12 +812,19 @@ int main(void) {
     let mut answers = Vec::new();
     for _ in 0..2 {
         let image = Image::parse(&baked.index, &baked.blob).expect("parse the image");
-        let mut process = boot("determinism", image);
-        let exit = process.run();
+        let mut system = boot("determinism", image);
+        let exit = system.run();
         assert_eq!(exit, Exit::Status(0), "the container did not exit cleanly");
         answers.push(
-            String::from_utf8(process.kernel.store.contents(kisal::paths::CONSOLE_STDOUT))
-                .expect("utf-8"),
+            String::from_utf8(
+                system
+                    .current()
+                    .kernel
+                    .store
+                    .borrow()
+                    .contents(kisal::paths::CONSOLE_STDOUT),
+            )
+            .expect("utf-8"),
         );
     }
     assert_eq!(answers[0], answers[1], "two runs disagreed");
@@ -886,5 +972,302 @@ int main(void) {
 }
 "#,
         Linkage::Dynamic,
+    );
+}
+
+/// **`fork`.**
+///
+/// `container-plan.md` specifies this and treats it as critical; an earlier
+/// version of this engine refused it by name, which was reading a milestone
+/// boundary as a policy. What the interpreter changes is the *price*: on the
+/// other path a fork is a snapshot plus a resume-chain walk to rebuild the
+/// parent's frames, and the resume bodies that walk needs are the doubled
+/// code section. Here the child's machine state is a control block and its
+/// address space is bytes — the child returns from `fork` by being
+/// interpreted, which is the only thing the loop ever does.
+///
+/// The parent and child each write, so the test fails if either never ran;
+/// they diverge on the return value, so it fails if the child got the
+/// parent's; and the child mutates a variable the parent then prints, so it
+/// fails if they share an address space when they must not.
+#[test]
+fn a_forked_child_runs_and_is_waited_for() {
+    agrees_with_native(
+        "fork",
+        r#"
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+static int shared_by_copy = 100;
+
+int main(void) {
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        /* Only the child sees this. */
+        shared_by_copy = 7;
+        printf("child sees %d\n", shared_by_copy);
+        fflush(stdout);
+        _exit(3);
+    }
+    int status = 0;
+    pid_t reaped = waitpid(child, &status, 0);
+    printf("parent sees %d, reaped %d, exited %d\n",
+           shared_by_copy, reaped == child, WEXITSTATUS(status));
+    return 0;
+}
+"#,
+        Linkage::Dynamic,
+    );
+}
+
+/// Several children, each with its own address space, reaped in turn.
+///
+/// The shape a shell has and a build system has: fan out, wait for each. It
+/// fails if two children share memory, if a status is lost, or if `wait`
+/// returns the wrong child.
+#[test]
+fn several_children_are_reaped_with_their_own_statuses() {
+    agrees_with_native(
+        "fork-many",
+        r#"
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+int main(void) {
+    pid_t children[4];
+    for (int index = 0; index < 4; index++) {
+        fflush(stdout);
+        children[index] = fork();
+        if (children[index] == 0) {
+            /* Each child computes from its own copy of the loop variable. */
+            _exit(index + 1);
+        }
+    }
+    int total = 0;
+    for (int index = 0; index < 4; index++) {
+        int status = 0;
+        waitpid(children[index], &status, 0);
+        total += WEXITSTATUS(status) * (index + 1);
+    }
+    printf("total %d\n", total);
+    /* And no children left. */
+    printf("echild %d\n", wait(0) == -1);
+    return 0;
+}
+"#,
+        Linkage::Dynamic,
+    );
+}
+
+/// **`fork` and `execve` together**, which is what a subprocess is.
+///
+/// A `fork` on its own covers a daemon that splits off a copy of itself. The
+/// pair is every subprocess anything actually launches — `subprocess.run`, a
+/// shell's `$(...)`, a build system's compiler — and it is the pair that
+/// `container-plan.md` treats as critical.
+///
+/// The child replaces its address space with a second program in the image,
+/// that program reads the arguments it was given and picks its own status,
+/// and the parent — whose memory must be untouched by any of it — reads the
+/// status back. So the test fails if the exec did not happen, if the
+/// arguments did not survive the address space that held them, if the status
+/// was lost, or if the exec disturbed the parent.
+#[test]
+fn a_child_execs_a_second_program() {
+    agrees_with_native_beside(
+        "exec",
+        r#"
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+int main(void) {
+    static char untouched[] = "the parent's own memory";
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        char *arguments[] = {"helper", "seven", 0};
+        execv("./helper", arguments);
+        /* Only reached when the exec failed, and then it is the failure. */
+        perror("execv");
+        _exit(1);
+    }
+    int status = 0;
+    waitpid(child, &status, 0);
+    printf("%s, child exited %d\n", untouched, WEXITSTATUS(status));
+    return 0;
+}
+"#,
+        Linkage::Dynamic,
+        &[Plugin {
+            path: "/helper",
+            form: Form::Program(Linkage::Dynamic),
+            source: r#"
+#include <stdio.h>
+
+int main(int count, char **arguments) {
+    printf("helper: %d args, second is %s\n", count, arguments[1]);
+    return 9;
+}
+"#,
+        }],
+    );
+}
+
+/// **`execve` that fails returns to the caller.**
+///
+/// The property the whole ordering in [`kisal::system`] exists for: `execvp`
+/// walks `PATH` calling `execve` once per directory and *depends* on getting
+/// `ENOENT` back from every miss. A kernel that tore the address space down
+/// before it knew the program would load would make the first miss fatal —
+/// and the failure would look like "python3 does not exist" on a machine
+/// where it does.
+///
+/// So this fails on the wrong errno, and it segfaults on the wrong order.
+#[test]
+fn a_failed_exec_leaves_the_caller_running() {
+    agrees_with_native_beside(
+        "exec-fails",
+        r#"
+#include <errno.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+
+int main(void) {
+    char *arguments[] = {"nothing", 0};
+    /* Absent. */
+    printf("absent: %d\n", execv("/no/such/program", arguments) == -1 ? errno : 0);
+    /* There, and not a program. */
+    printf("directory: %d\n", execv("/", arguments) == -1 ? errno : 0);
+    /* There, may be run, and not a program at all. */
+    printf("data: %d\n", execv("./data", arguments) == -1 ? errno : 0);
+    /* There, a program, and not marked executable. */
+    printf("unmarked: %d\n", execv("./unmarked", arguments) == -1 ? errno : 0);
+    /* And the caller is still the caller. */
+    printf("still running as %d\n", getpid() > 0);
+    return 0;
+}
+"#,
+        Linkage::Dynamic,
+        &[
+            Plugin {
+                path: "/data",
+                form: Form::Data,
+                source: "not an ELF, and nothing here pretends to be\n",
+            },
+            Plugin {
+                path: "/unmarked",
+                form: Form::Unmarked,
+                source: "int main(void) { return 0; }\n",
+            },
+        ],
+    );
+}
+
+/// **`SIGCHLD`**, which is how a program that is not sitting in `wait4`
+/// finds out that a child has finished.
+///
+/// The other half of reaping: a shell installs this handler and reaps from
+/// inside it, so a kernel that only wakes a parked `wait4` leaves that shell
+/// with zombies it never hears about. The default is to ignore, so this also
+/// fails if a program that never installed a handler is disturbed by one.
+#[test]
+fn a_child_exiting_raises_sigchld() {
+    agrees_with_native(
+        "sigchld",
+        r#"
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+static volatile sig_atomic_t heard = 0;
+
+static void note(int signal) {
+    (void)signal;
+    heard++;
+}
+
+int main(void) {
+    struct sigaction action = {0};
+    action.sa_handler = note;
+    action.sa_flags = SA_RESTART;
+    sigaction(SIGCHLD, &action, 0);
+
+    for (int index = 0; index < 3; index++) {
+        fflush(stdout);
+        if (fork() == 0) {
+            _exit(0);
+        }
+    }
+    /* Reap from the loop, not from the handler: what is being tested is
+       that the handler ran at all. */
+    while (wait(0) > 0) {
+    }
+    printf("heard %d\n", heard > 0);
+    return 0;
+}
+"#,
+        Linkage::Dynamic,
+    );
+}
+
+/// **An orphan is reaped by the first process**, which is what `init` is
+/// for.
+///
+/// A child whose parent exits first is reparented — on Linux to the system's
+/// `init`, and here to the container's first process, which is the same role
+/// played by the same rule. Without it the grandchild is a zombie whose
+/// parent does not exist, `reap` never matches it, and the container ends
+/// holding a process nothing can collect.
+///
+/// Checked directly rather than against a native run, and that is the point
+/// rather than a shortcut: run natively, this program's orphan goes to the
+/// *host's* `init` and the parent never sees it. The container's answer is
+/// the correct one for a container, so the host is not the oracle here.
+#[test]
+fn an_orphan_is_reparented_to_the_first_process() {
+    let (_tree, baked) = image_of(
+        "orphan",
+        r#"
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+int main(void) {
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        /* A grandchild that outlives its parent. */
+        if (fork() == 0) {
+            _exit(5);
+        }
+        _exit(4);
+    }
+    int first = 0;
+    waitpid(child, &first, 0);
+    /* The grandchild is this process's now, so this reaps it. */
+    int second = 0;
+    pid_t orphan = wait(&second);
+    printf("child %d, orphan %d exited %d\n",
+           WEXITSTATUS(first), orphan > 0, WEXITSTATUS(second));
+    printf("and then %d\n", wait(0) == -1);
+    return 0;
+}
+"#,
+        Linkage::Dynamic,
+    );
+    assert_eq!(
+        interpreted_output("orphan", baked),
+        "child 4, orphan 1 exited 5\nand then 1\n"
     );
 }

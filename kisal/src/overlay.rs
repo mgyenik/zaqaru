@@ -79,6 +79,7 @@ enum Entry {
 
 /// An upper node's contents.
 #[derive(Debug)]
+#[derive(Clone)]
 enum Body {
     Directory {
         entries: BTreeMap<Vec<u8>, Entry>,
@@ -105,6 +106,7 @@ enum Body {
 }
 
 #[derive(Debug)]
+#[derive(Clone)]
 struct Node {
     inode: Inode,
     body: Body,
@@ -118,6 +120,7 @@ pub struct Dirent<'a> {
     pub entry_type: u8,
 }
 
+#[derive(Clone)]
 pub struct Overlay<'a> {
     lower: Image<'a>,
     upper: Vec<Node>,

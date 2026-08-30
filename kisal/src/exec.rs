@@ -24,6 +24,15 @@ use std::vec::Vec;
 pub enum Error {
     /// Not an ELF at all, or not one this can run.
     NotLoadable(&'static str),
+    /// The path does not name something that can be run, for a reason a
+    /// *program* asked about rather than a reason a person reads.
+    ///
+    /// Which is why this one carries an errno where the rest carry prose:
+    /// `execvp` walks `PATH` calling `execve` once per directory, and
+    /// depends on getting `ENOENT` back from each miss to keep walking. A
+    /// single wrong code there turns "python3 is in /usr/local/bin" into
+    /// "python3 does not exist".
+    NotFound(crate::errno::Errno),
     /// A header points outside the file.
     Truncated(&'static str),
     /// The program headers are not in any loaded segment, so nothing can
@@ -37,10 +46,26 @@ pub enum Error {
 }
 
 impl Error {
+    /// What a guest that called `execve` is told.
+    ///
+    /// Everything but [`Error::NotFound`] is a file that exists and cannot
+    /// be run, which is what `ENOEXEC` says — and which `execvp` correctly
+    /// treats as fatal rather than as a reason to try the next directory.
+    pub fn errno(&self) -> crate::errno::Errno {
+        match self {
+            Error::NotFound(errno) => *errno,
+            _ => crate::errno::Errno::NotExecutable,
+        }
+    }
+
     pub fn message(&self, into: &mut String) {
         into.push_str("kisal: cannot load the program: ");
         match self {
             Error::NotLoadable(why) => into.push_str(why),
+            Error::NotFound(errno) => {
+                into.push_str("the path names nothing runnable: ");
+                into.push_str(errno.name());
+            }
             Error::Truncated(what) => {
                 into.push_str("the file ends inside its ");
                 into.push_str(what);
@@ -1136,13 +1161,25 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
         let vnode = self
             .vfs
             .resolve(root, path, crate::vfs::Lookup::FOLLOW)
-            .map_err(|_| Error::NotLoadable("there is no such file in the image"))?;
+            // The resolver's own answer, not a flattened one: `ENOENT` and
+            // `ENOTDIR` are both reasons `execvp` keeps walking `PATH`, and
+            // `ELOOP` is a reason it stops.
+            .map_err(Error::NotFound)?;
         let inode = self
             .vfs
             .inode(vnode)
             .map_err(|_| Error::NotLoadable("its inode cannot be read"))?;
         if !inode.is_regular() {
-            return Err(Error::NotLoadable("it is not a regular file"));
+            // What Linux says for a directory or a device: it is there, and
+            // it is not something you may run.
+            return Err(Error::NotFound(crate::errno::Errno::Access));
+        }
+        // The execute bit, on any of the three sets. A container runs as one
+        // identity, so there is no user to match against — what the check
+        // catches is a data file on `PATH`, which `execvp` must step over
+        // rather than stop at.
+        if inode.mode & 0o111 == 0 {
+            return Err(Error::NotFound(crate::errno::Errno::Access));
         }
         let filesystem = self
             .vfs

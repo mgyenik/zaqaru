@@ -65,6 +65,7 @@ impl Lookup {
 /// `lookup(directory, name)` and nothing else. What a path *means* — `..`,
 /// symlinks, trailing slashes, where a mount begins — is decided in this
 /// loop, once, for every filesystem there will ever be.
+#[derive(Clone)]
 pub struct Vfs<'a> {
     mounts: Mounts<'a>,
     working_directory: Vnode,

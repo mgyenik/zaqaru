@@ -39,6 +39,7 @@ pub mod vm;
 pub mod space;
 pub mod synthetic;
 pub mod syscall;
+pub mod system;
 pub mod thread;
 pub mod vfs;
 pub mod write;
@@ -124,6 +125,7 @@ pub unsafe extern "C" fn kisal_syscall(
             }
             Outcome::Fault(_) => String::from("<fault>"),
             Outcome::Blocked => String::from("<blocked>"),
+            Outcome::Process(_) => String::from("<process>"),
             Outcome::Exit(status) => {
                 let mut text = String::from("<exit ");
                 push_decimal(&mut text, i64::from(*status));
@@ -144,6 +146,13 @@ pub unsafe extern "C" fn kisal_syscall(
             // Not reachable until M7 builds the scheduler: with one
             // thread there is nothing to switch to, so a wait that could
             // not be satisfied would be a hang rather than a block.
+            // Only the interpreted world has a process table, and only it
+            // can answer these.
+            Outcome::Process(_) => {
+                let message = "kisal: a process operation on the ahead-of-time path";
+                report(kernel, message);
+                Err(message.to_string())
+            }
             Outcome::Blocked => {
                 let message = "kisal: a syscall blocked before the scheduler exists";
                 report(kernel, message);

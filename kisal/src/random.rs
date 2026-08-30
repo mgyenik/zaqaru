@@ -25,6 +25,7 @@ use crate::errno::Errno;
 pub const SEED_BYTES: usize = 32;
 
 /// A ChaCha20 keystream, read as random bytes.
+#[derive(Clone)]
 pub struct Random {
     /// `None` until the seed arrives. A container whose host mounted no
     /// `/iso/random` has no entropy, and that is a capability decision made
@@ -34,6 +35,7 @@ pub struct Random {
     state: Option<State>,
 }
 
+#[derive(Clone)]
 struct State {
     key: [u32; 8],
     /// The block counter. Sixty-four bits of it, so it cannot wrap in any

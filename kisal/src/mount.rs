@@ -46,6 +46,7 @@ impl Vnode {
 /// should be the thing that notices when a third appears. The read interface
 /// is the image's, so that everything above — resolution, `stat`,
 /// `getdents64` — is written once and does not know which kind it is walking.
+#[derive(Clone)]
 pub enum Filesystem<'a> {
     /// A baked image, read-only. The synthetic mounts are these too: they
     /// are built at boot in the same format.
@@ -259,6 +260,7 @@ impl<'f> Entries<'f> {
 }
 
 /// One attached filesystem.
+#[derive(Clone)]
 struct Mount<'a> {
     filesystem: Filesystem<'a>,
     /// The directory this filesystem covers, in the mount above it. `None`
@@ -274,6 +276,7 @@ struct Mount<'a> {
 /// device as everything else that answers zero.
 const FIRST_DEVICE: u64 = 0x0001_0000;
 
+#[derive(Clone)]
 pub struct Mounts<'a> {
     entries: [Option<Mount<'a>>; MAX_MOUNTS],
     count: usize,

@@ -16,10 +16,18 @@ use kisal::abi::{Store, StoreOutcome};
 use kisal::image::Image;
 use kisal::machine::Interpreted;
 use kisal::run::{Exit, Process};
+use kisal::system::System;
 use kisal::syscall::{Enforcement, Kernel};
 
 /// A store that puts the guest's console on this process's.
-#[derive(Default)]
+///
+/// `Clone` because a fork clones the store, and what that means is the
+/// store's own decision: this one holds nothing but a flag and two
+/// descriptors it does not own, so parent and child sharing the terminal is
+/// exactly what copying it produces. A store that *held* the output — the
+/// test harness's does — wraps itself in [`kisal::abi::Shared`] instead, and
+/// then cloning shares rather than copies.
+#[derive(Default, Clone)]
 struct Terminal {
     trace: bool,
 }
@@ -99,10 +107,15 @@ fn main() {
         }
     };
 
+    let mut system = System::new(process);
     let running = std::time::Instant::now();
-    let exit = process.run();
+    let exit = system.run();
     let elapsed = running.elapsed().as_secs_f64();
-    let retired = process.kernel.machine.thread().retired;
+    // Across every process, because a container that forks does most of its
+    // work in children and a count that lost them would understate the
+    // engine by however much the guest chose to fan out.
+    let retired = system.retired();
+    let process = system.current();
     eprintln!(
         "\n{retired} instructions in {elapsed:.2}s = {:.1} MIPS",
         retired as f64 / elapsed / 1e6

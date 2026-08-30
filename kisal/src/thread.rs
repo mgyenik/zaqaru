@@ -34,6 +34,10 @@ pub enum State {
     /// every bit set, so one code path serves both and the plain case is
     /// the all-ones case rather than a second one.
     Waiting { word: u64, bitset: u32 },
+    /// It is in `wait4`, and a child ending completes the call: the answer
+    /// is written where the caller asked and the thread becomes runnable
+    /// again, rather than the syscall being re-run.
+    WaitingForChild { wanted: i32, status_at: u64 },
     /// It called `exit`. Its control block is kept until something reaps
     /// the identifier, because a thread that has ended is still a thread
     /// that existed.
@@ -168,6 +172,22 @@ impl Threads {
 
     pub fn find_mut(&mut self, tid: i32) -> Option<&mut Thread> {
         self.threads.iter_mut().find(|thread| thread.tid == tid)
+    }
+
+    /// Just the running thread, as a fork's child gets.
+    ///
+    /// POSIX: only the calling thread survives into the child. The others
+    /// are not stopped or unwound — they are not copied, which is the
+    /// difference between a table and a stack.
+    pub fn only_current(&self) -> Self {
+        let current = self.current();
+        let mut thread = Thread::new(FIRST, current.tcb.clone());
+        thread.owned = current.owned;
+        Self {
+            threads: vec![thread],
+            current: 0,
+            next: FIRST + 1,
+        }
     }
 
     /// Adds a thread, and answers its identifier.

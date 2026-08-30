@@ -149,6 +149,7 @@ impl Bitmap {
 }
 
 /// The guest's linear memory, and what may be done with each page of it.
+#[derive(Clone)]
 pub struct Space {
     /// One past the highest addressable byte. Linear memory grows in
     /// 64 KiB pages and never shrinks, so this only ever rises.

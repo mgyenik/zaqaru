@@ -22,7 +22,17 @@ pub enum Errno {
     /// `EAGAIN`: a futex whose value has already changed, which is the
     /// answer that closes the window between deciding to sleep and sleeping.
     TryAgain = 11,
+    /// `ECHILD`: the caller has no children to wait for, which is what
+    /// tells a `while (wait(...) > 0)` loop to stop.
+    NoChild = 10,
     Busy = 16,
+    /// `ENOEXEC`: the file is there and is not a program this can run.
+    NotExecutable = 8,
+    /// `E2BIG`: the argument or environment list handed to `execve` is
+    /// longer than the kernel will walk. A bound and not a limit found by
+    /// running out of memory — an array with no terminator has to end as a
+    /// named error rather than as a read to the top of the address space.
+    ArgumentsTooLong = 7,
     CrossDevice = 18,
     Exists = 17,
     NotDir = 20,
@@ -85,6 +95,8 @@ impl Errno {
             Self::TooManyFiles => "EMFILE",
             Self::NoTty => "ENOTTY",
             Self::TooBig => "EFBIG",
+            Self::ArgumentsTooLong => "E2BIG",
+            Self::NotExecutable => "ENOEXEC",
             Self::NoSpace => "ENOSPC",
             Self::NotSeekable => "ESPIPE",
             Self::ReadOnlyFs => "EROFS",
@@ -98,6 +110,7 @@ impl Errno {
             Self::NotSupported => "ENOTSUP",
             Self::AddressFamily => "EAFNOSUPPORT",
             Self::TryAgain => "EAGAIN",
+            Self::NoChild => "ECHILD",
             Self::NameNeeded => "a name this kernel did not keep",
         }
     }

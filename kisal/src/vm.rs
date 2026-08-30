@@ -14,6 +14,7 @@
 use crate::abi::HostStore;
 use crate::machine::Interpreted;
 use crate::run::{Exit, Process};
+use crate::system::System;
 use crate::syscall::{Enforcement, Kernel};
 
 /// The status a container reports when something the engine or the kernel
@@ -57,7 +58,11 @@ pub unsafe extern "C" fn targum_boot() -> i32 {
             panic!("kisal: {message}");
         }
     };
-    match process.run() {
+    // The process table, which is what makes a `fork` inside the module a
+    // second address space rather than an error. One process is the common
+    // case and costs a vector of one.
+    let mut system = System::new(process);
+    match system.run() {
         Exit::Status(status) => status,
         // Loud, and named. A container that stopped because the engine does
         // not implement an instruction, or the kernel a syscall, must not
@@ -65,7 +70,7 @@ pub unsafe extern "C" fn targum_boot() -> i32 {
         other => {
             let mut message = String::from("kisal: the container stopped: ");
             describe(&other, &mut message);
-            crate::report_to(&mut process.kernel, &message);
+            crate::report_to(&mut system.current().kernel, &message);
             UNIMPLEMENTED
         }
     }
