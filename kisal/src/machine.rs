@@ -92,6 +92,24 @@ pub trait Machine {
         true
     }
 
+    /// Puts this process's address space at the guest's addresses, and
+    /// takes it down again.
+    ///
+    /// Nothing to do by default, and that is the honest answer for the
+    /// ahead-of-time machine rather than a gap in it: there the address
+    /// space is the module instance's own memory and a second process is a
+    /// second instance, so no machine ever holds two. It is the interpreter
+    /// that runs every process in one engine and therefore has to say which
+    /// one the bytes belong to.
+    fn activate(&mut self, pages: &targum::space::Space) {
+        let _ = pages;
+    }
+
+    fn deactivate(&mut self, pages: &targum::space::Space) {
+        let _ = pages;
+    }
+
+
     /// Ends this thread, and answers how many are left.
     ///
     /// Zero from the default: the one thread ending *is* the process ending,
@@ -294,12 +312,81 @@ pub struct Interpreted {
     /// Every thread this process has, and which one is running. A context
     /// switch is choosing a different index.
     pub threads: crate::thread::Threads,
-    /// Linear memory. Inside the module there is nothing to hold — the
-    /// module *is* the memory — and natively it is a reservation with a
-    /// committed prefix. One line of difference, which is what the design
-    /// asked for.
+    /// Linear memory, natively: a reservation with a committed prefix,
+    /// backed by a file so that a process that is not running still has its
+    /// bytes somewhere. Making one current is one `MAP_FIXED` mapping of it
+    /// over the guest's range — a page-table swap, and nothing is copied.
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) memory: targum::arena::LinearMemory,
+    /// The same thing inside the module, where there is no page table to
+    /// swap: a dormant process's pages, held in the kernel's own heap.
+    ///
+    /// `Some` exactly when this process is *not* the one at the guest's
+    /// addresses, which is the invariant `activate` and `deactivate`
+    /// maintain between them.
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) dormant: Option<Dormant>,
+}
+
+/// A process's bytes while some other process is the one running.
+///
+/// Inside the module linear memory is shared with the engine — the
+/// program's segments low, the module's own data above them, the guest's
+/// arenas above that, all in one memory — so this cannot be a range. It is
+/// the pages the guest's own page table describes, and nothing else, which
+/// is what keeps a switch from writing over the engine that is performing
+/// it.
+///
+/// The bill, stated: a switch is a copy, not a mapping, and it costs a
+/// memcpy of everything the process has mapped. Natively the same operation
+/// is free. What keeps it affordable is that a switch happens only when the
+/// running process cannot continue or has used a whole process quantum —
+/// and the shape that matters, a `fork` whose parent immediately waits,
+/// costs two.
+#[cfg(target_arch = "wasm32")]
+pub struct Dormant {
+    /// Page address and its contents, ascending.
+    pages: Vec<(u64, [u8; PAGE_BYTES])>,
+}
+
+#[cfg(target_arch = "wasm32")]
+const PAGE_BYTES: usize = targum::space::PAGE_SIZE as usize;
+
+#[cfg(target_arch = "wasm32")]
+impl Dormant {
+    /// Takes a copy of everything the page table says is mapped.
+    ///
+    /// # Safety
+    /// A guest address is a linear-memory offset, so a mapped page is
+    /// `PAGE_BYTES` readable bytes at that offset — which is the identity
+    /// the whole design rests on, and the same one every load and store in
+    /// [`targum::space`] uses.
+    pub(crate) fn taken(pages: &targum::space::Space) -> Self {
+        let mut held = Vec::new();
+        for address in pages.mapped_pages() {
+            let mut bytes = [0u8; PAGE_BYTES];
+            // SAFETY: the page is inside the limit and mapped, which is what
+            // `mapped_pages` answered.
+            let from = unsafe {
+                core::slice::from_raw_parts(address as usize as *const u8, PAGE_BYTES)
+            };
+            bytes.copy_from_slice(from);
+            held.push((address, bytes));
+        }
+        Self { pages: held }
+    }
+
+    /// Writes them back where they came from.
+    pub(crate) fn restore(&self) {
+        for (address, bytes) in &self.pages {
+            // SAFETY: the page was inside the limit when it was taken, and
+            // linear memory never shrinks.
+            let into = unsafe {
+                core::slice::from_raw_parts_mut(*address as usize as *mut u8, PAGE_BYTES)
+            };
+            into.copy_from_slice(bytes);
+        }
+    }
 }
 
 impl Default for Interpreted {
@@ -355,6 +442,9 @@ impl Interpreted {
             threads: crate::thread::Threads::new(),
             #[cfg(not(target_arch = "wasm32"))]
             memory,
+            // A process that is being built is the process that is running.
+            #[cfg(target_arch = "wasm32")]
+            dormant: None,
         }
     }
 }
@@ -415,6 +505,14 @@ impl Machine for Interpreted {
     /// The current thread first, so a program that raises a signal at itself
     /// sees it on the thread that raised it — which is what every `raise(3)`
     /// expects, and what a `SIGSEGV` handler debugging its own thread needs.
+    fn activate(&mut self, pages: &targum::space::Space) {
+        Interpreted::activate(self, pages);
+    }
+
+    fn deactivate(&mut self, pages: &targum::space::Space) {
+        Interpreted::deactivate(self, pages);
+    }
+
     fn raise_process(&mut self, signal: i32) -> bool {
         let bit = 1u64 << (signal - 1);
         if self.threads.current().owned.blocked_signals & bit == 0 {

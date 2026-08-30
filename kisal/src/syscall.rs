@@ -1026,6 +1026,23 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
         }
     }
 
+    /// Puts this process's address space at the guest's addresses, and takes
+    /// it down again.
+    ///
+    /// Here rather than on the machine because it takes both halves of the
+    /// address space — the bytes, which are the machine's, and the page
+    /// table saying which of them are the guest's, which is the kernel's.
+    /// The module build needs the second to find the first.
+    pub fn activate(&mut self) {
+        let Self { machine, pages, .. } = self;
+        machine.activate(pages);
+    }
+
+    pub fn deactivate(&mut self) {
+        let Self { machine, pages, .. } = self;
+        machine.deactivate(pages);
+    }
+
     /// What survives an `execve`: the same process, with a new program in
     /// it.
     ///

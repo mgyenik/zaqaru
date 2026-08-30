@@ -280,6 +280,27 @@ impl Space {
     }
 
     /// What a page allows, for the kernel's own consistency check.
+    /// Every page that has any protection at all, in ascending order.
+    ///
+    /// What a *dormant* process's bytes are, inside the module: linear
+    /// memory there holds the engine's own data as well as the guest's, and
+    /// `baker::layout` interleaves them — the program's segments low, the
+    /// module's data above them, the arenas above that. So "the guest's
+    /// bytes" cannot be a range. It is exactly the set of pages the guest's
+    /// page table describes, which is what this is.
+    ///
+    /// A `PROT_NONE` page is deliberately not in it. Nothing can reach one
+    /// until an `mprotect` gives it a protection, and a fresh anonymous page
+    /// reads as zeroes when it does — so there is nothing there to carry.
+    pub fn mapped_pages(&self) -> impl Iterator<Item = u64> + '_ {
+        let count = (self.limit >> PAGE_SHIFT) as usize;
+        (0..count)
+            .filter(|&page| {
+                self.readable.get(page) || self.writable.get(page) || self.executable.get(page)
+            })
+            .map(|page| (page as u64) << PAGE_SHIFT)
+    }
+
     pub fn protection(&self, address: u64) -> Protection {
         let page = (address >> PAGE_SHIFT) as usize;
         Protection {

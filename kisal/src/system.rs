@@ -34,6 +34,29 @@ use crate::syscall::Request;
 /// The first process's identifier.
 pub const FIRST: i32 = 1;
 
+/// How many thread quanta a process gets before another one is considered.
+///
+/// A *process* switch is not the free thing a thread switch is. Natively it
+/// is one `MAP_FIXED` and costs nothing; inside the module there is no page
+/// table to swap and it is a copy of everything the process has mapped — so
+/// rotating on every thread quantum would put a memcpy of the guest's whole
+/// heap between every hundred thousand instructions, which is not a
+/// scheduler, it is a memcpy benchmark.
+///
+/// The same number in both builds, deliberately. It is denominated in
+/// retired instructions like everything else here, so the interleaving stays
+/// a pure function of execution — and a native run and a module run of the
+/// same container schedule identically, which is what makes the native tests
+/// evidence about the module.
+///
+/// Sixteen, so a process holds the processor for 1.6 million instructions:
+/// long enough that the copy is amortised even when two processes are both
+/// compute-bound, short enough that a container of them still interleaves at
+/// a granularity a human would call fair. The shapes that actually matter —
+/// a `fork` whose parent immediately waits, a `fork` and `exec` — never
+/// reach it, because a process that blocks yields at once.
+pub const SLICE: u64 = 16;
+
 /// One process: a kernel with its own address space, and the blocks decoded
 /// out of it.
 ///
@@ -54,6 +77,9 @@ pub struct System<'a, S: Store> {
     containers: Vec<Container<'a, S>>,
     current: usize,
     next: i32,
+    /// How many thread quanta the running process has used since it was
+    /// given the processor. See [`SLICE`].
+    slice: u64,
     /// What processes that are gone retired before they went.
     ///
     /// Kept here because reaping destroys the only other place the number
@@ -75,6 +101,7 @@ impl<'a, S: Store + Clone> System<'a, S> {
             }],
             current: 0,
             next: FIRST + 1,
+            slice: 0,
             departed: 0,
         }
     }
@@ -105,7 +132,7 @@ impl<'a, S: Store + Clone> System<'a, S> {
         let parent = self.current_pid();
         let (kernel, cache) = {
             let process = &self.containers[self.current].process;
-            let machine = process.kernel.machine.fork()?;
+            let machine = process.kernel.machine.fork(&process.kernel.pages)?;
             (process.kernel.fork(machine), BlockCache::new())
         };
         let pid = self.next;
@@ -130,13 +157,9 @@ impl<'a, S: Store + Clone> System<'a, S> {
         if index == self.current {
             return;
         }
-        self.containers[self.current]
-            .process
-            .kernel
-            .machine
-            .deactivate();
+        self.containers[self.current].process.kernel.deactivate();
         self.current = index;
-        self.containers[index].process.kernel.machine.activate();
+        self.containers[index].process.kernel.activate();
     }
 
     /// Picks the next process with something to run, round-robin.
@@ -145,7 +168,15 @@ impl<'a, S: Store + Clone> System<'a, S> {
     /// both are driven by the retired-instruction quantum — so the whole
     /// interleaving, across processes as well as threads, is a pure function
     /// of execution.
-    fn schedule(&mut self, rotate: bool) -> bool {
+    fn schedule(&mut self, preempted: bool) -> bool {
+        // A quantum expiring is a *thread* scheduling point. It becomes a
+        // process scheduling point once the process has had a whole slice of
+        // them — see [`SLICE`].
+        self.slice += u64::from(preempted);
+        let rotate = self.slice >= SLICE;
+        if rotate {
+            self.slice = 0;
+        }
         let count = self.containers.len();
         // From the next one when the quantum expired, and from this one
         // otherwise: a process that has just returned from a syscall keeps
@@ -155,6 +186,11 @@ impl<'a, S: Store + Clone> System<'a, S> {
         for step in first..first + count {
             let candidate = (self.current + step) % count;
             if self.ready(candidate) {
+                if candidate != self.current {
+                    // Somebody else's turn, which restarts the count
+                    // whether the switch was the slice's doing or a block's.
+                    self.slice = 0;
+                }
                 self.switch(candidate);
                 self.collect();
                 return true;
@@ -347,7 +383,7 @@ impl<'a, S: Store + Clone> System<'a, S> {
     fn execute(&mut self, path: &[u8], argv: &[Vec<u8>], envp: &[Vec<u8>]) {
         let argv: Vec<&[u8]> = argv.iter().map(Vec::as_slice).collect();
         let envp: Vec<&[u8]> = envp.iter().map(Vec::as_slice).collect();
-        self.current().kernel.machine.deactivate();
+        self.current().kernel.deactivate();
         let machine = Interpreted::new();
         let kernel = self.current().kernel.execed(machine);
         match Process::enter(kernel, path, &argv, &envp) {
@@ -360,7 +396,7 @@ impl<'a, S: Store + Clone> System<'a, S> {
             Err(error) => {
                 // The new one is dropped, dormant, having never been at the
                 // guest's addresses for longer than the load took.
-                self.current().kernel.machine.activate();
+                self.current().kernel.activate();
                 self.current().answer(error.errno().as_result());
             }
         }
@@ -482,22 +518,48 @@ impl Interpreted {
     /// table cleanup here rather than the torment it is for a pthread
     /// implementation, because the other threads' control blocks are simply
     /// not copied.
-    pub fn fork(&self) -> Option<Self> {
+    ///
+    /// The child is born *dormant*: the parent returns from `fork` first, so
+    /// the parent is the one that stays at the guest's addresses.
+    pub fn fork(&self, pages: &targum::space::Space) -> Option<Self> {
+        let _ = pages;
         Some(Self {
             threads: self.threads.only_current(),
+            // One kernel-side copy of a file, and no bytes through this
+            // process at all.
             #[cfg(not(target_arch = "wasm32"))]
             memory: self.memory.duplicate()?,
+            // The bytes the parent has right now, which is what `fork`
+            // means.
+            #[cfg(target_arch = "wasm32")]
+            dormant: Some(crate::machine::Dormant::taken(pages)),
         })
     }
 
     /// Puts this process's address space at the guest's addresses.
-    pub fn activate(&mut self) {
+    ///
+    /// Natively one `MAP_FIXED` mapping of the file the bytes live in;
+    /// inside the module a copy of the pages the table describes. Same
+    /// invariant either way, and it is the one the whole process table rests
+    /// on: **exactly one address space is at the guest's addresses**, so
+    /// touching a process's memory is only ever done to the current one.
+    pub fn activate(&mut self, pages: &targum::space::Space) {
+        let _ = pages;
         #[cfg(not(target_arch = "wasm32"))]
         self.memory.activate();
+        #[cfg(target_arch = "wasm32")]
+        if let Some(held) = self.dormant.take() {
+            held.restore();
+        }
     }
 
-    pub fn deactivate(&mut self) {
+    pub fn deactivate(&mut self, pages: &targum::space::Space) {
+        let _ = pages;
         #[cfg(not(target_arch = "wasm32"))]
         self.memory.deactivate();
+        #[cfg(target_arch = "wasm32")]
+        if self.dormant.is_none() {
+            self.dormant = Some(crate::machine::Dormant::taken(pages));
+        }
     }
 }
