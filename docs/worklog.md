@@ -2927,3 +2927,62 @@ out longhand and now says why; the insert cases have a macro of their own.
 Everything else was caught: both halves of both shuffles, the selector
 stride, the insert's half and its destination mask, the extract's half and
 its word.
+
+## 2026-08-30 — work item zero: the baker builds with resume, and what it costs
+
+The setjmp design's premise was that the container pipeline builds with
+`--resume`. The plan had said so since M6 and `baker::bake` had never passed
+it, which nothing noticed because nothing yet blocks on it — M7's scheduler
+is what needs a thread's frames to be a chain of resume IDs, and M7 is not
+built. `setjmp` is what brought the debt forward.
+
+Measured on the CPython container, not assumed:
+
+| | resume off | resume on | |
+| --- | --- | --- | --- |
+| functions | 123,053 | 123,053 | |
+| refusals | 540 | 544 | +4, none reached |
+| bake | 6.15 s | 8.41 s | 1.37× |
+| container | 211 MB | 317 MB | 1.50× |
+| boot, wall | 12.2 s | 20.5 s | 1.69× |
+| boot, CPU | 209 s | 383 s | 1.83× |
+
+Half the module and two thirds of the boot, for a second body per function.
+Affordable at this scale, and now a number the rest of the design can be
+priced against instead of a guess.
+
+### Two holes in the loud-error policy, both the same shape
+
+Turning it on did not work. Twice, and each failure was the trap policy
+covering **one of a function's two bodies**:
+
+- A *resume body* that could not be translated propagated its error instead
+  of standing in. The ordinary body of the same function was refused
+  politely and listed; its twin killed the bake.
+- A *call-split graph* that could not be built did the same, one stage
+  earlier — `ControlFlowGraph::build_resumable` is called before either body
+  exists, and its `?` went straight out.
+
+Both are under the policy now. The second one needed a decision rather than
+a wrapper: a function whose graph cannot be split refuses **both** bodies,
+because the alternative — an ordinary body translated without a site map, so
+its call sites store sentinels — is a function a thread can block underneath
+and whose frame chain then stops early at a sentinel. Silently. That is
+worse than a body that names itself and stops.
+
+Neither hole was reachable before today, and that is the point: a policy
+that had only ever been exercised on half the code it governs.
+
+### The premise, observed
+
+`tests/dlopen.rs`'s thorn test asserted that a failed `dlopen` dies on
+`RETURN_ADDRESS_SENTINEL`. It now dies on **`0x40000000e`** — table slot 14
+in the low half, resume entry 4 in the high. The word `setjmp` saved is a
+materialized continuation, saved by code that has no idea that is what it is
+doing.
+
+So the test changed what it records: that the value which misses is *not an
+address* — a resume ID is a small integer or larger than any address a guest
+can hold, never in between, which is the discrimination the design's miss
+path turns on. It also now says, if the sentinel ever comes back, that the
+container was built without resume rather than that `longjmp` changed.

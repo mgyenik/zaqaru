@@ -1328,7 +1328,18 @@ load-bearing fact is verified in the code rather than hoped
 (`src/translate.rs`, `ResumeSites`): under `--resume`, **every call
 site stores a resume ID in its return-address slot**, and the chain of
 those slots on the guest stack is a serialization of the frames above
-any call. The container pipeline always builds with resume on.
+any call.
+
+**Work item zero, with a cost to measure first: the baker does not
+build with resume on.** The plan has always said the container
+pipeline builds resume-on; the built baker does not — `with_resume` is
+called only from `src/main.rs` behind the flag, so every container
+baked to date carries sentinels in those slots, not IDs. This is a
+debt M7 already owes (threads cannot exist without it); longjmp moves
+the bill forward rather than creating it. The price is a second body
+per function — a code-section and engine-compile doubling at a
+six-figure function count for CPython — and it gets measured before
+anything below is built on it.
 
 **setjmp needs nothing at all.** It is ordinary code: it stores the
 callee-saved registers, `%rsp`, and the word at `(%rsp)` into the
@@ -1352,10 +1363,16 @@ misses, and dies in `kisal_no_function_at`. The pieces of the fix:
   carrying the resume-ID tag is a longjmp; one without it stays the
   loud error. Function-pointer calls — the hot case — hit the map and
   never see the check. The one requirement is that the stored form of
-  an ID be disjoint from every address: IDs are per-site *constants*
-  (an `i64.const` carrying the table relocation), so the tag bit is
-  baked into the constant for free, and the resume driver masks one
-  more bit beside `RED_ZONE_RESERVED` and `RESUME_ENTRY_MASK`.
+  an ID be disjoint from every address, and the bit accounting is
+  tighter than "a free bit": the slot holds bits 0–31, the entry
+  bits 32–62 (`RESUME_ENTRY_MASK` is 31 bits), and `RED_ZONE_RESERVED`
+  is bit 63 — so the tag comes out of the *entry field*, narrowing it
+  to 30 bits, which is still absurd headroom. It is still free at the
+  store: an ID is not one relocated constant but a relocated `i32`
+  table index OR'd with a plain `i64` constant carrying the entry and
+  flags (`src/translate.rs:1571`), and the tag rides that second
+  constant exactly as `RED_ZONE_RESERVED` already does at syscall
+  sites. The resume driver masks one more bit.
 - **Frame abandonment is the blocking-syscall leave path, verbatim.**
   The wasm frames between longjmp and setjmp's caller must go, and the
   system owns exactly one tool that discards guest frames: the throw
@@ -1365,14 +1382,34 @@ misses, and dies in `kisal_no_function_at`. The pieces of the fix:
   continuation to the given ID and returns the leave sentinel (a
   one-field kernel row — a *blocking syscall with a continuation
   override*), the helper throws, the catch schedules.
-- **Re-entry is resumption, verbatim.** The driver enters the saved
-  ID; setjmp's call site has a resume entry because every call site
-  does; the continuation reloads the machine from the globals, where
-  longjmp's own translated code just put everything. The frames below
-  setjmp's caller re-materialize lazily from the guest stack exactly
-  as after any block — `%rsp` restoration made the deeper slots
-  reachable again, and they still hold the IDs written on the way
-  down.
+- **Re-entry is resumption, verbatim — once something loops.** The
+  driver enters the saved ID; setjmp's call site has a resume entry
+  because every call site does; the continuation reloads the machine
+  from the globals, where longjmp's own translated code just put
+  everything. The frames below setjmp's caller re-materialize lazily
+  from the guest stack exactly as after any block. One thing must
+  exist first: today's catch is single-shot — a throw with no exit
+  recorded panics ("no scheduler to have parked it",
+  `kisal/src/lib.rs`) — so pre-M7 this design needs the **degenerate
+  boot loop**: the catch distinguishes "exited" from "runnable with a
+  continuation" and loops back into `run_thread` for the latter. A few
+  lines, subsumed by M7's real run loop; unnamed, the first longjmp
+  unwinds straight out of the container.
+
+**The continuation-override is load-bearing — do not "simplify" it
+away.** The tempting deletion: longjmp restored `%rsp`, so read the ID
+from the return slot at the setjmp site instead of carrying it through
+the `jmp_buf`. That slot is *reused by every later call the same frame
+makes at the same stack depth* — `if (setjmp(env)) return 1; g();`
+writes `g()`'s call-site ID over setjmp's at the identical address,
+and every real longjmp has this shape, because the caller must have
+made the call that led to it. At longjmp time the slot holds the
+continuation "as if the pending call returned" — entering it is
+silently wrong control flow, the one failure class with no detector.
+The `jmp_buf`'s saved word is the *only* surviving record of the
+setjmp-site continuation, which is exactly why hardware setjmp saves a
+PC at all. The stack drives everything *above* that first entry; the
+first entry comes from the buffer.
 
 **The cost model matches the workload.** A setjmp that never longjmps
 is free — and that is the overwhelming case: libjpeg and libpng take
@@ -1409,14 +1446,22 @@ Edges, named now:
   containers always build with resume on — but it is a constraint.
 
 Tests, corpus-ladder style: a same-frame round trip; longjmp across N
-frames with distinguishable callee-saved values checked after; longjmp
+frames with distinguishable callee-saved values checked after; the
+canonical idiom — setjmp, then a *call* from the same frame that
+longjmps back — which is the test that kills the read-the-slot
+simplification above (the slot holds the pending call's ID, and the
+run must take the setjmp arm, not the returned-normally arm); longjmp
 in a tight loop — **the wasm stack must not grow**, which is the throw
 earning its keep and the test that kills the naive
 call-the-continuation design (that one leaks a frame chain per
-longjmp); both libcs, since one mangles and one does not; and the gate
-that reopened this design — `dlopen` of a missing library returning
-`NULL` with `dlerror` text, differential against native. It also
-unblocks the parked setjmp case in the test ledger.
+longjmp); a longjmp whose target frame was itself entered by a resume
+body — resume bodies' call sites push IDs too, so it should compose,
+but it is the case where "the frames re-materialize lazily" does the
+most work, and it gets a test rather than an inference; both libcs,
+since one mangles and one does not; and the gate that reopened this
+design — `dlopen` of a missing library returning `NULL` with
+`dlerror` text, differential against native. It also unblocks the
+parked setjmp case in the test ledger.
 
 ### x87 and MMX
 

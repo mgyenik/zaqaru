@@ -579,46 +579,138 @@ impl<'a> Transpiler<'a> {
             // With resume on, both of the function's bodies are built against
             // the same call-split graph and site map: the ordinary body
             // stores the IDs, the resume body is what they name.
-            let resume_context = match (plan.resume, plan.resume_slot) {
-                (Some(_), Some(slot)) => {
-                    let graph = ControlFlowGraph::build_resumable(lifted)
-                        .with_context(|| format!("splitting `{}` at its calls", lifted.name))?;
-                    let entries = resume_entries(lifted, &graph)
-                        .with_context(|| format!("mapping `{}`'s resume points", lifted.name))?;
-                    Some((graph, slot, entries))
+            //
+            // A function whose graph cannot be split refuses *both* bodies,
+            // and that is not caution. The alternative — an ordinary body
+            // whose call sites store sentinels because there is no site map
+            // — is a function a thread can block underneath and whose frame
+            // chain then stops early at a sentinel, silently, which is worse
+            // than a function that names itself and stops.
+            let mut split = None;
+            let mut graph_refused = false;
+            if let (Some(_), Some(slot)) = (plan.resume, plan.resume_slot) {
+                let built = ControlFlowGraph::build_resumable(lifted)
+                    .with_context(|| format!("splitting `{}` at its calls", lifted.name))
+                    .and_then(|graph| {
+                        let entries = resume_entries(lifted, &graph)
+                            .with_context(|| format!("mapping `{}`'s resume points", lifted.name))?;
+                        Ok((graph, slot, entries))
+                    });
+                match built {
+                    Ok(context) => split = Some(context),
+                    Err(error) if self.untranslatable == Untranslatable::Trap => {
+                        refused.push(Refusal {
+                            name: lifted.name.clone(),
+                            witness: self.object.functions[lifted.function].witness,
+                            reason: format!("{error:#}"),
+                        });
+                        graph_refused = true;
+                    }
+                    Err(error) => return Err(error),
                 }
-                _ => None,
-            };
+            }
+            let resume_context = split;
 
-            let translated = self
-                .translate_guest_function(&symbols, &machine, lifted, guest_type, &resume_context)
-                .with_context(|| format!("translating function `{}`", lifted.name));
+            let translated = match graph_refused {
+                true => Err(anyhow::anyhow!("its call-split graph could not be built")),
+                false => self
+                    .translate_guest_function(
+                        &symbols,
+                        &machine,
+                        lifted,
+                        guest_type,
+                        &resume_context,
+                    )
+                    .with_context(|| format!("translating function `{}`", lifted.name)),
+            };
+            let mut stands_in = graph_refused;
             let body = match translated {
                 Ok(body) => body,
                 Err(error) if self.untranslatable == Untranslatable::Trap => {
-                    refused.push(Refusal {
-                        name: lifted.name.clone(),
-                        witness: self.object.functions[lifted.function].witness,
-                        reason: format!("{error:#}"),
-                    });
+                    if !graph_refused {
+                        refused.push(Refusal {
+                            name: lifted.name.clone(),
+                            witness: self.object.functions[lifted.function].witness,
+                            reason: format!("{error:#}"),
+                        });
+                    }
+                    stands_in = true;
                     build_refusal(
                         &mut wasm,
                         &lifted.name,
                         symbols
                             .untranslated
                             .expect("the reporter is declared whenever trapping is asked for"),
+                        0,
                     )
                 }
                 Err(error) => return Err(error),
             };
             bodies.push((plan.guest.function_index, guest_type, body));
 
+            if let (Some(resume), None) = (plan.resume, &resume_context) {
+                // No graph, so nothing to translate against — the slot the
+                // plan reserved still needs a body, and it is the one that
+                // names the function and stops.
+                let name = format!("{} (resume body)", lifted.name);
+                let body = build_refusal(
+                    &mut wasm,
+                    &name,
+                    symbols
+                        .untranslated
+                        .expect("the reporter is declared whenever trapping is asked for"),
+                    1,
+                );
+                bodies.push((
+                    resume.function_index,
+                    resume_type.expect("resume bodies exist only when the type does"),
+                    body,
+                ));
+            }
             if let (Some(resume), Some((graph, slot, entries))) = (plan.resume, &resume_context) {
-                let resume_body = self
-                    .translate_resume_body(
-                        &symbols, &machine, lifted, guest_type, graph, *slot, entries,
-                    )
-                    .with_context(|| format!("translating `{}`'s resume body", lifted.name))?;
+                // The same policy, for the same reason. A function whose
+                // ordinary body could not be translated cannot be resumed
+                // either, so it does not get a second attempt; and one whose
+                // resume body alone fails stops only itself, exactly as an
+                // untranslatable function does — the function still runs,
+                // and it is being *resumed* that is the named failure.
+                //
+                // Without this the trap policy covered one of a function's
+                // two bodies. That went unnoticed because nothing baked a
+                // container with resume on, which is the whole of what work
+                // item zero found.
+                let attempt = match stands_in {
+                    true => Err(anyhow::anyhow!(
+                        "its ordinary body was not translated either"
+                    )),
+                    false => self
+                        .translate_resume_body(
+                            &symbols, &machine, lifted, guest_type, graph, *slot, entries,
+                        )
+                        .with_context(|| format!("translating `{}`'s resume body", lifted.name)),
+                };
+                let resume_body = match attempt {
+                    Ok(body) => body,
+                    Err(error) if self.untranslatable == Untranslatable::Trap => {
+                        let name = format!("{} (resume body)", lifted.name);
+                        if !stands_in {
+                            refused.push(Refusal {
+                                name: name.clone(),
+                                witness: self.object.functions[lifted.function].witness,
+                                reason: format!("{error:#}"),
+                            });
+                        }
+                        build_refusal(
+                            &mut wasm,
+                            &name,
+                            symbols
+                                .untranslated
+                                .expect("the reporter is declared whenever trapping is asked for"),
+                            1,
+                        )
+                    }
+                    Err(error) => return Err(error),
+                };
                 bodies.push((
                     resume.function_index,
                     resume_type.expect("resume bodies exist only when the type does"),
@@ -2337,7 +2429,18 @@ fn build_wide_division() -> FunctionBody {
     body.finish()
 }
 
-fn build_refusal(wasm: &mut WasmObject, name: &str, report: FunctionReference) -> FunctionBody {
+/// A body that names itself and stops.
+///
+/// `parameters` is the arity of the type it stands in for: an ordinary guest
+/// body takes none and a resume body takes one. The body itself ends in
+/// `unreachable`, which makes the rest of it polymorphic, so one shape
+/// serves both result types.
+fn build_refusal(
+    wasm: &mut WasmObject,
+    name: &str,
+    report: FunctionReference,
+    parameters: u32,
+) -> FunctionBody {
     let segment_index = wasm.data_segments.len() as u32;
     let bytes = name.as_bytes().to_vec();
     let size = bytes.len() as u32;
@@ -2360,7 +2463,7 @@ fn build_refusal(wasm: &mut WasmObject, name: &str, report: FunctionReference) -
         addend: 0,
     };
 
-    let mut body = FunctionBodyBuilder::new(0);
+    let mut body = FunctionBodyBuilder::new(parameters);
     body.i32_const_data_address(text);
     body.i32_const(size as i32);
     body.call(report);

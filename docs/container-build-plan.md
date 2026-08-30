@@ -1746,6 +1746,42 @@ The pieces, and where they live:
   from a new index region. Mapping an *untranslated* file executable is the
   loud error the design names.
 
+**Work item zero of the setjmp design is done (2026-08-30).** The baker
+builds with `--resume`, which this plan had claimed since M6 and the code
+had never done. What it costs, measured on the CPython container rather
+than assumed:
+
+| | resume off | resume on | |
+| --- | --- | --- | --- |
+| functions | 123,053 | 123,053 | |
+| refusals | 540 | 544 | +4, none reached |
+| bake | 6.15 s | 8.41 s | 1.37× |
+| container | 211 MB | 317 MB | 1.50× |
+| boot, wall | 12.2 s | 20.5 s | 1.69× |
+| boot, CPU | 209 s | 383 s | 1.83× |
+
+A second body per function costs half the module and two thirds of the
+boot. That is the bill for M7 and for setjmp, and it is affordable at this
+scale — which is the answer the item existed to get, and the number the
+rest of the setjmp design can now be priced against.
+
+Turning it on found two holes in the loud-error policy, both of the same
+shape: **the trap policy covered one of a function's two bodies.** A
+resume body that failed to translate, and a call-split graph that failed to
+build, each killed the whole bake rather than the function — which nothing
+had noticed because nothing had ever baked a container with resume on. Both
+are under the policy now, and a function whose graph cannot be split
+refuses *both* bodies rather than shipping an ordinary body whose call
+sites store sentinels: a thread blocking underneath one of those would have
+its frame chain stop early at a sentinel, silently, which is worse than a
+function that names itself and stops.
+
+And the design's premise is now observed rather than argued.
+`tests/dlopen.rs`'s thorn test used to assert the miss was on
+`RETURN_ADDRESS_SENTINEL`; it is now on `0x40000000e` — table slot 14,
+resume entry 4. The word `setjmp` saved really is a materialized
+continuation.
+
 **Not built, and not blocking:** the shadow GOT; `/etc/ld.so.cache`
 regeneration (nothing needed it, since the loader finds the files at the
 paths the bake placed them). **`dlopen` — untried, and it turned out to
@@ -2041,9 +2077,13 @@ paths stand between here and `import json`:
   the saved PC is already a continuation" — and it is assembly of
   existing parts: setjmp is ordinary code, longjmp is a tagged
   per-site constant, one arm in the exec-map miss path, a one-field
-  kernel row, and the existing leave/resume machinery. Until it is
-  built, the failure presents as an exec-map miss on the
-  saved-continuation value, and the spike triggers it once
+  kernel row, the degenerate boot loop, and the existing leave/resume
+  machinery. Its work item zero is real, though: the baker does not
+  yet build with resume on — the slots hold sentinels today — and
+  enabling it doubles the code section (a second body per function),
+  a cost M7 owes anyway and this brings forward, measured before the
+  rest is built. Until then, the failure presents as an exec-map miss
+  on the saved-continuation value, and the spike triggers it once
   deliberately so the shape is on record.
 
 The spike is a ladder, one question per rung, differential where a

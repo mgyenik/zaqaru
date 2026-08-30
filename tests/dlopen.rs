@@ -370,20 +370,22 @@ fn sweeping_an_image_with_nothing_in_it_changes_nothing() {
 }
 
 /// `dlopen` of something absent stops on the setjmp/longjmp thorn, and this
-/// records exactly how.
+/// records exactly how — which is now the *design's premise*, demonstrated.
 ///
-/// Not a test that a bug exists — a test of the *shape*, so that the day the
-/// thorn is designed away this fails and says so. `ld.so` reports a load
-/// failure by `longjmp`ing out of `_dl_catch_exception`, and `longjmp` jumps
-/// to the return address `setjmp` saved. In a translated program that slot
-/// holds `RETURN_ADDRESS_SENTINEL`, so the jump becomes an exec-map lookup
-/// on a value that is not an address at all.
+/// `ld.so` reports a load failure by `longjmp`ing out of
+/// `_dl_catch_exception`, and `longjmp` jumps to the return address `setjmp`
+/// saved. With the container pipeline building with `--resume`, that word is
+/// not a return address at all: it is the **resume ID** the call site stored,
+/// a materialized continuation saved by code that has no idea that is what
+/// it is doing. Which is the whole of `container-plan.md`'s setjmp design,
+/// observed rather than argued.
 ///
-/// Worth knowing before it is met in anger: it makes one whole class of
-/// ordinary failure — a library that is not there — present as a container
-/// death naming a nonsense address, rather than as the `dlerror` the program
-/// was written to handle. The happy path never longjmps, which is why the
-/// test above passes.
+/// So what this asserts is the *discrimination* the design turns on: the
+/// value that misses is not an address. A resume ID is a table slot in its
+/// low half and an entry index in its high one, so it is either a small
+/// integer or larger than any address a guest can hold — never in between,
+/// where code lives. When the design is built this stops being a miss at
+/// all, and this test is what says so.
 #[test]
 fn a_failed_dlopen_stops_on_the_longjmp_thorn() {
     let workspace = WorkingDirectory::new("dlopen-missing");
@@ -402,12 +404,31 @@ fn a_failed_dlopen_stops_on_the_longjmp_thorn() {
         report.contains("before\n"),
         "the program did not reach the `dlopen`:\n{report}"
     );
-    // And it stopped on the sentinel, which is the thorn's signature: a
-    // return address that was never an address.
+
+    // And it stopped on something that is not an address. The kernel names
+    // it in hexadecimal; pull it back out and check its shape.
+    let missed = report
+        .split("0x")
+        .filter_map(|rest| {
+            let digits: String = rest.chars().take_while(char::is_ascii_hexdigit).collect();
+            u64::from_str_radix(&digits, 16).ok().filter(|_| !digits.is_empty())
+        })
+        .find(|value| *value != 0)
+        .unwrap_or_else(|| panic!("the kernel named no address:\n{report}"));
+
     let sentinel = zaqaru::machine::RETURN_ADDRESS_SENTINEL as u64;
+    assert_ne!(
+        missed, sentinel,
+        "the saved return address is still the sentinel, so the container was \
+         built without `--resume` — which is work item zero of the setjmp \
+         design, not a property of `longjmp`:\n{report}"
+    );
+    // A slot alone, or a slot with an entry index above it. Nothing a guest
+    // could mistake for a function's address, which is what lets the miss
+    // path tell the two apart at no cost to the calls that hit.
     assert!(
-        report.contains(&format!("{sentinel:#x}")),
-        "the container stopped somewhere other than the saved return \
-         address, so this is not the thorn this test describes:\n{report}"
+        missed < 0x1_0000 || missed >= 1 << 32,
+        "{missed:#x} is in the range guest code lives in, so it is not a \
+         resume ID and this is a different failure:\n{report}"
     );
 }

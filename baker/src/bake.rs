@@ -130,6 +130,19 @@ pub fn container_with_invocation(
     // carries.
     let translation = zaqaru::transpile::Transpiler::new(&object)
         .with_untranslatable(zaqaru::transpile::Untranslatable::Trap)
+        // Checkpoint-resume, always. The build plan has said the container
+        // pipeline builds this way since M6 and the code did not, which
+        // nothing noticed because nothing yet blocks: it is M7's scheduler
+        // that needs a thread's frames to be a chain of resume IDs, and M7
+        // is not built. What brought the debt forward is `setjmp`, whose
+        // saved return address *is* one of those IDs — a materialized
+        // continuation stored by code that has no idea that is what it is
+        // doing — and which is the sentinel instead when resume is off. See
+        // `container-plan.md`'s setjmp section.
+        //
+        // The cost is a second body per function, measured rather than
+        // assumed; the worklog entry of 2026-08-30 carries the numbers.
+        .with_resume(true)
         .translate()
         .context("translating the program")?;
 
