@@ -34,6 +34,16 @@ impl Sink {
         Self::default()
     }
 
+    /// Puts a value where a guest will read it.
+    ///
+    /// A sink is normally something the guest fills and the host reads. This
+    /// is the other direction, and it is how the host answers a question the
+    /// guest asks — a configuration path is a mount whose content the
+    /// embedder decided.
+    pub fn place(&mut self, path: &[Vec<u8>], value: Vec<u8>) {
+        *self.slot(path) = value;
+    }
+
     fn slot(&mut self, path: &[Vec<u8>]) -> &mut Vec<u8> {
         if let Some(position) = self.entries.iter().position(|(key, _)| key == path) {
             return &mut self.entries[position].1;

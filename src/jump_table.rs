@@ -246,7 +246,7 @@ pub fn recover_all(object: &ObjectFile, functions: &mut [LiftedFunction]) -> Res
             if lifted.instruction.flow_control() != FlowControl::IndirectBranch {
                 continue;
             }
-            if let Some(candidate) = propose(object, function, position) {
+            if let Some(candidate) = propose(object, function, position, &boundaries) {
                 candidates.push((index, candidate));
             }
         }
@@ -282,7 +282,7 @@ pub fn recover_all(object: &ObjectFile, functions: &mut [LiftedFunction]) -> Res
             if lifted.instruction.flow_control() == FlowControl::IndirectBranch
                 && !function.jump_tables.contains_key(&position)
             {
-                reject_unrecognised_dispatch(object, function, position)?;
+                reject_unrecognised_dispatch(object, function, position, &boundaries)?;
             }
         }
     }
@@ -350,7 +350,12 @@ fn share_arm_spaces(function: &mut LiftedFunction) {
 ///
 /// Nearest matters: a function with two dispatches names both tables, and
 /// each loads the address of its own shortly beforehand.
-fn propose(object: &ObjectFile, function: &LiftedFunction, position: usize) -> Option<Candidate> {
+fn propose(
+    object: &ObjectFile,
+    function: &LiftedFunction,
+    position: usize,
+    boundaries: &std::collections::HashMap<usize, std::collections::BTreeSet<u64>>,
+) -> Option<Candidate> {
     let mut bases: Vec<u64> = Vec::new();
     for lifted in function.instructions[..=position].iter().rev() {
         // Every text address this instruction computes, kept for the entry
@@ -388,7 +393,7 @@ fn propose(object: &ObjectFile, function: &LiftedFunction, position: usize) -> O
                 .collect()
         };
         for (section, table_offset) in locations {
-            if holds_block_addresses(object, function, section, table_offset, &bases) {
+            if holds_block_addresses(object, function, section, table_offset, &bases, boundaries) {
                 return Some(Candidate {
                     position,
                     table_section: section,
@@ -436,13 +441,29 @@ fn absolute_operands(
     addresses.into_iter().filter(|address| *address != 0)
 }
 
-/// The data location a virtual address names, if it is in a data section.
+/// The data location a virtual address names, if it is in a data section a
+/// jump table could live in.
+///
+/// `.got` and `.got.plt` are excluded, and by the ABI rather than by
+/// heuristic: they are the linker's own indirection tables, written by the
+/// loader, and a `jmp` through one is a linkage stub's dispatch. Nothing a
+/// compiler emits as a `switch` lands there.
+///
+/// Excluding them is not merely tidiness. A `.got.plt` holds one entry per
+/// stub, each pointing at `stub + 6`, so read as a table its entries are a
+/// run of addresses inside the linkage section — the shape of a dispatch
+/// table exactly. What makes the exclusion safe is what makes it correct:
+/// a `jmp *GOT[n]` that recovers no table is translated as the indirect
+/// transfer it is, which resolves through the exec map. That is the
+/// cross-DSO call path the container plan calls the shadow GOT's generic
+/// fallback.
 fn data_at(object: &ObjectFile, address: u64) -> Option<(usize, u64)> {
     let (section, offset) = object.section_at(address)?;
-    object.sections[section]
-        .role
-        .is_data()
-        .then_some((section, offset))
+    let section_data = &object.sections[section];
+    if matches!(section_data.name.as_str(), ".got" | ".got.plt") {
+        return None;
+    }
+    section_data.role.is_data().then_some((section, offset))
 }
 
 /// Whether a data location begins a run of references to blocks *inside* this
@@ -454,17 +475,31 @@ fn holds_block_addresses(
     section: usize,
     offset: u64,
     bases: &[u64],
+    boundaries: &std::collections::HashMap<usize, std::collections::BTreeSet<u64>>,
 ) -> bool {
     if object.layout == Layout::Linked {
-        // Two entries in a row naming blocks inside this function, and
-        // neither of them its start: that is a dispatch table and not a
-        // function pointer, whichever form the entries turn out to be in.
+        // Two entries in a row naming blocks inside the body this function
+        // was cut from, and neither of them its start: that is a dispatch
+        // table and not a function pointer, whichever form the entries turn
+        // out to be in.
+        //
+        // *The body it was cut from*, not the piece. A `switch` whose arms
+        // are entered from elsewhere gets split at each of them, and then
+        // every arm is in a sibling piece — so asking about the piece finds
+        // nothing and the table is not recognised at all. What keeps the
+        // distinction from a vtable is unchanged: an array of function
+        // pointers names other functions' starts, which are outside this
+        // body whether or not it was cut.
+        let whole = &object.functions[function.function].whole;
         let table_address = object.sections[section].address + offset;
+        let starts = boundaries.get(&function.section);
         return entry_forms(table_address, bases).iter().any(|form| {
             (0..2).all(|index| {
                 read_linked_entry(object, section, offset + index * form.stride, *form)
                     .is_some_and(|target| {
-                        target != function.offset && begins_an_instruction(function, target)
+                        target != function.offset
+                            && whole.contains(&target)
+                            && starts.is_some_and(|starts| starts.contains(&target))
                     })
             })
         });
@@ -646,6 +681,7 @@ fn reject_unrecognised_dispatch(
     object: &ObjectFile,
     function: &LiftedFunction,
     position: usize,
+    boundaries: &std::collections::HashMap<usize, std::collections::BTreeSet<u64>>,
 ) -> Result<()> {
     if object.layout == Layout::Linked {
         // The same question, asked of bytes: does anything this dispatch
@@ -677,7 +713,7 @@ fn reject_unrecognised_dispatch(
                 let Some((section, offset)) = data_at(object, address) else {
                     continue;
                 };
-                if holds_block_addresses(object, function, section, offset, &bases) {
+                if holds_block_addresses(object, function, section, offset, &bases, boundaries) {
                     bail!(
                         "`{}` at {:#x} dispatches through what looks like a jump \
                          table in {}, but its entries could not be read; \

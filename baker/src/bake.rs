@@ -167,11 +167,17 @@ fn place(
         ..Default::default()
     };
     let node = tree.add(meta, crate::tree::Body::Regular(bytes));
-    let (directory, name) = tree
-        .place(path.as_bytes())
-        .with_context(|| format!("making room for {path} in the image"))?
-        .with_context(|| format!("{path} is not a path a file can go at"))?;
-    tree.link(directory, &name, node)
-        .with_context(|| format!("placing {path} in the image"))?;
+    // Every name the file answers to, all pointing at one node — which is
+    // one inode, one prelink base, and one translation. A distribution's
+    // `libz.so.1` and `libz.so.1.3` are the same library and must be the
+    // same library here.
+    for name in std::iter::once(path).chain(module.aliases.iter()) {
+        let (directory, leaf) = tree
+            .place(name.as_bytes())
+            .with_context(|| format!("making room for {name} in the image"))?
+            .with_context(|| format!("{name} is not a path a file can go at"))?;
+        tree.link(directory, &leaf, node)
+            .with_context(|| format!("placing {name} in the image"))?;
+    }
     Ok(())
 }

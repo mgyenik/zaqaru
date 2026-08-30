@@ -325,6 +325,18 @@ fn emit_dispatcher(
                 emit_conditional_leave(body, translator, lifted, index, graph)?;
                 transfer(body, not_taken, 0)?;
             }
+            // The mirror: taking the branch stays here, not taking it runs
+            // off the end into the function below.
+            Terminator::BranchOrFallOut { target, into } => {
+                let condition = graph.blocks[index]
+                    .terminating_instruction()
+                    .expect("a conditional block ends with its branch");
+                translator.branch_condition(body, &lifted.instructions[condition])?;
+                body.if_();
+                transfer(body, *target, 1)?;
+                body.end();
+                emit_falling_out(body, translator, *into)?;
+            }
             // Both edges leave: the branch tail-calls where it names, and
             // not taking it runs off the end into the function below.
             Terminator::ConditionalLeaveOrFallOut { into } => {
@@ -499,6 +511,21 @@ impl StructuredEmitter<'_> {
             }
             Terminator::ConditionalLeaveOrFallOut { into } => {
                 emit_conditional_leave(body, translator, self.lifted, block, self.graph)?;
+                emit_falling_out(body, translator, *into)
+            }
+            Terminator::BranchOrFallOut { target, into } => {
+                let destination = self.graph.block_at(*target)?;
+                let condition = self.graph.blocks[block]
+                    .terminating_instruction()
+                    .expect("a conditional block ends with its branch");
+                translator.branch_condition(body, &self.lifted.instructions[condition])?;
+                body.if_();
+                // The arm counts towards the branch depth exactly as the two
+                // arms of an ordinary conditional do.
+                self.context.push(ContextEntry::ConditionalArm);
+                self.emit_branch(body, translator, block, destination)?;
+                self.context.pop();
+                body.end();
                 emit_falling_out(body, translator, *into)
             }
             Terminator::Leaves => emit_leaving(body, translator, self.lifted, block, self.graph),

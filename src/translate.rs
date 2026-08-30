@@ -1057,12 +1057,29 @@ impl<'a> FunctionTranslator<'a> {
     /// The segment a memory operand is prefixed with, refusing any this
     /// translation cannot honour.
     ///
-    /// `%gs` is deliberately loud rather than approximated: nothing on this
-    /// path uses it, and a libc that reached for it would be a libc nothing
-    /// here has been tested against.
+    /// In 64-bit mode only `%fs` and `%gs` have a base at all: the
+    /// architecture forces `%cs`, `%ds`, `%es` and `%ss` to zero and ignores
+    /// their contents entirely, so a prefix naming one changes nothing about
+    /// the address. Reporting them as unsupported was refusing instructions
+    /// that mean exactly what they would without the prefix.
+    ///
+    /// It is not a corner. `notrack`, the control-flow-enforcement hint that
+    /// says an indirect branch need not land on an `endbr64`, is *encoded*
+    /// as a `%ds` prefix — so every `switch` in a control-flow-protected
+    /// non-position-independent binary carries one. On this machine's
+    /// `python3.12` that was 57 refused functions, each of them a jump table
+    /// that could not even be read, let alone recovered.
+    ///
+    /// `%gs` stays loud rather than approximated: it genuinely has a base,
+    /// nothing on this path uses it, and a libc that reached for one would
+    /// be a libc nothing here has been tested against.
     fn check_segment_prefix(instruction: &Instruction) -> Result<Register> {
         match instruction.segment_prefix() {
-            segment @ (Register::None | Register::FS) => Ok(segment),
+            Register::FS => Ok(Register::FS),
+            // Ignored, because the processor ignores them.
+            Register::None | Register::CS | Register::DS | Register::ES | Register::SS => {
+                Ok(Register::None)
+            }
             other => bail!(
                 "segment-prefixed memory operand ({other:?}) is out of scope; \
                  only `%fs` is translated"

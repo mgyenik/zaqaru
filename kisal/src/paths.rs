@@ -53,6 +53,21 @@ pub const TIME_MONOTONIC: &[&[u8]] = &[b"iso", b"time", b"monotonic_ns"];
 /// into one stream that nobody can separate afterwards.
 pub const LOG_ERROR: &[&[u8]] = &[b"iso", b"log", b"error"];
 
+/// Where a syscall trace goes when one is asked for.
+///
+/// Separate from the error log because it is a different kind of thing: the
+/// error log carries what went wrong, and this carries what happened. A run
+/// that succeeds writes nothing to the first and everything to the second.
+pub const LOG_DEBUG: &[&[u8]] = &[b"iso", b"log", b"debug"];
+
+/// Whether to trace. Read once, at the first syscall.
+///
+/// A mount rather than a flag, because the kernel has no other channel: the
+/// host interface is the store, so a question the host wants to answer is a
+/// path the host mounts. A container whose embedder mounts nothing here
+/// traces nothing and pays one failed read for the privilege.
+pub const CONFIG_TRACE: &[&[u8]] = &[b"iso", b"config", b"trace"];
+
 /// Where the exit status goes when the process is finished.
 ///
 /// A path rather than a return value because the host reaches the container

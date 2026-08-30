@@ -119,6 +119,24 @@ pub mod number {
     pub const LREMOVEXATTR: i64 = 198;
     pub const FREMOVEXATTR: i64 = 199;
 
+    /// Which argument of a syscall is a path, for a trace that says what
+    /// happened rather than where a pointer was.
+    ///
+    /// Only the ones a container's own diagnosis needs. An entry missing
+    /// here costs a hex number in a log line; a wrong one would print
+    /// whatever some other argument pointed at, so the list is short and
+    /// checked rather than long and assumed.
+    pub fn path_argument(number: i64) -> Option<usize> {
+        Some(match number {
+            OPEN | ACCESS | STAT | LSTAT | READLINK | CHDIR | UNLINK | RMDIR | MKDIR
+            | TRUNCATE | CHMOD | GETXATTR | LGETXATTR | SETXATTR | LSETXATTR | LISTXATTR
+            | LLISTXATTR | REMOVEXATTR | LREMOVEXATTR => 0,
+            OPENAT | NEWFSTATAT | STATX | READLINKAT | FACCESSAT | FACCESSAT2 | UNLINKAT
+            | MKDIRAT | FCHMODAT | UTIMENSAT => 1,
+            _ => return None,
+        })
+    }
+
     /// The name of a syscall number, for the loud error. Exhaustive over
     /// what the design doc's traces contain, and honest — an unrecognised
     /// number prints as its number, never as a guess.

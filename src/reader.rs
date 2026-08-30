@@ -384,6 +384,7 @@ impl ObjectFile {
             Layout::Relocatable => 0,
         };
         let evidence = crate::discover::FileEvidence {
+            base,
             entry,
             relocated: harvest_relocation_targets(&file, base),
         };

@@ -57,6 +57,18 @@ pub struct Function {
     /// Whether the *extent* above is something the file said or something
     /// this pass worked out. See [`Extent`].
     pub extent: Extent,
+    /// The extent of the function this one was cut from, which is its own
+    /// when nothing cut it.
+    ///
+    /// Splitting is how a function with several entries becomes several
+    /// functions, and it loses something on the way: that the pieces were
+    /// one body. Jump-table recovery needs that back. Its test for "is this
+    /// data a dispatch table rather than an array of function pointers" is
+    /// that the entries name places *inside the dispatching function* — and
+    /// after a split the arms of a `switch` are in sibling pieces, so the
+    /// test fails and every split `switch` in the program goes unrecovered.
+    /// CPython's `_Py_HashBytes` is one; there are dozens.
+    pub whole: std::ops::Range<u64>,
 }
 
 /// Where a function's extent came from, which is a different question from
@@ -329,6 +341,14 @@ impl Coverage {
 /// Both are strong: the format defines what they mean, and neither is an
 /// inference about what code looks like.
 pub struct FileEvidence {
+    /// The base the file was read at.
+    ///
+    /// Needed because a pointer *stored in data* is a link-time address in
+    /// a position-independent file — the loader adds the base when it
+    /// applies the relocation — so every scan that reads one has to add it
+    /// too. Zero for a fixed executable, whose stored pointers are already
+    /// the addresses they name.
+    pub base: u64,
     /// `e_entry` — the one address the kernel is defined to transfer to.
     /// Normally `_start` is found through its symbol or its frame entry, and
     /// a stripped binary with an unwind hole is obliged to provide neither.
@@ -358,7 +378,7 @@ pub fn discover(
     // questions below — which uncovered addresses are functions, and which
     // guessed extents ran past one.
     let tables = match layout {
-        Layout::Linked => data_array_targets(sections),
+        Layout::Linked => data_array_targets(sections, evidence.base),
         Layout::Relocatable => std::collections::BTreeSet::new(),
     };
     // Every address weak evidence names, whether or not something already
@@ -379,7 +399,7 @@ pub fn discover(
             coverage.establish(sections, function);
         }
 
-        let arrays = initialiser_array_targets(sections);
+        let arrays = initialiser_array_targets(sections, evidence.base);
         for function in placements(&coverage, sections, &arrays, Witness::InitialiserArray) {
             coverage.establish(sections, function);
         }
@@ -540,6 +560,7 @@ fn collect_functions(
             size,
             witness: Witness::Symbol,
             extent,
+            whole: symbol.offset..symbol.offset + size,
         });
     }
     functions.sort_by_key(|function| (function.section, function.offset));
@@ -571,6 +592,20 @@ fn collect_functions(
         if coverage.overlaps(section, offset..offset + length) {
             continue;
         }
+        // A linkage table's stubs share one unwind entry describing the
+        // whole section, because they share one frame layout — which is a
+        // statement about unwinding and not about where functions are. The
+        // ABI already says what those bytes are: stubs, at the section's
+        // stated stride, and that is the finer and correct answer.
+        //
+        // Taking the entry at face value makes the whole `.plt` one function
+        // several kilobytes long, and then `.got.plt` — whose entries all
+        // point at `stub + 6` — reads as a run of addresses inside it, which
+        // is indistinguishable from a jump table. python3.12 refuses to
+        // translate at all without this.
+        if is_linkage_table(&sections[section].name) {
+            continue;
+        }
         discovered.push(Function {
             // Named after where it is, since nothing named it.
             name: format!("fn.{address:#x}"),
@@ -581,6 +616,7 @@ fn collect_functions(
             witness: Witness::UnwindEntry,
             // An unwind entry states how long the function is.
             extent: Extent::Stated,
+            whole: offset..offset + length,
         });
     }
     for function in discovered {
@@ -616,6 +652,7 @@ fn collect_functions(
                     // length is that function's length.
                     extent: Extent::Stated,
                     witness: Witness::FileStated,
+                    whole: 0..section.bytes.len() as u64,
                 },
             );
         }
@@ -662,6 +699,7 @@ fn collect_functions(
                     // long a stub is.
                     extent: Extent::Stated,
                     witness: Witness::LinkageTable,
+                    whole: offset..offset + stride,
                 });
             }
         }
@@ -755,7 +793,7 @@ fn next_boundary(
 /// Matched by name because that is what this reader carries; the section
 /// *type* would be the stronger test, and these names are fixed by the ABI
 /// rather than by convention.
-fn initialiser_array_targets(sections: &[Section]) -> std::collections::BTreeSet<u64> {
+fn initialiser_array_targets(sections: &[Section], base: u64) -> std::collections::BTreeSet<u64> {
     let mut targets = std::collections::BTreeSet::new();
     for section in sections {
         if !matches!(
@@ -769,7 +807,7 @@ fn initialiser_array_targets(sections: &[Section]) -> std::collections::BTreeSet
             // A null entry is a slot the linker left empty, which each of
             // these arrays is allowed to contain.
             if address != 0 {
-                targets.insert(address);
+                targets.insert(address + base);
             }
         }
     }
@@ -832,7 +870,7 @@ fn addressed_placements(
 /// implements stride eight, which is what evidence shows, and the
 /// struct-stride generalisation waits for a binary that needs it — where it
 /// will arrive with a case rather than with a guess about one.
-fn data_array_targets(sections: &[Section]) -> std::collections::BTreeSet<u64> {
+fn data_array_targets(sections: &[Section], base: u64) -> std::collections::BTreeSet<u64> {
     /// A pointer, and the stride of a bare array of them.
     const STRIDE: usize = 8;
     /// Below this, a run is a coincidence rather than a table.
@@ -865,7 +903,13 @@ fn data_array_targets(sections: &[Section]) -> std::collections::BTreeSet<u64> {
                     section.bytes[cursor..cursor + STRIDE]
                         .try_into()
                         .expect("eight bytes"),
-                );
+                )
+                // What is stored is the link-time address; the loader adds
+                // the base. Reading one without adding it looks at the
+                // wrong part of the address space entirely, which in a
+                // shared object means every entry misses and the whole
+                // witness silently finds nothing.
+                .wrapping_add(base);
                 match code.iter().any(|range| range.contains(&value)) {
                     true => run.push(value),
                     false => break,
@@ -1158,6 +1202,7 @@ fn placements(
                 // Bounded by whatever begins next, which is a bound rather
                 // than a fact — every candidate placed here is revisable.
                 extent: Extent::Guessed,
+                whole: *offset..end,
             });
         }
     }
@@ -1505,6 +1550,9 @@ fn split_once(
                 } else {
                     Witness::InteriorEntry
                 },
+                // Every piece remembers the body it came out of, which is
+                // what jump-table recovery asks about.
+                whole: function.whole.clone(),
                 // A piece inherits its parent's standing. A piece of
                 // something the file stated the length of is still bounded
                 // by that statement — cutting it further on weak evidence
@@ -1580,6 +1628,7 @@ mod tests {
             size,
             witness,
             extent: Extent::Stated,
+            whole: offset..offset + size,
         }
     }
 

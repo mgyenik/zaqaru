@@ -44,6 +44,18 @@ pub enum Terminator {
     /// instruction of one piece, and its fall-through is the first byte of
     /// the next.
     ConditionalLeaveOrFallOut { into: u64 },
+    /// A conditional branch *into* the function, whose untaken path leaves:
+    /// taken to `target`, otherwise off the end into the function beginning
+    /// at `into`.
+    ///
+    /// The mirror of the two above, and splitting is what makes it too. A
+    /// piece cut in front of another piece can end with the loop-closing
+    /// branch of a loop wholly inside it — the branch goes backwards, which
+    /// is internal, and the fall-through is the first byte of the piece
+    /// below. CPython's `_PyRuntimeState_Init` is the case that found it:
+    /// nine iterations of an initialiser loop, and the `jne` closing it is
+    /// the last instruction of its piece.
+    BranchOrFallOut { target: u64, into: u64 },
     /// A `ret`, or a tail jump to another function — including an indirect
     /// one — which the translator turns into a call followed by a return.
     Leaves,
@@ -163,6 +175,13 @@ impl ControlFlowGraph {
                 .iter()
                 .filter_map(|offset| self.index_of_start.get(offset).copied())
                 .collect(),
+            // Only the taken edge stays here; the other leaves.
+            Terminator::BranchOrFallOut { target, .. } => self
+                .index_of_start
+                .get(target)
+                .copied()
+                .into_iter()
+                .collect(),
             Terminator::Leaves => Vec::new(),
         }
     }
@@ -233,6 +252,9 @@ impl ControlFlowGraph {
                 Terminator::Branch { target, not_taken } => {
                     graph.block_at(*target)?;
                     graph.block_at(*not_taken)?;
+                }
+                Terminator::BranchOrFallOut { target, .. } => {
+                    graph.block_at(*target)?;
                 }
                 // None of these names a block in this function: one stops,
                 // and the others leave for the function below.
@@ -667,6 +689,18 @@ fn classify_terminator(
                     .collect(),
             },
             None => Terminator::Leaves,
+        };
+    }
+    // A conditional branch that stays inside the function but whose
+    // fall-through does not. Checked before the internal case, which would
+    // otherwise name a block that is not in this function at all.
+    if is_internal_branch(lifted, function)
+        && instruction.flow_control() == FlowControl::ConditionalBranch
+        && !function.contains(block_end)
+    {
+        return Terminator::BranchOrFallOut {
+            target: canonical_target(function, instruction.near_branch64()),
+            into: block_end,
         };
     }
     if is_internal_branch(lifted, function) {

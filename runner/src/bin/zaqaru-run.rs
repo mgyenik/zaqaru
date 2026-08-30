@@ -13,15 +13,37 @@
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
+    let mut path = None;
+    let mut trace = None;
     let mut arguments = std::env::args().skip(1);
-    let Some(path) = arguments.next() else {
-        eprintln!("usage: zaqaru-run <container.wasm>");
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "-h" | "--help" => {
+                println!("usage: zaqaru-run <container.wasm> [--trace <file>]");
+                return ExitCode::SUCCESS;
+            }
+            // A syscall trace, in the shape `strace` prints. The guest is
+            // told to produce one by the presence of a mount, which is the
+            // only channel there is: the host interface is the store, so a
+            // question the host wants answered is a path the host mounts.
+            "--trace" => match arguments.next() {
+                Some(where_to) => trace = Some(where_to),
+                None => {
+                    eprintln!("zaqaru-run: `--trace` needs a file to write to");
+                    return ExitCode::from(2);
+                }
+            },
+            other if other.starts_with('-') => {
+                eprintln!("zaqaru-run: unknown option `{other}`");
+                return ExitCode::from(2);
+            }
+            other => path = Some(other.to_string()),
+        }
+    }
+    let Some(path) = path else {
+        eprintln!("usage: zaqaru-run <container.wasm> [--trace <file>]");
         return ExitCode::from(2);
     };
-    if path == "-h" || path == "--help" {
-        println!("usage: zaqaru-run <container.wasm>");
-        return ExitCode::SUCCESS;
-    }
 
     let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
@@ -31,7 +53,18 @@ fn main() -> ExitCode {
         }
     };
 
-    let mut container = match runner::Container::instantiate(&bytes, mounts()) {
+    let mut table = mounts();
+    if trace.is_some() {
+        let mut config = runner::store::Sink::new();
+        // The whole path: a mount table hands its store the path the guest
+        // asked for, not the part after the prefix.
+        config.place(
+            &[b"iso".to_vec(), b"config".to_vec(), b"trace".to_vec()],
+            b"1".to_vec(),
+        );
+        table.mount(&[b"iso", b"config"], Box::new(config));
+    }
+    let mut container = match runner::Container::instantiate(&bytes, table) {
         Ok(container) => container,
         Err(error) => {
             eprintln!("zaqaru-run: {error:?}");
@@ -46,6 +79,17 @@ fn main() -> ExitCode {
     // to report the failure would be the wrong half.
     print!("{}", console(&mut container, b"stdout"));
     eprint!("{}", console(&mut container, b"stderr"));
+
+    if let Some(where_to) = &trace {
+        let lines = read(&mut container, &[b"iso", b"log", b"debug"]);
+        match std::fs::write(where_to, lines.as_bytes()) {
+            Ok(()) => eprintln!(
+                "zaqaru-run: wrote {} syscalls to {where_to}",
+                lines.lines().count()
+            ),
+            Err(error) => eprintln!("zaqaru-run: writing {where_to}: {error}"),
+        }
+    }
 
     match status {
         Ok(status) => ExitCode::from(status.clamp(0, 255) as u8),

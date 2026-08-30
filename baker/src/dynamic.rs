@@ -158,7 +158,19 @@ pub struct Module {
     /// Where it goes in the image, which is where the loader will look for
     /// it — so it is the path the loader would have used, not a name of our
     /// choosing.
+    ///
+    /// **The name it was found by, not the file it resolves to.** A
+    /// distribution's libraries are a symlink farm: `DT_NEEDED` says
+    /// `libz.so.1` and the file is `libz.so.1.3`, and an image holding only
+    /// the second is an image where the loader's search fails. Which it
+    /// does silently as far as any syscall is concerned — the `openat`
+    /// returns `ENOENT` exactly as it would for a library that really is
+    /// absent.
     pub path: String,
+    /// Other names the same file answers to, placed as further links to one
+    /// inode. The canonical path, when it differs, so that a library naming
+    /// the real file finds it too.
+    pub aliases: Vec<String>,
     pub bytes: Vec<u8>,
     /// Whether it is the executable, the interpreter, or a library. Only
     /// the first two are named by the boot path.
@@ -190,6 +202,7 @@ pub fn closure(program: &Path, root: &Path) -> Result<Vec<Module>> {
         // whose name in the image is ours to choose, because nothing looks
         // it up by name.
         path: "/init".to_string(),
+        aliases: Vec::new(),
         bytes,
         role: Role::Executable,
     }];
@@ -201,10 +214,11 @@ pub fn closure(program: &Path, root: &Path) -> Result<Vec<Module>> {
         let (real, bytes) = read_under(root, &path)
             .with_context(|| format!("the interpreter `{path}` this program names"))?;
         placed.insert(path.clone());
-        placed.insert(real);
+        placed.insert(real.clone());
         let inner = needs(&bytes)?;
         queue.push((Vec::new(), inner.search.clone()));
         modules.push(Module {
+            aliases: alias(&path, &real),
             path,
             bytes,
             role: Role::Interpreter,
@@ -223,11 +237,16 @@ pub fn closure(program: &Path, root: &Path) -> Result<Vec<Module>> {
         let mut next = Vec::new();
         for (name, search) in pending.drain(..) {
             let name = String::from_utf8_lossy(&name).into_owned();
-            let (path, bytes) = find(root, &name, &search)
+            let (path, real, bytes) = find(root, &name, &search)
                 .with_context(|| format!("the library `{name}` this program needs"))?;
-            if !placed.insert(path.clone()) {
+            // Deduplicated by the *file*, not by the name: two libraries
+            // naming `libz.so.1` and `libz.so.1.3` want one translation at
+            // one base, and translating the same code twice would put two
+            // sets of exec-map entries at two addresses for one library.
+            if !placed.insert(real.clone()) {
                 continue;
             }
+            placed.insert(path.clone());
             let inner = needs(&bytes)?;
             next.extend(
                 inner
@@ -236,6 +255,7 @@ pub fn closure(program: &Path, root: &Path) -> Result<Vec<Module>> {
                     .map(|name| (name.clone(), inner.search.clone())),
             );
             modules.push(Module {
+                aliases: alias(&path, &real),
                 path,
                 bytes,
                 role: Role::Library,
@@ -269,16 +289,25 @@ fn read_under(root: &Path, path: &str) -> Result<(String, Vec<u8>)> {
     Ok((real, bytes))
 }
 
+/// The canonical path as a second name, when it is a different one.
+fn alias(path: &str, real: &str) -> Vec<String> {
+    match path == real {
+        true => Vec::new(),
+        false => std::vec![real.to_string()],
+    }
+}
+
 fn under(root: &Path, path: &str) -> PathBuf {
     root.join(path.trim_start_matches('/'))
 }
 
 /// Finds a library by the name `DT_NEEDED` recorded, in the order the loader
 /// searches: `DT_RUNPATH` first, then the default directories.
-fn find(root: &Path, name: &str, search: &[Vec<u8>]) -> Result<(String, Vec<u8>)> {
+fn find(root: &Path, name: &str, search: &[Vec<u8>]) -> Result<(String, String, Vec<u8>)> {
     // A name with a slash in it is a path, not a name to search for.
     if name.contains('/') {
-        return read_under(root, name);
+        let (real, bytes) = read_under(root, name)?;
+        return Ok((name.to_string(), real, bytes));
     }
     let directories = search
         .iter()
@@ -291,7 +320,10 @@ fn find(root: &Path, name: &str, search: &[Vec<u8>]) -> Result<(String, Vec<u8>)
         }
         let path = format!("{}/{name}", directory.trim_end_matches('/'));
         if under(root, &path).exists() {
-            return read_under(root, &path);
+            let (real, bytes) = read_under(root, &path)?;
+            // The searched path first: it is the name the loader will look
+            // for at run time, and so the name the image must answer to.
+            return Ok((path, real, bytes));
         }
         looked.push(path);
     }

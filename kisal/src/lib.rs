@@ -109,8 +109,27 @@ pub unsafe extern "C" fn kisal_syscall(
     // Whatever the previous syscall was handed by the host is dead now. The
     // arena's lifetime is one call, which is what stops the boundary leaking.
     abi::reset_transfer_arena();
+    let arguments = [a1, a2, a3, a4, a5, a6];
     let outcome = with_kernel(|kernel| {
-        match kernel.dispatch(number, Arguments::new([a1, a2, a3, a4, a5, a6])) {
+        let answer = kernel.dispatch(number, Arguments::new(arguments));
+        let rendered = match &answer {
+            Outcome::Done(value) => {
+                let mut text = String::new();
+                push_decimal(&mut text, *value);
+                text
+            }
+            Outcome::Fault(_) => String::from("<fault>"),
+            Outcome::Blocked => String::from("<blocked>"),
+            Outcome::Exit(status) => {
+                let mut text = String::from("<exit ");
+                push_decimal(&mut text, i64::from(*status));
+                text.push('>');
+                text
+            }
+        };
+        let line = traced(kernel, number, &arguments, &rendered);
+        trace(kernel, &line);
+        match answer {
             Outcome::Done(value) => Ok(value),
             Outcome::Fault(fault) => {
                 let mut message = String::new();
@@ -143,6 +162,139 @@ pub unsafe extern "C" fn kisal_syscall(
     match outcome {
         Ok(value) => value,
         Err(message) => panic!("{message}"),
+    }
+}
+
+/// Whether this container is tracing its syscalls, decided once.
+///
+/// `None` until the first syscall asks, because the store is not reachable
+/// before the kernel exists and the answer cannot change afterwards.
+static mut TRACING: Option<bool> = None;
+
+/// Writes one line of syscall trace, if a trace was asked for.
+///
+/// Deliberately after the call rather than before it: what a syscall did is
+/// the interesting half, and a line that appears only when the call returns
+/// also marks the one that did not. The format is the strace shape on
+/// purpose — the M6 oracle is a diff against a real `strace`, and a format
+/// that has to be translated first is a format that will disagree in ways
+/// nobody can attribute.
+fn trace(kernel: &mut Kernel<'_, HostStore, GuestMachine>, line: &str) {
+    // SAFETY: one instance, one thread of execution, and this is reached
+    // only from inside `with_kernel`, which is what serialises it.
+    let tracing = unsafe {
+        match TRACING {
+            Some(tracing) => tracing,
+            None => {
+                let mut answer = Vec::new();
+                let asked = kernel.store.read(paths::CONFIG_TRACE, &mut answer)
+                    == abi::StoreOutcome::Present
+                    && answer.first().is_some_and(|byte| *byte != b'0');
+                TRACING = Some(asked);
+                asked
+            }
+        }
+    };
+    if tracing {
+        let _ = kernel.store.write(paths::LOG_DEBUG, line.as_bytes());
+    }
+}
+
+/// Renders one syscall the way `strace` would.
+///
+/// The path argument is printed as the path, which is the difference
+/// between a trace and a hex dump: "openat(AT_FDCWD, "/lib/libm.so.6") = -2"
+/// says what happened, and the same line with a pointer in it says only that
+/// something did not open. Every diagnosis this instrument was built for
+/// needs the string.
+fn traced(
+    kernel: &mut Kernel<'_, HostStore, GuestMachine>,
+    number: i64,
+    arguments: &[i64; 6],
+    outcome: &str,
+) -> String {
+    let mut line = String::new();
+    match syscall::number::name(number) {
+        Some(name) => line.push_str(name),
+        None => {
+            line.push_str("syscall_");
+            push_decimal(&mut line, number);
+        }
+    }
+    line.push('(');
+    let names_a_path = syscall::number::path_argument(number);
+    for (index, argument) in arguments.iter().enumerate() {
+        if index > 0 {
+            line.push_str(", ");
+        }
+        match names_a_path == Some(index) {
+            true => push_guest_string(kernel, &mut line, *argument as u64),
+            false => push_hex(&mut line, *argument as u64),
+        }
+    }
+    line.push_str(") = ");
+    line.push_str(outcome);
+    line.push('\n');
+    line
+}
+
+/// Renders a NUL-terminated string out of guest memory, quoted.
+///
+/// Bounded, because this is a diagnostic reading whatever a pointer happens
+/// to hold: a run of bytes that never terminates is truncated rather than
+/// walked to the end of memory.
+fn push_guest_string(
+    kernel: &mut Kernel<'_, HostStore, GuestMachine>,
+    into: &mut String,
+    at: u64,
+) {
+    /// Longer than any path a container can hold, and short enough that a
+    /// wild pointer costs nothing.
+    const LIMIT: u64 = 256;
+    if at == 0 {
+        into.push_str("NULL");
+        return;
+    }
+    let memory = kernel.memory();
+    let length = (0..LIMIT)
+        .find(|offset| match memory.check(at + offset, 1) {
+            // SAFETY: the byte was just bounds-checked.
+            Ok(()) => unsafe { memory.slice(at + offset, 1) }
+                .map(|bytes| bytes[0] == 0)
+                .unwrap_or(true),
+            Err(_) => true,
+        })
+        .unwrap_or(LIMIT);
+    into.push('"');
+    // SAFETY: every byte up to `length` was bounds-checked above.
+    if let Ok(bytes) = unsafe { memory.slice(at, length) } {
+        for byte in bytes {
+            match byte.is_ascii_graphic() || *byte == b' ' {
+                true => into.push(*byte as char),
+                false => into.push('?'),
+            }
+        }
+    }
+    into.push('"');
+}
+
+fn push_decimal(into: &mut String, value: i64) {
+    if value < 0 {
+        into.push('-');
+    }
+    let mut digits = [0u8; 20];
+    let mut length = 0;
+    let mut left = value.unsigned_abs();
+    loop {
+        digits[length] = b'0' + (left % 10) as u8;
+        length += 1;
+        left /= 10;
+        if left == 0 {
+            break;
+        }
+    }
+    for index in (0..length).rev() {
+        into.push(digits[index] as char);
     }
 }
 
@@ -206,8 +358,29 @@ pub unsafe extern "C" fn kisal_boot() -> i32 {
         true => &[b"/init"],
         false => &recorded,
     };
+    // Eager binding, always. `_dl_runtime_resolve` is the function lazy
+    // binding calls on the first use of every imported symbol, and it is the
+    // hairiest assembly in userspace — it saves the whole vector register
+    // file with `xsave`, an instruction family that should never be on any
+    // path here. Binding everything at load means it is never called, which
+    // is why the three `xsave` refusals every container carries are
+    // harmless.
+    //
+    // **This is the lesser of the two mechanisms `container-plan.md` names,
+    // and it has a cost the other does not.** The design's primary is
+    // `DF_1_NOW` in each module's `.dynamic`, set by the bake; this variable
+    // is its backup. The variable works — ld.so reads it once at start-up
+    // and it covers every object loaded — but it is *visible to the guest*,
+    // which `.dynamic` is not: a program that reads its own environment sees
+    // a variable no native run would have, and M6's acceptance is a diff
+    // against a native `strace`.
+    //
+    // So this is a shortcut with a recorded price rather than an equivalent.
+    // What makes it safe meanwhile is that nothing here should bind lazily
+    // and the guest does not choose its own initial environment.
+    let environment: [&[u8]; 1] = [b"LD_BIND_NOW=1"];
     let program = with_kernel(|kernel| {
-        kernel.exec(b"/init", argv, &[]).map_err(|error| {
+        kernel.exec(b"/init", argv, &environment).map_err(|error| {
             let mut message = String::new();
             error.message(&mut message);
             report(kernel, &message);
