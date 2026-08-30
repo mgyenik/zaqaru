@@ -1604,7 +1604,10 @@ milestones.
 
 ### Not yet built
 
-- The acceptance ladder. `tests/boot.rs` runs a *corpus* program end to
+- The acceptance ladder's second rung. The first — busybox `echo`, `cat`
+  and `ls` — is green (`tests/applet_multiplexer.rs`); what Python still
+  needs has an appendix of its own at the end of this document.
+  `tests/boot.rs` runs a *corpus* program end to
   end — a real one, with a hand-written `_start`, argv and auxv read off
   the stack, and an exit status out through the store — but not musl
   BusyBox and not CPython.
@@ -1745,3 +1748,117 @@ libraries should work by the same path); `/etc/ld.so.cache` regeneration
 (nothing needed it, since the loader finds the files at the paths the bake
 placed them). **Not measured:** breadth. Three dynamic files read closely
 and fifteen more through a parse spike is not a population.
+
+## Appendix — M6's second checkpoint: what Python still needs (appended 2026-08-29)
+
+M6's acceptance ladder is "musl BusyBox `echo`/`cat`/`ls` first, then
+`python -c 'print("hello")'`". The first rung is green — on the
+distribution's own stripped static busybox rather than a musl build, since
+the dynamic tier arrived early and made that unnecessary. This is the state
+of the second rung and the work between here and it.
+
+The target is `/usr/bin/python3.12` as shipped: a **non-PIE dynamically
+linked** executable with five libraries. That shape was chosen over a
+musl-static CPython because the dynamic tier now exists and the distribution
+binary is the more honest input; the plan's original musl-static route
+remains available and is *smaller in surface*, which is the trade recorded
+in the dynamic-tier appendix above.
+
+### What is proven
+
+Measured, not assumed:
+
+| | |
+| --- | --- |
+| bake | 2.7s — 79,945 functions across six modules |
+| container | 91 MB |
+| refusals | 5, three of them reachable |
+| boot | `ld.so` runs, finds, maps and relocates all five libraries |
+| reached | CPython's own interpreter initialisation, 75 syscalls in |
+
+So the loader, the multi-library closure, the prelink round-trip, the
+cross-module exec map, and the whole of the dynamic tier are not the
+problem. What remains is inside CPython.
+
+### 1. A `switch` whose arms are in sibling pieces — *blocking*
+
+`_Py_HashBytes` is siphash, and its tail is `switch (len & 7)`. The table is
+recovered correctly — eight arms, eight-byte entries — but two of the arms
+lie outside the piece that dispatches, because the body was split at a
+direct branch into its middle. `emit_switch` emits an out-of-function arm as
+a tail call, which needs a function to begin exactly at the arm; none does,
+because arms are *indirect* targets and splitting cuts on direct branches.
+
+**The shape of the problem is ordering.** Jump-table recovery needs decoded
+instructions, so it runs after discovery; discovery is what decides where
+functions begin. An arm cannot be a cut point because nothing knows it is an
+arm until after the cutting is done.
+
+Three routes, in the order they are worth trying:
+
+- **(a) Iterate.** After `recover_all`, collect every arm that is not a
+  function start, feed them back into discovery as cut points, re-split and
+  re-lift. A recovered table's arm is evidence of the same grade as a direct
+  branch — the dispatch provably transfers there — so it may cut a *stated*
+  extent, which is what this case needs. Bounded like the other fixpoints.
+  The cost is a second lift of everything, which for python is seconds.
+
+  The risk to watch: recovery's own test asks whether entries land inside
+  the body a piece was cut from, so re-splitting can change what is
+  recovered. It has to settle, and the round limit has to be a real bound
+  rather than a hope.
+
+- **(b) Enter the sibling piece mid-body.** Wasm cannot branch into the
+  middle of another function — but a *resume body* is a dispatcher over
+  blocks and is enterable at any of them, which is exactly the mechanism
+  `docs/code-discovery.md` names for interior addresses of covered
+  functions. An out-of-function arm becomes a call into the containing
+  piece's resume body at that block. More general than (a) and it serves the
+  interior-address case as well; it needs resume graphs to carry entries at
+  arbitrary block starts rather than only at call sites.
+
+- **(c) Do not split a function that has a jump table.** Circular, and
+  recorded so nobody re-derives it: knowing which functions have tables is
+  the thing that requires the split to have already happened.
+
+The data-array witness is *not* a route. The table is 8 consecutive text
+pointers within 0x228 bytes, so D5's cluster rule refuses it — correctly:
+that rule is what keeps `_PyEval_EvalFrameDefault`'s 256 computed-goto
+labels from shredding the eval loop, and the two cases are
+indistinguishable from the data alone. What separates them is whether the
+enclosing body was split, which is a fact about discovery's output rather
+than about the table.
+
+### 2. The standard library — untested
+
+`python -c 'print(1)'` imports `encodings` before it runs anything, so the
+image needs `/usr/lib/python3.12`: 54 MB of it, against the 91 MB container
+that has none. Nothing here has baked an image of that size, and two things
+about it are unmeasured rather than expected to fail — bake time and the
+engine's compile time for a module that large.
+
+Two pieces of work fall out of it:
+
+- **The bake records `argv` and does not record `envp`.** `PYTHONHOME` and
+  `PYTHONPATH` are how an interpreter is told where its library is, and
+  there is currently no way to say so. The command-line region of the image
+  index is the obvious place, and it was built to hold exactly this.
+- **`LD_BIND_NOW=1` is injected into the environment**, which is the lesser
+  of the two mechanisms this plan's design doc names. It works and it is
+  visible to the guest, where `DF_1_NOW` in each module's `.dynamic` would
+  not be — and M6's acceptance is a diff against a native `strace`, in which
+  a fabricated environment variable is a divergence. Setting `DF_1_NOW` at
+  bake is the replacement.
+
+### 3. Everything after that is unknown, and the instrument exists now
+
+Beyond the two items above, what CPython needs is not predictable from here
+and should not be guessed at: the last four failures were each diagnosed
+wrongly by inspection and correctly by measurement. `zaqaru-run --trace`
+writes a syscall log in `strace`'s shape, with path arguments rendered as
+paths, and every remaining failure should be met with it before any theory.
+
+That trace is also the M6 acceptance item the plan already carries — "the
+strace-diff harness graduates to the real oracle" — half-built: the guest
+side produces the log, and nothing yet diffs it against a native run with
+addresses and fd numbers normalised.
