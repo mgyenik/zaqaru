@@ -2834,8 +2834,22 @@ What reproduces it deterministically is an instruction that continues
 followed by an opcode that does not exist in 64-bit mode — `0x06` — and the
 fixture says why it is built that way rather than copied.
 
-It is excluded from the relocatable breadth sweep, and the reason is the
-address-space split rather than a gap: in a `gcc -c` object an address in a
-text section is a function's table index or it is nothing, so taking the
-address of a table that lives in `.text` has no wasm spelling. The exclusion
-list now carries two categories instead of one.
+It is excluded from the relocatable breadth sweep, and the reason wants
+stating precisely because I first stated it too grandly. In a `gcc -c`
+object the assembler resolves `lea sbox(%rip)` itself — same section, known
+distance — so no relocation survives, and a text-section address's only wasm
+spelling is a function's table index. The refusal is correct.
+
+But **that collision is the fixture's and not a real input's.** The shapes it
+reproduces are real: `libcrypto.so.3` keeps Te0 in `.text` at `0xb66c0` and
+takes its address from two `lea`s (`b5c82` and `b613d`), and `RC4_options`
+states 208 bytes of which the last 64 are its strings. Both refused the
+*bake*, in linked mode, with "undecodable bytes" — a different error
+entirely. Nothing has ever produced the relocatable refusal except a corpus
+source written for the linked tier and swept as a relocatable one, and
+little could: compilers put constants in `.rodata`, so it takes hand-written
+assembly, and hand-written assembly arrives here inside linked libraries.
+
+The exclusion list now carries two categories instead of one, with that
+distinction written into it rather than the design's out-of-scope clause,
+which is real but was not what was happening.

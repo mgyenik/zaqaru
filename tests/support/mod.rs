@@ -619,14 +619,25 @@ pub fn corpus_signatures(name: &str) -> zaqaru::abi::SignatureTable {
 ///   nothing a container runs will ever legitimately execute — a stable
 ///   stand-in for whatever the gap list holds this week.
 /// - **Something that only means anything linked.** `data_in_text.s` takes
-///   the address of a table that lives *in* `.text`, which is what
-///   hand-written assembly does and what `libcrypto` is full of. In a
-///   relocatable object that address has no wasm spelling at all: an address
-///   in a text section is a function's table index or it is nothing, which
-///   is the address-space split `docs/design.md` opens with. The refusal is
-///   correct and says so. What the source is for is the *linked* pipeline,
-///   where the same bytes are an extent question — `tests/data_in_text.rs`
-///   is where it is tested, in all three of its claims.
+///   the address of a table that lives *in* `.text`. In a relocatable object
+///   the assembler resolves that reference itself — same section, known
+///   distance — so no relocation survives, and the transpiler is left with a
+///   text-section address whose only wasm spelling is a function's table
+///   index. `0x10` is not a function, so it refuses, correctly and by the
+///   address-space split `docs/design.md` opens with.
+///
+///   **This collision is the fixture's, not a real input's**, and the
+///   distinction is worth keeping straight. The shapes it reproduces are
+///   real and measured — `libcrypto.so.3` keeps AES's Te0 table in `.text`
+///   at `0xb66c0` and takes its address from two `lea`s, and `RC4_options`
+///   states a size that spans the strings it returns — but libcrypto is a
+///   *linked* shared object, where a text address is an address and all of
+///   it works. Nothing has produced this refusal except a corpus source
+///   written for the linked tier and swept as a relocatable one, and
+///   nothing much could: compilers put constants in `.rodata`, so it takes
+///   hand-written assembly, and hand-written assembly arrives here inside
+///   linked libraries. `tests/data_in_text.rs` is where the source is
+///   tested, in the pipeline it was written for.
 pub const DELIBERATELY_UNTRANSLATABLE: [&str; 3] = [
     "untranslatable.s",
     "calls_untranslatable.s",
