@@ -34,13 +34,24 @@
 //! xattrs    per-inode blocks referencing the strings region
 //! modules   sorted (inode, prelink base) pairs, one per translated ELF
 //! command   the boot command line: NUL-separated argument strings
+//! environ   the boot environment: NUL-separated `NAME=value` strings
 //! ```
 //!
-//! The command line is a region rather than a file because it is a fact
-//! about the container and not part of the guest's filesystem — the same
-//! argument the process-and-thread model makes about `/iso`, which the
-//! guest cannot see either. The baker owns what it says; an empty region
-//! means the default.
+//! The command line and the environment are regions rather than files
+//! because they are facts about the container and not part of the guest's
+//! filesystem — the same argument the process-and-thread model makes about
+//! `/iso`, which the guest cannot see either. An OCI image config carries
+//! `Env` beside `Cmd` for the same reason. The baker owns what they say; an
+//! empty region means the default.
+//!
+//! The environment is not decoration. A program that cannot read `HOME`
+//! does not fail — it takes a different path: CPython falls through
+//! `posixpath.expanduser` into `pwd.getpwuid`, which is glibc's NSS, which
+//! probes nscd over `AF_UNIX`. Measured on this machine, `python3 -c
+//! 'print("hello")'` opens two sockets and reads `/etc/passwd` with an empty
+//! environment and neither with `HOME` set. A container with no environment
+//! is not a container with a smaller syscall surface; it is one with a
+//! different and larger surface than the run it will be diffed against.
 //!
 //! The modules region is small on purpose. A prelink base is a fact about
 //! the handful of files that are translated ELFs, not about every inode, so
@@ -51,9 +62,9 @@
 
 /// `KISI` — kisal image.
 pub const MAGIC: u32 = u32::from_le_bytes(*b"KISI");
-pub const VERSION: u32 = 3;
+pub const VERSION: u32 = 4;
 
-pub const HEADER_SIZE: usize = 64;
+pub const HEADER_SIZE: usize = 72;
 /// Fixed and packed: `stat` is `inode_offset + index * INODE_SIZE`.
 pub const INODE_SIZE: usize = 64;
 pub const DIRENT_SIZE: usize = 12;
@@ -248,25 +259,35 @@ pub struct DirectoryEntry {
 }
 
 /// The index's region table.
-#[derive(Clone, Copy, Debug)]
-struct Header {
-    inode_count: u32,
-    inode_offset: u32,
-    dirent_offset: u32,
-    dirent_size: u32,
-    string_offset: u32,
-    string_size: u32,
-    xattr_offset: u32,
-    xattr_size: u32,
-    root_inode: u32,
+///
+/// Public, and written through by name rather than by position. The writer
+/// used to take fourteen bare `u32`s in a row and the reader unpacked them
+/// by offset, which is a shape where adding a region means adding a
+/// fifteenth argument to a call whose arguments are indistinguishable from
+/// one another — and where transposing two of them produces an index that
+/// parses and describes a different filesystem. There is no way to write
+/// that mistake now.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Header {
+    pub inode_count: u32,
+    pub inode_offset: u32,
+    pub dirent_offset: u32,
+    pub dirent_size: u32,
+    pub string_offset: u32,
+    pub string_size: u32,
+    pub xattr_offset: u32,
+    pub xattr_size: u32,
+    pub root_inode: u32,
     /// How many bytes of blob the index describes. The index's own length is
     /// derivable from the regions; the blob's is not, and a module that
     /// carries both as bare symbols has no other way to learn it.
-    blob_size: u32,
-    module_offset: u32,
-    module_count: u32,
-    command_offset: u32,
-    command_size: u32,
+    pub blob_size: u32,
+    pub module_offset: u32,
+    pub module_count: u32,
+    pub command_offset: u32,
+    pub command_size: u32,
+    pub environment_offset: u32,
+    pub environment_size: u32,
 }
 
 /// A baked image: the index and the blob its regular files live in.
@@ -312,6 +333,8 @@ impl<'a> Image<'a> {
             module_count: word(index, 52),
             command_offset: word(index, 56),
             command_size: word(index, 60),
+            environment_offset: word(index, 64),
+            environment_size: word(index, 68),
         };
 
         // Validate the regions once, here, so that everything after is an
@@ -332,6 +355,11 @@ impl<'a> Image<'a> {
                 (header.module_count as u64) * (MODULE_SIZE as u64),
             ),
             ("command", header.command_offset, header.command_size as u64),
+            (
+                "environment",
+                header.environment_offset,
+                header.environment_size as u64,
+            ),
         ] {
             let end = (offset as u64)
                 .checked_add(size)
@@ -395,6 +423,25 @@ impl<'a> Image<'a> {
         region
             .split(|byte| *byte == 0)
             .filter(|argument| !argument.is_empty())
+    }
+
+    /// The environment the bake recorded: `NAME=value`, in order.
+    ///
+    /// Empty when the bake said nothing. See the module header for why a
+    /// container without one is not merely a container with less: it takes
+    /// different paths through its own libraries.
+    pub fn environment(&self) -> impl Iterator<Item = &'a [u8]> {
+        let region = self
+            .index
+            .get(
+                self.header.environment_offset as usize
+                    ..self.header.environment_offset as usize
+                        + self.header.environment_size as usize,
+            )
+            .unwrap_or(&[]);
+        region
+            .split(|byte| *byte == 0)
+            .filter(|entry| !entry.is_empty())
     }
 
     /// The base the bake placed a translated ELF at, if this inode is one.
@@ -604,40 +651,25 @@ fn long(bytes: &[u8], at: usize) -> u64 {
 
 /// Writes an index header. Here rather than in the baker for the same reason
 /// [`Inode::write`] is: one definition, so a round trip is a real check.
-#[allow(clippy::too_many_arguments)]
-pub fn write_header(
-    into: &mut [u8; HEADER_SIZE],
-    inode_count: u32,
-    inode_offset: u32,
-    dirent_offset: u32,
-    dirent_size: u32,
-    string_offset: u32,
-    string_size: u32,
-    xattr_offset: u32,
-    xattr_size: u32,
-    root_inode: u32,
-    blob_size: u32,
-    module_offset: u32,
-    module_count: u32,
-    command_offset: u32,
-    command_size: u32,
-) {
+pub fn write_header(into: &mut [u8; HEADER_SIZE], header: &Header) {
     into[0..4].copy_from_slice(&MAGIC.to_le_bytes());
     into[4..8].copy_from_slice(&VERSION.to_le_bytes());
-    into[8..12].copy_from_slice(&inode_count.to_le_bytes());
-    into[12..16].copy_from_slice(&inode_offset.to_le_bytes());
-    into[16..20].copy_from_slice(&dirent_offset.to_le_bytes());
-    into[20..24].copy_from_slice(&dirent_size.to_le_bytes());
-    into[24..28].copy_from_slice(&string_offset.to_le_bytes());
-    into[28..32].copy_from_slice(&string_size.to_le_bytes());
-    into[32..36].copy_from_slice(&xattr_offset.to_le_bytes());
-    into[36..40].copy_from_slice(&xattr_size.to_le_bytes());
-    into[40..44].copy_from_slice(&root_inode.to_le_bytes());
-    into[44..48].copy_from_slice(&blob_size.to_le_bytes());
-    into[48..52].copy_from_slice(&module_offset.to_le_bytes());
-    into[52..56].copy_from_slice(&module_count.to_le_bytes());
-    into[56..60].copy_from_slice(&command_offset.to_le_bytes());
-    into[60..64].copy_from_slice(&command_size.to_le_bytes());
+    into[8..12].copy_from_slice(&header.inode_count.to_le_bytes());
+    into[12..16].copy_from_slice(&header.inode_offset.to_le_bytes());
+    into[16..20].copy_from_slice(&header.dirent_offset.to_le_bytes());
+    into[20..24].copy_from_slice(&header.dirent_size.to_le_bytes());
+    into[24..28].copy_from_slice(&header.string_offset.to_le_bytes());
+    into[28..32].copy_from_slice(&header.string_size.to_le_bytes());
+    into[32..36].copy_from_slice(&header.xattr_offset.to_le_bytes());
+    into[36..40].copy_from_slice(&header.xattr_size.to_le_bytes());
+    into[40..44].copy_from_slice(&header.root_inode.to_le_bytes());
+    into[44..48].copy_from_slice(&header.blob_size.to_le_bytes());
+    into[48..52].copy_from_slice(&header.module_offset.to_le_bytes());
+    into[52..56].copy_from_slice(&header.module_count.to_le_bytes());
+    into[56..60].copy_from_slice(&header.command_offset.to_le_bytes());
+    into[60..64].copy_from_slice(&header.command_size.to_le_bytes());
+    into[64..68].copy_from_slice(&header.environment_offset.to_le_bytes());
+    into[68..72].copy_from_slice(&header.environment_size.to_le_bytes());
 }
 
 /// The total length of an index whose header is `header`.
@@ -667,6 +699,7 @@ pub fn index_length(header: &[u8]) -> Result<usize, ImageError> {
         word(header, 32) as u64 + word(header, 36) as u64,
         word(header, 48) as u64 + word(header, 52) as u64 * (MODULE_SIZE as u64),
         word(header, 56) as u64 + word(header, 60) as u64,
+        word(header, 64) as u64 + word(header, 68) as u64,
     ]
     .into_iter()
     .max()

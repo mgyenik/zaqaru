@@ -25,6 +25,7 @@ fn main() -> Result<()> {
     let mut output: Option<PathBuf> = None;
     let mut root: Option<PathBuf> = None;
     let mut argv: Vec<Vec<u8>> = Vec::new();
+    let mut envp: Vec<Vec<u8>> = Vec::new();
     let mut arguments = arguments.iter();
     while let Some(argument) = arguments.next() {
         // Everything after `--` is the guest's command line, not ours.
@@ -43,10 +44,19 @@ fn main() -> Result<()> {
                     arguments.next().context("`--root` needs a path after it")?,
                 ));
             }
+            "-e" | "--env" => {
+                let entry = arguments
+                    .next()
+                    .context("`--env` needs a `NAME=value` after it")?;
+                if !entry.contains('=') {
+                    bail!("`--env {entry}` is not a `NAME=value`");
+                }
+                envp.push(entry.as_bytes().to_vec());
+            }
             "-h" | "--help" => {
                 println!(
                     "usage: zaqaru-bake <program> [-o <container.wasm>] \
-                     [--root <directory>] [-- <argv>...]"
+                     [--root <directory>] [--env NAME=value]... [-- <argv>...]"
                 );
                 return Ok(());
             }
@@ -54,33 +64,46 @@ fn main() -> Result<()> {
             other => program = Some(PathBuf::from(other)),
         }
     }
-    let program = program
-        .context("usage: zaqaru-bake <program> [-o <container.wasm>] [--root <directory>]")?;
+    let program = program.context(
+        "usage: zaqaru-bake <program> [-o <container.wasm>] [--root <directory>] \
+         [--env NAME=value]...",
+    )?;
     let output = output.unwrap_or_else(|| program.with_extension("wasm"));
 
     // The filesystem the container will have, before the translated files
     // go into it.
+    //
+    // A `--root` tree is read where it is. An earlier version copied it into
+    // the workspace first, and the copy was both pointless and lossy: the
+    // translated files are placed into the *in-memory* tree, so nothing was
+    // ever written back to it — while `std::fs::copy` follows symlinks, so
+    // an image built from a real root filesystem arrived with every symlink
+    // replaced by a copy of its target, and with a dangling one refusing the
+    // bake outright. A root filesystem is a symlink farm (`/lib`, every
+    // versioned `.so`, and CPython's own `config-*/libpython3.12.so`, which
+    // dangles by design), and `Tree::from_directory` already reads symlinks,
+    // hardlinks, device nodes and fifos faithfully. The copy stood between
+    // it and the truth.
     let workspace = tempdir(&output)?;
-    let image_root = workspace.join("image");
-    std::fs::create_dir_all(&image_root).context("creating the image tree")?;
-    match &root {
-        Some(source) => copy_tree(source, &image_root)
-            .with_context(|| format!("copying {} into the image", source.display()))?,
+    let tree = match &root {
+        Some(source) => baker::tree::Tree::from_directory(source)
+            .with_context(|| format!("reading {} as the image tree", source.display()))?,
         None => {
             // A program with no filesystem cannot open a file, and the first
             // thing an ordinary one does is write a temporary. Directories
             // rather than files: what goes in them is the guest's business,
             // and the overlay is what makes them writable.
+            let image_root = workspace.join("image");
             for directory in ["tmp", "var", "var/tmp", "home", "dev", "proc", "etc"] {
                 std::fs::create_dir_all(image_root.join(directory))
                     .with_context(|| format!("creating /{directory} in the image"))?;
             }
+            baker::tree::Tree::from_directory(&image_root).context("reading the image tree")?
         }
-    }
-    let tree = baker::tree::Tree::from_directory(&image_root).context("reading the image tree")?;
+    };
 
     let search = root.clone().unwrap_or_else(|| PathBuf::from("/"));
-    let baked = baker::bake::container_with_command(&program, &search, tree, &argv)?;
+    let baked = baker::bake::container_with_invocation(&program, &search, tree, &argv, &envp)?;
     if !argv.is_empty() {
         eprintln!(
             "zaqaru-bake: command line: {}",
@@ -100,6 +123,15 @@ fn main() -> Result<()> {
                 .iter()
                 .map(|(path, base)| format!("\n  {base:#012x}  {path}"))
                 .collect::<String>()
+        );
+    }
+    if !envp.is_empty() {
+        eprintln!(
+            "zaqaru-bake: environment: {}",
+            envp.iter()
+                .map(|entry| String::from_utf8_lossy(entry).into_owned())
+                .collect::<Vec<_>>()
+                .join(" ")
         );
     }
     if !baked.refused.is_empty() {
@@ -143,20 +175,6 @@ fn main() -> Result<()> {
 /// choice this will have to give up when it bakes a real distribution image:
 /// a libc's `.so` symlink farm is not decoration. It is enough for a tree
 /// someone assembled to run one program.
-fn copy_tree(from: &Path, to: &Path) -> Result<()> {
-    std::fs::create_dir_all(to)?;
-    for entry in std::fs::read_dir(from)? {
-        let entry = entry?;
-        let target = to.join(entry.file_name());
-        if entry.file_type()?.is_dir() {
-            copy_tree(&entry.path(), &target)?;
-        } else {
-            std::fs::copy(entry.path(), &target)?;
-        }
-    }
-    Ok(())
-}
-
 /// A scratch directory beside the output, so that the intermediate objects
 /// are somewhere a failed bake can be looked at.
 fn tempdir(output: &Path) -> Result<PathBuf> {

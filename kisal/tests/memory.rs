@@ -773,6 +773,71 @@ fn a_file_mapping_holds_the_files_bytes() {
     assert_eq!(fixture.bytes(buffer as u64, 4), &expected[..4]);
 }
 
+/// Mapping a file the bake did not translate as executable is refused, by
+/// name.
+///
+/// The AOT deal, at the one place it can be enforced. An executable mapping
+/// of an untranslated file promises to run code that does not exist in this
+/// module — there is no interpreter to fall back to and no way to translate
+/// at run time — so the honest answer is to stop here, where the fault names
+/// the mapping, rather than at the first call into it, where it names an
+/// address with no story.
+///
+/// It is tested here and not in the differential because Linux simply
+/// succeeds: this is kisal's policy rather than a conformance question, and
+/// a differential could only report it as a divergence. The corpus's own
+/// loader-carving case maps its text `PROT_READ` for exactly this reason,
+/// and says so.
+#[test]
+fn an_executable_mapping_of_an_untranslated_file_is_refused() {
+    let mut fixture = fixture("exec-map");
+    let fd = fixture.open("/etc/patterned");
+    let outcome = fixture.kernel.dispatch(
+        number::MMAP,
+        Arguments::new([
+            0,
+            PAGE,
+            (prot::READ | prot::EXEC) as i64,
+            map::PRIVATE as i64,
+            fd,
+            0,
+        ]),
+    );
+    let mut message = String::new();
+    match outcome {
+        Outcome::Fault(fault) => fault.message(&mut message),
+        other => panic!("an executable mapping of a data file was allowed: {other:?}"),
+    }
+    assert!(
+        message.contains("mmap") && message.contains("did not translate"),
+        "the refusal does not name what it refused: {message}"
+    );
+
+    // The same mapping without `PROT_EXEC` is fine, which is what makes the
+    // refusal about the protection rather than about the file.
+    let mapped = fixture.call(
+        number::MMAP,
+        [0, PAGE, prot::READ as i64, map::PRIVATE as i64, fd, 0],
+    );
+    assert!(mapped > 0, "a readable mapping of the same file failed");
+
+    // And an *anonymous* executable mapping is allowed: there is no file
+    // whose code might be missing, and a guest that wants one gets the
+    // bookkeeping the threat model already describes.
+    let anonymous = fixture.call(
+        number::MMAP,
+        [
+            0,
+            PAGE,
+            (prot::READ | prot::EXEC) as i64,
+            (map::PRIVATE | map::ANONYMOUS) as i64,
+            -1,
+            0,
+        ],
+    );
+    assert!(anonymous > 0, "an anonymous executable mapping was refused");
+}
+
 /// A mapping that runs past the end of the file reads as zeros there, which
 /// is what Linux guarantees for the tail of the last page.
 #[test]
@@ -816,12 +881,24 @@ fn the_loader_carving_sequence_lands_the_right_bytes() {
 
     // Then each segment over it, at its own file offset — the second page
     // as text, the third as read-only data.
+    //
+    // The middle segment is carved writable rather than executable, and
+    // that is the half of ld.so's sequence this fixture can honestly
+    // represent: an executable mapping of a file the bake did not translate
+    // is a named refusal — see
+    // `an_executable_mapping_of_an_untranslated_file_is_refused`, which owns
+    // that rule — while the writable data segment is the one a real loader
+    // genuinely re-copies, and the one whose protection differs from its
+    // neighbours' so that the shape below can tell them apart. A real
+    // loader carving a real module maps text executable and is answered,
+    // because the module *was* translated; `tests/dynamic_boot.rs` runs
+    // exactly that.
     let text = fixture.call(
         number::MMAP,
         [
             extent + PAGE,
             PAGE,
-            (prot::READ | prot::EXEC) as i64,
+            (prot::READ | prot::WRITE) as i64,
             (map::PRIVATE | map::FIXED) as i64,
             fd,
             PAGE,
@@ -861,7 +938,7 @@ fn the_loader_carving_sequence_lands_the_right_bytes() {
         shape,
         vec![
             (0, PAGE as u64, prot::READ),
-            (PAGE as u64, PAGE as u64, prot::READ | prot::EXEC),
+            (PAGE as u64, PAGE as u64, prot::READ | prot::WRITE),
             (2 * PAGE as u64, PAGE as u64, prot::READ),
         ]
     );
@@ -1096,16 +1173,21 @@ fn proc_self_maps_renders_the_tree_as_it_stands() {
     let fd = fixture.open("/etc/patterned");
     let file = fixture.call(
         number::MMAP,
-        [
-            0,
-            PAGE,
-            (prot::READ | prot::EXEC) as i64,
-            map::PRIVATE as i64,
-            fd,
-            PAGE,
-        ],
+        [0, PAGE, prot::READ as i64, map::PRIVATE as i64, fd, PAGE],
     );
     assert!(file > 0);
+    // Executable *afterwards*, which is the only way this kernel reaches an
+    // `r-xp` file line for a file the bake did not translate: `mmap` refuses
+    // that protection on such a file by name, and `mprotect` records
+    // whatever it is asked for and enforces nothing, exactly as the design
+    // says. So the state is reachable, and the rendering has to describe it.
+    assert_eq!(
+        fixture.call(
+            number::MPROTECT,
+            [file, PAGE, (prot::READ | prot::EXEC) as i64, 0, 0, 0]
+        ),
+        0
+    );
 
     let rendered = fixture.maps();
     let lines: Vec<&str> = rendered.lines().collect();

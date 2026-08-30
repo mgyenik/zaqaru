@@ -126,7 +126,21 @@ fn the_memory_rows_match_the_real_kernel() {
                 runner::Container::instantiate(&bytes, m1_mounts()).expect("instantiate");
             container
                 .call_guest("guest_memory", [1, 0, 0, 0, 0, 0])
-                .unwrap_or_else(|error| panic!("[{label}] the guest trapped: {error:?}"));
+                .unwrap_or_else(|error| {
+                    // The kernel names what stopped it, and a backtrace with
+                    // the name withheld is an afternoon: every other
+                    // container test reads this and this one did not.
+                    let log = container
+                        .mounts()
+                        .read(&[b"iso".to_vec(), b"log".to_vec(), b"error".to_vec()])
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default();
+                    panic!(
+                        "[{label}] the guest trapped: {error:?}\nkernel log: {}",
+                        String::from_utf8_lossy(&log)
+                    )
+                });
 
             let report = container
                 .mounts()

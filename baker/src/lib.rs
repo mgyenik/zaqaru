@@ -77,25 +77,48 @@ pub fn bake_tree(tree: &tree::Tree) -> Result<Image> {
 }
 
 /// The same, recording the command line the container boots with.
-///
-/// The arguments are a fact about the container rather than part of its
-/// filesystem, so they go in the index beside the other things the guest
-/// cannot see. An empty list leaves kisal at its default invocation.
 pub fn bake_tree_with_command(tree: &tree::Tree, argv: &[Vec<u8>]) -> Result<Image> {
+    bake_tree_with_invocation(tree, argv, &[])
+}
+
+/// The same, recording the environment as well.
+///
+/// Both are facts about the container rather than parts of its filesystem,
+/// so they go in the index beside the other things the guest cannot see —
+/// which is also how an OCI image config carries `Cmd` and `Env`. An empty
+/// list leaves kisal at its default.
+pub fn bake_tree_with_invocation(
+    tree: &tree::Tree,
+    argv: &[Vec<u8>],
+    envp: &[Vec<u8>],
+) -> Result<Image> {
     let mut builder = Builder::default();
-    for argument in argv {
-        if argument.contains(&0) {
-            bail!(
-                "the argument `{}` contains a NUL, which is not something an \
-                 argument can contain",
-                String::from_utf8_lossy(argument)
-            );
-        }
-        builder.command.extend_from_slice(argument);
-        builder.command.push(0);
-    }
+    builder.command = joined("argument", argv)?;
+    builder.environment = joined("environment entry", envp)?;
     let root = builder.add_node(tree, tree::ROOT)?;
     builder.finish(root)
+}
+
+/// NUL-separated, refusing an entry that contains one.
+///
+/// The region's own length is the end, so a NUL inside an entry would split
+/// it into two — which is exactly what an argument or an environment entry
+/// cannot survive, and exactly what a caller assembling one from untrusted
+/// bytes might hand over.
+fn joined(what: &str, entries: &[Vec<u8>]) -> Result<Vec<u8>> {
+    let mut joined = Vec::new();
+    for entry in entries {
+        if entry.contains(&0) {
+            bail!(
+                "the {what} `{}` contains a NUL, which is not something it \
+                 can contain",
+                String::from_utf8_lossy(entry)
+            );
+        }
+        joined.extend_from_slice(entry);
+        joined.push(0);
+    }
+    Ok(joined)
 }
 
 /// An image with nothing in it but a root directory.
@@ -140,6 +163,8 @@ struct Builder {
     by_node: HashMap<tree::NodeId, u32>,
     /// The boot command line, NUL-separated.
     command: Vec<u8>,
+    /// The boot environment, NUL-separated `NAME=value` strings.
+    environment: Vec<u8>,
 }
 
 impl Builder {
@@ -430,13 +455,14 @@ impl Builder {
         let xattr_offset = string_offset + self.strings.len();
         let module_offset = xattr_offset + self.xattrs.len();
         let command_offset = module_offset + module_records.len();
+        let environment_offset = command_offset + self.command.len();
 
         // Every region's extent is a `u32` in the index, so a bake that
         // overflows one has to fail rather than record a length modulo 2^32 —
         // which would validate against a shorter blob and read zeros for
         // every file above the wrap. A rootfs over four gigabytes is routine
         // for the images this is aimed at.
-        let total = command_offset + self.command.len();
+        let total = environment_offset + self.environment.len();
         for (what, size) in [
             ("the file contents", blob.len()),
             ("the directory entries", dirents.len()),
@@ -456,20 +482,24 @@ impl Builder {
         let mut header = [0u8; HEADER_SIZE];
         image::write_header(
             &mut header,
-            self.inodes.len() as u32,
-            inode_offset as u32,
-            dirent_offset as u32,
-            dirents.len() as u32,
-            string_offset as u32,
-            self.strings.len() as u32,
-            xattr_offset as u32,
-            self.xattrs.len() as u32,
-            root,
-            blob.len() as u32,
-            module_offset as u32,
-            modules.len() as u32,
-            command_offset as u32,
-            self.command.len() as u32,
+            &image::Header {
+                inode_count: self.inodes.len() as u32,
+                inode_offset: inode_offset as u32,
+                dirent_offset: dirent_offset as u32,
+                dirent_size: dirents.len() as u32,
+                string_offset: string_offset as u32,
+                string_size: self.strings.len() as u32,
+                xattr_offset: xattr_offset as u32,
+                xattr_size: self.xattrs.len() as u32,
+                root_inode: root,
+                blob_size: blob.len() as u32,
+                module_offset: module_offset as u32,
+                module_count: modules.len() as u32,
+                command_offset: command_offset as u32,
+                command_size: self.command.len() as u32,
+                environment_offset: environment_offset as u32,
+                environment_size: self.environment.len() as u32,
+            },
         );
         index.extend_from_slice(&header);
         for pending in &self.inodes {
@@ -482,6 +512,7 @@ impl Builder {
         index.extend_from_slice(&self.xattrs);
         index.extend_from_slice(&module_records);
         index.extend_from_slice(&self.command);
+        index.extend_from_slice(&self.environment);
 
         Ok(Image { blob, index })
     }

@@ -2513,3 +2513,140 @@ That is the build plan's Python appendix item 2, reached rather than
 predicted. Worth noting against that appendix: it found its `stdlib dir`
 from the compiled-in prefix without `PYTHONHOME`, so the environment
 question really is secondary to placing the tree.
+
+## 2026-08-30 — `python3 -c 'print("hello")'`, and the red tests that were there all along
+
+M6's acceptance ladder, second rung. The distribution's own
+`/usr/bin/python3.12` — non-PIE, dynamically linked, five libraries — baked
+with its whole standard library and run under wasmtime:
+
+    $ zaqaru-bake /usr/bin/python3.12 --root pyroot \
+        --env HOME=/root --env PATH=/usr/bin:/bin --env LANG=C.UTF-8 \
+        -o pyhello.wasm -- /usr/bin/python3.12 -c 'print("hello")'
+    $ zaqaru-run pyhello.wasm
+    hello
+
+Byte-identical to the same binary run natively with the same environment,
+exit 0, 494 syscalls. Six modules, 81,714 functions, 371 refusals, none of
+them reached.
+
+### The two unmeasured quantities, measured
+
+The build plan's Python appendix named them: bake time and the engine's
+compile time for an image of that size. Both are non-issues.
+
+| | |
+| --- | --- |
+| image tree | 58 MB (54 MB of `/usr/lib/python3.12`) |
+| bake | 4.0 s |
+| container | 153 MB |
+| boot, including wasmtime compiling the module | 5.9 s wall (1 m 40 s CPU) |
+
+### What stood between here and there
+
+**The eval loop's dispatch, then the tokenizer's.** Both recorded in the
+entry above and the one before it; the rule ended up as *two entries
+anywhere in the run that are blocks, at least one inside the dispatching
+body*, where a block is an instruction boundary that is not where some body
+begins. It took three attempts, each corrected by a binary rather than by
+argument:
+
+1. "the first two entries, inside this body" — rejected the eval loop,
+   whose entry zero is in its cold twin.
+2. "two anywhere in the run, inside this body" — rejected the tokenizer's
+   six-arm dispatch, five of whose arms are in a cold region.
+3. "any entry that is a body start disqualifies" — rejected three of the
+   four dispatches in `unicode_compare_eq`, each of which has a cold arm
+   that discovery gave a function of its own, beginning exactly at the arm.
+
+An array of function pointers is told apart by holding *nothing but* body
+starts, not by holding one.
+
+**A table nobody recognised was being overwritten.** The worst of the lot,
+because it had no symptom. `table_limit` bounded each table by the next
+*recognised* one, so a 19-arm table in `.rodata` was read as 25 and swallowed
+the tokenizer's six-arm table — whose entries were then rewritten as arms of
+the first one's space. The second dispatch, still unrecognised, read a
+rewritten entry and jumped into the middle of `.rodata`. Now every address an
+indirect jump reads its target from bounds the table before it, recognised or
+not; and two recovered tables that overlap are a build-time refusal, because
+the failure they cause has no other symptom.
+
+**A descriptor is an `int`** — the entry above. **`rt_sigaction` records**,
+which is the build plan's own M6/M10 split: CPython installs its handlers
+before it evaluates a line. `tgkill` now consults the disposition, so
+`SIG_IGN` is ignored and a signal with a handler is a named fault rather
+than a plausible death.
+
+**The environment.** `python -c` with no `HOME` does not fail — it takes a
+different path: `expanduser` falls through to `pwd.getpwuid`, which is
+glibc's NSS, which probes nscd over `AF_UNIX`. Measured natively: with
+`HOME` set, zero socket calls; with an empty environment, two and a read of
+`/etc/passwd`. So a container with no environment has a *larger* surface
+than the run it will be diffed against, not a smaller one. The image index
+grew an environment region beside its command line (version 4), and
+`zaqaru-bake --env NAME=value` records it. `LD_BIND_NOW=1` goes first now,
+so a bake that records its own wins.
+
+Two things fell out of that. The index header is written through a named
+struct rather than as fourteen bare `u32`s in a row — adding a fifteenth
+argument to that call was how a wrong image gets built silently, and one
+caller already passed `xattr_offset, 0, 0, 0` where only counting told you
+which zero was `root_inode`. And **`zaqaru-bake --root` no longer copies the
+tree**: the copy was pointless (the translated files go into the in-memory
+tree, so nothing was written back) and lossy (`std::fs::copy` follows
+symlinks, so an image built from a real root filesystem arrived with every
+symlink replaced by a copy of its target, and a dangling one refused the
+bake outright). A root filesystem is a symlink farm; `Tree::from_directory`
+already read them faithfully and the copy stood in front of it.
+
+### Three tests that were red before any of this, and are not now
+
+Found by running every target rather than the ones I had touched. All three
+were the same collision: the dynamic tier made `mmap(PROT_EXEC)` of a file
+the bake did not translate a named refusal, and M5's loader-carving fixtures
+still asked for exactly that.
+
+- `tests/corpus/memory.c`'s carving sequence and
+  `kisal/tests/memory.rs::the_loader_carving_sequence_lands_the_right_bytes`
+  now carve the *writable* segment, which is the half of ld.so's sequence a
+  data fixture can honestly represent and the one whose protection differs
+  from its neighbours', so the shape assertion still bites.
+- `proc_self_maps_renders_the_tree_as_it_stands` reaches `r-xp` on a file
+  line through `mprotect` afterwards, which is the only way this kernel
+  reaches that state for an untranslated file — `mmap` refuses it and
+  `mprotect` records whatever it is asked, exactly as the design says.
+- The refusal itself had no test at all. It has one now, in the kernel's own
+  suite rather than in a differential, because Linux simply succeeds: this
+  is kisal's policy, not a conformance question.
+
+And `tests/memory_differential.rs` did not print the kernel log on a trap,
+which every other container test does. Its backtrace named `kisal_syscall`
+and nothing else; the log named the mapping in one line.
+
+### One real gap the new corpus exposed in the *relocatable* path
+
+`cold_switch.s` swept as a `gcc -c` object and was refused, because the
+relocatable recogniser had the same hot/cold weakness the linked one had
+just lost — it asked whether the *first* relocation named a block inside the
+dispatching function. Both branches now ask the same question.
+
+Fixing it surfaced a latent silent bug beside it: a relocatable table's
+targets are section offsets carried without a section, and `resolve_entry`
+did not check which section a relocation resolved into. An arm in
+`.text.unlikely` — where gcc puts cold blocks in a relocatable object —
+would have had its offset read against `.text` and branched somewhere
+arbitrary. Such an arm is not representable until targets carry their
+section; stopping the run is the honest answer, and it is now what happens.
+
+### Where it stops
+
+`import json` — the first line of any real script — dlopens
+`lib-dynload/_json.cpython-312-x86_64-linux-gnu.so` and gets the named AOT
+fault, exactly where the build plan's dlopen appendix says it will:
+
+    kisal: unimplemented syscall mmap (9): an executable mapping of a file
+    the bake did not translate, whose code therefore does not exist in this
+    module
+
+That is the next rung, and its design and spike ladder are already written.

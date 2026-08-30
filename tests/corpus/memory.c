@@ -254,11 +254,25 @@ long guest_memory(long out, const char *prefix) {
 
 		/* The loader's carving sequence: the whole file, then each
 		 * segment over it at its own offset. Every byte must still be
-		 * the file's afterwards. */
+		 * the file's afterwards.
+		 *
+		 * The text segment is mapped PROT_READ rather than
+		 * PROT_READ|PROT_EXEC, and the reason is a rule rather than a
+		 * convenience: an executable mapping of a file the bake did not
+		 * translate is a named fault, because the code it would run does
+		 * not exist in the module. This fixture is a data file that
+		 * nothing executes, so asking for PROT_EXEC would be asking the
+		 * kernel to allow the one thing it must refuse. What is under
+		 * test here is the *copy* rules — which segment's bytes land at
+		 * which offset — and those do not depend on the protection. The
+		 * refusal has a test of its own, in the kernel's, where kisal's
+		 * policy rather than Linux's is the ground truth: natively the
+		 * call simply succeeds, so a differential could never assert
+		 * it. */
 		long extent = sys6(SYS_mmap, 0, 4 * PAGE, PROT_READ, MAP_PRIVATE, fd, 0);
 		emit(out, 310, extent > 0, 0, 0, 0, 0, 0);
 		if (extent > 0) {
-			long text = sys6(SYS_mmap, extent + PAGE, PAGE, PROT_READ | PROT_EXEC,
+			long text = sys6(SYS_mmap, extent + PAGE, PAGE, PROT_READ,
 			                 MAP_PRIVATE | MAP_FIXED, fd, PAGE);
 			emit(out, 311, text == extent + PAGE, 0, 0, 0, 0, 0);
 			long data = sys6(SYS_mmap, extent + 2 * PAGE, 2 * PAGE, PROT_READ,

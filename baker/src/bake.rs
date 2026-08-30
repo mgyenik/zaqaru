@@ -56,8 +56,26 @@ pub fn container(program: &Path, search: &Path, tree: crate::tree::Tree) -> Resu
 pub fn container_with_command(
     program: &Path,
     search: &Path,
+    tree: crate::tree::Tree,
+    argv: &[Vec<u8>],
+) -> Result<Bake> {
+    container_with_invocation(program, search, tree, argv, &[])
+}
+
+/// The same, with the environment as well.
+///
+/// The environment decides which *path* a program takes, not merely what it
+/// prints. CPython with no `HOME` falls through `expanduser` into `getpwuid`,
+/// which is glibc's NSS, which probes nscd over a socket — so a container
+/// booted with an empty environment exercises a surface the run it will be
+/// diffed against never touches. See `kisal::image`'s module header for the
+/// measurement.
+pub fn container_with_invocation(
+    program: &Path,
+    search: &Path,
     mut tree: crate::tree::Tree,
     argv: &[Vec<u8>],
+    envp: &[Vec<u8>],
 ) -> Result<Bake> {
     let modules = crate::dynamic::closure(program, search)
         .with_context(|| format!("finding what {} loads", program.display()))?;
@@ -128,7 +146,7 @@ pub fn container_with_command(
     }
 
     let image = crate::object::emit(
-        &crate::bake_tree_with_command(&tree, argv).context("baking the image")?,
+        &crate::bake_tree_with_invocation(&tree, argv, envp).context("baking the image")?,
     )
     .context("emitting the image object")?;
 

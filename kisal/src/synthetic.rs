@@ -233,22 +233,22 @@ fn assemble(index: &mut Vec<u8>, inodes: &[Inode], dirents: &[u8], strings: &[u8
         (&mut index[..HEADER_SIZE]).try_into().expect("the header");
     crate::image::write_header(
         header,
-        inodes.len() as u32,
-        inode_offset as u32,
-        dirent_offset as u32,
-        dirents.len() as u32,
-        string_offset as u32,
-        strings.len() as u32,
-        xattr_offset as u32,
-        0,
-        0,
-        0,
-        // A synthetic mount holds no ELF, so there is nothing to prelink,
-        // and it is not what a container boots.
-        0,
-        0,
-        0,
-        0,
+        &crate::image::Header {
+            inode_count: inodes.len() as u32,
+            inode_offset: inode_offset as u32,
+            dirent_offset: dirent_offset as u32,
+            dirent_size: dirents.len() as u32,
+            string_offset: string_offset as u32,
+            string_size: strings.len() as u32,
+            xattr_offset: xattr_offset as u32,
+            root_inode: 0,
+            // A synthetic mount holds no file contents, no ELF to prelink,
+            // and is not what a container boots — so no blob, no modules,
+            // no command line and no environment. Named fields rather than
+            // a run of zeroes, because a run of zeroes says which regions
+            // are empty only to whoever counts them.
+            ..crate::image::Header::default()
+        },
     );
     for inode in inodes {
         let mut record = [0u8; INODE_SIZE];

@@ -376,9 +376,14 @@ pub unsafe extern "C" fn kisal_boot() -> i32 {
     // against a native `strace`.
     //
     // So this is a shortcut with a recorded price rather than an equivalent.
-    // What makes it safe meanwhile is that nothing here should bind lazily
-    // and the guest does not choose its own initial environment.
-    let environment: [&[u8]; 1] = [b"LD_BIND_NOW=1"];
+    // What makes it safe meanwhile is that nothing here should bind lazily.
+    // It goes *first*, so that a bake which records `LD_BIND_NOW` of its own
+    // is the one the guest reads: ld.so takes the last of a repeated name,
+    // as `getenv` does.
+    let recorded_environment: Vec<&[u8]> = baked.environment().collect();
+    let mut environment: Vec<&[u8]> = Vec::with_capacity(recorded_environment.len() + 1);
+    environment.push(b"LD_BIND_NOW=1");
+    environment.extend_from_slice(&recorded_environment);
     let program = with_kernel(|kernel| {
         kernel.exec(b"/init", argv, &environment).map_err(|error| {
             let mut message = String::new();

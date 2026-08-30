@@ -397,6 +397,16 @@ pub struct Kernel<'a, S: Store, M: Machine> {
     /// bit zero. Only self-directed signals can ever be affected by it —
     /// nothing outside a container can send one.
     blocked_signals: u64,
+    /// What each signal is set to do, indexed by signal minus one.
+    ///
+    /// Recorded from M6 and delivered at M10, which is the build plan's own
+    /// sequencing and not a deferral invented here: CPython installs its
+    /// handlers before it runs a line, so refusing `rt_sigaction` stops the
+    /// interpreter at startup, while *running* a handler needs the chain
+    /// surgery M10 builds. What is recorded is enough to answer the two
+    /// questions a program can ask before then — what is this signal set to,
+    /// and what happens when I raise it at myself.
+    dispositions: [Disposition; 64],
     /// The head of this thread's robust futex list, from
     /// `set_robust_list`. Recorded with the same horizon.
     pub robust_list: u64,
@@ -492,6 +502,7 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             status: None,
             clear_child_tid: 0,
             blocked_signals: 0,
+            dispositions: [Disposition::DEFAULT; 64],
             robust_list: 0,
             // Carved from the top of whatever the module already occupies:
             // the linker's data, the shadow stack, and anything the
@@ -720,6 +731,7 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             number::CLOCK_GETTIME => self.clock_gettime(arguments),
             number::TIME => self.time(arguments),
             number::SENDFILE => self.sendfile(arguments),
+            number::RT_SIGACTION => self.signal_action(arguments),
             number::RT_SIGPROCMASK => self.signal_mask(arguments),
             number::TGKILL => self.tgkill(arguments),
             // Restartable sequences, refused for real. glibc asks once at
@@ -975,6 +987,74 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
         Outcome::Done(length as i64)
     }
 
+    /// `rt_sigaction(2)`: what a signal is set to do.
+    ///
+    /// Recorded, not delivered, and that split is the build plan's — M6
+    /// records dispositions and M10 makes them live. CPython installs its
+    /// handlers before it evaluates a line, so a refusal here stops the
+    /// interpreter at startup; running one needs the chain surgery M10
+    /// builds. What recording buys immediately is that the two questions a
+    /// program can ask *before* delivery exists are answered truthfully:
+    /// what is this signal currently set to, and what happens if I raise it
+    /// at myself — see [`Self::tgkill`], which now consults this rather than
+    /// assuming every signal is at its default.
+    ///
+    /// The structure exchanged is Linux's `struct kernel_sigaction` and not
+    /// glibc's `struct sigaction`: the wrapper converts, and this is the
+    /// syscall.
+    fn signal_action(&mut self, arguments: Arguments) -> Outcome {
+        let signal = arguments.get(0);
+        let act = arguments.get(1) as u64;
+        let old = arguments.get(2) as u64;
+        // Linux checks the mask size and refuses anything else, because a
+        // caller passing a different one was built against a different
+        // kernel.
+        if arguments.get(3) != 8 {
+            return Outcome::Done(Errno::Invalid.as_result());
+        }
+        if !(1..=64).contains(&signal) || signal == SIGKILL || signal == SIGSTOP {
+            // `SIGKILL` and `SIGSTOP` cannot be caught or ignored, and Linux
+            // refuses the call rather than dropping them quietly the way
+            // `rt_sigprocmask` drops them from a mask.
+            return Outcome::Done(Errno::Invalid.as_result());
+        }
+
+        // Both pointers are checked before either is used, so a bad one
+        // leaves the disposition exactly as it was. Linux installs first and
+        // reports `EFAULT` afterwards if the copy-out faults, which is a
+        // difference no conforming caller can observe — glibc's wrapper
+        // passes addresses of its own locals.
+        if act != 0 {
+            if let Err(errno) = self.memory().check(act, SIGACTION_SIZE) {
+                return Outcome::Done(errno.as_result());
+            }
+        }
+        if old != 0 {
+            if let Err(errno) = self.memory().check(old, SIGACTION_SIZE) {
+                return Outcome::Done(errno.as_result());
+            }
+        }
+
+        let index = (signal - 1) as usize;
+        if old != 0 {
+            let bytes = self.dispositions[index].to_bytes();
+            // SAFETY: the range was bounds-checked immediately above.
+            if let Err(errno) = unsafe { self.memory().write(old, &bytes) } {
+                return Outcome::Done(errno.as_result());
+            }
+        }
+        if act != 0 {
+            // SAFETY: `slice` bounds-checks the range itself, and the bytes
+            // are copied out of it before anything else can move memory.
+            let installed = match unsafe { self.memory().slice(act, SIGACTION_SIZE) } {
+                Ok(bytes) => Disposition::from_bytes(bytes),
+                Err(errno) => return Outcome::Done(errno.as_result()),
+            };
+            self.dispositions[index] = installed;
+        }
+        Outcome::Done(0)
+    }
+
     /// `rt_sigprocmask(2)`: which signals this thread has blocked.
     ///
     /// Recorded and honoured, but only for signals the process sends to
@@ -1045,10 +1125,14 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
     /// `SIGABRT` at itself and expects not to come back.
     ///
     /// A blocked signal stays pending forever instead, which is the same
-    /// thing that happens on Linux when nothing ever unblocks it. Handlers
-    /// are not modelled at all — `rt_sigaction` is still unimplemented, so a
-    /// program that installed one has already been told the truth loudly
-    /// rather than having its handler silently skipped here.
+    /// thing that happens on Linux when nothing ever unblocks it.
+    ///
+    /// What the disposition decides, now that `rt_sigaction` records one:
+    /// `SIG_IGN` is ignored, `SIG_DFL` does the default action, and a real
+    /// handler is a **named fault**. Running the handler is M10's chain
+    /// surgery; terminating instead would be a plausible wrong answer to a
+    /// program that installed one precisely so that it would not die, and
+    /// silently skipping it would be worse.
     fn tgkill(&mut self, arguments: Arguments) -> Outcome {
         let group = arguments.get(0);
         let thread = arguments.get(1);
@@ -1064,6 +1148,18 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
         if self.blocked_signals & signal_bit(signal) != 0 {
             // Pending, and nothing will ever deliver it.
             return Outcome::Done(0);
+        }
+        match self.dispositions[(signal - 1) as usize].handler {
+            SIG_IGN => return Outcome::Done(0),
+            SIG_DFL => {}
+            _ => {
+                return Outcome::Fault(Fault::detailed(
+                    number::TGKILL,
+                    arguments,
+                    "raising a signal that has a handler installed — delivery \
+                     is M10's chain surgery, and the disposition is recorded",
+                ));
+            }
         }
         if terminates(signal) {
             // What `wait` reports for a process killed by a signal: the
@@ -1588,6 +1684,63 @@ fn parse_nanoseconds(bytes: &[u8]) -> Option<i64> {
 /// `SIGKILL` and `SIGSTOP`, the two a thread may not block.
 const SIGKILL: i64 = 9;
 const SIGSTOP: i64 = 19;
+
+/// What a signal is set to do: Linux's `struct kernel_sigaction`, which is
+/// what the raw `rt_sigaction` syscall exchanges — *not* glibc's `struct
+/// sigaction`, which orders its fields differently and is converted by the
+/// wrapper before the call.
+///
+/// Thirty-two bytes: handler, flags, restorer, mask. The restorer is the
+/// return trampoline glibc supplies with `SA_RESTORER`, and it is recorded
+/// rather than used — `rt_sigreturn` never runs here, because a delivered
+/// handler returns through the resume chain kisal builds rather than through
+/// a stack frame it has to unwind itself (see `container-plan.md`'s signal
+/// design). Recording it anyway costs eight bytes and keeps `oldact` honest.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Disposition {
+    handler: u64,
+    flags: u64,
+    restorer: u64,
+    mask: u64,
+}
+
+impl Disposition {
+    /// `SIG_DFL` is zero, which is also what every other field starts as.
+    const DEFAULT: Self = Self {
+        handler: SIG_DFL,
+        flags: 0,
+        restorer: 0,
+        mask: 0,
+    };
+
+    fn to_bytes(self) -> [u8; 32] {
+        let mut bytes = [0u8; 32];
+        bytes[0..8].copy_from_slice(&self.handler.to_le_bytes());
+        bytes[8..16].copy_from_slice(&self.flags.to_le_bytes());
+        bytes[16..24].copy_from_slice(&self.restorer.to_le_bytes());
+        bytes[24..32].copy_from_slice(&self.mask.to_le_bytes());
+        bytes
+    }
+
+    fn from_bytes(bytes: &[u8]) -> Self {
+        let word = |at: usize| {
+            u64::from_le_bytes(bytes[at..at + 8].try_into().expect("eight bytes"))
+        };
+        Self {
+            handler: word(0),
+            flags: word(8),
+            restorer: word(16),
+            mask: word(24),
+        }
+    }
+}
+
+/// The two handler values that are not addresses.
+const SIG_DFL: u64 = 0;
+const SIG_IGN: u64 = 1;
+
+/// The size of a `struct kernel_sigaction` on x86-64.
+const SIGACTION_SIZE: u64 = 32;
 
 /// A signal's bit in a mask. Signal one is bit zero, which is the off-by-one
 /// every signal mask carries.

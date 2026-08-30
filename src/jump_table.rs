@@ -240,22 +240,71 @@ pub fn recover_all(object: &ObjectFile, functions: &mut [LiftedFunction]) -> Res
         }
     }
 
+    // Where each *body* begins — the extent a piece was cut from, not the
+    // piece. This is what tells a dispatch table from an array of function
+    // pointers: a function pointer names a function's start and a table
+    // entry names a block inside one. Pieces are not starts in that sense,
+    // because nothing outside the binary can name one.
+    let mut bodies: std::collections::HashMap<usize, std::collections::BTreeSet<u64>> =
+        std::collections::HashMap::new();
+    for function in &object.functions {
+        bodies
+            .entry(function.section)
+            .or_default()
+            .insert(function.whole.start);
+    }
+
     let mut candidates: Vec<(usize, Candidate)> = Vec::new();
     for (index, function) in functions.iter().enumerate() {
         for (position, lifted) in function.instructions.iter().enumerate() {
             if lifted.instruction.flow_control() != FlowControl::IndirectBranch {
                 continue;
             }
-            if let Some(candidate) = propose(object, function, position, &boundaries) {
+            if let Some(candidate) = propose(object, function, position, &boundaries, &bodies) {
                 candidates.push((index, candidate));
             }
         }
     }
 
-    let starts: Vec<(usize, u64)> = candidates
+    // Where the tables are, for bounding each one by the next.
+    //
+    // Not only the tables that were *recognised*. A dispatch whose table
+    // this cannot read still reads it, and the address it reads from is
+    // where some other table has to stop — otherwise the earlier table runs
+    // straight through it, and the rewrite that makes the earlier dispatch
+    // work overwrites entries the later one is still using. That is not a
+    // surplus arm; it is a silent wrong branch in a dispatch nothing has
+    // complained about.
+    //
+    // Measured on `/usr/bin/python3.12`: a 19-arm table in `.rodata` was
+    // read as 25, swallowing the tokenizer's six-arm dispatch, whose entries
+    // were then rewritten as arms of the first one's space — after which
+    // `python -c 'print("hello")'` jumped into the middle of `.rodata`.
+    //
+    // The address is taken from the *jump's own* memory operand and not from
+    // the backward scan, because a jump that reads its target out of memory
+    // names the table exactly, and anything the scan turns up before it is a
+    // guess that could truncate a table that is perfectly readable.
+    let mut starts: Vec<(usize, u64)> = candidates
         .iter()
         .map(|(_, candidate)| (candidate.table_section, candidate.table_offset))
         .collect();
+    for function in functions.iter() {
+        for lifted in &function.instructions {
+            if lifted.instruction.flow_control() != FlowControl::IndirectBranch {
+                continue;
+            }
+            starts.extend(
+                absolute_operands(
+                    &lifted.instruction,
+                    object.sections[function.section].address,
+                )
+                .filter_map(|address| data_at(object, address)),
+            );
+        }
+    }
+    starts.sort_unstable();
+    starts.dedup();
 
     for (function_index, candidate) in &candidates {
         let limit = table_limit(object, &starts, candidate);
@@ -273,6 +322,42 @@ pub fn recover_all(object: &ObjectFile, functions: &mut [LiftedFunction]) -> Res
             .insert(candidate.position, table);
     }
 
+    // No two tables may describe the same bytes. Each one's entries are
+    // *rewritten* so the dispatch computes an arm number, and two tables
+    // overlapping means one rewrite lands on the other's entries — which
+    // makes one of the two dispatches branch to the wrong arm and say
+    // nothing. Bounding each table by the next is what should prevent it;
+    // this is the assertion that the bounding worked, because the failure it
+    // guards against has no other symptom.
+    let mut extents: Vec<(usize, u64, u64)> = functions
+        .iter()
+        .flat_map(|function| function.jump_tables.values())
+        .map(|table| {
+            (
+                table.table_section,
+                table.table_offset,
+                table.table_offset + table.byte_length(),
+            )
+        })
+        .collect();
+    extents.sort_unstable();
+    extents.dedup();
+    for pair in extents.windows(2) {
+        let [(section, _, end), (next_section, next_start, _)] = pair else {
+            continue;
+        };
+        if section == next_section && end > next_start {
+            bail!(
+                "two jump tables in {} overlap — one ends at {:#x} and the \
+                 next begins at {:#x} — so rewriting the first would \
+                 overwrite entries the second still dispatches through",
+                object.sections[*section].name,
+                object.sections[*section].address + end,
+                object.sections[*section].address + next_start,
+            );
+        }
+    }
+
     for function in functions.iter_mut() {
         share_arm_spaces(function);
     }
@@ -282,7 +367,7 @@ pub fn recover_all(object: &ObjectFile, functions: &mut [LiftedFunction]) -> Res
             if lifted.instruction.flow_control() == FlowControl::IndirectBranch
                 && !function.jump_tables.contains_key(&position)
             {
-                reject_unrecognised_dispatch(object, function, position, &boundaries)?;
+                reject_unrecognised_dispatch(object, function, position, &boundaries, &bodies)?;
             }
         }
     }
@@ -355,6 +440,7 @@ fn propose(
     function: &LiftedFunction,
     position: usize,
     boundaries: &std::collections::HashMap<usize, std::collections::BTreeSet<u64>>,
+    bodies: &std::collections::HashMap<usize, std::collections::BTreeSet<u64>>,
 ) -> Option<Candidate> {
     let mut bases: Vec<u64> = Vec::new();
     for lifted in function.instructions[..=position].iter().rev() {
@@ -393,7 +479,15 @@ fn propose(
                 .collect()
         };
         for (section, table_offset) in locations {
-            if holds_block_addresses(object, function, section, table_offset, &bases, boundaries) {
+            if holds_block_addresses(
+                object,
+                function,
+                section,
+                table_offset,
+                &bases,
+                boundaries,
+                bodies,
+            ) {
                 return Some(Candidate {
                     position,
                     table_section: section,
@@ -476,69 +570,114 @@ fn holds_block_addresses(
     offset: u64,
     bases: &[u64],
     boundaries: &std::collections::HashMap<usize, std::collections::BTreeSet<u64>>,
+    bodies: &std::collections::HashMap<usize, std::collections::BTreeSet<u64>>,
 ) -> bool {
     if object.layout == Layout::Linked {
-        // Two entries naming blocks inside the body this function was cut
-        // from, neither of them a start: that is a dispatch table and not an
-        // array of function pointers, whichever form the entries turn out to
-        // be in. A function pointer names a function's *start*; only a
-        // dispatch names the interior of the body dispatching.
+        // **A table entry names a block; a function pointer names a
+        // function's start.** That is the whole discriminator, and the only
+        // difficulty is spelling "a block".
         //
-        // *The body it was cut from*, not the piece. A `switch` whose arms
-        // are entered from elsewhere gets split at each of them, and then
-        // every arm is in a sibling piece — so asking about the piece finds
-        // nothing and the table is not recognised at all.
+        // Written first as "the first two entries are inside the body this
+        // function was cut from", it failed twice on one binary, both times
+        // because gcc's hot/cold splitting puts the arms of one dispatch in
+        // two bodies:
         //
-        // *Two anywhere in the run*, not the first two, and that is a
-        // correction a real binary forced. gcc splits a function's cold
-        // blocks into a body of their own, so a dispatch's arms land in two
-        // bodies — and which particular arms land in which is a property of
-        // the numbering, not of the table. CPython's `opcode_targets[]` is
-        // 256 entries of which 181 are in `_PyEval_EvalFrameDefault` and 75
-        // in its cold twin, and **entry zero is one of the 75**: asking
-        // about the first two rejected the hottest dispatch in the
-        // milestone target, which then translated as an indirect transfer
-        // and missed in the exec map at run time.
+        // - CPython's `opcode_targets[]` has 181 of its 256 entries inside
+        //   `_PyEval_EvalFrameDefault` and 75 inside its cold twin, and
+        //   entry *zero* is one of the 75.
+        // - The tokenizer's six-arm dispatch at `0x51a410` has **one** entry
+        //   inside its own body and five in a cold region at `0x422xxx`.
+        //
+        // So which entries land in the dispatching body is a property of the
+        // numbering, and counting them is the wrong question. The right one
+        // is asked of every entry: is it a *block* — an instruction boundary
+        // that is not where some body begins? An array of function pointers
+        // holds nothing but body starts, whatever else it holds, and this
+        // rejects it on the first entry.
+        //
+        // So the test is: **two entries that are blocks, and at least one of
+        // them inside the body that dispatches.** The second half ties the
+        // table to *this* `switch` rather than to some other function's; a
+        // dispatch every one of whose arms was moved out would be refused,
+        // as a loud miss with the binary in hand, which is when to revisit
+        // it.
+        //
+        // An entry that *is* a body start is not evidence and is not a veto
+        // either. Written first as a veto, it rejected three of the four
+        // dispatches in CPython's `unicode_compare_eq` — each has a cold arm
+        // that gcc moved out far enough that discovery gave it a function of
+        // its own, beginning exactly at the arm. An array of function
+        // pointers is told apart by having *nothing but* starts, not by
+        // having one.
         //
         // The scan stops where the entries stop being instruction
-        // boundaries — the same bound `read_linked_table` uses — and as soon
-        // as it has its two, so a real table costs a handful of reads and a
-        // run of unrelated data costs one.
+        // boundaries, the same bound `read_linked_table` uses.
         let whole = &object.functions[function.function].whole;
         let table_address = object.sections[section].address + offset;
         let starts = boundaries.get(&function.section);
+        let begins_a_body = bodies.get(&function.section);
         return entry_forms(table_address, bases).iter().any(|form| {
-            let mut inside = 0;
+            let mut blocks = 0;
+            let mut ours = false;
             for index in 0.. {
                 let Some(target) =
                     read_linked_entry(object, section, offset + index * form.stride, *form)
                 else {
-                    return false;
+                    break;
                 };
                 if !starts.is_some_and(|starts| starts.contains(&target)) {
-                    return false;
+                    break;
                 }
-                // Not the piece's own start, and not the body's: an array
-                // holding the dispatching function's own address is a
-                // function-pointer array, which is the thing being told
-                // apart.
-                if target != function.offset && target != whole.start && whole.contains(&target) {
-                    inside += 1;
-                    if inside == 2 {
-                        return true;
-                    }
+                if begins_a_body.is_some_and(|starts| starts.contains(&target)) {
+                    // A body's start, which is what a function pointer names.
+                    // Not evidence of a table; not evidence against one.
+                    continue;
+                }
+                blocks += 1;
+                ours |= whole.contains(&target);
+                if blocks >= 2 && ours {
+                    return true;
                 }
             }
             false
         });
     }
-    let Some(relocation) = relocation_at(object, section, offset) else {
+    // The same rule as above, asked of relocations instead of bytes: two
+    // entries that are blocks, at least one of them inside the body that
+    // dispatches. A relocatable object states its stride in the relocation
+    // rather than in the entry's shape, so there is one form to try rather
+    // than several.
+    let whole = &object.functions[function.function].whole;
+    let starts = boundaries.get(&function.section);
+    let begins_a_body = bodies.get(&function.section);
+    let Some(first) = relocation_at(object, section, offset) else {
         return false;
     };
-    let Some(target) = resolve_entry(object, relocation, offset, offset) else {
-        return false;
-    };
-    target != function.offset && begins_an_instruction(function, target)
+    let stride = first.kind.width();
+    let mut blocks = 0;
+    let mut ours = false;
+    for index in 0.. {
+        let entry = offset + index * stride;
+        let Some(relocation) = relocation_at(object, section, entry) else {
+            break;
+        };
+        let Some(target) = resolve_entry(object, relocation, entry, offset, function.section)
+        else {
+            break;
+        };
+        if !starts.is_some_and(|starts| starts.contains(&target)) {
+            break;
+        }
+        if begins_a_body.is_some_and(|starts| starts.contains(&target)) {
+            continue;
+        }
+        blocks += 1;
+        ours |= whole.contains(&target);
+        if blocks >= 2 && ours {
+            return true;
+        }
+    }
+    false
 }
 
 /// Where a table ends: at the next table in the same section, or at the end
@@ -595,11 +734,25 @@ fn read_table(
         {
             break;
         }
-        let Some(target) = resolve_entry(object, relocation, entry_offset, candidate.table_offset)
-        else {
+        let Some(target) = resolve_entry(
+            object,
+            relocation,
+            entry_offset,
+            candidate.table_offset,
+            function.section,
+        ) else {
             break;
         };
-        if !begins_an_instruction(function, target) {
+        // An instruction boundary anywhere in this section, not only in the
+        // dispatching function — the same rule the linked reader follows,
+        // and for the same reason: gcc moves a `switch`'s cold arms into a
+        // fragment of their own, and bounding the scan to the dispatching
+        // function reads a short table whose valid indices then dispatch
+        // past its end.
+        if !boundaries
+            .get(&function.section)
+            .is_some_and(|starts| starts.contains(&target))
+        {
             break;
         }
         targets.push(target);
@@ -674,15 +827,25 @@ fn read_linked_table(
     })
 }
 
-/// The text offset one entry names.
+/// The text offset one entry names, within the section that dispatches.
+///
+/// `in_section` is not a filter for tidiness. A recovered table's targets are
+/// section offsets carried without a section — `emit_switch` reads them
+/// against the dispatching function's — so an arm resolving into a *different*
+/// text section (gcc's `.text.unlikely`, which is where cold blocks go in a
+/// relocatable object) would have its offset read against the wrong base and
+/// branch somewhere arbitrary with nothing said. Such an arm is not
+/// representable, and stopping the run is the honest answer until targets
+/// carry their section.
 fn resolve_entry(
     object: &ObjectFile,
     relocation: &Relocation,
     entry_offset: u64,
     table_offset: u64,
+    in_section: usize,
 ) -> Option<u64> {
     let (section, offset) = object.resolve(relocation.symbol, relocation.addend)?;
-    if object.sections[section].role != SectionRole::Text {
+    if section != in_section || object.sections[section].role != SectionRole::Text {
         return None;
     }
     // An entry of the relative form holds the difference between its target
@@ -710,6 +873,7 @@ fn reject_unrecognised_dispatch(
     function: &LiftedFunction,
     position: usize,
     boundaries: &std::collections::HashMap<usize, std::collections::BTreeSet<u64>>,
+    bodies: &std::collections::HashMap<usize, std::collections::BTreeSet<u64>>,
 ) -> Result<()> {
     if object.layout == Layout::Linked {
         // The same question, asked of bytes: does anything this dispatch
@@ -741,7 +905,9 @@ fn reject_unrecognised_dispatch(
                 let Some((section, offset)) = data_at(object, address) else {
                     continue;
                 };
-                if holds_block_addresses(object, function, section, offset, &bases, boundaries) {
+                if holds_block_addresses(
+                    object, function, section, offset, &bases, boundaries, bodies,
+                ) {
                     bail!(
                         "`{}` at {:#x} dispatches through what looks like a jump \
                          table in {}, but its entries could not be read; \
@@ -771,8 +937,14 @@ fn reject_unrecognised_dispatch(
                 .filter(|relocation| relocation.offset >= offset)
                 .take(2)
                 .any(|relocation| {
-                    resolve_entry(object, relocation, relocation.offset, offset)
-                        .is_some_and(|target| function.contains(target))
+                    resolve_entry(
+                        object,
+                        relocation,
+                        relocation.offset,
+                        offset,
+                        function.section,
+                    )
+                    .is_some_and(|target| function.contains(target))
                 });
             if names_this_function {
                 bail!(
@@ -800,12 +972,3 @@ fn data_location(object: &ObjectFile, symbol: usize, addend: i64) -> Option<(usi
     Some((section, offset as u64))
 }
 
-/// Whether an offset is the start of an instruction of this function — the
-/// last check that an entry really is one.
-fn begins_an_instruction(function: &LiftedFunction, offset: u64) -> bool {
-    function.contains(offset)
-        && function
-            .instructions
-            .iter()
-            .any(|lifted| lifted.offset == offset)
-}
