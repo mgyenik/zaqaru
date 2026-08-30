@@ -48,6 +48,8 @@ pub enum State {
     /// It is in `poll` or `epoll_wait`, waiting for a descriptor to become
     /// ready or for a deadline to pass.
     Watching(Watching),
+    /// It is in `accept`, waiting for a connection to arrive on a listener.
+    Accepting(Accepting),
     /// It called `pause`, and is waiting for a signal and nothing else.
     ///
     /// The one wait with no object: every other parked thread is waiting
@@ -73,6 +75,24 @@ pub struct Watching {
     /// timeout — which is the case that costs nothing, because the thread
     /// is simply not runnable until the answer changes.
     pub deadline: Option<u64>,
+}
+
+/// A parked `accept`.
+///
+/// The listener is arena state, so whether this can complete is answerable
+/// while choosing which process to run. Where the peer's address goes is a
+/// guest address, so the completion happens on the parked process's own
+/// turn — the same split, and for the same reason, as
+/// [`crate::poll::Watch`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Accepting {
+    pub listener: u32,
+    /// Where to write the peer's address, and where the length is. Zero for
+    /// a caller that did not ask for one, which `accept(fd, NULL, NULL)` is.
+    pub at: u64,
+    pub length_at: u64,
+    /// `SOCK_NONBLOCK` and `SOCK_CLOEXEC` for the accepted descriptor.
+    pub flags: i32,
 }
 
 /// The kernel's own per-thread cells.
@@ -108,6 +128,13 @@ pub struct Owned {
     pub on_altstack: bool,
     /// What the frame the current handler is running on says the mask was.
     pub interrupted_mask: u64,
+    /// Whether the call in progress asked for `MSG_NOSIGNAL`.
+    ///
+    /// Per *call*, not per socket and not per thread — which is why it is
+    /// set and cleared around one row rather than stored anywhere durable.
+    /// It suppresses the signal and never the errno: a server that passes it
+    /// still gets `EPIPE`, and that is the whole point of the flag.
+    pub no_sigpipe: bool,
 }
 
 /// One thread.

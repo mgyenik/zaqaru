@@ -1472,6 +1472,12 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
         Outcome::Done(0)
     }
 
+    /// Records that the call in progress asked not to be signalled on a
+    /// broken pipe. See [`crate::thread::Owned::no_sigpipe`].
+    pub(crate) fn suppress_sigpipe(&mut self, suppressed: bool) {
+        self.machine.owned().no_sigpipe = suppressed;
+    }
+
     /// Sends a signal to this process from *outside* it.
     ///
     /// `raise_at_process` is the same decision reached through a syscall, and
@@ -1895,6 +1901,16 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             number::SOCKET => self.make_socket(arguments),
             number::SOCKETPAIR => self.make_socketpair(arguments),
             number::SHUTDOWN => self.shutdown(arguments),
+            number::BIND => self.bind(arguments),
+            number::LISTEN => self.listen(arguments),
+            number::CONNECT => self.connect(arguments),
+            number::ACCEPT | number::ACCEPT4 => self.accept(number, arguments),
+            number::GETSOCKNAME | number::GETPEERNAME => {
+                self.socket_address(number, arguments)
+            }
+            number::SETSOCKOPT => self.setsockopt(arguments),
+            number::GETSOCKOPT => self.getsockopt(arguments),
+            number::SENDTO | number::RECVFROM => self.send_receive(number, arguments),
             number::SCHED_GETAFFINITY => self.sched_getaffinity(arguments),
             number::MBIND | number::SET_MEMPOLICY | number::GET_MEMPOLICY => {
                 Outcome::Done(Errno::NoSys.as_result())

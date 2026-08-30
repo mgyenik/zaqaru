@@ -417,6 +417,15 @@ impl<'a, S: Store + Clone> System<'a, S> {
                             into.push_str(" with a deadline");
                         }
                     }
+                    crate::thread::State::Accepting(waiting) => {
+                        let sockets = container.process.kernel.sockets.borrow();
+                        let _ = write!(
+                            &mut into,
+                            "in `accept` on listener {} ({} queued)",
+                            waiting.listener,
+                            sockets.queued(waiting.listener),
+                        );
+                    }
                     crate::thread::State::Paused => {
                         into.push_str("in `pause`, waiting for a signal");
                     }

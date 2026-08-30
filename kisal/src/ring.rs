@@ -168,6 +168,23 @@ impl Rings {
         }
     }
 
+    /// Copies bytes out *without* removing them, which is `MSG_PEEK`.
+    ///
+    /// A separate operation rather than a flag on `take`, because the
+    /// difference is the whole of what the flag means and a boolean threaded
+    /// through the taking loop is how one of the two ends up consuming when
+    /// it should not.
+    pub fn peek(&self, id: u32, into: &mut [u8]) -> usize {
+        let Some(ring) = self.ring(id) else {
+            return 0;
+        };
+        let moved = into.len().min(ring.bytes.len());
+        for (slot, byte) in into.iter_mut().zip(ring.bytes.iter()).take(moved) {
+            *slot = *byte;
+        }
+        moved
+    }
+
     /// Moves bytes out, up to what `into` holds. Answers how many.
     pub fn take(&mut self, id: u32, into: &mut [u8]) -> usize {
         let Some(ring) = self.ring_mut(id) else {
@@ -342,7 +359,10 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
                         // so a program that has not ignored it never sees
                         // this errno, and one that has sees exactly it.
                         const SIGPIPE: i32 = 13;
-                        if self.signal_process(SIGPIPE) {
+                        // `MSG_NOSIGNAL` suppresses the signal and not the
+                        // errno, which is what every server that writes to a
+                        // socket it might outlive depends on.
+                        if !self.machine.owned().no_sigpipe && self.signal_process(SIGPIPE) {
                             return Progress::Done(BROKEN.as_result());
                         }
                         return match transfer.done {

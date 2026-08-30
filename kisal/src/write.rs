@@ -173,6 +173,22 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
         Ok(Vnode::new(directory.mount, created))
     }
 
+    /// The node an `AF_UNIX` `bind` leaves in the filesystem.
+    ///
+    /// A real `S_IFSOCK` node, not a marker: `connect` finds a listener by
+    /// the *vnode* the path resolves to, which is what makes two names for
+    /// one file the same address and what makes an unlinked socket
+    /// unreachable by name while its connections live on. It is also what
+    /// makes glibc's `/var/run/nscd/socket` probe answer honestly — the
+    /// path is not there, so the `connect` says so.
+    pub(crate) fn create_socket_node(&mut self, path: i64, mode: u32) -> Result<Vnode, Errno> {
+        let (directory, name) = self.writable_parent(at::FDCWD, path, false)?;
+        let inode = self.new_inode(file_type::SOCKET, mode);
+        let overlay = self.overlay_of(directory)?;
+        let created = overlay.create(directory.inode, &name, inode, Some(Vec::new()))?;
+        Ok(Vnode::new(directory.mount, created))
+    }
+
     pub(crate) fn mkdir(&mut self, arguments: Arguments) -> Outcome {
         self.mkdirat(Arguments::new([
             at::FDCWD,

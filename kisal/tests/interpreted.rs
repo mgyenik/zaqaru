@@ -2004,3 +2004,202 @@ int main(void) {
         Linkage::Dynamic,
     );
 }
+
+/// **A loopback server and client in one process tree**, which is the shape
+/// the demo stack is made of: nginx binds a port, gunicorn connects to it.
+///
+/// Every piece of N1 at once — `socket`, `bind`, `listen`, `connect`,
+/// `accept4`, `getsockname`, and a parked `accept` woken by a connection
+/// that arrives from another *process*. No host is involved: both ends are
+/// in the guest, so a connection is two rings in an arena the process tree
+/// shares, and `connect` is a queue push.
+#[test]
+fn a_loopback_server_answers_a_forked_client() {
+    agrees_with_native(
+        "loopback",
+        r#"
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+int main(void) {
+    int listener = socket(AF_INET, SOCK_STREAM, 0);
+    if (listener < 0) { perror("socket"); return 1; }
+    struct sockaddr_in bound = {0};
+    bound.sin_family = AF_INET;
+    bound.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    /* Port zero: the kernel picks, and getsockname says which. */
+    bound.sin_port = 0;
+    if (bind(listener, (struct sockaddr *)&bound, sizeof bound) != 0) {
+        perror("bind"); return 1;
+    }
+    if (listen(listener, 8) != 0) { perror("listen"); return 1; }
+
+    struct sockaddr_in mine = {0};
+    socklen_t length = sizeof mine;
+    getsockname(listener, (struct sockaddr *)&mine, &length);
+    printf("bound to loopback %d, a real port %d\n",
+           mine.sin_addr.s_addr == htonl(INADDR_LOOPBACK), ntohs(mine.sin_port) != 0);
+
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        int client = socket(AF_INET, SOCK_STREAM, 0);
+        if (connect(client, (struct sockaddr *)&mine, sizeof mine) != 0) {
+            perror("connect"); _exit(1);
+        }
+        write(client, "GET / HTTP/1.0", 14);
+        shutdown(client, SHUT_WR);
+        char reply[64] = {0};
+        size_t total = 0;
+        ssize_t piece;
+        while ((piece = read(client, reply + total, sizeof reply - 1 - total)) > 0) {
+            total += (size_t)piece;
+        }
+        printf("client read: %s\n", reply);
+        fflush(stdout);
+        close(client);
+        _exit(0);
+    }
+
+    /* The parent parks here until the child's connect queues one. */
+    struct sockaddr_in peer = {0};
+    socklen_t peerlen = sizeof peer;
+    int served = accept(listener, (struct sockaddr *)&peer, &peerlen);
+    if (served < 0) { perror("accept"); return 1; }
+    char request[64] = {0};
+    size_t total = 0;
+    ssize_t piece;
+    while ((piece = read(served, request + total, sizeof request - 1 - total)) > 0) {
+        total += (size_t)piece;
+    }
+    printf("server read %zu: %s\n", total, request);
+    write(served, "HTTP/1.0 200 OK", 15);
+    close(served);
+    close(listener);
+    waitpid(child, 0, 0);
+    return 0;
+}
+"#,
+        Linkage::Dynamic,
+    );
+}
+
+/// **Connecting to a port nothing is listening on** is `ECONNREFUSED`, and
+/// an `AF_UNIX` path that is not there is `ENOENT`.
+///
+/// The distinction is the one glibc's NSS depends on: it probes
+/// `/var/run/nscd/socket` before it will read `/etc/passwd`, four times in
+/// the traced baseline, and the `ENOENT` is what sends it to the file it was
+/// going to read anyway.
+#[test]
+fn connecting_to_nothing_says_which_nothing() {
+    agrees_with_native(
+        "refused",
+        r#"
+#include <errno.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
+
+int main(void) {
+    int client = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in nowhere = {0};
+    nowhere.sin_family = AF_INET;
+    nowhere.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    nowhere.sin_port = htons(9);
+    errno = 0;
+    int refused = connect(client, (struct sockaddr *)&nowhere, sizeof nowhere);
+    printf("inet %d errno %d\n", refused, errno == ECONNREFUSED);
+    close(client);
+
+    int unix_client = socket(AF_UNIX, SOCK_STREAM, 0);
+    struct sockaddr_un absent = {0};
+    absent.sun_family = AF_UNIX;
+    strcpy(absent.sun_path, "/var/run/nscd/socket");
+    errno = 0;
+    int missing = connect(unix_client, (struct sockaddr *)&absent, sizeof absent);
+    printf("unix %d errno %d\n", missing, errno == ENOENT);
+    close(unix_client);
+    return 0;
+}
+"#,
+        Linkage::Dynamic,
+    );
+}
+
+/// **`send`, `recv` and the options**, which is the rest of what the traced
+/// stack asks a socket for.
+///
+/// `MSG_PEEK` reads without consuming — a separate operation and not a flag
+/// threaded through the taking loop, because that is how one of the two ends
+/// up consuming when it should not. `MSG_NOSIGNAL` suppresses the signal and
+/// never the errno, which is what every server that writes to a socket it
+/// might outlive depends on. And `SO_ERROR` is read once and cleared, which
+/// nginx does after every connect whether or not one was needed.
+#[test]
+fn the_socket_options_and_message_flags_answer() {
+    agrees_with_native(
+        "sockopt",
+        r#"
+#include <errno.h>
+#include <signal.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+int main(void) {
+    int ends[2];
+    socketpair(AF_UNIX, SOCK_STREAM, 0, ends);
+
+    /* What a socket says about itself. */
+    int kind = 0, held = sizeof kind;
+    getsockopt(ends[0], SOL_SOCKET, SO_TYPE, &kind, (socklen_t *)&held);
+    printf("type stream %d, listening %d\n", kind == SOCK_STREAM, ({
+        int accepting = 1; socklen_t n = sizeof accepting;
+        getsockopt(ends[0], SOL_SOCKET, SO_ACCEPTCONN, &accepting, &n);
+        accepting; }));
+
+    /* Recorded and read back. */
+    int on = 1;
+    setsockopt(ends[0], SOL_SOCKET, SO_KEEPALIVE, &on, sizeof on);
+    int back = 0; socklen_t backlen = sizeof back;
+    getsockopt(ends[0], SOL_SOCKET, SO_KEEPALIVE, &back, &backlen);
+    printf("keepalive %d\n", back != 0);
+
+    /* No error has happened, and reading clears it. */
+    int problem = -1; socklen_t problemlen = sizeof problem;
+    getsockopt(ends[0], SOL_SOCKET, SO_ERROR, &problem, &problemlen);
+    printf("so_error %d\n", problem);
+
+    /* Peek, then read the same bytes again. */
+    send(ends[0], "peek at me", 10, 0);
+    char first[32] = {0}, second[32] = {0};
+    ssize_t peeked = recv(ends[1], first, sizeof first - 1, MSG_PEEK);
+    ssize_t taken = recv(ends[1], second, sizeof second - 1, 0);
+    printf("peeked %zd '%s', took %zd '%s'\n", peeked, first, taken, second);
+    printf("and then nothing %zd\n", recv(ends[1], first, sizeof first - 1, MSG_DONTWAIT));
+
+    /* A write with nobody reading, and no signal about it. */
+    signal(SIGPIPE, SIG_IGN);
+    close(ends[1]);
+    errno = 0;
+    ssize_t refused = send(ends[0], "gone", 4, MSG_NOSIGNAL);
+    printf("nosignal %zd errno %d\n", refused, errno == EPIPE);
+    close(ends[0]);
+    return 0;
+}
+"#,
+        Linkage::Dynamic,
+    );
+}

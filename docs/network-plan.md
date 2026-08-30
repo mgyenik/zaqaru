@@ -548,6 +548,66 @@ suites grow, never shrink; native kisal tests first at every step, the
 module build at checkpoints — the same discipline every prior milestone
 carried.
 
+**N1 — the loopback arena. BUILT, 2026-08-30**, except two rows named at
+the end. `kisal/src/ring.rs` is the generalized transfer — split out of
+`pipe.rs` first, because a connected socket is two rings crossed and the
+run loop must not grow a second case for that. `kisal/src/socket.rs` is
+the arena: `Backing::Socket`, the port table as a scan over listeners
+(which *is* a port table for the handful a container holds), `AF_INET`
+loopback streams, `AF_UNIX` by the vnode `bind` creates, `socketpair`,
+the half-close matrix, `SIGPIPE` with `MSG_NOSIGNAL`, `MSG_PEEK` and
+`MSG_DONTWAIT`, and the option rows.
+
+Twelve of N0's twenty-four missing rows are gone: `socket`, `bind`,
+`listen`, `connect`, `accept`/`accept4`, `socketpair`, `shutdown`,
+`getsockname`, `getpeername`, `setsockopt`, `getsockopt`,
+`sendto`/`recvfrom`.
+
+**The half-close matrix is not a matrix**, which is the return on the
+ring split. `shutdown(SHUT_WR)` drops the endpoint's writer reference on
+the ring it transmits into, so the peer drains and then reads zero —
+which is what the last writer of a pipe closing already does.
+`SHUT_RD` drops its reader reference on the ring it receives from, so the
+peer's next write is `EPIPE`. One rule per direction, and every cell of
+the table the milestone asks for is that rule seen from a different side.
+
+**Readiness needed one arm**, which is the evidence section 4's claim was
+right. A socket's readiness is its rings' contents and its accept queue's
+length — all arena state, so a scheduling decision can ask it without
+touching any process's memory. `EPOLLRDHUP` falls out and is kept
+distinct from `POLLHUP`, which is only for when both directions are done.
+
+**A parked `accept` completes on the parked process's own turn**, joining
+the parked transfers, the parked waits and `wait4` under the same rule,
+for the same reason: the peer's address is written into that process's
+memory.
+
+Five programs against native runs of the same binary: a socketpair across
+a fork carrying both directions; the half-close matrix; a loopback server
+with a *forked* client, port zero, `getsockname`, and an `accept` parked
+until another process connects; `ECONNREFUSED` for a port nothing holds
+against `ENOENT` for an `AF_UNIX` path that is not there — the
+distinction glibc's `nscd` probe turns on; and the options with
+`MSG_PEEK`, `MSG_DONTWAIT` and `MSG_NOSIGNAL`. The negative control was
+run rather than reasoned about: delete the socket half of the reference
+census and the socketpair test deadlocks.
+
+**What is left of N1**: `recvmsg`/`sendmsg`, which N0 found on the
+*shutdown* path — nginx's master tells its worker to stop over their
+channel socketpair — and `eventfd2`. Neither is on the request path, and
+both are small; they land with N2.
+
+**Two corrections to this section's own text**, both from building it.
+`SO_RCVTIMEO`/`SNDTIMEO` are refused by name rather than recorded,
+because a program told its timeout was accepted will wait forever when it
+should have fired — they need N4's deadlines. And `SO_REUSEADDR` is
+recorded with *no* effect rather than affecting a rebind rule: the rule
+exists on Linux to let a listener rebind a port still held by connections
+in `TIME_WAIT`, and there is no `TIME_WAIT` here because there is no TCP,
+so a port is free the moment its listener closes.
+
+The original text follows.
+
 **N1 — the loopback arena.** `Backing::Socket`, the arena with port
 table and census, `AF_INET` loopback streams, `AF_UNIX` by vnode,
 `socketpair`, the half-close matrix, `SIGPIPE`/`MSG_NOSIGNAL`, the

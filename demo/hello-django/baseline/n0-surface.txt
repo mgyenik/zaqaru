@@ -35,30 +35,30 @@
       21  getpid               row
       19  gettid               row
       14  epoll_ctl            row
-      12  recvfrom             MISSING
+      12  recvfrom             row
        9  socket               row
-       9  getsockname          MISSING
+       9  getsockname          row
        8  utimensat            row
        7  pread64              row
        7  set_robust_list      row
        7  geteuid              row
        7  mkdir                row
-       7  accept4              MISSING
+       7  accept4              row
        6  execve               row
        6  getrandom            row
        6  getcwd               row
        6  readlink             row
-       6  connect              MISSING
+       6  connect              row
        6  rt_sigreturn         row
        6  wait4                row
        5  prlimit64            row
        5  getppid              row
        5  chown                MISSING
-       5  setsockopt           MISSING
-       5  sendto               MISSING
+       5  setsockopt           row
+       5  sendto               row
        4  rseq                 row
        4  getegid              row
-       4  listen               MISSING
+       4  listen               row
        4  unlink               row
        4  clock_nanosleep      MISSING
        4  pselect6             MISSING
@@ -69,8 +69,8 @@
        3  set_tid_address      row
        3  clone                row
        3  uname                row
-       3  bind                 MISSING
-       3  socketpair           MISSING
+       3  bind                 row
+       3  socketpair           row
        3  mremap               row
        2  getuid               row
        2  getgid               row
@@ -79,8 +79,8 @@
        2  epoll_create1        row
        2  chdir                row
        2  umask                MISSING
-       2  getsockopt           MISSING
-       2  shutdown             MISSING
+       2  getsockopt           row
+       2  shutdown             row
        2  readv                row
        2  poll                 row
        2  recvmsg              MISSING
@@ -100,29 +100,17 @@
        1  madvise              row
        1  exit                 row
        1  kill                 row
-       1  getpeername          MISSING
+       1  getpeername          row
 
-[missing]  24 rows the stack calls and kisal has none for
+[missing]  12 rows the stack calls and kisal has none for
 
-      12  recvfrom
-       9  getsockname
-       7  accept4
-       6  connect
        5  chown
-       5  sendto
-       5  setsockopt
        4  clock_nanosleep
-       4  listen
        4  pselect6
-       3  bind
-       3  socketpair
-       2  getsockopt
        2  recvmsg
        2  rt_sigsuspend
-       2  shutdown
        2  umask
        1  eventfd2
-       1  getpeername
        1  sendmsg
        1  setgid
        1  setgroups

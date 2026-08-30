@@ -278,6 +278,7 @@ impl<'a, S: Store> Process<'a, S> {
         // *before* the scheduler is asked what to run.
         self.resume_transfers();
         self.resume_watches();
+        self.resume_accepts();
         self.resume_paused();
         // A process can be given the processor back with its current thread
         // still parked: `Progress::Idle` hands the turn away without
@@ -376,6 +377,11 @@ impl<'a, S: Store> Process<'a, S> {
                 crate::thread::State::Watching(watching) => {
                     watching.deadline.is_some() || self.kernel.watch_ready(watching.watch)
                 }
+                // Waiting for a connection, and one has queued. All arena
+                // state, which is what lets a scheduling decision ask it.
+                crate::thread::State::Accepting(waiting) => {
+                    self.kernel.sockets.borrow().queued(waiting.listener) > 0
+                }
                 // Waiting for a signal, and one has arrived.
                 crate::thread::State::Paused => thread.deliverable().is_some(),
                 _ => thread.is_runnable(),
@@ -440,6 +446,35 @@ impl<'a, S: Store> Process<'a, S> {
                 thread.state = crate::thread::State::Runnable;
                 thread.tcb.registers[0] = crate::errno::Errno::Interrupted.as_result() as u64;
             }
+        }
+    }
+
+    /// Completes every parked `accept` whose connection has arrived.
+    ///
+    /// On the parked process's own turn, because the peer's address is
+    /// written into that process's memory — the same rule the transfers and
+    /// the waits obey, and the reason none of them completes on the turn of
+    /// whoever made them ready.
+    fn resume_accepts(&mut self) {
+        let parked: Vec<(usize, crate::thread::Accepting)> = self
+            .kernel
+            .machine
+            .threads
+            .all()
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, thread)| match thread.state {
+                crate::thread::State::Accepting(waiting) => Some((slot, waiting)),
+                _ => None,
+            })
+            .collect();
+        for (slot, waiting) in parked {
+            let Some(answer) = self.kernel.complete_accept(waiting) else {
+                continue;
+            };
+            let thread = &mut self.kernel.machine.threads.all_mut()[slot];
+            thread.state = crate::thread::State::Runnable;
+            thread.tcb.registers[0] = answer as u64;
         }
     }
 

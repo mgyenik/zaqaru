@@ -95,6 +95,11 @@ pub trait Machine {
         false
     }
 
+    /// Parks this thread in `accept`, waiting for a connection.
+    fn park_on_accept(&mut self, _waiting: crate::thread::Accepting) -> bool {
+        false
+    }
+
     /// Marks a signal pending on some thread that has not blocked it.
     ///
     /// What a *process*-directed signal means: `kill(2)` names a process,
@@ -599,6 +604,11 @@ impl Machine for Interpreted {
 
     fn park_on_signal(&mut self) -> bool {
         self.threads.current_mut().state = crate::thread::State::Paused;
+        true
+    }
+
+    fn park_on_accept(&mut self, waiting: crate::thread::Accepting) -> bool {
+        self.threads.current_mut().state = crate::thread::State::Accepting(waiting);
         true
     }
 

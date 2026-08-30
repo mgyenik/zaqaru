@@ -707,3 +707,681 @@ pub enum Reach {
     Finished,
     Refused(Errno),
 }
+
+/// A `sockaddr` as the guest wrote it, before it means anything.
+///
+/// Separate from [`Address`] because `bind` and `connect` interpret the same
+/// bytes differently: an `AF_UNIX` `bind` *creates* the node its path names
+/// and a `connect` *resolves* one, so the parse cannot resolve on its own
+/// without deciding which call it is in.
+#[derive(Clone, Debug)]
+pub enum Requested {
+    Inet { address: u32, port: u16 },
+    Unix { path: Vec<u8> },
+}
+
+/// `struct sockaddr_in`.
+const SOCKADDR_IN: u64 = 16;
+/// `struct sockaddr_un`: a family and 108 bytes of path.
+const SOCKADDR_UN: u64 = 110;
+const UNIX_PATH: usize = 108;
+
+impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_, S, M> {
+    /// Reads a `sockaddr` out of guest memory.
+    ///
+    /// The one place the byte layout is known, so that everything else
+    /// compares values. Ports and addresses are network order on the wire
+    /// and host order in the arena, and the swap happens here — a
+    /// comparison against `INADDR_ANY` written in network order is a
+    /// comparison nobody can read.
+    fn address_at(&self, at: u64, length: u64) -> Result<Requested, Errno> {
+        if length < 2 {
+            return Err(Errno::Invalid);
+        }
+        let mut family = [0u8; 2];
+        self.pages.read(at, &mut family).map_err(|_| Errno::Fault)?;
+        match i32::from(u16::from_le_bytes(family)) {
+            family::INET => {
+                if length < SOCKADDR_IN {
+                    return Err(Errno::Invalid);
+                }
+                let mut bytes = [0u8; SOCKADDR_IN as usize];
+                self.pages.read(at, &mut bytes).map_err(|_| Errno::Fault)?;
+                Ok(Requested::Inet {
+                    port: u16::from_be_bytes(bytes[2..4].try_into().expect("two bytes")),
+                    address: u32::from_be_bytes(bytes[4..8].try_into().expect("four bytes")),
+                })
+            }
+            family::UNIX => {
+                let span = length.min(SOCKADDR_UN);
+                let mut bytes = vec![0u8; span as usize];
+                self.pages.read(at, &mut bytes).map_err(|_| Errno::Fault)?;
+                let path = &bytes[2..];
+                if path.first() == Some(&0) {
+                    // The abstract namespace: a name with no filesystem
+                    // behind it, which this kernel has no table for.
+                    // Refused by name rather than treated as an empty path,
+                    // which would silently make every abstract socket the
+                    // same one.
+                    return Err(Errno::AddressUnavailable);
+                }
+                let end = path.iter().position(|byte| *byte == 0).unwrap_or(path.len());
+                if end == 0 {
+                    return Err(Errno::Invalid);
+                }
+                Ok(Requested::Unix {
+                    path: path[..end].to_vec(),
+                })
+            }
+            _ => Err(Errno::AddressFamily),
+        }
+    }
+
+    /// Writes an [`Address`] back where `getsockname` and friends were told
+    /// to put it, and updates the length the caller passed in and out.
+    ///
+    /// The out-length is the address's *full* size even when the buffer was
+    /// smaller — Linux truncates the bytes and reports what it would have
+    /// needed, which is how a caller learns to ask again.
+    fn write_address(&mut self, at: u64, length_at: u64, address: &Address) -> Result<(), Errno> {
+        if at == 0 || length_at == 0 {
+            return Ok(());
+        }
+        let mut room = [0u8; 4];
+        self.pages
+            .read(length_at, &mut room)
+            .map_err(|_| Errno::Fault)?;
+        let room = u32::from_le_bytes(room) as u64;
+        let rendered: Vec<u8> = match address {
+            Address::Unbound => {
+                let mut bytes = vec![0u8; SOCKADDR_IN as usize];
+                bytes[0..2].copy_from_slice(&(family::UNIX as u16).to_le_bytes());
+                bytes.truncate(2);
+                bytes
+            }
+            Address::Inet { address, port } => {
+                let mut bytes = vec![0u8; SOCKADDR_IN as usize];
+                bytes[0..2].copy_from_slice(&(family::INET as u16).to_le_bytes());
+                bytes[2..4].copy_from_slice(&port.to_be_bytes());
+                bytes[4..8].copy_from_slice(&address.to_be_bytes());
+                bytes
+            }
+            Address::Unix { path, .. } => {
+                let kept = path.len().min(UNIX_PATH - 1);
+                // Two for the family, the path, and the terminator Linux
+                // counts in the length it reports.
+                let mut bytes = vec![0u8; 2 + kept + 1];
+                bytes[0..2].copy_from_slice(&(family::UNIX as u16).to_le_bytes());
+                bytes[2..2 + kept].copy_from_slice(&path[..kept]);
+                bytes
+            }
+        };
+        let written = (rendered.len() as u64).min(room);
+        if written > 0 {
+            self.pages
+                .write(at, &rendered[..written as usize])
+                .map_err(|_| Errno::Fault)?;
+        }
+        self.pages
+            .write(length_at, &(rendered.len() as u32).to_le_bytes())
+            .map_err(|_| Errno::Fault)?;
+        Ok(())
+    }
+
+    /// `bind(2)`.
+    pub(crate) fn bind(&mut self, arguments: crate::syscall::Arguments) -> crate::syscall::Outcome {
+        use crate::syscall::Outcome;
+        let fd = arguments.get(0) as i32;
+        let Some(id) = self.socket_of(fd) else {
+            return Outcome::Done(self.not_a_socket(fd));
+        };
+        let requested = match self.address_at(arguments.get(1) as u64, arguments.get(2) as u64) {
+            Ok(requested) => requested,
+            Err(errno) => return Outcome::Done(errno.as_result()),
+        };
+        // Bound once. Linux answers `EINVAL` for a second `bind`, which is
+        // how a program learns it is looking at the wrong socket rather
+        // than at a busy address.
+        if !matches!(self.sockets.borrow().get(id).map(|s| &s.state), Some(State::Idle)) {
+            return Outcome::Done(Errno::Invalid.as_result());
+        }
+        let address = match requested {
+            Requested::Inet { address, port } => {
+                // Loopback and the wildcard are the two this container can
+                // answer to. An address belonging to some other machine is
+                // `EADDRNOTAVAIL`, which is what Linux says and what stops a
+                // program believing it bound something it did not.
+                if address != INADDR_ANY && address != INADDR_LOOPBACK {
+                    return Outcome::Done(Errno::AddressUnavailable.as_result());
+                }
+                let port = match port {
+                    // Port zero means "pick one", which a server that binds
+                    // before it knows its port relies on.
+                    0 => match self.sockets.borrow().ephemeral() {
+                        Some(port) => port,
+                        None => return Outcome::Done(Errno::AddressInUse.as_result()),
+                    },
+                    port => port,
+                };
+                Address::Inet { address, port }
+            }
+            Requested::Unix { path } => {
+                // The node is created here, which is also the check: a name
+                // already taken is `EADDRINUSE`, and `create` says `EEXIST`.
+                let vnode = match self.create_socket_node(arguments.get(1) as i64 + 2, 0o755) {
+                    Ok(vnode) => vnode,
+                    Err(Errno::Exists) => {
+                        return Outcome::Done(Errno::AddressInUse.as_result())
+                    }
+                    Err(errno) => return Outcome::Done(errno.as_result()),
+                };
+                Address::Unix { vnode, path }
+            }
+        };
+        if self.sockets.borrow().bound(&address) {
+            return Outcome::Done(Errno::AddressInUse.as_result());
+        }
+        if let Some(socket) = self.sockets.borrow_mut().get_mut(id) {
+            socket.state = State::Bound(address);
+        }
+        Outcome::Done(0)
+    }
+
+    /// `listen(2)`.
+    pub(crate) fn listen(&mut self, arguments: crate::syscall::Arguments) -> crate::syscall::Outcome {
+        use crate::syscall::Outcome;
+        let fd = arguments.get(0) as i32;
+        let Some(id) = self.socket_of(fd) else {
+            return Outcome::Done(self.not_a_socket(fd));
+        };
+        // Linux clamps rather than refuses, which is why the traced stack's
+        // 2048 works on a machine whose `somaxconn` is smaller.
+        let backlog = (arguments.get(1).max(0) as usize).min(MAX_BACKLOG).max(1);
+        let mut sockets = self.sockets.borrow_mut();
+        let Some(socket) = sockets.get_mut(id) else {
+            return Outcome::Done(Errno::BadFile.as_result());
+        };
+        let address = match &socket.state {
+            State::Bound(address) => address.clone(),
+            // Listening twice only changes the backlog, which nginx does
+            // on reload.
+            State::Listening { .. } => {
+                if let State::Listening { backlog: held, .. } = &mut socket.state {
+                    *held = backlog;
+                }
+                return Outcome::Done(0);
+            }
+            // An unbound `listen` on Linux binds an ephemeral port first.
+            State::Idle => Address::Inet {
+                address: INADDR_LOOPBACK,
+                port: 0,
+            },
+            State::Connected(_) => return Outcome::Done(Errno::AlreadyConnected.as_result()),
+        };
+        let address = match address {
+            Address::Inet { address, port: 0 } => match sockets.ephemeral() {
+                Some(port) => Address::Inet { address, port },
+                None => return Outcome::Done(Errno::AddressInUse.as_result()),
+            },
+            address => address,
+        };
+        let Some(socket) = sockets.get_mut(id) else {
+            return Outcome::Done(Errno::BadFile.as_result());
+        };
+        socket.state = State::Listening {
+            address,
+            backlog,
+            queue: std::collections::VecDeque::new(),
+        };
+        Outcome::Done(0)
+    }
+
+    /// `connect(2)`, which on loopback completes in one step.
+    ///
+    /// There is no handshake: the listener is a queue in the same arena, so
+    /// connecting is making two rings and pushing the far end onto it. Which
+    /// is why `EINPROGRESS` does not arise here — the plan's pitfall 4, and
+    /// the reason it insists the asymmetry with the edge be stated.
+    ///
+    /// `SO_ERROR` *does* arise here, though, because nginx reads it after
+    /// every connect whether or not one was needed. See the N0 baseline.
+    pub(crate) fn connect(&mut self, arguments: crate::syscall::Arguments) -> crate::syscall::Outcome {
+        use crate::syscall::Outcome;
+        let fd = arguments.get(0) as i32;
+        let Some(id) = self.socket_of(fd) else {
+            return Outcome::Done(self.not_a_socket(fd));
+        };
+        let requested = match self.address_at(arguments.get(1) as u64, arguments.get(2) as u64) {
+            Ok(requested) => requested,
+            Err(errno) => return Outcome::Done(errno.as_result()),
+        };
+        match self.sockets.borrow().get(id).map(|socket| &socket.state) {
+            Some(State::Connected(_)) => {
+                return Outcome::Done(Errno::AlreadyConnected.as_result())
+            }
+            Some(State::Listening { .. }) => {
+                return Outcome::Done(Errno::AlreadyConnected.as_result())
+            }
+            None => return Outcome::Done(Errno::BadFile.as_result()),
+            _ => {}
+        }
+        let wanted = match requested {
+            Requested::Inet { address, port } => Address::Inet {
+                // A connection to any local address is a connection to this
+                // container; there is nowhere else for it to go.
+                address: match address {
+                    INADDR_ANY => INADDR_LOOPBACK,
+                    address => address,
+                },
+                port,
+            },
+            Requested::Unix { path } => {
+                // Resolved rather than created: a path that is not there is
+                // `ENOENT`, which is exactly what glibc's `nscd` probe
+                // reads before falling back to `/etc/passwd`.
+                let root = self.vfs.root();
+                let vnode = match self.vfs.resolve(root, &path, crate::vfs::Lookup::FOLLOW) {
+                    Ok(vnode) => vnode,
+                    Err(errno) => return Outcome::Done(errno.as_result()),
+                };
+                Address::Unix { vnode, path }
+            }
+        };
+        let Some(listener) = self.sockets.borrow().listener_for(&wanted) else {
+            // Nothing is listening there. For a unix socket whose node
+            // exists this is `ECONNREFUSED`, and for one whose node does not
+            // the resolve above already answered `ENOENT` — which is the
+            // distinction a program probing for a daemon depends on.
+            return Outcome::Done(Errno::ConnectionRefused.as_result());
+        };
+        // Two rings, crossed. Each starts with one reader and one writer,
+        // which is one endpoint on each side of it.
+        let up = self.rings.borrow_mut().create();
+        let down = self.rings.borrow_mut().create();
+        let mut sockets = self.sockets.borrow_mut();
+        let local = match &wanted {
+            Address::Inet { .. } => match sockets.ephemeral() {
+                Some(port) => Address::Inet {
+                    address: INADDR_LOOPBACK,
+                    port,
+                },
+                None => Address::Unbound,
+            },
+            // A unix client is unnamed unless it bound a path of its own,
+            // which is what `getsockname` on one answers.
+            _ => Address::Unbound,
+        };
+        let (family, kind) = match sockets.get(id) {
+            Some(socket) => (socket.family, socket.kind),
+            None => return Outcome::Done(Errno::BadFile.as_result()),
+        };
+        // The far end: a socket nothing holds a descriptor for yet. Its one
+        // reference is the accept queue's, and `accept4` hands it to a
+        // descriptor without changing the count.
+        let far = sockets.create(family, kind);
+        if let Some(socket) = sockets.get_mut(far) {
+            socket.state = State::Connected(Endpoint {
+                receive: up,
+                transmit: down,
+                local: wanted.clone(),
+                peer: local.clone(),
+                read_shut: false,
+                write_shut: false,
+            });
+        }
+        if let Err(errno) = sockets.enqueue(listener, far) {
+            sockets.release(far);
+            drop(sockets);
+            let mut rings = self.rings.borrow_mut();
+            for ring in [up, down] {
+                rings.release(ring, End::Read);
+                rings.release(ring, End::Write);
+            }
+            return Outcome::Done(errno.as_result());
+        }
+        if let Some(socket) = sockets.get_mut(id) {
+            socket.state = State::Connected(Endpoint {
+                receive: down,
+                transmit: up,
+                local,
+                peer: wanted,
+                read_shut: false,
+                write_shut: false,
+            });
+        }
+        Outcome::Done(0)
+    }
+
+    /// `accept(2)` and `accept4(2)`.
+    pub(crate) fn accept(&mut self, number: i64, arguments: crate::syscall::Arguments) -> crate::syscall::Outcome {
+        use crate::syscall::Outcome;
+        let fd = arguments.get(0) as i32;
+        let Some(id) = self.socket_of(fd) else {
+            return Outcome::Done(self.not_a_socket(fd));
+        };
+        let flags = match number == crate::syscall::number::ACCEPT4 {
+            true => arguments.get(3) as i32,
+            false => 0,
+        };
+        if flags & !(kind::NONBLOCK | kind::CLOEXEC) != 0 {
+            return Outcome::Done(Errno::Invalid.as_result());
+        }
+        if !matches!(
+            self.sockets.borrow().get(id).map(|socket| &socket.state),
+            Some(State::Listening { .. })
+        ) {
+            // `accept` on a socket that never listened is `EINVAL`, which is
+            // how a program learns it forgot the `listen`.
+            return Outcome::Done(Errno::Invalid.as_result());
+        }
+        let waiting = crate::thread::Accepting {
+            listener: id,
+            at: arguments.get(1) as u64,
+            length_at: arguments.get(2) as u64,
+            flags,
+        };
+        match self.complete_accept(waiting) {
+            Some(answer) => Outcome::Done(answer),
+            None => {
+                let blocking = self
+                    .files
+                    .description(fd)
+                    .map(|file| file.flags & crate::file::open_flags::NONBLOCK == 0)
+                    .unwrap_or(false);
+                if !blocking {
+                    return Outcome::Done(Errno::TryAgain.as_result());
+                }
+                if !self.machine.park_on_accept(waiting) {
+                    return Outcome::Done(Errno::TryAgain.as_result());
+                }
+                Outcome::Blocked
+            }
+        }
+    }
+
+    /// Pops one connection off a listener's queue and gives it a descriptor,
+    /// or answers `None` because the queue is empty.
+    ///
+    /// Separate from the row because a parked `accept` finishes here too —
+    /// on the parked process's own turn, which is the rule every completion
+    /// in this kernel obeys, because the address the peer is written to is
+    /// that process's memory.
+    pub(crate) fn complete_accept(&mut self, waiting: crate::thread::Accepting) -> Option<i64> {
+        let accepted = self.sockets.borrow_mut().dequeue(waiting.listener)?;
+        let peer = self
+            .sockets
+            .borrow()
+            .endpoint(accepted)
+            .map(|endpoint| endpoint.peer.clone())
+            .unwrap_or_default();
+        if let Err(errno) = self.write_address(waiting.at, waiting.length_at, &peer) {
+            self.sockets.borrow_mut().release(accepted);
+            return Some(errno.as_result());
+        }
+        let flags = crate::file::open_flags::READ_WRITE
+            | match waiting.flags & kind::NONBLOCK != 0 {
+                true => crate::file::open_flags::NONBLOCK,
+                false => 0,
+            };
+        match self.files.open(
+            crate::fd::Backing::Socket(accepted),
+            flags,
+            waiting.flags & kind::CLOEXEC != 0,
+        ) {
+            Ok(fd) => Some(i64::from(fd)),
+            Err(errno) => {
+                self.sockets.borrow_mut().release(accepted);
+                Some(errno.as_result())
+            }
+        }
+    }
+
+    /// `getsockname(2)` and `getpeername(2)`.
+    pub(crate) fn socket_address(&mut self, number: i64, arguments: crate::syscall::Arguments) -> crate::syscall::Outcome {
+        use crate::syscall::Outcome;
+        let fd = arguments.get(0) as i32;
+        let Some(id) = self.socket_of(fd) else {
+            return Outcome::Done(self.not_a_socket(fd));
+        };
+        let peer = number == crate::syscall::number::GETPEERNAME;
+        let address = {
+            let sockets = self.sockets.borrow();
+            let Some(socket) = sockets.get(id) else {
+                return Outcome::Done(Errno::BadFile.as_result());
+            };
+            match (&socket.state, peer) {
+                (State::Connected(endpoint), true) => endpoint.peer.clone(),
+                (State::Connected(endpoint), false) => endpoint.local.clone(),
+                // A listener has no peer, and gunicorn asks — which is what
+                // makes this arm a traced fact rather than a guess.
+                (_, true) => return Outcome::Done(Errno::NotConnected.as_result()),
+                (State::Bound(address), false) => address.clone(),
+                (State::Listening { address, .. }, false) => address.clone(),
+                (State::Idle, false) => Address::Unbound,
+            }
+        };
+        match self.write_address(arguments.get(1) as u64, arguments.get(2) as u64, &address) {
+            Ok(()) => Outcome::Done(0),
+            Err(errno) => Outcome::Done(errno.as_result()),
+        }
+    }
+
+    /// The errno for a descriptor that was handed to a socket row and is not
+    /// a socket — which is a different fact from being closed.
+    fn not_a_socket(&self, fd: i32) -> i64 {
+        match self.files.is_open(fd) {
+            true => Errno::NotSocket.as_result(),
+            false => Errno::BadFile.as_result(),
+        }
+    }
+}
+
+/// The `send`/`recv` flags this kernel reads.
+pub mod message {
+    /// Read without consuming.
+    pub const PEEK: i32 = 2;
+    /// This one call does not block, whatever the descriptor says.
+    pub const DONTWAIT: i32 = 0x40;
+    /// A broken pipe is an errno and not a signal, for this call. Every
+    /// server that writes to a socket it might outlive passes it.
+    pub const NOSIGNAL: i32 = 0x4000;
+}
+
+impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_, S, M> {
+    /// `setsockopt(2)`.
+    ///
+    /// Mostly recording, and the honesty is in *which* ones do nothing and
+    /// why rather than in a blanket zero. `SO_RCVBUF` and `SO_SNDBUF` are
+    /// remembered but do not resize a ring yet; `TCP_NODELAY` and
+    /// `SO_KEEPALIVE` cannot do anything, there being no TCP to tune; and
+    /// `SO_REUSEADDR` has nothing to relax, because the `TIME_WAIT` it
+    /// exists for is a TCP state this kernel does not have.
+    pub(crate) fn setsockopt(&mut self, arguments: crate::syscall::Arguments) -> crate::syscall::Outcome {
+        use crate::syscall::Outcome;
+        let fd = arguments.get(0) as i32;
+        let Some(id) = self.socket_of(fd) else {
+            return Outcome::Done(self.not_a_socket(fd));
+        };
+        let level = arguments.get(1) as i32;
+        let name = arguments.get(2) as i32;
+        let at = arguments.get(3) as u64;
+        let length = arguments.get(4) as u64;
+        let value = match length >= 4 {
+            true => {
+                let mut bytes = [0u8; 4];
+                if self.pages.read(at, &mut bytes).is_err() {
+                    return Outcome::Done(Errno::Fault.as_result());
+                }
+                i32::from_le_bytes(bytes)
+            }
+            false => 0,
+        };
+        let mut sockets = self.sockets.borrow_mut();
+        let Some(socket) = sockets.get_mut(id) else {
+            return Outcome::Done(Errno::BadFile.as_result());
+        };
+        match (level, name) {
+            (option::SOL_SOCKET, option::REUSEADDR) => socket.options.reuse_address = value != 0,
+            (option::SOL_SOCKET, option::KEEPALIVE) => socket.options.keep_alive = value != 0,
+            (option::SOL_SOCKET, option::RCVBUF) => socket.options.receive_buffer = value as u32,
+            (option::SOL_SOCKET, option::SNDBUF) => socket.options.send_buffer = value as u32,
+            (option::SOL_TCP, option::TCP_NODELAY) => socket.options.no_delay = value != 0,
+            // Timeouts, which need the deadline machinery N4 builds. Named
+            // rather than accepted: a program that sets a receive timeout
+            // and is told it worked will wait forever when it fires.
+            (option::SOL_SOCKET, option::RCVTIMEO | option::SNDTIMEO) => {
+                return Outcome::Fault(crate::syscall::Fault::detailed(
+                    crate::syscall::number::SETSOCKOPT,
+                    arguments,
+                    "`SO_RCVTIMEO`/`SO_SNDTIMEO`, which are a parked transfer \
+                     racing a deadline — and a deadline needs the waiting \
+                     machinery of `docs/network-plan.md`'s N4",
+                ));
+            }
+            // Everything else is recorded as accepted, which is what Linux
+            // does for the options a protocol does not implement.
+            _ => {}
+        }
+        Outcome::Done(0)
+    }
+
+    /// `getsockopt(2)`.
+    pub(crate) fn getsockopt(&mut self, arguments: crate::syscall::Arguments) -> crate::syscall::Outcome {
+        use crate::syscall::Outcome;
+        let fd = arguments.get(0) as i32;
+        let Some(id) = self.socket_of(fd) else {
+            return Outcome::Done(self.not_a_socket(fd));
+        };
+        let level = arguments.get(1) as i32;
+        let name = arguments.get(2) as i32;
+        let at = arguments.get(3) as u64;
+        let length_at = arguments.get(4) as u64;
+        let answer = {
+            let mut sockets = self.sockets.borrow_mut();
+            let Some(socket) = sockets.get_mut(id) else {
+                return Outcome::Done(Errno::BadFile.as_result());
+            };
+            match (level, name) {
+                // Read once and cleared, which is how a non-blocking
+                // `connect` reports what happened — and nginx reads it
+                // after every connect whether or not one was needed.
+                (option::SOL_SOCKET, option::ERROR) => {
+                    let held = socket.options.error;
+                    socket.options.error = 0;
+                    held
+                }
+                (option::SOL_SOCKET, option::REUSEADDR) => i32::from(socket.options.reuse_address),
+                (option::SOL_SOCKET, option::KEEPALIVE) => i32::from(socket.options.keep_alive),
+                (option::SOL_SOCKET, option::RCVBUF) => socket.options.receive_buffer as i32,
+                (option::SOL_SOCKET, option::SNDBUF) => socket.options.send_buffer as i32,
+                (option::SOL_SOCKET, option::TYPE) => socket.kind,
+                (option::SOL_SOCKET, option::DOMAIN) => socket.family,
+                (option::SOL_SOCKET, option::PROTOCOL) => 0,
+                (option::SOL_SOCKET, option::ACCEPTCONN) => {
+                    i32::from(matches!(socket.state, State::Listening { .. }))
+                }
+                (option::SOL_TCP, option::TCP_NODELAY) => i32::from(socket.options.no_delay),
+                _ => return Outcome::Done(Errno::NoProtocolOption.as_result()),
+            }
+        };
+        if length_at != 0 {
+            let mut room = [0u8; 4];
+            if self.pages.read(length_at, &mut room).is_err() {
+                return Outcome::Done(Errno::Fault.as_result());
+            }
+            let room = u32::from_le_bytes(room).min(4);
+            if room > 0 && self.pages.write(at, &answer.to_le_bytes()[..room as usize]).is_err() {
+                return Outcome::Done(Errno::Fault.as_result());
+            }
+            if self.pages.write(length_at, &4u32.to_le_bytes()).is_err() {
+                return Outcome::Done(Errno::Fault.as_result());
+            }
+        }
+        Outcome::Done(0)
+    }
+
+    /// `sendto(2)` and `recvfrom(2)`, which on a connected stream are
+    /// `write` and `read` with flags.
+    ///
+    /// The address argument is what makes them separate calls, and on a
+    /// stream socket Linux ignores it — there is one peer and it is already
+    /// chosen. What is not ignored is the flags: `MSG_PEEK` reads without
+    /// consuming, `MSG_DONTWAIT` makes this one call non-blocking whatever
+    /// the descriptor says, and `MSG_NOSIGNAL` turns a broken pipe into an
+    /// errno alone, which every server that writes to a socket it might
+    /// outlive passes.
+    pub(crate) fn send_receive(&mut self, number: i64, arguments: crate::syscall::Arguments) -> crate::syscall::Outcome {
+        use crate::syscall::Outcome;
+        let fd = arguments.get(0) as i32;
+        let buffer = arguments.get(1) as u64;
+        let count = arguments.get(2);
+        let flags = arguments.get(3) as i32;
+        if count < 0 {
+            return Outcome::Done(Errno::Invalid.as_result());
+        }
+        let sending = number == crate::syscall::number::SENDTO;
+        let direction = match sending {
+            true => End::Write,
+            false => End::Read,
+        };
+        let (ring, mut open_flags) = match self.socket_ring(fd, direction) {
+            Reach::Ring { ring, flags } => (ring, flags),
+            Reach::Finished => {
+                if sending {
+                    return self.broken(flags);
+                }
+                return Outcome::Done(0);
+            }
+            Reach::Refused(errno) => {
+                if sending && errno == crate::ring::BROKEN {
+                    return self.broken(flags);
+                }
+                return Outcome::Done(errno.as_result());
+            }
+            Reach::Elsewhere => return Outcome::Done(self.not_a_socket(fd)),
+        };
+        if flags & message::PEEK != 0 {
+            if sending {
+                return Outcome::Done(Errno::Invalid.as_result());
+            }
+            return self.peek_ring(ring, buffer, count as u64);
+        }
+        if flags & message::DONTWAIT != 0 {
+            open_flags |= crate::file::open_flags::NONBLOCK;
+        }
+        // `MSG_NOSIGNAL` suppresses the signal and not the errno, so the
+        // suppression is recorded on the thread for the transfer to read
+        // rather than folded into the flags.
+        self.suppress_sigpipe(flags & message::NOSIGNAL != 0);
+        let outcome = self.transfer_ring(ring, direction, open_flags, buffer, count as u64);
+        self.suppress_sigpipe(false);
+        outcome
+    }
+
+    /// A write to a direction this endpoint has given up: `EPIPE`, and a
+    /// `SIGPIPE` unless the caller said not to.
+    fn broken(&mut self, flags: i32) -> crate::syscall::Outcome {
+        use crate::syscall::Outcome;
+        const SIGPIPE: i32 = 13;
+        if flags & message::NOSIGNAL == 0 && self.signal_process(SIGPIPE) {
+            return Outcome::Exit(128 + SIGPIPE);
+        }
+        Outcome::Done(crate::ring::BROKEN.as_result())
+    }
+
+    fn peek_ring(&mut self, ring: u32, buffer: u64, count: u64) -> crate::syscall::Outcome {
+        use crate::syscall::Outcome;
+        if let Err(errno) = self.memory().check(buffer, count) {
+            return Outcome::Done(errno.as_result());
+        }
+        let available = self.rings.borrow().queued(ring) as u64;
+        let want = count.min(available) as usize;
+        let mut bytes = vec![0u8; want];
+        let seen = self.rings.borrow().peek(ring, &mut bytes);
+        // SAFETY: the buffer was bounds-checked a moment ago.
+        match unsafe { self.memory_mut().write(buffer, &bytes[..seen]) } {
+            Ok(()) => Outcome::Done(seen as i64),
+            Err(errno) => Outcome::Done(errno.as_result()),
+        }
+    }
+}
