@@ -16,9 +16,10 @@
 //! - **It reads `argv[0]` to choose one.** Which is why the bake records a
 //!   command line at all.
 //!
-//! `ls` is the applet chosen because it is the widest one that does not
-//! fork: the table lookup, a directory read, a `stat` per entry, the clock,
-//! and formatted output through the write path.
+//! `ls -l` is the applet chosen because it is the widest one that does not
+//! fork: the table lookup, a directory read, a `stat` per entry, the uid and
+//! gid the bake preserved, the clock, and formatted output through the write
+//! path.
 //!
 //! Skipped where the system has no busybox — a machine without one is not
 //! this test's failure. One container, because each applet would need its
@@ -56,7 +57,7 @@ fn a_stripped_applet_multiplexer_finds_its_applet() {
     );
     tree.link(directory, &name, file).expect("link");
 
-    let argv: Vec<Vec<u8>> = [b"busybox".as_slice(), b"ls", b"/etc"]
+    let argv: Vec<Vec<u8>> = [b"busybox".as_slice(), b"ls", b"-l", b"/etc"]
         .iter()
         .map(|argument| argument.to_vec())
         .collect();
@@ -104,7 +105,25 @@ fn a_stripped_applet_multiplexer_finds_its_applet() {
         .read(&path(&[b"iso", b"console", b"stdout"]))
         .expect("console")
         .unwrap_or_default();
-    assert_eq!(String::from_utf8_lossy(&out), "sample.txt\n");
+    // The long form on purpose: it is the applet's widest path — a `stat`
+    // per entry, the uid and gid the bake preserved, the clock, and the
+    // number formatting — and it is what found the last discovery gap, an
+    // address named by a `lea` inside a guessed extent that nothing was
+    // allowed to revise. The fields that depend on the host's own file are
+    // matched loosely; the ones that are this kernel's answers are not.
+    let out = String::from_utf8_lossy(&out).into_owned();
+    let mut lines = out.lines();
+    assert_eq!(lines.next(), Some("total 1"), "output was: {out:?}");
+    let entry = lines.next().unwrap_or_default();
+    assert!(
+        entry.starts_with("-rw") && entry.ends_with(" sample.txt"),
+        "the long listing is not one: {entry:?}"
+    );
+    assert!(
+        entry.split_whitespace().nth(4) == Some("11"),
+        "the size is not the file's: {entry:?}"
+    );
+    assert_eq!(lines.next(), None, "something else was listed: {out:?}");
 }
 
 fn present(path: &str) -> Option<std::path::PathBuf> {

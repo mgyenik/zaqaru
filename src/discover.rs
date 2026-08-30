@@ -361,6 +361,10 @@ pub fn discover(
         Layout::Linked => data_array_targets(sections),
         Layout::Relocatable => std::collections::BTreeSet::new(),
     };
+    // Every address weak evidence names, whether or not something already
+    // covers it. What is covered by a *guessed* extent cuts it; see
+    // `split_once`.
+    let mut revisable: std::collections::BTreeSet<u64> = tables.clone();
     collect_functions(&mut coverage, symbols, sections, layout)?;
     if layout == Layout::Linked {
         // The entry point and the relocation targets, which the file states
@@ -379,13 +383,32 @@ pub fn discover(
         for function in placements(&coverage, sections, &arrays, Witness::InitialiserArray) {
             coverage.establish(sections, function);
         }
-        fill_from_transfers(&mut coverage, sections, &tables)?;
+        // The addresses instructions *take*, kept: like a table's entries,
+        // one landing inside a guessed extent is evidence the guess was
+        // wrong rather than something to drop.
+        revisable.extend(fill_from_transfers(&mut coverage, sections, &tables)?);
     }
     let mut functions = coverage.finish();
     if layout == Layout::Linked {
         functions.sort_by_key(|function| (function.section, function.offset));
     }
-    split_at_interior_entries(sections, layout, &tables, &mut functions)?;
+    // Resolved to section offsets once, here, rather than per round inside
+    // the splitting fixpoint. The lookup is linear in the number of
+    // sections, and a merged dynamic program has ninety of them across
+    // three files — doing it per target per round cost more than twice the
+    // whole bake.
+    let mut revisable_by_section: std::collections::HashMap<usize, Vec<u64>> =
+        std::collections::HashMap::new();
+    for address in &revisable {
+        if let Some((section, offset)) = section_holding(sections, *address) {
+            revisable_by_section.entry(section).or_default().push(offset);
+        }
+    }
+    for offsets in revisable_by_section.values_mut() {
+        offsets.sort_unstable();
+        offsets.dedup();
+    }
+    split_at_interior_entries(sections, layout, &revisable_by_section, &mut functions)?;
     make_names_unique(sections, &mut functions);
     Ok(functions)
 }
@@ -818,6 +841,16 @@ fn data_array_targets(sections: &[Section]) -> std::collections::BTreeSet<u64> {
     /// labels in one function, not a table of functions.
     const CLUSTER: u64 = 0x400;
 
+    // The text ranges, once. This is read for every eight-byte word of every
+    // data section — hundreds of thousands of them across a merged dynamic
+    // program — and a merged program has ninety sections to walk if the
+    // question is asked section by section.
+    let code: Vec<std::ops::Range<u64>> = sections
+        .iter()
+        .filter(|section| section.role == SectionRole::Text && section.address != 0)
+        .map(|section| section.address..section.address + section.bytes.len() as u64)
+        .collect();
+
     let mut found = std::collections::BTreeSet::new();
     for section in sections {
         if !section.role.is_data() || section.bytes.is_empty() {
@@ -833,7 +866,7 @@ fn data_array_targets(sections: &[Section]) -> std::collections::BTreeSet<u64> {
                         .try_into()
                         .expect("eight bytes"),
                 );
-                match in_text(sections, value) {
+                match code.iter().any(|range| range.contains(&value)) {
                     true => run.push(value),
                     false => break,
                 }
@@ -849,16 +882,6 @@ fn data_array_targets(sections: &[Section]) -> std::collections::BTreeSet<u64> {
         }
     }
     found
-}
-
-/// Whether an address lands inside a section holding code.
-fn in_text(sections: &[Section], address: u64) -> bool {
-    sections.iter().any(|section| {
-        section.role == SectionRole::Text
-            && section.address != 0
-            && address >= section.address
-            && address < section.address + section.bytes.len() as u64
-    })
 }
 
 /// Whether every target sits inside one short span — the computed-goto tell.
@@ -1164,7 +1187,7 @@ fn fill_from_transfers(
     coverage: &mut Coverage,
     sections: &[Section],
     tables: &std::collections::BTreeSet<u64>,
-) -> Result<()> {
+) -> Result<std::collections::BTreeSet<u64>> {
     const ROUNDS: usize = 16;
     let mut targets = std::collections::BTreeSet::new();
     let mut addressed = std::collections::BTreeSet::new();
@@ -1213,7 +1236,7 @@ fn fill_from_transfers(
         }));
         placed.retain(|function| !declined.contains(&(function.section, function.offset)));
         if placed.is_empty() {
-            return Ok(());
+            return Ok(addressed);
         }
         if round == ROUNDS {
             bail!(
@@ -1236,13 +1259,13 @@ fn fill_from_transfers(
             }
         }
     }
-    Ok(())
+    Ok(addressed)
 }
 
 fn split_at_interior_entries(
     sections: &[Section],
     layout: Layout,
-    tables: &std::collections::BTreeSet<u64>,
+    revisable: &std::collections::HashMap<usize, Vec<u64>>,
     functions: &mut Vec<Function>,
 ) -> Result<()> {
     // To a fixpoint, because a cut makes boundaries that were not there
@@ -1252,7 +1275,7 @@ fn split_at_interior_entries(
     // branch into the tail, which exposes another.
     const ROUNDS: usize = 16;
     for round in 0..=ROUNDS {
-        if !split_once(sections, layout, tables, functions)? {
+        if !split_once(sections, layout, revisable, functions)? {
             return Ok(());
         }
         if round == ROUNDS {
@@ -1270,7 +1293,7 @@ fn split_at_interior_entries(
 fn split_once(
     sections: &[Section],
     layout: Layout,
-    tables: &std::collections::BTreeSet<u64>,
+    revisable: &std::collections::HashMap<usize, Vec<u64>>,
     functions: &mut Vec<Function>,
 ) -> Result<bool> {
     use std::collections::{BTreeSet, HashMap};
@@ -1416,27 +1439,27 @@ fn split_once(
     // means the first guess wins permanently over better evidence — which is
     // how busybox's applet table came to name the interior of a function
     // nothing had ever stated the size of.
-    for target in tables {
-        let Some((section, offset)) = section_holding(sections, *target) else {
+    for (section, offsets) in revisable {
+        let Some(placed) = by_section.get(section) else {
             continue;
         };
-        let Some(placed) = by_section.get(&section) else {
-            continue;
-        };
-        let mut at = placed.partition_point(|(start, _, _)| *start <= offset);
-        while at > 0 {
-            let (_, reach, index) = placed[at - 1];
-            if reach <= offset {
-                break;
-            }
-            at -= 1;
-            let function = &functions[index];
-            if function.extent != Extent::Guessed {
-                continue;
-            }
-            let interior = (function.offset + 1..function.offset + function.size).contains(&offset);
-            if interior && starts.get(&index).is_some_and(|b| b.contains(&offset)) {
-                cuts.entry(index).or_default().insert(offset);
+        for offset in offsets {
+            let mut at = placed.partition_point(|(start, _, _)| start <= offset);
+            while at > 0 {
+                let (_, reach, index) = placed[at - 1];
+                if reach <= *offset {
+                    break;
+                }
+                at -= 1;
+                let function = &functions[index];
+                if function.extent != Extent::Guessed {
+                    continue;
+                }
+                let interior =
+                    (function.offset + 1..function.offset + function.size).contains(offset);
+                if interior && starts.get(&index).is_some_and(|b| b.contains(offset)) {
+                    cuts.entry(index).or_default().insert(*offset);
+                }
             }
         }
     }
@@ -1682,8 +1705,9 @@ mod tests {
         guessed.extent = Extent::Guessed;
         let mut functions = std::vec![stated, guessed];
 
-        let inside = std::collections::BTreeSet::from([0x400000 + 0x140, 0x400000 + 0x240]);
-        split_at_interior_entries(&sections, Layout::Linked, &inside, &mut functions).expect("split");
+        let inside = std::collections::HashMap::from([(0usize, std::vec![0x140u64, 0x240])]);
+        split_at_interior_entries(&sections, Layout::Linked, &inside, &mut functions)
+            .expect("split");
 
         let starts: Vec<u64> = functions.iter().map(|function| function.offset).collect();
         assert!(
