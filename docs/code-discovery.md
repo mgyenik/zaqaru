@@ -97,6 +97,33 @@ here":
 | `R_X86_64_IRELATIVE` addends | the startup code calls this resolver | **D3** |
 | `R_X86_64_RELATIVE` targets landing in text (PIE / static-PIE inputs) | an embedded code pointer, marked exactly | **D3** |
 
+### A stated extent and a guessed one are not the same thing
+
+The first version of this document made the permission to cut turn on
+*witness strength*, and that is the wrong axis. The two come apart: a symbol
+is a strong witness, but a symbol with no size states only a **start**, and
+its extent is then whatever begins next — a bound, not a fact. The same is
+true of every candidate `placements` bounds.
+
+So a function carries, beside its witness, where its **extent** came from:
+
+- **Stated** — the file said so. A symbol's size, an unwind entry's length,
+  a linkage table's stride, the length of `.init`.
+- **Guessed** — worked out here, from whatever begins next.
+
+The invariant's argument is that a false start silently truncates a real
+function. That argument is about *stated* extents. An extent this pass
+guessed is already a guess, and refusing to revise it means the first guess
+wins permanently over better evidence.
+
+Which is not hypothetical: busybox's `applet_main[]` names 278 functions
+inside a span that a transfer target had been bounded across a 631 KiB
+unwind hole, and `busybox cat` reached one of them and died on an exec-map
+miss. So **weak evidence landing inside a guessed extent cuts it**, and
+inside a stated one is skipped exactly as before — which is what keeps a
+computed goto's 256 labels from shredding `_PyEval_EvalFrameDefault`, whose
+size its symbol states.
+
 **Weak witnesses may only introduce a function into a region no strong
 witness covers.** A weak witness must never split, shorten, or bound a
 function that strong evidence established. Weak evidence is an
@@ -106,7 +133,7 @@ function that strong evidence established. Weak evidence is an
 |---|---|---|
 | direct transfer targets — a discovered function calls or jumps here | this instruction transfers *here* | built (`discover_from_transfers`, gap-only by construction: `uncovered_functions` skips covered code) |
 | address-taken code in operands — a RIP-relative `lea` or a `mov` immediate whose value lands in text | this instruction takes the address of *here* | **D4** |
-| data address arrays — a corroborated run of code pointers in a data section | something indexes a table of these | **D5** |
+| data address arrays — a corroborated run of code pointers in a data section | something indexes a table of these | built (`data_array_targets`) |
 
 The fourth witness already obeys the gap-only rule — `uncovered_functions`
 refuses anything inside covered code, and a transfer *into* a covered
@@ -216,14 +243,22 @@ pass **all** of:
 1. The source is pointer-size aligned and lies wholly inside a loaded,
    initialized, non-text section.
 2. It is part of a run of **at least three** entries at a constant stride
-   — any constant stride, not eight, with the pointer at a fixed offset
-   within the stride, because real tables are arrays of structs as often
-   as arrays of pointers — whose values all land in text sections.
+   whose values all land in text sections.
+
+   *Built as stride eight only, and the reason is a measurement.* This rule
+   was written expecting arrays of structs, and the pitfall index below said
+   a stride-eight scan would miss the applet table. On this machine's
+   busybox it does not: the table is 278 bare pointers at stride eight in
+   `.data.rel.ro`. The struct-stride generalisation waits for a binary that
+   needs it, where it will arrive with a case instead of a guess about one.
 3. Every target lands on an instruction boundary under the fixpoint
    sweep's decoding of the surrounding gap, and the bytes at the target
    are not padding (below).
-4. Every target lies in a region no strong witness covers (the
-   invariant).
+4. Every target lies in a region no *stated* extent covers — see "A stated
+   extent and a guessed one are not the same thing". A target inside a
+   **guessed** extent cuts it, because that is evidence the bound was
+   wrong; a target inside a stated one is skipped, which is the invariant
+   doing its job.
 5. The run is refused, with a log line naming it, if its targets all
    cluster inside one span smaller than the run could plausibly describe
    as separate functions — the computed-goto/jump-table tell — or if the
@@ -586,8 +621,13 @@ being reached by any other witness — deleting the harvest makes it fail;
 and the merged sweep discovers and splits exactly what the separate loops
 did on the standing fixtures.*
 
-**D5 — The data-array witness and the negative filters.** As specified
-above. *Acceptance: the stripped busybox reaches its applet dispatch —
+**D5 — The data-array witness and the negative filters.** *Built.* As
+specified above, with the stride narrowed to eight by measurement and rule 4
+refined to the stated/guessed distinction — which turned out to be the load-
+bearing half: the applet table's targets are not in a *gap*, they are inside
+an extent a transfer target guessed across a 631 KiB unwind hole, so a
+gap-only witness alone would have found nothing. `busybox cat` and
+`busybox ls` reach their applets. *Acceptance: the stripped busybox reaches its applet dispatch —
 the indirect call through the applet table resolves — and a fixture
 containing a computed-goto-shaped label table in data next to an
 uncovered region is refused with the cluster log line, not shredded.*
@@ -666,9 +706,11 @@ the caller who cannot be asked to opt in.
 1. A data value that equals a covered function's interior address is not
    an error and not a discovery — it is skipped by the invariant. Do not
    "fix" the skip; it is the design (the CPython trap above).
-2. The applet-table shape is structs, not bare pointers — a stride-8
-   scan misses it. The stride is any constant; detect the run first,
-   then the field offset (D5 rule 2).
+2. ~~The applet-table shape is structs, not bare pointers.~~ **Measured
+   and wrong** for this machine's busybox: 278 bare pointers at stride
+   eight in `.data.rel.ro`. The generalisation to struct strides is real
+   and unbuilt; this pitfall was a prediction about a binary nobody had
+   looked at (D5 rule 2).
 3. An immediate operand is a number. Without the padding check and the
    text-section check, D4 mints functions out of constants (D4).
 4. The dynamic-relocation read must skip what it does not model. Refusal

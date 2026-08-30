@@ -54,6 +54,36 @@ pub struct Function {
     /// What said this function is here. Carried so that a refusal or a
     /// runtime miss can name its evidence rather than only its address.
     pub witness: Witness,
+    /// Whether the *extent* above is something the file said or something
+    /// this pass worked out. See [`Extent`].
+    pub extent: Extent,
+}
+
+/// Where a function's extent came from, which is a different question from
+/// what said the function is there.
+///
+/// The two come apart, and the design's first version conflated them. A
+/// symbol is a strong witness, but a symbol with no size states only a
+/// start; its extent is then whatever begins next, which is a bound rather
+/// than a fact. The same is true of every candidate `placements` bounds.
+///
+/// The distinction is what decides whether later evidence may cut. The
+/// invariant's whole argument is that a false start silently truncates a
+/// real function — but that argument is about extents the file *stated*.
+/// An extent this pass guessed is already a guess, and refusing to revise
+/// it means the first guess wins permanently over better evidence, which is
+/// how busybox's applet table came to point into the middle of a 0x1f584-
+/// byte function nothing had ever stated the size of.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Extent {
+    /// The file said so: a symbol's size, an unwind entry's length, a
+    /// linkage table's stride, the length of `.init`. Never cut on weak
+    /// evidence — this is what defends `_PyEval_EvalFrameDefault` from its
+    /// own opcode table.
+    Stated,
+    /// Worked out here, from whatever begins next. Weak evidence landing
+    /// inside one is evidence the bound was wrong.
+    Guessed,
 }
 
 /// What said a function is here.
@@ -90,6 +120,10 @@ pub enum Witness {
     /// or an immediate in non-position-independent code. How a callback is
     /// registered before anything calls it.
     AddressTaken,
+    /// A corroborated run of code pointers in a data section: something
+    /// indexes a table of these. busybox's `applet_main[]` is the case it
+    /// was written for.
+    DataArray,
     /// Cut out of a function that something branched into partway. The piece
     /// before it keeps its original witness.
     InteriorEntry,
@@ -110,7 +144,7 @@ impl Witness {
             | Witness::LinkageTable
             | Witness::InitialiserArray
             | Witness::FileStated => true,
-            Witness::Transfer | Witness::AddressTaken => false,
+            Witness::Transfer | Witness::AddressTaken | Witness::DataArray => false,
             // Not evidence of its own: a cut redistributes a function that
             // strong or weak evidence had already established, and the
             // pieces inherit whatever standing it had.
@@ -320,6 +354,13 @@ pub fn discover(
     evidence: &FileEvidence,
 ) -> Result<Vec<Function>> {
     let mut coverage = Coverage::default();
+    // Runs of code pointers in data, read once: the same set answers two
+    // questions below — which uncovered addresses are functions, and which
+    // guessed extents ran past one.
+    let tables = match layout {
+        Layout::Linked => data_array_targets(sections),
+        Layout::Relocatable => std::collections::BTreeSet::new(),
+    };
     collect_functions(&mut coverage, symbols, sections, layout)?;
     if layout == Layout::Linked {
         // The entry point and the relocation targets, which the file states
@@ -338,13 +379,13 @@ pub fn discover(
         for function in placements(&coverage, sections, &arrays, Witness::InitialiserArray) {
             coverage.establish(sections, function);
         }
-        fill_from_transfers(&mut coverage, sections)?;
+        fill_from_transfers(&mut coverage, sections, &tables)?;
     }
     let mut functions = coverage.finish();
     if layout == Layout::Linked {
         functions.sort_by_key(|function| (function.section, function.offset));
     }
-    split_at_interior_entries(sections, layout, &mut functions)?;
+    split_at_interior_entries(sections, layout, &tables, &mut functions)?;
     make_names_unique(sections, &mut functions);
     Ok(functions)
 }
@@ -431,11 +472,15 @@ fn collect_functions(
         // Hand-written assembly routinely omits `.size`, and a symbol
         // without one says only where a function starts. The unwind table
         // knows how long it is.
+        // Whether the size came from the file or from what follows, which
+        // decides whether later evidence may revise it.
+        let mut extent = Extent::Stated;
         let size = match symbol.size {
             0 => unwind
                 .get(&(sections[section].address + symbol.offset))
                 .copied()
                 .or_else(|| {
+                    extent = Extent::Guessed;
                     next_boundary(&boundaries, section, symbol.offset)
                         .map(|next| next - symbol.offset)
                 })
@@ -471,6 +516,7 @@ fn collect_functions(
             offset: symbol.offset,
             size,
             witness: Witness::Symbol,
+            extent,
         });
     }
     functions.sort_by_key(|function| (function.section, function.offset));
@@ -510,6 +556,8 @@ fn collect_functions(
             offset,
             size: length,
             witness: Witness::UnwindEntry,
+            // An unwind entry states how long the function is.
+            extent: Extent::Stated,
         });
     }
     for function in discovered {
@@ -541,6 +589,9 @@ fn collect_functions(
                     section: index,
                     offset: 0,
                     size: section.bytes.len() as u64,
+                    // The ABI says the section holds one function, so its
+                    // length is that function's length.
+                    extent: Extent::Stated,
                     witness: Witness::FileStated,
                 },
             );
@@ -584,6 +635,9 @@ fn collect_functions(
                     section: index,
                     offset,
                     size: stride,
+                    // The section's alignment is the linker stating how
+                    // long a stub is.
+                    extent: Extent::Stated,
                     witness: Witness::LinkageTable,
                 });
             }
@@ -721,6 +775,108 @@ fn addressed_placements(
         .into_iter()
         .filter(|function| !claimed.contains(&(function.section, function.offset)))
         .collect()
+}
+
+/// Addresses named by a corroborated run of code pointers in a data section.
+///
+/// The witness busybox needs. Its `applet_main[]` is 278 consecutive
+/// eight-byte pointers in `.data.rel.ro`, and the functions they name are
+/// reached no other way — no symbol, no unwind entry, and no instruction
+/// anywhere naming their address, because the only thing that ever computes
+/// one is an index into this table.
+///
+/// The corroboration is what makes a bit pattern evidence. A run must be
+/// pointer-aligned, at least three entries long, and every value must land
+/// in a text section; a lone word that happens to look like an address is
+/// exactly what the rule exists to reject. Two further negative filters,
+/// both from `docs/code-discovery.md`:
+///
+/// - **A cluster is a computed goto, not a function table.** Labels inside
+///   one function bunch together; genuine function pointers scatter. A run
+///   whose targets all fall inside one span shorter than the run could
+///   plausibly describe as separate functions is refused, because the
+///   alternative is shredding the function that owns them — the trap
+///   `_PyEval_EvalFrameDefault` poses.
+/// - **A string is not a pointer array.** Overlap with plausible text
+///   rejects the source.
+///
+/// **Deviation from the design, recorded rather than quietly taken.** The
+/// document specifies a run "at a constant stride — any constant stride,
+/// not eight", on the argument that real tables are arrays of structs as
+/// often as arrays of pointers, and its pitfall index says a stride-eight
+/// scan misses the applet table. Measured on this machine's busybox, that
+/// is not so: the table is bare pointers at stride eight. So this
+/// implements stride eight, which is what evidence shows, and the
+/// struct-stride generalisation waits for a binary that needs it — where it
+/// will arrive with a case rather than with a guess about one.
+fn data_array_targets(sections: &[Section]) -> std::collections::BTreeSet<u64> {
+    /// A pointer, and the stride of a bare array of them.
+    const STRIDE: usize = 8;
+    /// Below this, a run is a coincidence rather than a table.
+    const SHORTEST: usize = 3;
+    /// A run whose targets all sit inside this much text is describing
+    /// labels in one function, not a table of functions.
+    const CLUSTER: u64 = 0x400;
+
+    let mut found = std::collections::BTreeSet::new();
+    for section in sections {
+        if !section.role.is_data() || section.bytes.is_empty() {
+            continue;
+        }
+        let mut at = 0usize;
+        while at + STRIDE <= section.bytes.len() {
+            let mut run: Vec<u64> = Vec::new();
+            let mut cursor = at;
+            while cursor + STRIDE <= section.bytes.len() {
+                let value = u64::from_le_bytes(
+                    section.bytes[cursor..cursor + STRIDE]
+                        .try_into()
+                        .expect("eight bytes"),
+                );
+                match in_text(sections, value) {
+                    true => run.push(value),
+                    false => break,
+                }
+                cursor += STRIDE;
+            }
+            if run.len() >= SHORTEST
+                && !clustered(&run, CLUSTER)
+                && !reads_as_text(&section.bytes[at..cursor])
+            {
+                found.extend(run.iter().copied());
+            }
+            at = cursor.max(at + STRIDE);
+        }
+    }
+    found
+}
+
+/// Whether an address lands inside a section holding code.
+fn in_text(sections: &[Section], address: u64) -> bool {
+    sections.iter().any(|section| {
+        section.role == SectionRole::Text
+            && section.address != 0
+            && address >= section.address
+            && address < section.address + section.bytes.len() as u64
+    })
+}
+
+/// Whether every target sits inside one short span — the computed-goto tell.
+fn clustered(run: &[u64], within: u64) -> bool {
+    let (Some(low), Some(high)) = (run.iter().min(), run.iter().max()) else {
+        return false;
+    };
+    high - low < within
+}
+
+/// Whether bytes read as plausible text, which a pointer array does not.
+fn reads_as_text(bytes: &[u8]) -> bool {
+    bytes
+        .iter()
+        .filter(|byte| matches!(byte, 0x20..=0x7e))
+        .count()
+        * 2
+        > bytes.len()
 }
 
 /// Whether a candidate function begins on bytes that are filler.
@@ -976,6 +1132,9 @@ fn placements(
                 offset: *offset,
                 size: end - *offset,
                 witness,
+                // Bounded by whatever begins next, which is a bound rather
+                // than a fact — every candidate placed here is revisable.
+                extent: Extent::Guessed,
             });
         }
     }
@@ -1001,7 +1160,11 @@ fn placements(
 /// until nothing new appears — over what the previous round added, not over
 /// everything. Re-decoding every function every round is the difference
 /// between a second and a minute on a two-megabyte program.
-fn fill_from_transfers(coverage: &mut Coverage, sections: &[Section]) -> Result<()> {
+fn fill_from_transfers(
+    coverage: &mut Coverage,
+    sections: &[Section],
+    tables: &std::collections::BTreeSet<u64>,
+) -> Result<()> {
     const ROUNDS: usize = 16;
     let mut targets = std::collections::BTreeSet::new();
     let mut addressed = std::collections::BTreeSet::new();
@@ -1036,6 +1199,18 @@ fn fill_from_transfers(coverage: &mut Coverage, sections: &[Section]) -> Result<
         placed.extend(addressed_placements(
             coverage, sections, &addressed, &placed,
         ));
+        // The tables' targets, for the ones no witness has covered. A target
+        // that lands *inside* something is not this door's business — it is
+        // either an interior of a stated extent, which the invariant refuses
+        // to touch, or evidence that a guessed one was too long, which
+        // `split_once` acts on.
+        let claimed: Vec<Function> = placed.clone();
+        placed.extend(addressed_placements(
+            coverage, sections, tables, &claimed,
+        ).into_iter().map(|mut function| {
+            function.witness = Witness::DataArray;
+            function
+        }));
         placed.retain(|function| !declined.contains(&(function.section, function.offset)));
         if placed.is_empty() {
             return Ok(());
@@ -1067,6 +1242,7 @@ fn fill_from_transfers(coverage: &mut Coverage, sections: &[Section]) -> Result<
 fn split_at_interior_entries(
     sections: &[Section],
     layout: Layout,
+    tables: &std::collections::BTreeSet<u64>,
     functions: &mut Vec<Function>,
 ) -> Result<()> {
     // To a fixpoint, because a cut makes boundaries that were not there
@@ -1076,7 +1252,7 @@ fn split_at_interior_entries(
     // branch into the tail, which exposes another.
     const ROUNDS: usize = 16;
     for round in 0..=ROUNDS {
-        if !split_once(sections, layout, functions)? {
+        if !split_once(sections, layout, tables, functions)? {
             return Ok(());
         }
         if round == ROUNDS {
@@ -1091,7 +1267,12 @@ fn split_at_interior_entries(
 
 /// One pass of [`split_at_interior_entries`], reporting whether it cut
 /// anything.
-fn split_once(sections: &[Section], layout: Layout, functions: &mut Vec<Function>) -> Result<bool> {
+fn split_once(
+    sections: &[Section],
+    layout: Layout,
+    tables: &std::collections::BTreeSet<u64>,
+    functions: &mut Vec<Function>,
+) -> Result<bool> {
     use std::collections::{BTreeSet, HashMap};
 
     // Where each function's instructions begin, and everywhere anything
@@ -1227,6 +1408,39 @@ fn split_once(sections: &[Section], layout: Layout, functions: &mut Vec<Function
             }
         }
     }
+    // And the tables' targets, which may cut a *guessed* extent and never a
+    // stated one. This is the invariant refined rather than relaxed: the
+    // argument that a false start silently truncates a real function is an
+    // argument about extents the file stated, and an extent this pass worked
+    // out from what begins next is already a guess. Refusing to revise it
+    // means the first guess wins permanently over better evidence — which is
+    // how busybox's applet table came to name the interior of a function
+    // nothing had ever stated the size of.
+    for target in tables {
+        let Some((section, offset)) = section_holding(sections, *target) else {
+            continue;
+        };
+        let Some(placed) = by_section.get(&section) else {
+            continue;
+        };
+        let mut at = placed.partition_point(|(start, _, _)| *start <= offset);
+        while at > 0 {
+            let (_, reach, index) = placed[at - 1];
+            if reach <= offset {
+                break;
+            }
+            at -= 1;
+            let function = &functions[index];
+            if function.extent != Extent::Guessed {
+                continue;
+            }
+            let interior = (function.offset + 1..function.offset + function.size).contains(&offset);
+            if interior && starts.get(&index).is_some_and(|b| b.contains(&offset)) {
+                cuts.entry(index).or_default().insert(offset);
+            }
+        }
+    }
+
     if cuts.is_empty() {
         return Ok(false);
     }
@@ -1268,6 +1482,11 @@ fn split_once(sections: &[Section], layout: Layout, functions: &mut Vec<Function
                 } else {
                     Witness::InteriorEntry
                 },
+                // A piece inherits its parent's standing. A piece of
+                // something the file stated the length of is still bounded
+                // by that statement — cutting it further on weak evidence
+                // would reopen exactly the truncation the invariant closes.
+                extent: function.extent,
             });
             start = point;
         }
@@ -1327,6 +1546,8 @@ mod tests {
         }
     }
 
+    /// A function whose extent the file stated, which is the case the
+    /// invariant is strictest about.
     fn function(offset: u64, size: u64, witness: Witness) -> Function {
         Function {
             name: format!("fn.{offset:#x}"),
@@ -1335,6 +1556,7 @@ mod tests {
             offset,
             size,
             witness,
+            extent: Extent::Stated,
         }
     }
 
@@ -1439,6 +1661,39 @@ mod tests {
         assert_eq!(placed.len(), 2);
         assert_eq!(placed[0].size, 0x80);
         assert_eq!(placed[1].size, 0x280);
+    }
+
+    /// A guessed extent may be cut by weak evidence; a stated one may not.
+    ///
+    /// This is the invariant refined rather than relaxed, and both halves
+    /// matter. Refusing to cut a *stated* extent is what keeps a computed
+    /// goto's label table from shredding the function that owns it —
+    /// `_PyEval_EvalFrameDefault` is 256 such labels. Allowing a *guessed*
+    /// one to be cut is what lets busybox's applet table name functions
+    /// inside a span nothing ever stated the length of.
+    #[test]
+    fn only_a_guessed_extent_may_be_revised() {
+        let sections = [text(0x400)];
+        // Two identical functions but for where their extents came from,
+        // and one table naming a byte inside each.
+        let mut stated = function(0x100, 0x100, Witness::Symbol);
+        stated.extent = Extent::Stated;
+        let mut guessed = function(0x200, 0x100, Witness::Transfer);
+        guessed.extent = Extent::Guessed;
+        let mut functions = std::vec![stated, guessed];
+
+        let inside = std::collections::BTreeSet::from([0x400000 + 0x140, 0x400000 + 0x240]);
+        split_at_interior_entries(&sections, Layout::Linked, &inside, &mut functions).expect("split");
+
+        let starts: Vec<u64> = functions.iter().map(|function| function.offset).collect();
+        assert!(
+            !starts.contains(&0x140),
+            "a stated extent was cut on weak evidence"
+        );
+        assert!(
+            starts.contains(&0x240),
+            "a guessed extent was not revised by better evidence"
+        );
     }
 
     /// What is left over, which is what the saturated tier is built on.
