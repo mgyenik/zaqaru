@@ -63,6 +63,16 @@ Current documents:
   overlay and the synthetic `/dev` and `/proc`) and M5 (`brk`, `mmap` and
   the VMA tree) are built. Each milestone's section carries what an
   adversarial review found after it was first reported done.
+- [network-plan.md](network-plan.md) — **draft**: the design and plan for
+  networking under the interpreter, aimed at the nginx+gunicorn+django
+  demo served by `zaqaru-run` and answered by `curl`: the two-network
+  split (loopback as arena state, the edge as host-terminated streams —
+  no packets anywhere), the `/iso/net` store protocol over the unchanged
+  two imports, the blocking wait read that retires the idle spin, the
+  syscall surface priced against the real stack with its potholes named
+  (`SCM_RIGHTS`, `MAP_SHARED`-across-fork, netlink), the amendments to
+  fold back into `container-plan.md`, and gates N0–N5 from a native
+  strace baseline through "curl gets the Django page".
 - [worklog.md](worklog.md) — the working layer under the build plan:
   decisions taken mid-build and why, roadblocks and how they were cleared,
   and the mistakes worth not repeating. Where the build plan records a

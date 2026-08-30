@@ -95,6 +95,7 @@ pub mod number {
     pub const EPOLL_PWAIT2: i64 = 441;
     pub const CLOSE_RANGE: i64 = 436;
     pub const FADVISE64: i64 = 221;
+    pub const PAUSE: i64 = 34;
     pub const STATFS: i64 = 137;
     pub const FSTATFS: i64 = 138;
     pub const GETRANDOM: i64 = 318;
@@ -200,6 +201,7 @@ pub mod number {
             EPOLL_PWAIT2 => "epoll_pwait2",
             CLOSE_RANGE => "close_range",
             FADVISE64 => "fadvise64",
+            PAUSE => "pause",
             STATFS => "statfs",
             FSTATFS => "fstatfs",
             PIPE => "pipe",
@@ -417,6 +419,8 @@ pub enum Request {
         status: u64,
         options: i32,
     },
+    /// A signal for a *different* process, which only the table can find.
+    Kill { pid: i32, signal: i32 },
     /// This process, running a different program. The strings are owned
     /// because the memory they were read from is what `exec` replaces.
     Execute {
@@ -523,6 +527,16 @@ pub struct Kernel<'a, S: Store, M: Machine> {
     /// Resolution, and the mount table it walks. One filesystem is attached
     /// until M4's overlay; what a path *means* is decided here either way.
     pub vfs: crate::vfs::Vfs<'a>,
+    /// Which process this kernel is, and whose child it is.
+    ///
+    /// Not a constant any more. It was one for as long as a container had
+    /// one process — "the entry process is the first in its own namespace"
+    /// — and `fork` is what made that false: a child that answered `getpid`
+    /// with 1 would collide with its parent in every temporary filename and
+    /// every lock a program keys by process, and could not be signalled by
+    /// the parent that just created it.
+    pub pid: i32,
+    pub parent: i32,
     /// The descriptor table, and the open file descriptions under it.
     pub files: crate::fd::FdTable,
     /// Every pipe in the container, **shared** with every other process in
@@ -535,10 +549,9 @@ pub struct Kernel<'a, S: Store, M: Machine> {
     /// `container-plan.md`'s fd hoisting lands once the shared thing lives
     /// somewhere both processes can reach.
     pub pipes: crate::pipe::Shared,
-    /// Every `epoll` instance in the container, shared for the same reason
-    /// the pipes are: a descriptor is inheritable, and an inherited one has
-    /// to name the set the parent registered things in.
-    pub epolls: crate::poll::Shared,
+    /// Every `epoll` instance in *this* process. See [`crate::poll::Epolls`]
+    /// for why this one is not shared where the pipes are.
+    pub epolls: crate::poll::Held,
     /// The counter new timestamps come from. See `Kernel::now`.
     pub clock: i64,
     /// The status the process finished with, once something has finished.
@@ -738,9 +751,14 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             random: crate::random::Random::unseeded(),
             executable: String::new(),
             vfs: crate::vfs::Vfs::new(image),
+            pid: PROCESS_ID as i32,
+            // The entry process of a container has no parent inside it, and
+            // Linux answers zero for a process whose parent is outside its
+            // namespace — which is exactly this case.
+            parent: 0,
             files: crate::fd::FdTable::with_standard_streams(),
             pipes: crate::pipe::Shared::default(),
-            epolls: crate::poll::Shared::default(),
+            epolls: crate::poll::Held::default(),
             clock: 1,
             status: None,
             pages,
@@ -1065,11 +1083,25 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             // close-on-exec, which does not help here: cloexec clears at
             // *exec*, so a plain fork carries cloexec-marked descriptors
             // into a child that may never exec.
+            // Placeholders: only the process table knows what number a new
+            // process gets, so `System::fork` writes both the moment it has
+            // decided. Set to the parent's here so that a path that forgot
+            // would be caught by a child claiming to *be* its parent rather
+            // than by a zero nothing notices.
+            pid: self.pid,
+            parent: self.pid,
             files: self.files.clone(),
             // Shared, not copied — see the field. The counts were raised
             // above, once per descriptor the copied table holds.
             pipes: crate::pipe::Shared::clone(&self.pipes),
-            epolls: crate::poll::Shared::clone(&self.epolls),
+            // Copied, and marked: a registration names a description, and
+            // a description is an index into a table the child has its own
+            // copy of. See [`crate::poll::Epolls`].
+            epolls: {
+                let mut copied = self.epolls.borrow().clone();
+                copied.inherit();
+                crate::poll::Held::new(copied)
+            },
             clock: self.clock,
             // The child has not finished and is not going anywhere.
             status: None,
@@ -1163,12 +1195,19 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             // properties of the process, and the process is the thing that
             // survives.
             vfs: self.vfs.clone(),
+            // The same process, running a different program: `execve` does
+            // not change either number, which is what makes a shell's
+            // `exec` transparent to whoever is waiting.
+            pid: self.pid,
+            parent: self.parent,
             files,
             // Kept, which is the entire reason `dup2` before an `execve` is
             // how every shell wires a pipeline: the descriptors survive and
             // so must what is behind them.
             pipes: crate::pipe::Shared::clone(&self.pipes),
-            epolls: crate::poll::Shared::clone(&self.epolls),
+            // The same process, so not inherited: `execve` keeps the
+            // descriptor table it did not close, and the indices with it.
+            epolls: crate::poll::Held::new(self.epolls.borrow().clone()),
             clock: self.clock,
             status: None,
             continuation: None,
@@ -1274,6 +1313,28 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
         Err(Errno::ArgumentsTooLong)
     }
 
+    /// `pause(2)`: wait for a signal, and only for a signal.
+    ///
+    /// It never succeeds. `pause` returns when a handler has run, and then
+    /// it returns `-1` with `EINTR` — so the interesting case is the one
+    /// where it does *not* return at all, because the signal's default
+    /// action ended the process.
+    ///
+    /// A signal already pending and not blocked means there is nothing to
+    /// wait for: parking would be a wait for something that has already
+    /// happened, which is a hang.
+    fn pause(&mut self) -> Outcome {
+        if !self.machine.park_on_signal() {
+            return Outcome::Fault(Fault::detailed(
+                number::PAUSE,
+                Arguments::new([0; 6]),
+                "waiting for a signal on a machine with no scheduler, where \
+                 nothing could ever arrive to end the wait",
+            ));
+        }
+        Outcome::Blocked
+    }
+
     /// `wait4(2)`: what happened to a child.
     fn wait_for_child(&mut self, arguments: Arguments) -> Outcome {
         let pid = arguments.get(0) as i32;
@@ -1302,18 +1363,40 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
     fn kill(&mut self, arguments: Arguments) -> Outcome {
         let target = arguments.get(0);
         let signal = arguments.get(1);
-        if target != PROCESS_ID && target != 0 {
-            return Outcome::Done(Errno::NoProcess.as_result());
-        }
         if !(0..=64).contains(&signal) {
             return Outcome::Done(Errno::Invalid.as_result());
         }
-        // Signal zero asks whether the process exists and sends nothing,
-        // which is how every `kill -0` liveness check works.
-        if signal == 0 {
-            return Outcome::Done(0);
+        // Zero means the caller's process group, and a container has one —
+        // so it means the caller, which is what it has always meant here.
+        if target == 0 || target == i64::from(self.pid) {
+            // Signal zero asks whether the process exists and sends
+            // nothing, which is how every `kill -0` liveness check works.
+            if signal == 0 {
+                return Outcome::Done(0);
+            }
+            return self.raise_at_process(signal, number::KILL, arguments);
         }
-        self.raise_at_process(signal, number::KILL, arguments)
+        if target < 0 {
+            // A process group, or every process the caller may signal. Both
+            // need a grouping this container does not have — there is one
+            // group — and answering as though `-1` meant "the caller" would
+            // be a plausible wrong answer to a shell cleaning up.
+            return Outcome::Fault(Fault::detailed(
+                number::KILL,
+                arguments,
+                "a negative target, which names a process group — and a \
+                 container has one group, so there is nothing here for the \
+                 number to select",
+            ));
+        }
+        let Ok(pid) = i32::try_from(target) else {
+            return Outcome::Done(Errno::NoProcess.as_result());
+        };
+        // Somebody else's, and only the table knows who exists.
+        Outcome::Process(Request::Kill {
+            pid,
+            signal: signal as i32,
+        })
     }
 
     /// The half `kill` and `tgkill` share: what a signal *does* to a process
@@ -1879,6 +1962,7 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             number::EPOLL_CTL => self.epoll_control(arguments),
             number::CLOSE_RANGE => self.close_range(arguments),
             number::FADVISE64 => self.fadvise(arguments),
+            number::PAUSE => self.pause(),
             number::STATFS | number::FSTATFS => self.statfs(number, arguments),
             number::EPOLL_WAIT | number::EPOLL_PWAIT => self.epoll_wait(arguments),
             number::DUP => self.dup(arguments),
@@ -1893,7 +1977,7 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             // Everything here is fixed. A container's entry process is the
             // first in its own namespace, which is what makes the answer a
             // constant rather than something to derive.
-            number::GETPID => Outcome::Done(PROCESS_ID),
+            number::GETPID => Outcome::Done(i64::from(self.pid)),
             // Not the same number once there is more than one thread, which
             // is the whole reason glibc asks: `pthread_self` and every
             // recursive mutex compare them.
@@ -1906,10 +1990,11 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             number::GETUID | number::GETGID | number::GETEUID | number::GETEGID => {
                 Outcome::Done(0)
             }
-            // The entry process of a container has no parent inside it.
-            // Linux answers zero for a process whose parent is outside its
-            // namespace, which is exactly this case.
-            number::GETPPID => Outcome::Done(0),
+            // Zero for the entry process, which has no parent inside the
+            // container — Linux answers zero for a process whose parent is
+            // outside its namespace, which is exactly that case — and the
+            // real number for anything forked since.
+            number::GETPPID => Outcome::Done(i64::from(self.parent)),
             number::UNAME => self.uname(arguments),
             number::PRCTL => self.prctl(arguments),
             number::SET_TID_ADDRESS => self.set_tid_address(arguments),
@@ -1966,7 +2051,10 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
     /// It never fails, and it answers with the caller's thread id.
     fn set_tid_address(&mut self, arguments: Arguments) -> Outcome {
         self.machine.owned().clear_child_tid = arguments.get(0) as u64;
-        Outcome::Done(PROCESS_ID)
+        // The caller's *thread* id, which is what Linux answers — the same
+        // number as the process id only for the first thread of the first
+        // process, which is why it read as a constant for so long.
+        Outcome::Done(i64::from(self.machine.current_tid()))
     }
 
     /// `set_robust_list(2)`: the list of futexes to release if this thread
@@ -2123,8 +2211,8 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
         let new_limit = arguments.get(2) as u64;
         let old_limit = arguments.get(3) as u64;
 
-        // Zero means this process, and this process is the only one.
-        if process != 0 && process != PROCESS_ID {
+        // Zero means this process.
+        if process != 0 && process != i64::from(self.pid) {
             return Outcome::Done(Errno::NoProcess.as_result());
         }
         if new_limit != 0 {
@@ -2469,7 +2557,7 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
         let group = arguments.get(0);
         let thread = arguments.get(1);
         let signal = arguments.get(2);
-        if group != PROCESS_ID {
+        if group != i64::from(self.pid) {
             return Outcome::Done(Errno::NoProcess.as_result());
         }
         // Signals go to a *thread*, and once there is more than one the

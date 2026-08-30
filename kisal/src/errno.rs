@@ -26,6 +26,10 @@ pub enum Errno {
     /// tells a `while (wait(...) > 0)` loop to stop.
     NoChild = 10,
     Busy = 16,
+    /// `EINTR`: a signal arrived while the call was waiting. Never an
+    /// outcome a call *chose* — it is the wait being cut short, which is
+    /// why `pause` answers it every single time it returns at all.
+    Interrupted = 4,
     /// `ENOEXEC`: the file is there and is not a program this can run.
     NotExecutable = 8,
     /// `E2BIG`: the argument or environment list handed to `execve` is
@@ -97,6 +101,7 @@ impl Errno {
             Self::TooBig => "EFBIG",
             Self::ArgumentsTooLong => "E2BIG",
             Self::NotExecutable => "ENOEXEC",
+            Self::Interrupted => "EINTR",
             Self::NoSpace => "ENOSPC",
             Self::NotSeekable => "ESPIPE",
             Self::ReadOnlyFs => "EROFS",

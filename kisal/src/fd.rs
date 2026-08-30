@@ -232,6 +232,39 @@ impl FdTable {
         self.descriptions[index].as_mut().ok_or(Errno::BadFile)
     }
 
+    /// Which open file description a descriptor names.
+    ///
+    /// The *description*, not the descriptor, is what `epoll` registers
+    /// interest against — Linux's rule, and the reason a registered fd that
+    /// is closed while a `dup` survives still fires. See
+    /// [`crate::poll::Epolls`].
+    pub fn description_index(&self, fd: i32) -> Result<usize, Errno> {
+        let index = usize::try_from(fd).map_err(|_| Errno::BadFile)?;
+        self.descriptors
+            .get(index)
+            .and_then(|held| *held)
+            .map(|held| held.description)
+            .ok_or(Errno::BadFile)
+    }
+
+    /// The description at an index, for whoever holds one rather than a
+    /// descriptor.
+    pub fn at(&self, description: usize) -> Option<&OpenFile> {
+        self.descriptions.get(description)?.as_ref()
+    }
+
+    /// Every description the table still holds open.
+    ///
+    /// Used to notice when one has *gone*: a description's slot is reused,
+    /// so anything holding an index has to be told when the file behind it
+    /// is freed, or it will silently start watching whatever opens next.
+    pub fn live_descriptions(&self) -> impl Iterator<Item = usize> + '_ {
+        self.descriptions
+            .iter()
+            .enumerate()
+            .filter_map(|(index, held)| held.as_ref().map(|_| index))
+    }
+
     /// Every pipe end the table holds, once per *descriptor*.
     ///
     /// What a fork has to raise the counts by, and what an `execve` has to

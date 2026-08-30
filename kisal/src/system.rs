@@ -67,9 +67,9 @@ pub struct Container<'a, S: Store> {
     pub process: Process<'a, S>,
     pub pid: i32,
     pub parent: i32,
-    /// Set when it has exited and nothing has reaped it — a zombie, which
+    /// Set when it has ended and nothing has reaped it — a zombie, which
     /// exists so that a parent can still ask what happened.
-    pub status: Option<i32>,
+    pub status: Option<Ending>,
 }
 
 /// Every process, and which one is running.
@@ -149,6 +149,10 @@ impl<'a, S: Store + Clone> System<'a, S> {
         let pid = self.next;
         self.next += 1;
         let mut child = Process { kernel, cache };
+        // The numbers the kernel could not know: it is a copy of the
+        // parent's, and only the table decides who a new process is.
+        child.kernel.pid = pid;
+        child.kernel.parent = parent;
         // `fork` returns zero in the child. `%rip` is already past the
         // `syscall`, which is the whole of what the other path needed a
         // resume driver for.
@@ -356,7 +360,7 @@ impl<'a, S: Store + Clone> System<'a, S> {
                 // write. Reporting it beats spinning, because spinning looks
                 // exactly like working.
                 return match self.containers.first().and_then(|first| first.status) {
-                    Some(status) => Exit::Status(status),
+                    Some(status) => status.as_exit(),
                     None => Exit::Deadlocked,
                 };
             }
@@ -380,7 +384,7 @@ impl<'a, S: Store + Clone> System<'a, S> {
                 container.pid, container.parent
             );
             if let Some(status) = container.status {
-                let _ = write!(&mut into, " exited {status}, unreaped");
+                let _ = write!(&mut into, " {status:?}, unreaped");
             }
             into.push('\n');
             for thread in container.process.kernel.machine.threads.all() {
@@ -412,6 +416,9 @@ impl<'a, S: Store + Clone> System<'a, S> {
                         if watching.deadline.is_some() {
                             into.push_str(" with a deadline");
                         }
+                    }
+                    crate::thread::State::Paused => {
+                        into.push_str("in `pause`, waiting for a signal");
                     }
                     crate::thread::State::Exited { status } => {
                         let _ = write!(&mut into, "exited {status}");
@@ -451,6 +458,42 @@ impl<'a, S: Store + Clone> System<'a, S> {
                 options,
             } => self.wait(pid, status, options),
             Request::Execute { path, argv, envp } => self.execute(&path, &argv, &envp),
+            Request::Kill { pid, signal } => self.signal_process(pid, signal),
+        }
+    }
+
+    /// `kill` aimed at somebody else.
+    ///
+    /// The disposition is consulted in the *target's* kernel, because that
+    /// is where it lives — a signal's meaning is a property of the process
+    /// receiving it, which is why this could not be answered by the caller.
+    fn signal_process(&mut self, pid: i32, signal: i32) {
+        let Some(index) = self.containers.iter().position(|held| held.pid == pid) else {
+            return self.current().answer(crate::errno::Errno::NoProcess.as_result());
+        };
+        // A zombie is still a process id until it is reaped, and a signal
+        // sent to one succeeds and does nothing — which is what Linux does
+        // and what keeps a `kill` racing a child's exit from becoming an
+        // error the caller has to distinguish.
+        if self.containers[index].status.is_some() {
+            return self.current().answer(0);
+        }
+        // Signal zero asks whether the process exists and sends nothing.
+        if signal == 0 {
+            return self.current().answer(0);
+        }
+        let fatal = self.containers[index].process.kernel.signal_process(signal);
+        self.current().answer(0);
+        if fatal {
+            // Nothing caught it and its default action ends the process.
+            // What a shell reports for a process killed by a signal is 128
+            // plus the number, and a parent's `wait4` reads the same.
+            self.finish_at(index, Exit::Signalled {
+                signal,
+                address: 0,
+                rip: 0,
+                access: None,
+            });
         }
     }
 
@@ -519,18 +562,16 @@ impl<'a, S: Store + Clone> System<'a, S> {
 
     /// Writes a child's status where `wait4` was told to put it.
     ///
-    /// The encoding is Linux's: a status byte in bits 8..16 for a process
-    /// that exited, which is what `WEXITSTATUS` shifts back out.
-    fn report(&mut self, at: u64, status: i32) {
+    /// The encoding is [`Ending`]'s, which is Linux's.
+    fn report(&mut self, at: u64, status: Ending) {
         if at == 0 {
             return;
         }
-        let encoded = ((status & 0xff) as u32) << 8;
         let _ = self
             .current()
             .kernel
             .pages
-            .write(at, &encoded.to_le_bytes());
+            .write(at, &status.wait_status().to_le_bytes());
     }
 
     /// Records that the running process has ended, and tells whoever was
@@ -540,13 +581,23 @@ impl<'a, S: Store + Clone> System<'a, S> {
     /// process ends: a container is a process tree and its status is the
     /// root's, exactly as a `docker run`'s is.
     fn finish(&mut self, exit: Exit) -> Option<Exit> {
-        let index = self.current;
+        self.finish_at(self.current, exit)
+    }
+
+    /// The same for a process that is not the running one — which is what a
+    /// `kill` from another process produces.
+    ///
+    /// Safe to do to a dormant process because none of it touches guest
+    /// memory: closing descriptors is the fd table and the shared arenas,
+    /// and letting go of the address space is dropping the bytes rather
+    /// than reading them.
+    fn finish_at(&mut self, index: usize, exit: Exit) -> Option<Exit> {
         let pid = self.containers[index].pid;
         let status = match exit {
-            Exit::Status(status) => status,
-            // Died of something. The parent still hears about it, and the
-            // encoding is what a shell reports.
-            Exit::Signalled { signal, .. } => 128 + signal,
+            Exit::Status(code) => Ending::Exited(code),
+            // Died of something, which the parent hears about as a
+            // *signal* rather than as a code — see [`Ending`].
+            Exit::Signalled { signal, .. } => Ending::Signalled(signal),
             _ => {
                 // An engine or kernel limit, which is not a process ending
                 // in any sense the guest would recognise. It ends the
@@ -608,7 +659,7 @@ impl<'a, S: Store + Clone> System<'a, S> {
             let _ = self.containers[at].process.kernel.signal_process(SIGCHLD);
         }
         match pid == FIRST {
-            true => Some(Exit::Status(status)),
+            true => Some(status.as_exit()),
             false => None,
         }
     }
@@ -630,11 +681,51 @@ enum Yield {
     Given,
 }
 
+/// How a process ended, which is not one number.
+///
+/// Linux packs both into one status word and they are not the same field:
+/// an exit code lives in bits 8..16 and a terminating signal in the low
+/// seven, and `WIFEXITED` versus `WIFSIGNALED` is how a caller tells which
+/// one it is looking at. Storing an exit *code* for both — which is what
+/// "128 plus the signal" amounts to — makes every killed process look to
+/// its parent like one that chose to fail, and a shell cannot tell a
+/// segfaulting program from one that returned 139.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Ending {
+    Exited(i32),
+    Signalled(i32),
+}
+
+impl Ending {
+    /// The status word `wait4` writes, in Linux's encoding.
+    pub fn wait_status(self) -> i32 {
+        match self {
+            Ending::Exited(code) => (code & 0xff) << 8,
+            // No core-dump bit: nothing here writes one, and setting it
+            // would be a claim about a file that does not exist.
+            Ending::Signalled(signal) => signal & 0x7f,
+        }
+    }
+
+    /// What the *container* reports when its first process ends this way.
+    pub fn as_exit(self) -> Exit {
+        match self {
+            Ending::Exited(code) => Exit::Status(code),
+            Ending::Signalled(signal) => Exit::Signalled {
+                signal,
+                address: 0,
+                rip: 0,
+                access: None,
+            },
+        }
+    }
+}
+
 /// What `wait4` found.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Reaped {
     /// A child that has exited, now reaped.
-    Exited { pid: i32, status: i32 },
+    Exited { pid: i32, status: Ending },
     /// Children exist and none has exited.
     Running,
     /// No children at all: `ECHILD`.

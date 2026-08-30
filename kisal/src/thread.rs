@@ -48,6 +48,12 @@ pub enum State {
     /// It is in `poll` or `epoll_wait`, waiting for a descriptor to become
     /// ready or for a deadline to pass.
     Watching(Watching),
+    /// It called `pause`, and is waiting for a signal and nothing else.
+    ///
+    /// The one wait with no object: every other parked thread is waiting
+    /// for a futex word, a child, a pipe or a descriptor, and this one is
+    /// waiting for the *interruption* those others merely tolerate.
+    Paused,
     /// It called `exit`. Its control block is kept until something reaps
     /// the identifier, because a thread that has ended is still a thread
     /// that existed.

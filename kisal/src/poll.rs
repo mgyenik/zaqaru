@@ -66,9 +66,21 @@ pub const POLLFD: u64 = 8;
 const MAX_DESCRIPTORS: i64 = 1024 * 1024;
 
 /// One registration in an `epoll` set.
+///
+/// **Two keys, and the difference between them is the whole of `epoll`'s
+/// most famous behaviour.** `epoll_ctl` names a *descriptor*, so `MOD` and
+/// `DEL` match on `fd`. Readiness follows the *description*, because that is
+/// what Linux registers interest against — which is why a registered
+/// descriptor closed while a `dup` of it survives goes on firing. Real
+/// software depends on that, and so do its test suites, so it is built
+/// rather than tidied away.
 #[derive(Clone, Copy, Debug)]
 struct Watched {
+    /// What `epoll_ctl` named. Only ever compared, never dereferenced.
     fd: i32,
+    /// What readiness is asked of, and what has to *go* for this
+    /// registration to end.
+    description: usize,
     events: u32,
     /// The caller's own word, handed back untouched. Usually a pointer to
     /// whatever the program wanted to find again.
@@ -81,15 +93,25 @@ pub struct EpollSet {
     watched: Vec<Watched>,
     /// How many descriptors name this instance.
     references: u32,
+    /// Set on the child's copy at `fork`. See [`Epolls`].
+    inherited: bool,
 }
 
-/// Every `epoll` instance in the container.
+/// Every `epoll` instance in one process.
 ///
-/// Shared across the process tree for the same reason [`crate::pipe::Pipes`]
-/// is: a descriptor can be inherited, and an inherited `epoll` descriptor
-/// has to name the set the parent registered things in. Linux is explicit
-/// that this is what a fork gives you, and that it is usually a mistake to
-/// rely on — but a mistake the guest gets to make.
+/// **Per process, unlike [`crate::pipe::Pipes`]**, and the reason is
+/// structural rather than a preference: a registration names an open file
+/// *description*, and a description is an index into a table each process
+/// has its own copy of. An arena shared across the tree keyed by those
+/// indices would let one process's `close` cancel another's registration —
+/// which is not a subtle wrongness, it is a `poll` that never wakes.
+///
+/// Linux does share an `epoll` instance across a `fork`, at the description
+/// level, and it is famous as a footgun. `container-plan.md` decided that
+/// case explicitly: "using an inherited epoll fd from the child after plain
+/// fork is a loud, documented error, revisited if something real trips it".
+/// So a fork copies the sets and marks them, and the child is told rather
+/// than quietly given a private one.
 #[derive(Clone, Default, Debug)]
 pub struct Epolls {
     sets: Vec<Option<EpollSet>>,
@@ -115,6 +137,7 @@ impl Epolls {
         let set = EpollSet {
             watched,
             references: 1,
+            inherited: false,
         };
         if let Some(free) = self.sets.iter().position(Option::is_none) {
             self.sets[free] = Some(set);
@@ -150,10 +173,40 @@ impl Epolls {
             None => &[],
         }
     }
+
+    /// Drops every registration on a description that no longer exists.
+    ///
+    /// Linux's `eventpoll_release`, and it is not tidiness: a description's
+    /// slot is *reused*, so a registration left behind would start watching
+    /// whichever file opened next and report it under the old caller's
+    /// data word. Called when the last descriptor naming a description
+    /// closes, which is exactly when Linux frees the file.
+    /// Marks every set as the child's copy of its parent's. See [`Epolls`].
+    pub fn inherit(&mut self) {
+        for set in self.sets.iter_mut().flatten() {
+            set.inherited = true;
+        }
+    }
+
+    pub fn is_inherited(&self, id: u32) -> bool {
+        self.sets
+            .get(id as usize)
+            .and_then(Option::as_ref)
+            .is_some_and(|set| set.inherited)
+    }
+
+    pub fn forget(&mut self, description: usize) {
+        for set in self.sets.iter_mut().flatten() {
+            set.watched.retain(|entry| entry.description != description);
+        }
+    }
 }
 
-/// The table, as the kernel holds it. See [`crate::pipe::Shared`].
-pub type Shared = std::rc::Rc<std::cell::RefCell<Epolls>>;
+/// A borrow-checker convenience, not a sharing one: the kernel reaches its
+/// own `epoll` sets while holding a borrow of its descriptor table, which a
+/// plain field would forbid. Contrast [`crate::pipe::Shared`], which is an
+/// `Rc` because the pipes genuinely *are* shared.
+pub type Held = std::cell::RefCell<Epolls>;
 
 impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_, S, M> {
     /// What a descriptor would answer right now, given what is asked about.
@@ -163,7 +216,22 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
     /// program polling for `POLLIN` on a pipe whose writer has gone needs to
     /// hear about it, and it did not think to ask.
     pub(crate) fn readiness(&self, fd: i32, interest: i16) -> i16 {
-        let Ok(file) = self.files.description(fd) else {
+        match self.files.description_index(fd) {
+            Ok(description) => self.readiness_of(description, interest),
+            // Not a descriptor this process has, which `poll` reports as
+            // `POLLNVAL`. An `epoll` registration cannot arrive here at
+            // all, because it names a description rather than a number.
+            Err(_) => event::NVAL,
+        }
+    }
+
+    /// The same, of an open file description rather than of a descriptor.
+    ///
+    /// This is the one `epoll` uses, and the split is the whole of why a
+    /// closed descriptor with a surviving `dup` goes on firing: nothing
+    /// here ever looks up a number.
+    pub(crate) fn readiness_of(&self, description: usize, interest: i16) -> i16 {
+        let Some(file) = self.files.at(description) else {
             return event::NVAL;
         };
         let ready = match file.backing {
@@ -219,6 +287,30 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
         ready & (interest | always)
     }
 
+    /// Refuses an `epoll` descriptor a `fork` handed down, by name.
+    ///
+    /// Linux shares the interest list across a fork at the description
+    /// level. Here a description is a per-process index, so sharing the
+    /// list would mean one process's `close` cancelling another's
+    /// registration. `container-plan.md` chose the loud error over the
+    /// complexity knot, and this is it: a divergence stated on the box
+    /// rather than a `poll` that mysteriously never wakes.
+    fn refuse_inherited(&mut self, number: i64, arguments: Arguments) -> Option<Outcome> {
+        let id = self.epoll_of(arguments.get(0) as i32)?;
+        if !self.epolls.borrow().is_inherited(id) {
+            return None;
+        }
+        Some(Outcome::Fault(crate::syscall::Fault::detailed(
+            number,
+            arguments,
+            "an `epoll` descriptor inherited across a `fork`, whose interest \
+             list Linux shares between the two processes — a shape \
+             `container-plan.md` refuses by name rather than approximate, \
+             because the alternative is a registration one process can \
+             cancel out from under the other",
+        )))
+    }
+
     /// The `epoll` instance a descriptor names, or `None`.
     pub(crate) fn epoll_of(&self, fd: i32) -> Option<u32> {
         match self.files.description(fd).ok()?.backing {
@@ -236,7 +328,7 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
                 // The low bits of an `epoll` mask are the `poll` bits, which
                 // is why one readiness function serves both.
                 let asked = (entry.events & 0xffff) as i16;
-                let ready = self.readiness(entry.fd, asked);
+                let ready = self.readiness_of(entry.description, asked);
                 match ready {
                     0 => None,
                     bits => Some((entry.data, bits as u16 as u32)),
@@ -305,6 +397,9 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
 
     /// `epoll_ctl(2)`: add, change or remove one registration.
     pub(crate) fn epoll_control(&mut self, arguments: Arguments) -> Outcome {
+        if let Some(refusal) = self.refuse_inherited(crate::syscall::number::EPOLL_CTL, arguments) {
+            return refusal;
+        }
         let Some(id) = self.epoll_of(arguments.get(0) as i32) else {
             // Either the descriptor is closed or it is not an epoll
             // instance, and Linux distinguishes them.
@@ -315,9 +410,9 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
         };
         let operation = arguments.get(1);
         let fd = arguments.get(2) as i32;
-        if !self.files.is_open(fd) {
+        let Ok(description) = self.files.description_index(fd) else {
             return Outcome::Done(Errno::BadFile.as_result());
-        }
+        };
         // An epoll instance watching itself is a cycle with no bottom.
         if self.epoll_of(fd) == Some(id) {
             return Outcome::Done(Errno::Invalid.as_result());
@@ -340,13 +435,23 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
                 // instead of silently replacing.
                 Some(_) => Outcome::Done(Errno::Exists.as_result()),
                 None => {
-                    set.watched.push(Watched { fd, events, data });
+                    set.watched.push(Watched {
+                        fd,
+                        description,
+                        events,
+                        data,
+                    });
                     Outcome::Done(0)
                 }
             },
             control::MOD => match existing {
                 Some(index) => {
-                    set.watched[index] = Watched { fd, events, data };
+                    set.watched[index] = Watched {
+                        fd,
+                        description,
+                        events,
+                        data,
+                    };
                     Outcome::Done(0)
                 }
                 None => Outcome::Done(Errno::NoEntry.as_result()),
@@ -364,6 +469,9 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
 
     /// `epoll_wait` and `epoll_pwait`.
     pub(crate) fn epoll_wait(&mut self, arguments: Arguments) -> Outcome {
+        if let Some(refusal) = self.refuse_inherited(crate::syscall::number::EPOLL_WAIT, arguments) {
+            return refusal;
+        }
         let Some(id) = self.epoll_of(arguments.get(0) as i32) else {
             return Outcome::Done(match self.files.is_open(arguments.get(0) as i32) {
                 true => Errno::Invalid.as_result(),
@@ -506,8 +614,16 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
                 continue;
             }
             let interest = i16::from_le_bytes(bytes[4..6].try_into().expect("two bytes"));
+            let Ok(description) = self.files.description_index(fd) else {
+                // A descriptor that is not open answers `POLLNVAL` at once
+                // rather than being waited for — which `begin_wait` has
+                // already reported, so reaching here means the caller asked
+                // to wait on nothing.
+                continue;
+            };
             watched.push(Watched {
                 fd,
+                description,
                 events: interest as u16 as u32,
                 data: 0,
             });

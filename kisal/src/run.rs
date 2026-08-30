@@ -278,6 +278,7 @@ impl<'a, S: Store> Process<'a, S> {
         // *before* the scheduler is asked what to run.
         self.resume_transfers();
         self.resume_watches();
+        self.resume_paused();
         // A process can be given the processor back with its current thread
         // still parked: `Progress::Idle` hands the turn away without
         // choosing a successor, because at that moment there was none. So
@@ -375,6 +376,8 @@ impl<'a, S: Store> Process<'a, S> {
                 crate::thread::State::Watching(watching) => {
                     watching.deadline.is_some() || self.kernel.watch_ready(watching.watch)
                 }
+                // Waiting for a signal, and one has arrived.
+                crate::thread::State::Paused => thread.deliverable().is_some(),
                 _ => thread.is_runnable(),
             }
         })
@@ -422,6 +425,21 @@ impl<'a, S: Store> Process<'a, S> {
             let thread = &mut self.kernel.machine.threads.all_mut()[slot];
             thread.state = crate::thread::State::Runnable;
             thread.tcb.registers[0] = answer as u64;
+        }
+    }
+
+    /// Wakes every thread in `pause` that now has a signal to take.
+    ///
+    /// With `EINTR` already in `%rax`, before the handler runs — which is
+    /// the order the guest observes: the frame the handler returns through
+    /// carries the interrupted call's answer, so `sigreturn` lands back in
+    /// `pause` with the error it is documented to always give.
+    fn resume_paused(&mut self) {
+        for thread in self.kernel.machine.threads.all_mut() {
+            if thread.state == crate::thread::State::Paused && thread.deliverable().is_some() {
+                thread.state = crate::thread::State::Runnable;
+                thread.tcb.registers[0] = crate::errno::Errno::Interrupted.as_result() as u64;
+            }
         }
     }
 

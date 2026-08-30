@@ -1721,3 +1721,168 @@ int main(void) {
         Linkage::Dynamic,
     );
 }
+
+/// **Process identity**, now that there is more than one process.
+///
+/// `getpid` was a constant for as long as a container had one process — the
+/// entry process is the first in its own namespace, so the answer was fixed.
+/// `fork` is what made that false, and the failure is quiet: a child that
+/// answers 1 collides with its parent in every temporary filename and every
+/// lock a program keys by process, and cannot be signalled by the parent
+/// that just created it.
+#[test]
+fn every_process_knows_which_one_it_is() {
+    agrees_with_native(
+        "identity",
+        r#"
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+int main(void) {
+    pid_t mine = getpid();
+    fflush(stdout);
+    int ends[2];
+    pipe(ends);
+    pid_t child = fork();
+    if (child == 0) {
+        close(ends[0]);
+        pid_t reported[2] = {getpid(), getppid()};
+        write(ends[1], reported, sizeof reported);
+        close(ends[1]);
+        _exit(0);
+    }
+    close(ends[1]);
+    pid_t reported[2] = {0, 0};
+    read(ends[0], reported, sizeof reported);
+    close(ends[0]);
+    waitpid(child, 0, 0);
+    printf("child is itself %d, its parent is me %d, and not me %d\n",
+           reported[0] == child, reported[1] == mine, reported[0] != mine);
+    return 0;
+}
+"#,
+        Linkage::Dynamic,
+    );
+}
+
+/// **`kill` reaching another process**, which is the other half of having
+/// identities at all.
+///
+/// The disposition is consulted in the *target's* kernel, because that is
+/// where it lives: what a signal means is a property of the process
+/// receiving it. So this fails if the signal was decided by the sender, if
+/// the target could not be found, or if a signal to a process that has
+/// already exited is an error rather than a no-op.
+#[test]
+fn a_signal_reaches_another_process() {
+    agrees_with_native(
+        "kill",
+        r#"
+#include <errno.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+int main(void) {
+    int ready[2];
+    pipe(ready);
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        close(ready[0]);
+        /* Nothing catches it, so the default action ends the child. */
+        close(ready[1]);
+        for (;;) {
+            pause();
+        }
+    }
+    close(ready[1]);
+    /* The child closes its end and then waits forever; the read returning
+       zero is how this knows the child has got that far. */
+    char byte;
+    read(ready[0], &byte, 1);
+    close(ready[0]);
+
+    printf("alive %d\n", kill(child, 0) == 0);
+    printf("sent %d\n", kill(child, SIGTERM) == 0);
+    int status = 0;
+    waitpid(child, &status, 0);
+    printf("signalled %d by %d\n", WIFSIGNALED(status), WTERMSIG(status));
+    /* Reaped, so gone. The call and the errno are separate statements
+       because reading `errno` in the same `printf` as the call that sets it
+       is unsequenced, and the two sides would be comparing evaluation
+       orders rather than kernels. */
+    errno = 0;
+    int missing = kill(child, 0);
+    printf("gone %d %d\n", missing, errno == ESRCH);
+    return 0;
+}
+"#,
+        Linkage::Dynamic,
+    );
+}
+
+/// **The `epoll` dup footgun, asserted rather than avoided.**
+///
+/// Interest is registered on the open file *description*, not on the
+/// descriptor — which is Linux's rule and the reason a registered
+/// descriptor closed while a `dup` of it survives goes on firing. It is
+/// famous as a bug source, real software depends on it, and
+/// `container-plan.md` asks for it by name. So it is built, and the test
+/// says so both ways: the registration survives the close that leaves a
+/// dup, and it is gone after the close that leaves none.
+///
+/// The second half is not decoration. A description's slot is reused, so a
+/// registration outliving its file would start reporting whichever file
+/// opened next, under the old caller's data word.
+#[test]
+fn epoll_interest_follows_the_description_not_the_descriptor() {
+    agrees_with_native(
+        "epoll-dup",
+        r#"
+#include <stdio.h>
+#include <string.h>
+#include <sys/epoll.h>
+#include <unistd.h>
+
+int main(void) {
+    int ends[2];
+    pipe(ends);
+    int set = epoll_create1(0);
+
+    struct epoll_event watch = { .events = EPOLLIN, .data = { .u64 = 0xfeed } };
+    epoll_ctl(set, EPOLL_CTL_ADD, ends[0], &watch);
+    int copy = dup(ends[0]);
+    write(ends[1], "x", 1);
+
+    struct epoll_event fired[4];
+    printf("registered %d\n", epoll_wait(set, fired, 4, 0));
+
+    /* The registered descriptor goes, and the dup keeps the description —
+       so the registration is still there and still fires. */
+    close(ends[0]);
+    printf("after close %d data %llx\n",
+           epoll_wait(set, fired, 4, 0), (unsigned long long)fired[0].data.u64);
+
+    /* And now the last one goes, which is what actually ends it. */
+    close(copy);
+    printf("after both %d\n", epoll_wait(set, fired, 4, 0));
+
+    /* A file opened now takes the freed slot. Nothing may report it. */
+    /* Relative, so it is the same file on both sides: the tree is the
+       guest's root and the guest starts in it. */
+    int reused = open("./init", 0);
+    printf("reused %d, still quiet %d\n", reused >= 0, epoll_wait(set, fired, 4, 0));
+    close(reused);
+    close(set);
+    close(ends[1]);
+    return 0;
+}
+"#,
+        Linkage::Dynamic,
+    );
+}

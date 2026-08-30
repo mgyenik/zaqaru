@@ -470,10 +470,15 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
         // one — which is what turns a reader's next `read` into end-of-file
         // and a writer's next `write` into `EPIPE`.
         let before = self.shared_census();
+        // Which description this descriptor named, read while it still
+        // names one: if this is the last descriptor on it, the description
+        // is about to go and anything holding its *index* has to be told.
+        let had = self.files.description_index(fd).ok();
         let result = self.files.close(fd);
         if result.is_ok() {
             self.reclaim_after_close(held);
             self.reconcile_shared(&before);
+            self.forget_description(had);
         }
         Outcome::Done(match result {
             Ok(()) => 0,
@@ -1791,8 +1796,10 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
                 },
                 Err(_) => None,
             };
+            let had = self.files.description_index(fd).ok();
             if self.files.close(fd).is_ok() {
                 self.reclaim_after_close(held);
+                self.forget_description(had);
             }
         }
         self.reconcile_shared(&before);
@@ -1940,6 +1947,26 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
         }
     }
 
+    /// Drops an `epoll` registration whose open file description has gone.
+    ///
+    /// Linux's `eventpoll_release`, and it is not tidiness: a description's
+    /// slot is *reused*, so a registration left behind would start watching
+    /// whichever file opened next and report it under the old caller's data
+    /// word.
+    ///
+    /// Called with the index the descriptor *had*, at the one place a
+    /// description can die — rather than by comparing the table before and
+    /// after, which is the same answer and allocates a vector of every open
+    /// descriptor on every `close`. `tests/filesystem.rs` measures that the
+    /// syscall path allocates nothing, and it is right to.
+    pub(crate) fn forget_description(&mut self, had: Option<usize>) {
+        if let Some(index) = had
+            && self.files.at(index).is_none()
+        {
+            self.epolls.borrow_mut().forget(index);
+        }
+    }
+
     /// Moves the pipe reference counts to match a descriptor table that has
     /// just changed.
     ///
@@ -1990,11 +2017,15 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
             });
         }
         let before = self.shared_census();
+        // `dup2` closes whatever the target was, which can be the last
+        // descriptor naming its description.
+        let displaced = self.files.description_index(new).ok();
         let answer = match self.files.duplicate_to(old, new, false) {
             Ok(fd) => fd as i64,
             Err(errno) => errno.as_result(),
         };
         self.reconcile_shared(&before);
+        self.forget_description(displaced);
         Outcome::Done(answer)
     }
 
@@ -2012,6 +2043,7 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
             return Outcome::Done(Errno::Invalid.as_result());
         }
         let before = self.shared_census();
+        let displaced = self.files.description_index(new).ok();
         let answer = match self
             .files
             .duplicate_to(old, new, flags & open_flags::CLOEXEC != 0)
@@ -2020,6 +2052,7 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
             Err(errno) => errno.as_result(),
         };
         self.reconcile_shared(&before);
+        self.forget_description(displaced);
         Outcome::Done(answer)
     }
 
@@ -2146,6 +2179,10 @@ const EPOLL_INODE_BASE: u64 = 0x9100_0000;
 /// A snapshot of the shared things a descriptor table points at. See
 /// [`crate::syscall::Kernel::reconcile_shared`].
 #[derive(Clone, Debug, Default)]
+/// Deliberately only the *shared* things, which a container that has opened
+/// no pipe and no `epoll` has none of — so both vectors are empty and
+/// neither allocates. What is per-process is handled where it happens; see
+/// [`crate::syscall::Kernel::forget_description`].
 pub struct Census {
     pipes: Vec<(u32, crate::pipe::End)>,
     epolls: Vec<u32>,

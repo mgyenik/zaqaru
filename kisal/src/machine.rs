@@ -90,6 +90,11 @@ pub trait Machine {
         false
     }
 
+    /// Parks this thread in `pause`, waiting for a signal.
+    fn park_on_signal(&mut self) -> bool {
+        false
+    }
+
     /// Marks a signal pending on some thread that has not blocked it.
     ///
     /// What a *process*-directed signal means: `kill(2)` names a process,
@@ -589,6 +594,11 @@ impl Machine for Interpreted {
 
     fn park_on_watch(&mut self, watching: crate::thread::Watching) -> bool {
         self.threads.current_mut().state = crate::thread::State::Watching(watching);
+        true
+    }
+
+    fn park_on_signal(&mut self) -> bool {
+        self.threads.current_mut().state = crate::thread::State::Paused;
         true
     }
 
