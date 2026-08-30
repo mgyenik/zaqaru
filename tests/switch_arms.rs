@@ -19,100 +19,12 @@ use support::WorkingDirectory;
 use zaqaru::discover::{Extent, Witness};
 use zaqaru::reader::ObjectFile;
 
-/// The path the container's program is placed at, as everywhere else.
-const PROGRAM: &str = "init";
-
-fn path(segments: &[&[u8]]) -> Vec<Vec<u8>> {
-    segments.iter().map(|segment| segment.to_vec()).collect()
-}
-
 /// A fixture, read the way a bake reads it.
 fn read(workspace: &WorkingDirectory, source: &str) -> (std::path::PathBuf, Vec<u8>, ObjectFile) {
     let elf = support::link_corpus_executable(workspace, source, "_start", "-O1");
     let bytes = std::fs::read(&elf).expect("read the program");
     let object = ObjectFile::parse(&bytes).expect("parse the program");
     (elf, bytes, object)
-}
-
-/// Runs a fixture both ways and requires the two to agree: the same ELF
-/// executed by Linux, and the same ELF baked into a container.
-///
-/// Comparing the bytes as well as the status matters here — an arm that went
-/// to the wrong place can still add up to the same total, and the six bytes
-/// say in which order the arms were reached.
-fn agrees_with_native(workspace: &WorkingDirectory, source: &str, label: &str, expected: i32) {
-    let (elf, bytes, object) = read(workspace, source);
-
-    let native = std::process::Command::new(&elf)
-        .env_clear()
-        .output()
-        .expect("run the program natively");
-    let native_status = native.status.code().expect("a native exit status");
-    assert_eq!(
-        native_status, expected,
-        "natively the program no longer visits every arm; it wrote {:?}",
-        native.stdout
-    );
-
-    let top = object
-        .segments
-        .iter()
-        .map(|segment| segment.address + segment.memory_size)
-        .max()
-        .expect("a linked program has segments");
-    let translation = zaqaru::transpile::Transpiler::new(&object)
-        .translate()
-        .expect("translate the program");
-    let guest = workspace.write(&format!("{label}.wasm.o"), &translation.module);
-
-    let root = workspace.path().join("image");
-    std::fs::create_dir_all(&root).expect("create the image tree");
-    let mut placed = bytes.clone();
-    baker::program::apply(&mut placed, &translation.patches).expect("apply the patches");
-    std::fs::write(root.join(PROGRAM), &placed).expect("place the program");
-    let image = baker::object::emit(&baker::bake_directory(&root).expect("bake"))
-        .expect("emit the image object");
-
-    let module = support::link_container_for_program(
-        workspace,
-        std::slice::from_ref(&guest),
-        &image,
-        label,
-        Some(top),
-    );
-    let mut container = runner::Container::instantiate(
-        &std::fs::read(&module).expect("read the container"),
-        support::mounts_seeded(&[0x33; 32]),
-    )
-    .expect("instantiate the container");
-
-    let status = container.boot().unwrap_or_else(|error| {
-        let log = container
-            .mounts()
-            .read(&path(&[b"iso", b"log", b"error"]))
-            .ok()
-            .flatten()
-            .unwrap_or_default();
-        panic!(
-            "the container did not finish: {error:?}\nkernel log: {}",
-            String::from_utf8_lossy(&log)
-        )
-    });
-
-    let written = container
-        .mounts()
-        .read(&path(&[b"iso", b"console", b"stdout"]))
-        .expect("the console mount failed")
-        .unwrap_or_default();
-    assert_eq!(
-        written, native.stdout,
-        "the transpiled program reached different arms than the native one"
-    );
-    assert_eq!(
-        i64::from(status),
-        i64::from(native_status),
-        "the transpiled program's arms summed differently"
-    );
 }
 
 /// A function begins at every arm that needed one, and says why it does.
@@ -200,7 +112,8 @@ fn an_arm_in_a_sibling_piece_becomes_a_function() {
 #[test]
 fn a_program_whose_switch_arms_were_split_away_runs() {
     let workspace = WorkingDirectory::new("switch-arms-run");
-    agrees_with_native(&workspace, "split_switch.s", "switch-arms", 63);
+    let status = support::program_agrees_with_native(&workspace, "split_switch.s", "switch-arms");
+    assert_eq!(status, 63, "the program no longer reaches every arm");
 }
 
 /// A table whose *first* entry is in the cold body is still a table.
@@ -264,7 +177,8 @@ fn a_table_whose_first_arm_is_in_the_cold_body_is_still_recovered() {
 #[test]
 fn a_program_dispatching_into_its_cold_body_runs() {
     let workspace = WorkingDirectory::new("switch-arms-cold-run");
-    agrees_with_native(&workspace, "cold_switch.s", "cold-switch", 31);
+    let status = support::program_agrees_with_native(&workspace, "cold_switch.s", "cold-switch");
+    assert_eq!(status, 31, "the program no longer reaches every arm");
 }
 
 /// The trap this design exists to leave closed.

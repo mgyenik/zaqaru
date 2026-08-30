@@ -2034,11 +2034,17 @@ paths stand between here and `import json`:
 - **Dynamic TLS**: a dlopen'ed module with `__thread` takes the
   DTV-growth path through `__tls_get_addr` — guest code that has never
   run, because boot-time libraries get static TLS.
-- **The error path lands on the setjmp/longjmp thorn**:
-  `_dl_catch_exception` leaves by `longjmp` on failure, presenting as
-  an exec-map miss on the sentinel — recorded in the design doc so the
-  first real hit is recognized, and triggered once deliberately by the
-  spike.
+- **The error path needs longjmp**: `_dl_catch_exception` leaves by
+  `longjmp` on failure — and a failing `dlopen` is normal Python
+  control flow (`ctypes` probes by name and catches the `OSError`).
+  The design is now written — `container-plan.md`, "setjmp/longjmp:
+  the saved PC is already a continuation" — and it is assembly of
+  existing parts: setjmp is ordinary code, longjmp is a tagged
+  per-site constant, one arm in the exec-map miss path, a one-field
+  kernel row, and the existing leave/resume machinery. Until it is
+  built, the failure presents as an exec-map miss on the
+  saved-continuation value, and the spike triggers it once
+  deliberately so the shape is on record.
 
 The spike is a ladder, one question per rung, differential where a
 native oracle exists: **(0)** the existing dynamic-boot image re-baked

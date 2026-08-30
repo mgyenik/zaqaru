@@ -725,6 +725,7 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             number::UNAME => self.uname(arguments),
             number::PRCTL => self.prctl(arguments),
             number::SET_TID_ADDRESS => self.set_tid_address(arguments),
+            number::FUTEX => self.futex(arguments),
             number::SET_ROBUST_LIST => self.set_robust_list(arguments),
             number::PRLIMIT64 => self.prlimit64(arguments),
             number::GETRANDOM => self.getrandom(arguments),
@@ -985,6 +986,58 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             written += want as u64;
         }
         Outcome::Done(length as i64)
+    }
+
+    /// `futex(2)`, for the half of it that has a true answer today.
+    ///
+    /// **`WAKE` wakes nobody, and that is exact rather than approximate.**
+    /// There is one thread — M7 is the milestone that makes more — so no
+    /// thread can be parked on any address, and the number of waiters woken
+    /// is zero. Answering zero is not a stub standing in for the real thing;
+    /// it is the real thing, for a process that cannot have a waiter.
+    ///
+    /// It earns a row because the alternative is worse than a gap. glibc and
+    /// OpenSSL wake futexes on ordinary initialisation and teardown paths
+    /// that no contention ever reaches — `import hashlib` does it before it
+    /// hashes anything — so refusing here stops single-threaded programs on
+    /// a call whose answer is not in doubt.
+    ///
+    /// **`WAIT` stays a named fault**, and for the mirror reason: a wait
+    /// that would block has nothing to wake it and no scheduler to switch
+    /// to, so the honest answer is to stop with the operation named rather
+    /// than to return a value the caller will act on. When M7 builds the
+    /// wait queues, both halves get their real implementation together —
+    /// and the loud half is what makes sure the quiet half is revisited then
+    /// rather than inherited.
+    fn futex(&mut self, arguments: Arguments) -> Outcome {
+        const PRIVATE: i64 = 128;
+        const CLOCK_REALTIME: i64 = 256;
+        const WAKE: i64 = 1;
+        const WAKE_BITSET: i64 = 10;
+
+        // The two flags say where the futex lives and which clock a timeout
+        // is against. Neither changes what an operation *is*, and with one
+        // thread neither changes its answer.
+        let operation = arguments.get(1) & !(PRIVATE | CLOCK_REALTIME);
+        match operation {
+            WAKE | WAKE_BITSET => {
+                // The address still has to be one the guest owns: Linux
+                // answers `EFAULT` for a futex word outside the address
+                // space, and a caller that passed a bad pointer should hear
+                // about it here rather than at the first real contention.
+                let word = arguments.get(0) as u64;
+                match self.memory().check(word, 4) {
+                    Ok(()) => Outcome::Done(0),
+                    Err(errno) => Outcome::Done(errno.as_result()),
+                }
+            }
+            _ => Outcome::Fault(Fault::detailed(
+                number::FUTEX,
+                arguments,
+                "an operation that would wait — there is one thread, so \
+                 nothing could wake it; the wait queues are M7's",
+            )),
+        }
     }
 
     /// `rt_sigaction(2)`: what a signal is set to do.

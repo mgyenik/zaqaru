@@ -607,16 +607,31 @@ pub fn corpus_signatures(name: &str) -> zaqaru::abi::SignatureTable {
 }
 
 /// Every source in the corpus directory, in a stable order.
-/// Corpus sources that exist *to be* untranslatable, and are therefore not
-/// part of the breadth sweep.
+/// Corpus sources the breadth sweep does not transpile, and why.
 ///
-/// A translation policy that gives an untranslatable function a trapping
-/// body needs something untranslatable to give one to, and `hlt` is a
-/// privileged instruction nothing a container runs will ever legitimately
-/// execute — which makes it a stable stand-in for whatever the gap list
-/// holds this week. The sweep asks "is there anything in the corpus the
-/// transpiler refuses", and for these two the answer is yes on purpose.
-pub const DELIBERATELY_UNTRANSLATABLE: [&str; 2] = ["untranslatable.s", "calls_untranslatable.s"];
+/// The sweep asks "is there anything in the corpus the transpiler refuses",
+/// over *relocatable objects*. For these the answer is yes on purpose, in
+/// two different ways:
+///
+/// - **Something untranslatable, on purpose.** A translation policy that
+///   gives an untranslatable function a trapping body needs something
+///   untranslatable to give one to, and `hlt` is a privileged instruction
+///   nothing a container runs will ever legitimately execute — a stable
+///   stand-in for whatever the gap list holds this week.
+/// - **Something that only means anything linked.** `data_in_text.s` takes
+///   the address of a table that lives *in* `.text`, which is what
+///   hand-written assembly does and what `libcrypto` is full of. In a
+///   relocatable object that address has no wasm spelling at all: an address
+///   in a text section is a function's table index or it is nothing, which
+///   is the address-space split `docs/design.md` opens with. The refusal is
+///   correct and says so. What the source is for is the *linked* pipeline,
+///   where the same bytes are an extent question — `tests/data_in_text.rs`
+///   is where it is tested, in all three of its claims.
+pub const DELIBERATELY_UNTRANSLATABLE: [&str; 3] = [
+    "untranslatable.s",
+    "calls_untranslatable.s",
+    "data_in_text.s",
+];
 
 pub fn corpus_sources() -> Vec<String> {
     let directory = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1220,6 +1235,93 @@ pub fn m1_mounts() -> runner::store::MountTable {
 /// mount has no randomness, and that is the capability model rather than an
 /// oversight. A default that quietly supplied entropy would make the
 /// distinction untestable.
+/// Runs a corpus program both ways and requires the two to agree: the same
+/// ELF executed by Linux, and the same ELF baked into a container.
+///
+/// Returns the exit status the two agreed on, so a caller can say what it
+/// expects that to be — which is worth saying, because a program that failed
+/// to reach its own work would agree with a native run that failed the same
+/// way.
+///
+/// Comparing the bytes as well as the status is the point: a program can add
+/// up to the same total having gone somewhere else entirely.
+pub fn program_agrees_with_native(
+    workspace: &WorkingDirectory,
+    source: &str,
+    label: &str,
+) -> i32 {
+    let elf = link_corpus_executable(workspace, source, "_start", "-O1");
+    let bytes = std::fs::read(&elf).expect("read the program");
+    let object = zaqaru::reader::ObjectFile::parse(&bytes).expect("parse the program");
+
+    let native = std::process::Command::new(&elf)
+        .env_clear()
+        .output()
+        .expect("run the program natively");
+    let native_status = native.status.code().expect("a native exit status");
+
+    let top = object
+        .segments
+        .iter()
+        .map(|segment| segment.address + segment.memory_size)
+        .max()
+        .expect("a linked program has segments");
+    let translation = zaqaru::transpile::Transpiler::new(&object)
+        .translate()
+        .expect("translate the program");
+    let guest = workspace.write(&format!("{label}.wasm.o"), &translation.module);
+
+    let root = workspace.path().join(format!("image-{label}"));
+    std::fs::create_dir_all(&root).expect("create the image tree");
+    let mut placed = bytes.clone();
+    baker::program::apply(&mut placed, &translation.patches).expect("apply the patches");
+    std::fs::write(root.join("init"), &placed).expect("place the program");
+    let image = baker::object::emit(&baker::bake_directory(&root).expect("bake"))
+        .expect("emit the image object");
+
+    let module = link_container_for_program(
+        workspace,
+        std::slice::from_ref(&guest),
+        &image,
+        label,
+        Some(top),
+    );
+    let mut container = runner::Container::instantiate(
+        &std::fs::read(&module).expect("read the container"),
+        mounts_seeded(&[0x33; 32]),
+    )
+    .expect("instantiate the container");
+
+    let status = container.boot().unwrap_or_else(|error| {
+        let log = container
+            .mounts()
+            .read(&[b"iso".to_vec(), b"log".to_vec(), b"error".to_vec()])
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        panic!(
+            "the container did not finish: {error:?}\nkernel log: {}",
+            String::from_utf8_lossy(&log)
+        )
+    });
+
+    let written = container
+        .mounts()
+        .read(&[b"iso".to_vec(), b"console".to_vec(), b"stdout".to_vec()])
+        .expect("the console mount failed")
+        .unwrap_or_default();
+    assert_eq!(
+        written, native.stdout,
+        "[{label}] the transpiled program wrote something else than the native one"
+    );
+    assert_eq!(
+        i64::from(status),
+        i64::from(native_status),
+        "[{label}] the transpiled program exited differently"
+    );
+    native_status
+}
+
 pub fn mounts_seeded(seed: &[u8]) -> runner::store::MountTable {
     let mut mounts = m1_mounts();
     mounts.mount(&[b"iso", b"random"], Box::new(runner::store::Sink::new()));

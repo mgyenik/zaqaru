@@ -325,6 +325,9 @@ ones adopted:
   through a different door.
 - **A string is not a pointer array.** Overlap with a plausible string
   rejects the source.
+- **An extent ends where its code stops decoding.** Not a filter on
+  candidates but on their *extents*, and it applies to stated and guessed
+  alike — see below.
 
 What is deliberately *not* adopted: weighted or Bayesian scoring over the
 witnesses (Ddisasm's auction, FunProbe's belief propagation). Scoring
@@ -334,6 +337,54 @@ stratification captures what the weights are for at zero tuning surface.
 The witness provenance D2 records is the substrate scoring would need, so
 the option stays open at no cost; the trigger for taking it is a real
 binary the hard rules cannot decide, not a preference for sophistication.
+
+## An extent is where the bytes end; the decode says where the code ends
+
+The two are not the same thing, and only a compiler keeps them together.
+Hand-written assembly puts constant pools inside `.text` as a matter of
+course, and `libcrypto.so.3` supplies both shapes of it:
+
+- **A table something takes the address of.** OpenSSL's AES keeps its Te0
+  S-box in `.text`, sixteen-byte aligned, immediately after
+  `AES_cbc_encrypt` — and something naturally takes its address, because it
+  is a lookup table. The operand harvest (D4) then mints a function out of
+  `c6 63 63 a5 f8 7c 7c 84 …`, with a **guessed** extent bounded by whatever
+  begins next, whose code stops decoding four bytes in.
+- **A pool inside a symbol's own size.** `RC4_options` is 208 bytes by its
+  `.size`, of which the last 64 are the strings it returns: `repz ret`,
+  alignment padding, then `"rc4(8x,int)"`. perlasm writes
+  `.size name,.-name` *after* the pool, so a **stated** extent deliberately
+  spans data.
+
+So the rule is uniform: where the extent and the decode disagree, the code
+ends where the decode says, and the extent is cut back to there. What is
+kept is every instruction that decoded; what is dropped never decoded and so
+could never have executed.
+
+**Why this does not weaken the invariant.** A stated extent's authority is
+over where a function *starts* and that nothing else begins inside it. It
+was never a claim that every byte is an instruction — `RC4_options` is the
+counterexample, written that way on purpose by the tool that generated it.
+Cutting an extent back does not invent a boundary, mint a function or move a
+start; it removes bytes from a body, and the bytes it removes are ones no
+decoder would accept.
+
+**Where the dangerous case stays loud.** A genuine decode desync — the
+fixpoint failing, and a real function's tail lost — is the thing a build-time
+refusal was protecting against. It is still loud, one stage later and more
+precisely: the last instruction kept is by construction one that *continues*,
+its fall-through lands where nothing begins, and that is an `unreachable`.
+Every other way into the lost tail is an exec-map miss naming the address.
+Refusing instead was the previous behaviour, and it refused the whole
+*bake* — a worse answer than the project gives an untranslatable function,
+and one no perlasm library survives.
+
+`tests/data_in_text.rs` and `tests/corpus/data_in_text.s` carry both shapes.
+The fixture is excluded from the relocatable breadth sweep and the reason is
+worth stating, because it is the address-space split rather than a gap: in a
+`gcc -c` object, an address in a text section is a function's table index or
+it is nothing, so taking the address of a table that lives in `.text` has no
+wasm spelling at all.
 
 ## The floor: the saturated tier (D6)
 

@@ -2734,3 +2734,108 @@ refuse the bake, because a guess that runs into data is a guess that ran too
 long, and code lost that way was undecodable anyway — anything that reaches
 it gets a loud exec-map miss. Unbuilt. It blocks `hashlib`, `ssl` and
 everything under them.
+
+## 2026-08-30 — an extent is where the bytes end, not where the code does
+
+`libcrypto.so.3` refused to translate: *undecodable bytes in
+`fn.0x100b66c0` at offset `0x16c4`*. The fix was smaller than the diagnosis
+and the diagnosis was wrong twice before it was right.
+
+### What is actually at `0xb66c0`
+
+`c6 63 63 a5, f8 7c 7c 84, ee 77 77 99, f6 7b 7b 8d` — AES's **Te0 S-box**.
+It sits in `.text`, sixteen-byte aligned, immediately after
+`AES_cbc_encrypt` (which states 1427 bytes and ends at `0xb66b3`), and
+something takes its address because it is a lookup table. So the operand
+harvest minted a function out of it, with a *guessed* extent bounded by
+whatever begins next, and the decode fell over four bytes in.
+
+Truncating a guessed extent at the poison is right for both shapes it meets:
+a candidate that was never code becomes a dead three-byte stub nothing
+transfers to, and a candidate that *was* code with a table beside it keeps
+its code. Refusing the candidate outright would serve the first and lose
+real code in the second, and a threshold between them would be a tuning
+surface. Truncation needs neither.
+
+### And then `RC4_options`, which says the asymmetry was wrong
+
+With guessed extents truncating, the next refusal was a *stated* one, and
+the first version of this fix kept those loud on the argument that a symbol
+saying "1427 bytes of function" makes undecodable bytes inside it a decode
+that lost sync.
+
+`RC4_options` says otherwise. It is 208 bytes by its own `.size`, of which
+the last 64 are the strings it returns: `repz ret` at `+0x27`, alignment
+padding, then `"rc4(8x,int)"`. perlasm writes `.size name,.-name` *after*
+the constant pool, so a stated extent spans data deliberately, and every
+library built that way — which is every library with hand-written asm in it
+— was refused.
+
+So the rule is uniform. **An extent is where a function's bytes end; the
+decode is where its code ends.** A stated extent's authority is over where a
+function starts and that nothing else begins inside it; it was never a claim
+that every byte is an instruction.
+
+The dangerous case is still loud, one stage later and more precisely: the
+last instruction kept is by construction one that *continues*, so its
+fall-through lands where nothing begins and that is an `unreachable`, and
+every other way in is an exec-map miss naming the address. What was there
+before refused the whole *bake*, which is a worse answer than the project
+gives an untranslatable function.
+
+The truncation is read back into discovery by the front-end fixpoint, so
+`Function` and `LiftedFunction` agree about size — the same channel D7's arm
+feedback uses, and the second kind of evidence to flow backwards through it.
+Two quantities now move and both move one way (cuts subdivide, extents only
+shrink), which is what makes the loop terminate.
+
+One interaction worth naming: the monotonicity guard would have fired on a
+*correct* truncation, because "instructions" decoded out of an S-box include
+indirect jumps and some of those recovered tables. A dispatch that no
+function covers any more is not a dispatch that stopped being recoverable,
+and the guard now says so.
+
+### Where it got to
+
+`libcrypto.so.3` lifts: 11,469 functions in 1.1 s. Then
+`futex(FUTEX_WAKE_PRIVATE, INT_MAX)`, which OpenSSL calls on initialisation.
+With one thread nothing can be parked on any address, so the number woken is
+zero — exact rather than approximate, and a row it earns because refusing
+stops single-threaded programs on a call whose answer is not in doubt.
+`WAIT` stays a named fault: a wait that would block has nothing to wake it,
+and the loud half is what makes sure the quiet half is revisited when M7
+builds the queues rather than inherited.
+
+    import hashlib -> sha256   identical to native
+
+And with it `base64`, `uuid`, `random`, `datetime`, `struct`, `array`, on
+top of the `json`, `math`, `cmath`, `re`, `collections`, `itertools` and
+`functools` from the entry above.
+
+Two left on the probe, both named rather than guessed: `zlib` reaches
+`pshuflw` and `pinsrw`, which are two rows of the SSE gap list
+`docs/design.md` already carries; `sqlite3` is the setjmp/longjmp thorn,
+reached because its library is not in the tree.
+
+### The fixture, and what building it cost
+
+`tests/corpus/data_in_text.s` carries both shapes. Three attempts to make it
+reproduce, each wrong in an instructive way:
+
+1. Thirty-two real bytes of Te0 decode cleanly — where a table stops a
+   decoder depends on which boundaries the fixpoint found in the surrounding
+   garbage, so copying the bytes does not copy the failure.
+2. Two hundred and fifty-six of them do too.
+3. Starting the table with `nop` made it vanish: padding is never a
+   function, and that filter refuses the candidate before this one is
+   reached. Which is the filter working.
+
+What reproduces it deterministically is an instruction that continues
+followed by an opcode that does not exist in 64-bit mode — `0x06` — and the
+fixture says why it is built that way rather than copied.
+
+It is excluded from the relocatable breadth sweep, and the reason is the
+address-space split rather than a gap: in a `gcc -c` object an address in a
+text section is a function's table index or it is nothing, so taking the
+address of a table that lives in `.text` has no wasm spelling. The exclusion
+list now carries two categories instead of one.

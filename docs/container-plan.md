@@ -1096,15 +1096,16 @@ arrived at runtime — `pip install` fetching a native wheel — hits
 Pure-Python installs are just files and work fine; native extensions
 must be baked. That is the AOT deal.
 
-One failure shape worth knowing before it is met in anger: `dlopen`'s
-*error* path leaves by `longjmp` (`_dl_catch_exception`), which is the
-parked setjmp/longjmp thorn — so a `dlopen` that fails inside ld.so (a
-missing `DT_NEEDED` of an extension module, say) will present as an
-exec-map miss on the sentinel value, not as a `dlerror`. The happy path
-never longjmps — the `setjmp` on entry is save-only, and save works —
-so this blocks nothing; it makes one class of failure maximally
-misleading until the thorn's third-arm design exists, and the dlopen
-corpus triggers it once deliberately so the shape is on record.
+One dependency stated plainly: `dlopen`'s *error* path leaves by
+`longjmp` (`_dl_catch_exception`), so a `dlopen` that fails inside
+ld.so — a missing `DT_NEEDED` of an extension module, or the
+name-probing `ctypes` does routinely — needs the setjmp/longjmp design
+(its own section below). The happy path never longjmps — the `setjmp`
+on entry is save-only, and save is ordinary code — so imports of baked
+modules do not wait on it. Until it is built, a failing `dlopen`
+presents as an exec-map miss on the saved-continuation value rather
+than as a `dlerror`, and the dlopen corpus triggers that once
+deliberately so the shape is on record.
 
 And the labeled grind: transpiling ld.so and glibc themselves —
 hand-written entry asm, self-relocation, jump-table-rich string
@@ -1319,17 +1320,103 @@ instance death. A flag-gated zero-check in the div translation
 (branching to a kisal raise) buys conformance for a per-div branch;
 off by default, named.
 
-**One parked thorn: setjmp/longjmp**, including `siglongjmp` out of a
-handler. glibc's `setjmp` saves callee-saved registers, `rsp`, and a
-return address read from the stack — which under `--resume` is a
-resume ID. That suggests `longjmp`'s indirect jump dispatches through
-a third arm of the standing discrimination (small integer = table
-slot, arena range = exec-map address, high-bits-set = resume ID →
-enter the resume body), meaning the saved "PC" was already a
-materialized continuation. The shape is promising; the stack-balance
-bookkeeping around the jump needs its own design pass, so this is an
-open question, not a solved one. Not needed for the Flask target;
-needed for real-world C (libjpeg and libpng error paths).
+### setjmp/longjmp: the saved PC is already a continuation
+
+Formerly the parked thorn; now a design, and it is assembly of
+existing parts in the same sense the saturated tier is. The
+load-bearing fact is verified in the code rather than hoped
+(`src/translate.rs`, `ResumeSites`): under `--resume`, **every call
+site stores a resume ID in its return-address slot**, and the chain of
+those slots on the guest stack is a serialization of the frames above
+any call. The container pipeline always builds with resume on.
+
+**setjmp needs nothing at all.** It is ordinary code: it stores the
+callee-saved registers, `%rsp`, and the word at `(%rsp)` into the
+`jmp_buf` — and that word *is the resume ID of its caller's
+continuation*, a materialized, enterable continuation saved by code
+that has no idea that is what it is doing. glibc's pointer mangling
+(`xor %fs:0x30; rol $0x11` at save, the inverse at restore) is pure
+integer arithmetic on the stored value, translated faithfully on both
+sides, so it round-trips exactly; musl does not mangle. No shim, no
+name-matching — which matters, because a stripped static binary has no
+names to match.
+
+**longjmp is one new arm plus machinery that exists.** It restores the
+callee-saved registers and `%rsp` from the buffer (ordinary translated
+stores into the globals, `val` into `rax`), then does `jmp *value`
+with a resume ID as the operand. Today that reaches the exec map,
+misses, and dies in `kisal_no_function_at`. The pieces of the fix:
+
+- **Discrimination in the miss path, at zero hot-path cost.** The
+  check lives where the exec-map lookup already fails: a missed value
+  carrying the resume-ID tag is a longjmp; one without it stays the
+  loud error. Function-pointer calls — the hot case — hit the map and
+  never see the check. The one requirement is that the stored form of
+  an ID be disjoint from every address: IDs are per-site *constants*
+  (an `i64.const` carrying the table relocation), so the tag bit is
+  baked into the constant for free, and the resume driver masks one
+  more bit beside `RED_ZONE_RESERVED` and `RESUME_ENTRY_MASK`.
+- **Frame abandonment is the blocking-syscall leave path, verbatim.**
+  The wasm frames between longjmp and setjmp's caller must go, and the
+  system owns exactly one tool that discards guest frames: the throw
+  the seam raises when a syscall blocks, caught at `x86_run_thread`.
+  The longjmp arm runs after the flush every transfer performs, and
+  calls a seam-shaped helper: kisal sets the current thread's
+  continuation to the given ID and returns the leave sentinel (a
+  one-field kernel row — a *blocking syscall with a continuation
+  override*), the helper throws, the catch schedules.
+- **Re-entry is resumption, verbatim.** The driver enters the saved
+  ID; setjmp's call site has a resume entry because every call site
+  does; the continuation reloads the machine from the globals, where
+  longjmp's own translated code just put everything. The frames below
+  setjmp's caller re-materialize lazily from the guest stack exactly
+  as after any block — `%rsp` restoration made the deeper slots
+  reachable again, and they still hold the IDs written on the way
+  down.
+
+**The cost model matches the workload.** A setjmp that never longjmps
+is free — and that is the overwhelming case: libjpeg and libpng take
+one on *every decode call* and longjmp only on corrupt input, and
+`dlopen` takes one on every call (`_dl_catch_exception`) and longjmps
+only on failure. An actual longjmp costs about one blocking syscall,
+which is honest — it is semantically a context switch.
+
+**Why it matters more than the Flask target suggests**: `dlopen`
+returning `NULL` is normal control flow in real Python —
+`ctypes.util.find_library` and the packages wrapping C libraries
+*probe* by dlopening candidates and catching the `OSError` — and
+setjmp/longjmp is the C ecosystem's exception mechanism (libjpeg,
+libpng, Lua, Fortran runtimes). For "the target is any binary" it is
+not exotic.
+
+Edges, named now:
+
+- **`siglongjmp` out of a handler composes only because delivery
+  splices.** A throw must never cross a Rust frame, so this design
+  works with M10's chain-surgery delivery — the handler is spliced
+  into the chain and entered by the driver, never called from a kisal
+  frame — and would break under a delivery that calls. This is the
+  splice rule's second client. The mask restore is `rt_sigprocmask`
+  from translated code, an existing row.
+- **A stale `jmp_buf`** (longjmp after the saving frame returned) is
+  UB natively and stays UB here: the entered continuation reads
+  garbage slots and dies in a loud miss soon after — better than
+  native offers.
+- **`__longjmp_chk`'s** fortify check compares guest `%rsp` values,
+  both faithful; it works untouched.
+- **Resume off** (the relocatable/testing pipeline): slots hold the
+  sentinel and the miss stays loud. The constraint costs nothing —
+  containers always build with resume on — but it is a constraint.
+
+Tests, corpus-ladder style: a same-frame round trip; longjmp across N
+frames with distinguishable callee-saved values checked after; longjmp
+in a tight loop — **the wasm stack must not grow**, which is the throw
+earning its keep and the test that kills the naive
+call-the-continuation design (that one leaks a frame chain per
+longjmp); both libcs, since one mangles and one does not; and the gate
+that reopened this design — `dlopen` of a missing library returning
+`NULL` with `dlerror` text, differential against native. It also
+unblocks the parked setjmp case in the test ledger.
 
 ### x87 and MMX
 
@@ -1521,12 +1608,11 @@ Dictated by the trace, not by difficulty:
   setuid bits, `security.capability`); whether kisal ever *honors* any
   of it — permission checks, capability grants — is deliberately
   undecided. The preserved bits keep every option open.
-- setjmp/longjmp: the saved return address is a resume ID under
-  `--resume`, so `longjmp` plausibly dispatches through a third arm of
-  the slot/address discrimination — but the stack-balance bookkeeping
-  around the jump needs a dedicated design pass (see the Signals
-  section). Blocks `siglongjmp`-from-handler and common C error paths
-  (libjpeg, libpng), not the Flask target.
+- ~~setjmp/longjmp~~ — **designed**; see "setjmp/longjmp: the saved PC
+  is already a continuation". setjmp is ordinary code; longjmp is a
+  tagged constant, one arm in the exec-map miss path, a one-field
+  kernel row, and the existing leave/resume machinery. What remains is
+  the build and its corpus ladder, not a design pass.
 - The syscall dispatch itself: direct call per rewritten site when the
   number is a constant in `rax` (it almost always is), `br_table` in the
   kernel otherwise — measure whether the distinction matters.

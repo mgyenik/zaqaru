@@ -186,6 +186,10 @@ fn decode_function(object: &ObjectFile, function_index: usize) -> Result<LiftedF
     let mut instructions;
     let mut poisoned = BTreeSet::new();
     let mut rounds = 0;
+    // Where the code stopped, when it stopped before the extent said it
+    // would. The front-end fixpoint reads this back into discovery so that
+    // the two agree about how big the function is.
+    let mut truncated: Option<u64> = None;
     loop {
         poisoned.clear();
         instructions = decode_pass(object, function, body, &boundaries, &mut poisoned)?;
@@ -215,16 +219,46 @@ fn decode_function(object: &ObjectFile, function_index: usize) -> Result<LiftedF
             // That is the case where the decode has lost sync with the
             // program, which has to be loud — the alternative is a
             // translation quietly missing instructions.
-            for lifted in &instructions {
+            // **Where the code ends is what the decode says, not what the
+            // extent says**, and the two disagree routinely.
+            //
+            // An extent is where a function's *bytes* end. Hand-written
+            // assembly puts its constant pool inside its own symbol as a
+            // matter of course, and two cases from one library make the
+            // point better than the rule does:
+            //
+            // - `libcrypto.so.3` has AES's Te0 S-box at `0xb66c0`,
+            //   immediately after `AES_cbc_encrypt` and 16-byte aligned, and
+            //   something takes its address because it is a lookup table. So
+            //   the address-taken witness minted a function out of
+            //   `c6 63 63 a5 f8 7c 7c 84 …` — a *guessed* extent over bytes
+            //   that were never code, falling over four bytes in.
+            // - `RC4_options` in the same library is 208 bytes by its own
+            //   `.size`, of which the last 64 are the strings it returns:
+            //   `repz ret`, alignment padding, then `"rc4(8x,int)"`. A
+            //   *stated* extent, deliberately spanning data, because
+            //   perlasm writes `.size name,.-name` after the pool.
+            //
+            // So truncating at the poison, for either kind. What is kept is
+            // every instruction that decoded; what is dropped never decoded
+            // and so could never have executed. The dangerous case — a real
+            // decode desync losing a function's tail — stays loud, but at
+            // run time rather than at build time: the last kept instruction
+            // is by construction one that continues, its fall-through lands
+            // where nothing begins, and that is an `unreachable`. Every
+            // other way in is an exec-map miss naming the address.
+            //
+            // Refusing instead was the previous behaviour and it refused the
+            // whole bake, which is a worse answer than the project gives an
+            // untranslatable *function*, and which no perlasm library can
+            // survive.
+            let ran_into = instructions.iter().find_map(|lifted| {
                 let next = lifted.offset + lifted.length();
-                if poisoned.contains(&next) && continues_past(&lifted.instruction) {
-                    bail!(
-                        "undecodable bytes in `{}` at offset {next:#x}, which \
-                         `{:#x}` runs into",
-                        function.name,
-                        lifted.offset
-                    );
-                }
+                (poisoned.contains(&next) && continues_past(&lifted.instruction)).then_some(next)
+            });
+            if let Some(at) = ran_into {
+                instructions.retain(|lifted| lifted.offset + lifted.length() <= at);
+                truncated = Some(at);
             }
             break;
         }
@@ -244,7 +278,10 @@ fn decode_function(object: &ObjectFile, function_index: usize) -> Result<LiftedF
         function: function_index,
         section: function.section,
         offset: function.offset,
-        size: function.size,
+        size: match truncated {
+            Some(at) => at - function.offset,
+            None => function.size,
+        },
         instructions,
         jump_tables: std::collections::BTreeMap::new(),
     })

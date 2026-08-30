@@ -65,10 +65,13 @@ use crate::reader::{Layout, ObjectFile};
 
 /// How many times the loop may go round.
 ///
-/// Each round can only cut, and a cut only subdivides, so the sequence is
-/// strictly decreasing in the number of arms that lie outside their piece.
-/// Two rounds is what the case that forced this needs. The bound is here to
-/// make a wrong belief about that loud rather than to run out.
+/// Two quantities move and both move one way: a round can only *cut*, and a
+/// cut only subdivides; and it can only *shorten* an extent, never lengthen
+/// one. So the sequence is strictly decreasing in the number of arms that
+/// lie outside their piece and in the total size of the functions, and it
+/// terminates. Three rounds is what the case that forced this needs. The
+/// bound is here to make a wrong belief about that loud rather than to run
+/// out.
 const ROUNDS: usize = 8;
 
 /// Runs the front end to a fixpoint, leaving `object.functions` final.
@@ -107,22 +110,43 @@ pub fn settle(object: &mut ObjectFile) -> Result<()> {
         // build-time error naming the dispatch.
         let now = dispatches(&lifted);
         if let Some(before) = &recovered {
-            still_recovered(&object.sections, before, &now)?;
+            still_recovered(&object.sections, &object.functions, before, &now)?;
         }
         recovered = Some(now);
 
+        // What the decode found out about extents, read back into discovery.
+        // A guessed extent that runs into undecodable bytes ran too long,
+        // and the lifter says where the code actually stopped — evidence
+        // discovery could not have had, arriving a pass later, exactly like
+        // a recovered arm.
+        let mut shortened = 0;
+        for body in &lifted {
+            let function = &mut object.functions[body.function];
+            if body.size < function.size {
+                function.size = body.size;
+                shortened += 1;
+            }
+        }
+
         let arms = stranded_arms(object, &lifted);
-        if arms.is_empty() {
+        if arms.is_empty() && shortened == 0 {
             return Ok(());
         }
         if round == ROUNDS {
             bail!(
                 "the front end did not settle in {ROUNDS} rounds: {} `switch` \
-                 arms still lie outside the piece that dispatches to them, \
-                 the first at {:#x}",
+                 arms still lie outside the piece that dispatches to them \
+                 (the first at {:#x}), and {shortened} extents moved",
                 arms.len(),
                 arms.first().copied().unwrap_or_default()
             );
+        }
+        if arms.is_empty() {
+            // Only extents moved. Nothing to cut, but the next round still
+            // has to lift against the shorter bodies: a smaller function is
+            // a different set of instructions, and jump-table recovery asks
+            // about instruction boundaries.
+            continue;
         }
         if !crate::discover::cut_at_switch_arms(
             &object.sections,
@@ -159,10 +183,23 @@ pub fn settle(object: &mut ObjectFile) -> Result<()> {
 /// dispatch.
 fn still_recovered(
     sections: &[crate::reader::Section],
+    functions: &[crate::discover::Function],
     before: &std::collections::BTreeSet<(usize, u64)>,
     now: &std::collections::BTreeSet<(usize, u64)>,
 ) -> Result<()> {
-    let Some((section, offset)) = before.difference(now).next() else {
+    // A dispatch the previous round *truncated away* is not a dispatch that
+    // stopped being recoverable — the bytes it was decoded from turned out
+    // not to be code at all, which is the whole point of shortening a
+    // guessed extent. What the guard is for is a table that became
+    // unreadable while its jump is still there, so a jump no function
+    // covers any more is not its business.
+    let covered = |(section, offset): &(usize, u64)| {
+        functions.iter().any(|function| {
+            function.section == *section
+                && (function.offset..function.offset + function.size).contains(offset)
+        })
+    };
+    let Some((section, offset)) = before.difference(now).find(|gone| covered(gone)) else {
         return Ok(());
     };
     let address = sections
@@ -253,10 +290,11 @@ mod tests {
     #[test]
     fn a_round_may_recover_more_dispatches() {
         let sections = [section(0x400000)];
+        let functions = [covering(0, 0x1000)];
         let before = std::collections::BTreeSet::from([(0, 0x10)]);
         let now = std::collections::BTreeSet::from([(0, 0x10), (0, 0x40)]);
-        assert!(still_recovered(&sections, &before, &now).is_ok());
-        assert!(still_recovered(&sections, &before, &before).is_ok());
+        assert!(still_recovered(&sections, &functions, &before, &now).is_ok());
+        assert!(still_recovered(&sections, &functions, &before, &before).is_ok());
     }
 
     /// The guard, and the reason it names an address rather than a count: a
@@ -265,14 +303,46 @@ mod tests {
     #[test]
     fn a_round_that_loses_a_dispatch_is_refused_by_address() {
         let sections = [section(0x400000)];
+        let functions = [covering(0, 0x1000)];
         let before = std::collections::BTreeSet::from([(0, 0x10), (0, 0x40)]);
         let now = std::collections::BTreeSet::from([(0, 0x10)]);
-        let error = still_recovered(&sections, &before, &now)
+        let error = still_recovered(&sections, &functions, &before, &now)
             .expect_err("losing a dispatch was accepted");
         let report = format!("{error:#}");
         assert!(
             report.contains("0x400040"),
             "the refusal did not name the dispatch it lost: {report}"
         );
+    }
+
+    /// And a dispatch the round truncated away is not a loss.
+    ///
+    /// Shortening a guessed extent is how a candidate that was never code
+    /// stops being translated — `libcrypto`'s AES tables are the case — and
+    /// the "instructions" decoded out of such bytes routinely include
+    /// indirect jumps. Treating those as dispatches gone missing would turn
+    /// the fix into a refusal.
+    #[test]
+    fn a_dispatch_the_round_truncated_away_is_not_a_loss() {
+        let sections = [section(0x400000)];
+        // The function now ends at 0x20, so the dispatch at 0x40 is in no
+        // function at all.
+        let functions = [covering(0, 0x20)];
+        let before = std::collections::BTreeSet::from([(0, 0x10), (0, 0x40)]);
+        let now = std::collections::BTreeSet::from([(0, 0x10)]);
+        assert!(still_recovered(&sections, &functions, &before, &now).is_ok());
+    }
+
+    fn covering(offset: u64, size: u64) -> crate::discover::Function {
+        crate::discover::Function {
+            name: String::new(),
+            symbol: None,
+            section: 0,
+            offset,
+            size,
+            witness: crate::discover::Witness::Symbol,
+            extent: crate::discover::Extent::Stated,
+            whole: offset..offset + size,
+        }
     }
 }
