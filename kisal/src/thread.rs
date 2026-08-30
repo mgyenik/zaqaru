@@ -45,10 +45,28 @@ pub enum State {
     /// sees one count at the end. Re-running would move the first piece
     /// twice.
     Transferring(crate::pipe::Transfer),
+    /// It is in `poll` or `epoll_wait`, waiting for a descriptor to become
+    /// ready or for a deadline to pass.
+    Watching(Watching),
     /// It called `exit`. Its control block is kept until something reaps
     /// the identifier, because a thread that has ended is still a thread
     /// that existed.
     Exited { status: i32 },
+}
+
+/// A parked `poll` or `epoll_wait`.
+///
+/// The set is addresses rather than a copy, which is what keeps a thread's
+/// state a plain value: the `pollfd` array lives in the caller's own memory
+/// and is still there while the caller is parked, so re-reading it costs
+/// nothing and copying it would only be a second version of the truth.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Watching {
+    pub watch: crate::poll::Watch,
+    /// Nanoseconds on the monotonic clock, or `None` for a wait with no
+    /// timeout — which is the case that costs nothing, because the thread
+    /// is simply not runnable until the answer changes.
+    pub deadline: Option<u64>,
 }
 
 /// The kernel's own per-thread cells.

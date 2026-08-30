@@ -97,7 +97,7 @@ fn main() {
         image,
         Enforcement::Mapped,
     );
-    let mut process = match Process::boot(kernel, argv[0], &argv, &[]) {
+    let process = match Process::boot(kernel, argv[0], &argv, &[]) {
         Ok(process) => process,
         Err(error) => {
             let mut message = String::new();
@@ -115,16 +115,22 @@ fn main() {
     // work in children and a count that lost them would understate the
     // engine by however much the guest chose to fan out.
     let retired = system.retired();
+    let decoded = system.decoded();
+    let stall = match exit == Exit::Deadlocked {
+        true => system.stall(),
+        false => String::new(),
+    };
     let process = system.current();
     eprintln!(
         "\n{retired} instructions in {elapsed:.2}s = {:.1} MIPS",
         retired as f64 / elapsed / 1e6
     );
-    eprintln!("blocks decoded: {}", process.cache.decoded);
+    eprintln!("blocks decoded: {decoded}");
     match exit {
         Exit::Status(status) => std::process::exit(status),
         other => {
             eprintln!("{other:?}");
+            eprint!("{stall}");
             // Only the mappings around whatever the guest touched, because a
             // hundred-line map of a Python process buries the two lines that
             // matter.

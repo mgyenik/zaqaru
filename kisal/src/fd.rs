@@ -51,6 +51,10 @@ pub enum Backing {
         pipe: u32,
         end: crate::pipe::End,
     },
+    /// An `epoll` instance, named the same way and shared for the same
+    /// reason. A descriptor that *is* a set rather than a file is the whole
+    /// idea of `epoll`, and it is why it needs a backing of its own.
+    Epoll(u32),
 }
 
 /// What `dup` and friends share.
@@ -245,6 +249,18 @@ impl FdTable {
             })
     }
 
+    /// The same for `epoll` instances, once per descriptor.
+    pub fn epoll_sets(&self) -> impl Iterator<Item = u32> + '_ {
+        self.descriptors
+            .iter()
+            .flatten()
+            .filter_map(|descriptor| self.descriptions[descriptor.description].as_ref())
+            .filter_map(|file| match file.backing {
+                Backing::Epoll(id) => Some(id),
+                _ => None,
+            })
+    }
+
     /// How many descriptors in this table are on one end of one pipe.
     ///
     /// Asked after a close, to decide whether the *process* has let go of
@@ -254,6 +270,34 @@ impl FdTable {
         self.pipe_ends()
             .filter(|&(held, side)| held == pipe && side == end)
             .count()
+    }
+
+    /// Every open descriptor and a word for what is behind it, for the
+    /// stall report — where "which descriptors did this process still have"
+    /// is usually the answer.
+    pub fn open_descriptors(&self) -> impl Iterator<Item = (i32, String)> + '_ {
+        self.descriptors
+            .iter()
+            .enumerate()
+            .filter_map(|(fd, held)| Some((fd as i32, (*held)?)))
+            .filter_map(|(fd, held)| {
+                let file = self.descriptions[held.description].as_ref()?;
+                let what = match file.backing {
+                    Backing::Image(vnode) => format!("file:{}", vnode.inode),
+                    Backing::Console(stream) => format!("console:{stream:?}"),
+                    Backing::Pipe { pipe, end } => format!("pipe{pipe}:{end:?}"),
+                    Backing::Epoll(id) => format!("epoll{id}"),
+                };
+                Some((fd, what))
+            })
+    }
+
+    /// The highest descriptor this table has open, or `None`.
+    pub fn highest(&self) -> Option<i32> {
+        self.descriptors
+            .iter()
+            .rposition(Option::is_some)
+            .map(|slot| slot as i32)
     }
 
     /// Closes every descriptor marked close-on-exec.

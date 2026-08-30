@@ -526,6 +526,7 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             // because a pipe write can park and this signature cannot say
             // so. `pwrite` does arrive, and a pipe has no position.
             crate::fd::Backing::Pipe { .. } => return Err(Errno::NotSeekable),
+            crate::fd::Backing::Epoll(_) => return Err(Errno::Invalid),
             crate::fd::Backing::Image(vnode) => {
                 let inode = self.vfs.inode(vnode)?;
                 return match inode.file_type() {
@@ -744,9 +745,9 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             let fd = i32::try_from(dirfd).map_err(|_| Errno::BadFile)?;
             match self.files.description(fd)?.backing {
                 crate::fd::Backing::Image(vnode) => vnode,
-                crate::fd::Backing::Console(_) | crate::fd::Backing::Pipe { .. } => {
-                    return Ok(());
-                }
+                crate::fd::Backing::Console(_)
+                | crate::fd::Backing::Pipe { .. }
+                | crate::fd::Backing::Epoll(_) => return Ok(()),
             }
         } else {
             let text = self.path_at(path)?;
@@ -863,9 +864,9 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
         }
         let vnode = match file.backing {
             crate::fd::Backing::Image(vnode) => vnode,
-            crate::fd::Backing::Console(_) | crate::fd::Backing::Pipe { .. } => {
-                return Outcome::Done(0);
-            }
+            crate::fd::Backing::Console(_)
+            | crate::fd::Backing::Pipe { .. }
+            | crate::fd::Backing::Epoll(_) => return Outcome::Done(0),
         };
         let outcome = self.change_mode_at(at::FDCWD, 0, vnode, mode);
         self.finish_change(arguments, outcome)

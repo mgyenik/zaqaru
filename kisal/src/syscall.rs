@@ -27,6 +27,7 @@ pub mod number {
     pub const LSEEK: i64 = 8;
     pub const PREAD64: i64 = 17;
     pub const ACCESS: i64 = 21;
+    pub const POLL: i64 = 7;
     pub const PIPE: i64 = 22;
     pub const DUP: i64 = 32;
     pub const DUP2: i64 = 33;
@@ -85,6 +86,14 @@ pub mod number {
     pub const FACCESSAT: i64 = 269;
     pub const DUP3: i64 = 292;
     pub const PIPE2: i64 = 293;
+    pub const EPOLL_CREATE: i64 = 213;
+    pub const EPOLL_WAIT: i64 = 232;
+    pub const EPOLL_CTL: i64 = 233;
+    pub const EPOLL_PWAIT: i64 = 281;
+    pub const EPOLL_CREATE1: i64 = 291;
+    pub const PPOLL: i64 = 271;
+    pub const EPOLL_PWAIT2: i64 = 441;
+    pub const CLOSE_RANGE: i64 = 436;
     pub const GETRANDOM: i64 = 318;
     pub const STATX: i64 = 332;
     pub const RSEQ: i64 = 334;
@@ -178,6 +187,15 @@ pub mod number {
             LSEEK => "lseek",
             PREAD64 => "pread64",
             ACCESS => "access",
+            POLL => "poll",
+            PPOLL => "ppoll",
+            EPOLL_CREATE => "epoll_create",
+            EPOLL_CREATE1 => "epoll_create1",
+            EPOLL_CTL => "epoll_ctl",
+            EPOLL_WAIT => "epoll_wait",
+            EPOLL_PWAIT => "epoll_pwait",
+            EPOLL_PWAIT2 => "epoll_pwait2",
+            CLOSE_RANGE => "close_range",
             PIPE => "pipe",
             PIPE2 => "pipe2",
             DUP => "dup",
@@ -511,6 +529,10 @@ pub struct Kernel<'a, S: Store, M: Machine> {
     /// `container-plan.md`'s fd hoisting lands once the shared thing lives
     /// somewhere both processes can reach.
     pub pipes: crate::pipe::Shared,
+    /// Every `epoll` instance in the container, shared for the same reason
+    /// the pipes are: a descriptor is inheritable, and an inherited one has
+    /// to name the set the parent registered things in.
+    pub epolls: crate::poll::Shared,
     /// The counter new timestamps come from. See `Kernel::now`.
     pub clock: i64,
     /// The status the process finished with, once something has finished.
@@ -712,6 +734,7 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             vfs: crate::vfs::Vfs::new(image),
             files: crate::fd::FdTable::with_standard_streams(),
             pipes: crate::pipe::Shared::default(),
+            epolls: crate::poll::Shared::default(),
             clock: 1,
             status: None,
             pages,
@@ -1006,6 +1029,10 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             for (pipe, end) in self.files.pipe_ends() {
                 pipes.acquire(pipe, end);
             }
+            let mut epolls = self.epolls.borrow_mut();
+            for id in self.files.epoll_sets() {
+                epolls.acquire(id);
+            }
         }
         Self {
             // The host boundary, which both processes reach. Sharing it is
@@ -1036,6 +1063,7 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             // Shared, not copied — see the field. The counts were raised
             // above, once per descriptor the copied table holds.
             pipes: crate::pipe::Shared::clone(&self.pipes),
+            epolls: crate::poll::Shared::clone(&self.epolls),
             clock: self.clock,
             // The child has not finished and is not going anywhere.
             status: None,
@@ -1094,19 +1122,24 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
         // standard output, marks the original close-on-exec, and the reader
         // sees end-of-file when the child finishes rather than never.
         {
+            // Once per descriptor lost, not once per pipe: a `dup`ed end is
+            // two references and closing one of them closes nothing.
             let mut pipes = self.pipes.borrow_mut();
-            // Once per descriptor lost, not once per end: a `dup`ed pipe end
-            // is two references and closing one of them closes nothing.
-            let mut seen: Vec<(u32, crate::pipe::End)> = Vec::new();
-            for held in self.files.pipe_ends() {
-                if seen.contains(&held) {
-                    continue;
-                }
-                seen.push(held);
-                let (pipe, end) = held;
-                let lost = self.files.holds_pipe(pipe, end) - files.holds_pipe(pipe, end);
+            let before: Vec<_> = self.files.pipe_ends().collect();
+            let after: Vec<_> = files.pipe_ends().collect();
+            for held in crate::file::distinct(&before, &after) {
+                let lost = crate::file::count(&before, &held) - crate::file::count(&after, &held);
                 for _ in 0..lost {
-                    pipes.release(pipe, end);
+                    pipes.release(held.0, held.1);
+                }
+            }
+            let mut epolls = self.epolls.borrow_mut();
+            let before: Vec<_> = self.files.epoll_sets().collect();
+            let after: Vec<_> = files.epoll_sets().collect();
+            for held in crate::file::distinct(&before, &after) {
+                let lost = crate::file::count(&before, &held) - crate::file::count(&after, &held);
+                for _ in 0..lost {
+                    epolls.release(held);
                 }
             }
         }
@@ -1129,6 +1162,7 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             // how every shell wires a pipeline: the descriptors survive and
             // so must what is behind them.
             pipes: crate::pipe::Shared::clone(&self.pipes),
+            epolls: crate::poll::Shared::clone(&self.epolls),
             clock: self.clock,
             status: None,
             continuation: None,
@@ -1832,6 +1866,13 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             }
             number::FCNTL => self.fcntl(arguments),
             number::PIPE | number::PIPE2 => self.make_pipe(number, arguments),
+            number::POLL | number::PPOLL => self.poll(number, arguments),
+            number::EPOLL_CREATE | number::EPOLL_CREATE1 => {
+                self.epoll_create(number, arguments)
+            }
+            number::EPOLL_CTL => self.epoll_control(arguments),
+            number::CLOSE_RANGE => self.close_range(arguments),
+            number::EPOLL_WAIT | number::EPOLL_PWAIT => self.epoll_wait(arguments),
             number::DUP => self.dup(arguments),
             number::DUP2 => self.dup2(arguments),
             number::DUP3 => self.dup3(arguments),
@@ -2764,9 +2805,14 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             crate::fd::Backing::Console(crate::fd::Console::Input) => {
                 return Outcome::Done(Errno::BadFile.as_result());
             }
-            // Answered before this row is reached; see `write_pipe`.
+            // Answered before this row is reached; see `transfer_pipe`.
             crate::fd::Backing::Pipe { .. } => {
                 return Outcome::Done(Errno::NotSeekable.as_result());
+            }
+            // An `epoll` descriptor is a set. Writing to it is not a smaller
+            // version of `epoll_ctl`; it is nothing.
+            crate::fd::Backing::Epoll(_) => {
+                return Outcome::Done(Errno::Invalid.as_result());
             }
             crate::fd::Backing::Image(vnode) => {
                 return Outcome::Done(
@@ -2950,7 +2996,7 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
 /// Surrounding whitespace is accepted because a host writing a number into a
 /// file is entitled to end it with a newline. Anything else is refused: a
 /// clock that half-parsed is worse than one that failed.
-fn parse_nanoseconds(bytes: &[u8]) -> Option<i64> {
+pub(crate) fn parse_nanoseconds(bytes: &[u8]) -> Option<i64> {
     let text = core::str::from_utf8(bytes).ok()?.trim();
     let (negative, digits) = match text.strip_prefix('-') {
         Some(rest) => (true, rest),

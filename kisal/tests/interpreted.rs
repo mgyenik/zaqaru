@@ -1454,3 +1454,270 @@ int main(void) {
         Linkage::Dynamic,
     );
 }
+
+/// **`poll` on a pipe**, including the wait.
+///
+/// Three questions in one program: what does an empty pipe answer with no
+/// timeout, what does it answer once something is in it, and what does the
+/// reader hear when the writer closes. The last is `POLLHUP`, reported
+/// whether or not it was asked for — which is `poll(2)`'s rule, and the one
+/// a program depends on to notice that a child has finished.
+#[test]
+fn poll_reports_a_pipe_becoming_readable() {
+    agrees_with_native(
+        "poll",
+        r#"
+#include <poll.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+
+int main(void) {
+    int ends[2];
+    pipe(ends);
+    struct pollfd watch = { .fd = ends[0], .events = POLLIN };
+
+    /* Nothing there, and asked not to wait. */
+    printf("empty %d %d\n", poll(&watch, 1, 0), watch.revents);
+
+    write(ends[1], "x", 1);
+    watch.revents = 0;
+    printf("ready %d in=%d\n", poll(&watch, 1, 0), (watch.revents & POLLIN) != 0);
+
+    char byte;
+    read(ends[0], &byte, 1);
+    close(ends[1]);
+    watch.revents = 0;
+    /* The writer is gone, so this must return rather than wait forever. */
+    printf("hup %d hup=%d\n", poll(&watch, 1, -1), (watch.revents & POLLHUP) != 0);
+    close(ends[0]);
+    return 0;
+}
+"#,
+        Linkage::Dynamic,
+    );
+}
+
+/// **`poll` that actually parks**, and is woken by another process.
+///
+/// The empty-pipe wait with no timeout, which is the whole reason `poll`
+/// blocks: nothing here can run, the container gives the child a turn, and
+/// the parent's `poll` answers when the child writes. It fails by hanging if
+/// readiness is not what wakes the process, and by returning zero early if
+/// the wait is not really a wait.
+#[test]
+fn a_parked_poll_is_woken_by_another_process() {
+    agrees_with_native(
+        "poll-fork",
+        r#"
+#include <poll.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+int main(void) {
+    int ends[2];
+    pipe(ends);
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        close(ends[0]);
+        write(ends[1], "from the child", 14);
+        close(ends[1]);
+        _exit(0);
+    }
+    close(ends[1]);
+    struct pollfd watch = { .fd = ends[0], .events = POLLIN };
+    int ready = poll(&watch, 1, -1);
+    char buffer[32] = {0};
+    ssize_t got = read(ends[0], buffer, sizeof buffer - 1);
+    close(ends[0]);
+    waitpid(child, 0, 0);
+    printf("ready %d, read %zd: %s\n", ready, got, buffer);
+    return 0;
+}
+"#,
+        Linkage::Dynamic,
+    );
+}
+
+/// **`epoll`**, which is the same question with the set kept in the kernel.
+///
+/// Registering, waiting, the caller's own word coming back untouched, and
+/// `EEXIST` for a second `ADD` of one descriptor — the errors `epoll_ctl`
+/// has instead of silently replacing a registration.
+#[test]
+fn epoll_reports_registered_descriptors() {
+    agrees_with_native(
+        "epoll",
+        r#"
+#include <errno.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/epoll.h>
+#include <unistd.h>
+
+int main(void) {
+    int ends[2];
+    pipe(ends);
+    int set = epoll_create1(EPOLL_CLOEXEC);
+    if (set < 0) { perror("epoll_create1"); return 1; }
+
+    struct epoll_event watch = { .events = EPOLLIN, .data = { .u64 = 0x1234abcd } };
+    printf("add %d\n", epoll_ctl(set, EPOLL_CTL_ADD, ends[0], &watch));
+    /* Twice is `EEXIST`, which is how a program learns it already had it.
+       The call and the errno are separate statements on purpose: reading
+       `errno` in the same `printf` as the call that sets it is unsequenced,
+       and the two sides would be comparing evaluation orders. */
+    errno = 0;
+    int twice = epoll_ctl(set, EPOLL_CTL_ADD, ends[0], &watch);
+    printf("again %d %d\n", twice, errno);
+
+    struct epoll_event fired[4];
+    printf("quiet %d\n", epoll_wait(set, fired, 4, 0));
+
+    write(ends[1], "wake up", 7);
+    int count = epoll_wait(set, fired, 4, -1);
+    printf("count %d in=%d data %llx\n", count,
+           (fired[0].events & EPOLLIN) != 0,
+           (unsigned long long)fired[0].data.u64);
+
+    printf("del %d\n", epoll_ctl(set, EPOLL_CTL_DEL, ends[0], 0));
+    printf("gone %d\n", epoll_wait(set, fired, 4, 0));
+    close(set);
+    close(ends[0]);
+    close(ends[1]);
+    return 0;
+}
+"#,
+        Linkage::Dynamic,
+    );
+}
+
+/// **`close_range`**, and what a process ending does with what it held.
+///
+/// Two halves of one fact. A child that `close_range`s everything above
+/// standard error and then writes is the shape `fork` plus `exec` takes in
+/// every subprocess library; and a child that *exits* must let go of its
+/// descriptors too, because a zombie is a status and a process id and not an
+/// open file. Without the second, the parent's read on a pipe the child held
+/// waits for an end-of-file that already happened, which is a hang and not
+/// an error.
+#[test]
+fn an_ending_process_lets_go_of_its_descriptors() {
+    agrees_with_native(
+        "close-range",
+        r#"
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+int main(void) {
+    int ends[2];
+    pipe(ends);
+    int spare[2];
+    pipe(spare);
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        /* Everything but the standard streams and this one pipe. */
+        dup2(ends[1], 3);
+        close_range(4, ~0U, 0);
+        write(3, "from a tidy child", 17);
+        /* And then exit *without* closing it: the kernel has to. */
+        _exit(0);
+    }
+    close(ends[1]);
+    close(spare[0]);
+    close(spare[1]);
+    char buffer[64] = {0};
+    size_t total = 0;
+    ssize_t got;
+    while ((got = read(ends[0], buffer + total, sizeof buffer - 1 - total)) > 0) {
+        total += (size_t)got;
+    }
+    close(ends[0]);
+    waitpid(child, 0, 0);
+    printf("read %zu: %s\n", total, buffer);
+    return 0;
+}
+"#,
+        Linkage::Dynamic,
+    );
+}
+
+/// **A pipeline**, which is the shape a shell makes: two children, one pipe
+/// between them, and standard output and input `dup2`ed onto its ends.
+///
+/// Every piece of the fd work at once — a fork that shares the ring, a
+/// `dup2` that moves a count, a `close` in each child of the end it does not
+/// use, and the writer's exit being what ends the reader's loop. Get any of
+/// them wrong and this hangs.
+#[test]
+fn two_children_form_a_pipeline() {
+    agrees_with_native(
+        "pipeline",
+        r#"
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+int main(void) {
+    int middle[2];
+    int out[2];
+    pipe(middle);
+    pipe(out);
+    fflush(stdout);
+
+    if (fork() == 0) {
+        /* The producer: its standard output is the pipe. */
+        dup2(middle[1], 1);
+        close(middle[0]);
+        close(middle[1]);
+        close(out[0]);
+        close(out[1]);
+        for (int index = 0; index < 3; index++) {
+            printf("row %d\n", index);
+        }
+        fflush(stdout);
+        _exit(0);
+    }
+    if (fork() == 0) {
+        /* The consumer: its input is that pipe and its output is the next. */
+        dup2(middle[0], 0);
+        dup2(out[1], 1);
+        close(middle[0]);
+        close(middle[1]);
+        close(out[0]);
+        close(out[1]);
+        int rows = 0;
+        int character;
+        while ((character = getchar()) != EOF) {
+            rows += character == '\n';
+        }
+        printf("counted %d\n", rows);
+        fflush(stdout);
+        _exit(0);
+    }
+    close(middle[0]);
+    close(middle[1]);
+    close(out[1]);
+    char buffer[64] = {0};
+    size_t total = 0;
+    ssize_t got;
+    while ((got = read(out[0], buffer + total, sizeof buffer - 1 - total)) > 0) {
+        total += (size_t)got;
+    }
+    close(out[0]);
+    while (wait(0) > 0) {
+    }
+    printf("pipeline said: %s", buffer);
+    return 0;
+}
+"#,
+        Linkage::Dynamic,
+    );
+}

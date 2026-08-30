@@ -85,6 +85,11 @@ pub trait Machine {
         false
     }
 
+    /// Parks this thread in a `poll` or an `epoll_wait`.
+    fn park_on_watch(&mut self, _watching: crate::thread::Watching) -> bool {
+        false
+    }
+
     /// Marks a signal pending on some thread that has not blocked it.
     ///
     /// What a *process*-directed signal means: `kill(2)` names a process,
@@ -354,6 +359,7 @@ pub struct Interpreted {
 /// and the shape that matters, a `fork` whose parent immediately waits,
 /// costs two.
 #[cfg(target_arch = "wasm32")]
+#[derive(Default)]
 pub struct Dormant {
     /// Page address and its contents, ascending.
     pages: Vec<(u64, [u8; PAGE_BYTES])>,
@@ -505,6 +511,11 @@ impl Machine for Interpreted {
 
     fn park_on_transfer(&mut self, transfer: crate::pipe::Transfer) -> bool {
         self.threads.current_mut().state = crate::thread::State::Transferring(transfer);
+        true
+    }
+
+    fn park_on_watch(&mut self, watching: crate::thread::Watching) -> bool {
+        self.threads.current_mut().state = crate::thread::State::Watching(watching);
         true
     }
 

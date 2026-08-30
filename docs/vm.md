@@ -531,11 +531,43 @@ Which also means "no thread here can run" stopped being a deadlock: it is
 a question about the container, so `Process` reports `Idle` and only
 `System`, which can see every process, calls it.
 
-**What is left is `poll`, `epoll` and sockets.** `subprocess.run` with
-`capture_output` needs the first two, because CPython's `selectors` picks
-`epoll` on Linux at import time; a socket is the next thing after that
-whose state two processes share, and it hoists the same way a pipe does
-because the arena is already the shape for it.
+**`poll` and `epoll` are built on the same idea**, and the idea is forced
+by the same rule everything else here is: readiness is asked *while
+choosing which process to run*, so it must be answerable without touching
+any process's memory. `epoll` already keeps its set in the kernel. `poll`
+is handed one on every call, in the caller's own address space — so
+parking a `poll` copies its set into a kernel one that lives for exactly
+that call. Which makes a `poll` an `epoll` set with a short life, and
+makes the readiness path one function instead of two.
+
+That rule is not theoretical. Written the other way — re-reading the
+caller's `pollfd` array to decide whether to wake it — the array is read
+while the *forked child's* memory is at the guest's addresses, and a
+forked child has a stack at the same address. It does not fault. It
+answers with somebody else's bytes and the wait never wakes.
+
+A wait with no timeout costs nothing: the thread is not runnable and its
+process is scheduled again exactly when the answer changes. A wait *with*
+a timeout spins, because there is nothing to sleep on — the host boundary
+is two `ll-store` imports and neither of them waits.
+
+**And a process that ends lets go of everything.** Its descriptors and its
+address space, before there is a zombie: a zombie is a status and a
+process id so a parent can ask what happened, and nothing else. Keeping
+the descriptors keeps a pipe's writer count standing, and the parent's
+`poll` on the other end waits forever for an end-of-file that already
+happened — which is exactly how `subprocess.run` hung, and exactly what
+the stall report (`System::stall`, printed whenever a container
+deadlocks) said in one line.
+
+**Verified in the blob:** `subprocess.run([sys.executable, "-c",
+"print(6*7)"], capture_output=True)` and `subprocess.check_output`, inside
+a 124 MB `.wasm` — a second CPython forked, `execve`d, captured through a
+pipe, waited for, and reaped.
+
+What is left is sockets, which are the next thing whose state two
+processes share, and which hoist the way a pipe does because the arena is
+already that shape.
 
 The `vfork`/`posix_spawn` fast path is unchanged and is still the case
 that matters: no snapshot at all, the child instantiated fresh from the

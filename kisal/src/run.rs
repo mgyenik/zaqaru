@@ -277,6 +277,7 @@ impl<'a, S: Store> Process<'a, S> {
         // has since been written to is runnable again, and it has to be so
         // *before* the scheduler is asked what to run.
         self.resume_transfers();
+        self.resume_watches();
         // A process can be given the processor back with its current thread
         // still parked: `Progress::Idle` hands the turn away without
         // choosing a successor, because at that moment there was none. So
@@ -364,6 +365,16 @@ impl<'a, S: Store> Process<'a, S> {
         self.kernel.machine.threads.all().iter().any(|thread| {
             match thread.state {
                 crate::thread::State::Transferring(transfer) => transfer.ready(&pipes),
+                // A wait with a deadline is always worth a turn, because the
+                // only way to find out whether the deadline has passed is to
+                // look at the clock — and looking at the clock crosses the
+                // host boundary, which a scheduling decision must not do. So
+                // a container whose only pending work is a timeout spins
+                // until it fires. There is no sleep to call: the boundary is
+                // two `ll-store` imports and neither of them waits.
+                crate::thread::State::Watching(watching) => {
+                    watching.deadline.is_some() || self.kernel.watch_ready(watching.watch)
+                }
                 _ => thread.is_runnable(),
             }
         })
@@ -378,6 +389,42 @@ impl<'a, S: Store> Process<'a, S> {
     /// process is the one at the guest's addresses. A writer that filled a
     /// pipe cannot complete the reader's `read` on its way past, however
     /// convenient that would be.
+    /// Completes every parked `poll` or `epoll_wait` whose answer has
+    /// arrived — or whose deadline has passed, which is the same call
+    /// answering zero.
+    fn resume_watches(&mut self) {
+        let parked: Vec<(usize, crate::thread::Watching)> = self
+            .kernel
+            .machine
+            .threads
+            .all()
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, thread)| match thread.state {
+                crate::thread::State::Watching(watching) => Some((slot, watching)),
+                _ => None,
+            })
+            .collect();
+        for (slot, watching) in parked {
+            let ready = self.kernel.watch_ready(watching.watch);
+            if !ready && !self.kernel.expired(watching.deadline) {
+                continue;
+            }
+            // Writes into the guest's own memory, which is why this is here
+            // and not wherever the descriptor became ready.
+            let answer = match ready {
+                true => self.kernel.report_ready(watching.watch),
+                // The deadline passed with nothing ready, which `poll` and
+                // `epoll_wait` both report as zero rather than as an error.
+                false => 0,
+            };
+            self.kernel.release_watch(watching.watch);
+            let thread = &mut self.kernel.machine.threads.all_mut()[slot];
+            thread.state = crate::thread::State::Runnable;
+            thread.tcb.registers[0] = answer as u64;
+        }
+    }
+
     fn resume_transfers(&mut self) {
         let parked: Vec<(usize, crate::pipe::Transfer)> = self
             .kernel

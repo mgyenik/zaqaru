@@ -80,13 +80,15 @@ pub struct System<'a, S: Store> {
     /// How many thread quanta the running process has used since it was
     /// given the processor. See [`SLICE`].
     slice: u64,
-    /// What processes that are gone retired before they went.
+    /// What processes that are gone retired and decoded before they went.
     ///
-    /// Kept here because reaping destroys the only other place the number
-    /// lived, and a container that forks does most of its work in children:
-    /// a rate computed from the survivors would understate the engine by
-    /// however much the guest chose to fan out.
+    /// Kept here because ending destroys the only other place those numbers
+    /// lived — a process lets go of its control blocks and its block cache
+    /// the moment it exits — and a container that forks does most of its
+    /// work in children: a rate computed from the survivors would understate
+    /// the engine by however much the guest chose to fan out.
     departed: u64,
+    departed_blocks: u64,
 }
 
 impl<'a, S: Store + Clone> System<'a, S> {
@@ -103,6 +105,7 @@ impl<'a, S: Store + Clone> System<'a, S> {
             next: FIRST + 1,
             slice: 0,
             departed: 0,
+            departed_blocks: 0,
         }
     }
 
@@ -114,13 +117,21 @@ impl<'a, S: Store + Clone> System<'a, S> {
         self.containers[self.current].pid
     }
 
-    /// Instructions retired by every process, living or reaped.
+    /// Instructions retired by every process, living or gone.
     pub fn retired(&self) -> u64 {
         self.containers
             .iter()
             .flat_map(|container| container.process.kernel.machine.threads.all())
             .map(|thread| thread.tcb.retired)
             .fold(self.departed, u64::saturating_add)
+    }
+
+    /// Blocks decoded by every process, living or gone.
+    pub fn decoded(&self) -> u64 {
+        self.containers
+            .iter()
+            .map(|container| container.process.cache.decoded as u64)
+            .fold(self.departed_blocks, u64::saturating_add)
     }
 
     /// Forks the running process, and answers the child's identifier.
@@ -168,12 +179,17 @@ impl<'a, S: Store + Clone> System<'a, S> {
     /// both are driven by the retired-instruction quantum — so the whole
     /// interleaving, across processes as well as threads, is a pure function
     /// of execution.
-    fn schedule(&mut self, preempted: bool) -> bool {
+    fn schedule(&mut self, why: Yield) -> bool {
         // A quantum expiring is a *thread* scheduling point. It becomes a
         // process scheduling point once the process has had a whole slice of
-        // them — see [`SLICE`].
-        self.slice += u64::from(preempted);
-        let rotate = self.slice >= SLICE;
+        // them — see [`SLICE`]. A process that cannot continue gives up its
+        // turn whatever is left of the slice, which is not the same thing
+        // and must not be counted as one.
+        self.slice += u64::from(why == Yield::Quantum);
+        let rotate = match why {
+            Yield::Given => true,
+            _ => self.slice >= SLICE,
+        };
         if rotate {
             self.slice = 0;
         }
@@ -289,16 +305,10 @@ impl<'a, S: Store + Clone> System<'a, S> {
             any = true;
             if let Some(status) = container.status {
                 let pid = container.pid;
-                let gone = self.containers.remove(index);
-                self.departed = gone
-                    .process
-                    .kernel
-                    .machine
-                    .threads
-                    .all()
-                    .iter()
-                    .map(|thread| thread.tcb.retired)
-                    .fold(self.departed, u64::saturating_add);
+                // Its counts were taken when it ended, which is also when it
+                // let go of everything else — so removing it here adds
+                // nothing and must not add it twice.
+                self.containers.remove(index);
                 if self.current > index {
                     self.current -= 1;
                 }
@@ -316,30 +326,30 @@ impl<'a, S: Store + Clone> System<'a, S> {
     /// process tree's is on Linux.
     pub fn run(&mut self) -> Exit {
         loop {
-            let rotate = match self.current().step(targum::QUANTUM) {
-                Progress::Running => false,
+            let why = match self.current().step(targum::QUANTUM) {
+                Progress::Running => Yield::Kept,
                 // The quantum expired, so every process gets a turn — the
                 // same rule the threads inside one already follow, and with
                 // the same consequence: the whole interleaving, across
                 // processes as well as threads, is a function of how many
                 // instructions have retired.
-                Progress::Preempted => true,
+                Progress::Preempted => Yield::Quantum,
                 // This process is waiting for something only another one can
                 // do. Give somebody else a turn; if nobody can take it, the
                 // loop below is what says so.
-                Progress::Idle => true,
+                Progress::Idle => Yield::Given,
                 Progress::Requested(request) => {
                     self.answer(request);
-                    false
+                    Yield::Kept
                 }
                 Progress::Finished(exit) => {
                     if let Some(ending) = self.finish(exit) {
                         return ending;
                     }
-                    true
+                    Yield::Given
                 }
             };
-            if !self.schedule(rotate) {
+            if !self.schedule(why) {
                 // Nothing runnable anywhere. Either everything has ended, or
                 // every process is waiting for something no process will
                 // ever do — a futex nothing will post, a pipe nothing will
@@ -351,6 +361,76 @@ impl<'a, S: Store + Clone> System<'a, S> {
                 };
             }
         }
+    }
+
+    /// Why nothing can run, process by process and thread by thread.
+    ///
+    /// A container that stops with "deadlocked" and nothing else sends
+    /// whoever reads that to a debugger, and the information they will look
+    /// for is exactly this: which processes exist, which threads they have,
+    /// and what each one is parked on. It is cheap — the state is right
+    /// there — and it is the difference between a bug report and a bisect.
+    pub fn stall(&self) -> String {
+        use core::fmt::Write;
+        let mut into = String::new();
+        for container in &self.containers {
+            let _ = write!(
+                &mut into,
+                "  process {} (parent {})",
+                container.pid, container.parent
+            );
+            if let Some(status) = container.status {
+                let _ = write!(&mut into, " exited {status}, unreaped");
+            }
+            into.push('\n');
+            for thread in container.process.kernel.machine.threads.all() {
+                let _ = write!(&mut into, "    thread {} ", thread.tid);
+                match thread.state {
+                    crate::thread::State::Runnable => into.push_str("runnable"),
+                    crate::thread::State::Waiting { word, bitset } => {
+                        let _ = write!(&mut into, "parked on futex {word:#x} bitset {bitset:#x}");
+                    }
+                    crate::thread::State::WaitingForChild { wanted, .. } => {
+                        let _ = write!(&mut into, "waiting for child {wanted}");
+                    }
+                    crate::thread::State::Transferring(transfer) => {
+                        let pipes = container.process.kernel.pipes.borrow();
+                        let _ = write!(
+                            &mut into,
+                            "{:?} on pipe {} ({} of {} bytes; {} queued, {} readers, {} writers)",
+                            transfer.end,
+                            transfer.pipe,
+                            transfer.done,
+                            transfer.length,
+                            pipes.queued(transfer.pipe),
+                            pipes.readers(transfer.pipe),
+                            pipes.writers(transfer.pipe),
+                        );
+                    }
+                    crate::thread::State::Watching(watching) => {
+                        let _ = write!(&mut into, "in {:?}", watching.watch);
+                        if watching.deadline.is_some() {
+                            into.push_str(" with a deadline");
+                        }
+                    }
+                    crate::thread::State::Exited { status } => {
+                        let _ = write!(&mut into, "exited {status}");
+                    }
+                }
+                into.push('\n');
+            }
+            let open: Vec<String> = container
+                .process
+                .kernel
+                .files
+                .open_descriptors()
+                .map(|(fd, what)| format!("{fd}:{what}"))
+                .collect();
+            if !open.is_empty() {
+                let _ = writeln!(&mut into, "    open {}", open.join(" "));
+            }
+        }
+        into
     }
 
     /// Does the thing only the system can do, and writes the answer back.
@@ -475,6 +555,35 @@ impl<'a, S: Store + Clone> System<'a, S> {
             }
         };
         self.containers[index].status = Some(status);
+        // Everything it was holding, let go of — descriptors first, then the
+        // address space. A zombie is a status and a process id: it exists so
+        // a parent can still ask what happened, and nothing more. Keeping
+        // its descriptors would keep a pipe's writer count standing, and
+        // keeping its address space would keep every byte of it.
+        {
+            let process = &mut self.containers[index].process;
+            // Counted before the state that holds them goes.
+            self.departed = process
+                .kernel
+                .machine
+                .threads
+                .all()
+                .iter()
+                .map(|thread| thread.tcb.retired)
+                .fold(self.departed, u64::saturating_add);
+            self.departed_blocks = self
+                .departed_blocks
+                .saturating_add(process.cache.decoded as u64);
+            process.kernel.relinquish();
+            process.kernel.deactivate();
+            process.kernel.machine.relinquish();
+            process.cache = BlockCache::new();
+            // Banked above, so zeroed here: a number counted in two places
+            // is a number that will be added twice by whoever comes next.
+            for thread in process.kernel.machine.threads.all_mut() {
+                thread.tcb.retired = 0;
+            }
+        }
         let parent = self.containers[index].parent;
         // Whatever this process was the parent of is now `init`'s, which is
         // the first process — the same rule Linux has, and here it is what
@@ -504,6 +613,21 @@ impl<'a, S: Store + Clone> System<'a, S> {
         }
     }
 
+}
+
+/// Why the running process stopped, which is what decides whether another
+/// one gets a turn.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Yield {
+    /// It returned from a syscall and can carry on. Switching here would put
+    /// a mapping — or, in the module, a copy — between every `write` and the
+    /// next instruction.
+    Kept,
+    /// Its quantum expired. One of a slice; see [`SLICE`].
+    Quantum,
+    /// It cannot continue at all: parked, or finished. Whatever is left of
+    /// its slice is not something it can use.
+    Given,
 }
 
 /// What `wait4` found.
@@ -557,6 +681,20 @@ impl Interpreted {
         #[cfg(target_arch = "wasm32")]
         if let Some(held) = self.dormant.take() {
             held.restore();
+        }
+    }
+
+    /// Lets go of this process's address space entirely, which is what
+    /// ending does — natively the file the bytes lived in, and in the module
+    /// the copy of them the kernel's heap was holding.
+    pub fn relinquish(&mut self) {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.memory = targum::arena::LinearMemory::new();
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.dormant = Some(crate::machine::Dormant::default());
         }
     }
 
