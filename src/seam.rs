@@ -453,6 +453,20 @@ pub fn build_seam_object() -> Result<Vec<u8>> {
     body.i32_const_table_index(yield_slot);
     define(&mut wasm, YIELD_SLOT, slot_accessor_type, body.finish());
 
+    // The resume driver's slot, for the same reason and by the same
+    // arrangement as the exec-map lookup above: the kernel names it
+    // unconditionally, a resume-on guest defines the real one and the linker
+    // prefers it, and without one this says there is nothing to re-enter.
+    let mut body = FunctionBodyBuilder::new(0);
+    body.i32_const(NO_EXEC_MAP);
+    define_with(
+        &mut wasm,
+        crate::transpile::RESUME_SLOT,
+        slot_accessor_type,
+        body.finish(),
+        symbol_flags::WEAK,
+    );
+
     Ok(wasm.serialize())
 }
 

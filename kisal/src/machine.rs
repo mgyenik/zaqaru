@@ -158,9 +158,14 @@ impl Machine for GuestMachine {
 pub struct Registers {
     pub segment_base: i64,
     pub stack_pointer: i64,
-    /// The address space a native test is pretending to have. Unbounded by
-    /// default, because a native test hands over real host pointers; a test
-    /// that is *about* the bound sets one.
+    /// The address space a native test is pretending to have. The whole of
+    /// it by default, because a native test hands over real host pointers
+    /// and is not usually about the bound; a test that *is* about the bound
+    /// sets a smaller one.
+    ///
+    /// Not `u64::MAX`, which it used to be: the page table is sized against
+    /// the limit, and an address space larger than the machine has is not a
+    /// generous default but a bitmap covering half a petabyte.
     pub memory_limit: u64,
     /// How far [`Machine::grow`] may raise that limit. A test that exercises
     /// the memory rows sets this to the end of the buffer it owns, so that
@@ -178,10 +183,214 @@ impl Default for Registers {
         Self {
             segment_base: 0,
             stack_pointer: 0,
-            memory_limit: u64::MAX,
-            ceiling: u64::MAX,
+            memory_limit: targum::space::CEILING,
+            ceiling: targum::space::CEILING,
             floating_point_resets: 0,
         }
+    }
+}
+
+/// The machine the interpreter runs.
+///
+/// **The thread control block lives here, and here is inside the kernel** —
+/// `Kernel` owns its `machine`, so owning the control block through it is
+/// the ownership `docs/vm.md` section 3 asks for ("the TCB, owned by kisal
+/// as M7 always intended") with no second path to the same state. The six
+/// places the kernel reaches for machine state do not change shape at all;
+/// they simply land on a control block instead of on a wasm global.
+///
+/// What is *not* here is the address space, which is the kernel's own field
+/// because the mapping rows write it, and the block cache, which is the
+/// scheduler's. See [`crate::run::Process`].
+pub struct Interpreted {
+    pub thread: targum::state::Tcb,
+    /// Linear memory. Inside the module there is nothing to hold — the
+    /// module *is* the memory — and natively it is a reservation with a
+    /// committed prefix. One line of difference, which is what the design
+    /// asked for.
+    #[cfg(not(target_arch = "wasm32"))]
+    memory: targum::arena::LinearMemory,
+}
+
+impl Default for Interpreted {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// How much of the address space a program is left, natively.
+///
+/// Inside the module this is `baker::layout`'s job: a container carrying a
+/// program has the module's own data placed above everything that program
+/// will occupy, so linear memory already reaches past the program's top
+/// before the kernel exists and `Kernel::new` carves the guest's arenas from
+/// there up. Natively there is no bake and no linker to do it, so the same
+/// reservation is made here — grow past the program's region first, and the
+/// arenas land above it.
+///
+/// Sixty-four megabytes because a static glibc program tops out a few
+/// megabytes in and a static CPython an order of magnitude further, and
+/// because an untouched reservation costs nothing but address space. A
+/// program that exceeds it does not corrupt anything: its `MAP_FIXED`
+/// segment collides with the arena and `exec` refuses to load it, by name.
+#[cfg(not(target_arch = "wasm32"))]
+pub const PROGRAM_REGION: u64 = 64 << 20;
+
+impl Interpreted {
+    pub fn new() -> Self {
+        #[cfg(not(target_arch = "wasm32"))]
+        let memory = {
+            let mut memory = targum::arena::LinearMemory::new();
+            assert!(
+                memory.grow(PROGRAM_REGION),
+                "reserving the program's region failed"
+            );
+            memory
+        };
+        Self {
+            thread: targum::state::Tcb::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            memory,
+        }
+    }
+}
+
+impl Machine for Interpreted {
+    fn segment_base(&self) -> i64 {
+        self.thread.fs_base as i64
+    }
+
+    fn set_segment_base(&mut self, value: i64) {
+        self.thread.fs_base = value as u64;
+    }
+
+    fn stack_pointer(&self) -> i64 {
+        self.thread.stack_pointer() as i64
+    }
+
+    fn set_stack_pointer(&mut self, value: i64) {
+        self.thread.set_stack_pointer(value as u64);
+    }
+
+    /// A fresh process gets a fresh unit — and *erased*, not merely emptied.
+    /// `fninit` marks the stack unreachable and leaves the bytes; `execve`
+    /// must not hand one program another's.
+    fn reset_floating_point(&mut self) {
+        self.thread.x87.reset();
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn memory_limit(&self) -> u64 {
+        core::arch::wasm32::memory_size(0) as u64 * 65536
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn grow(&mut self, to: u64) -> bool {
+        GuestMachine.grow(to)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn memory_limit(&self) -> u64 {
+        self.memory.limit()
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn grow(&mut self, to: u64) -> bool {
+        self.memory.grow(to)
+    }
+}
+
+/// A buffer at a *guest* address, for the native tests that hand the kernel
+/// a pointer.
+///
+/// A test used to declare a stack array and pass its host address as a guest
+/// address, which worked while the kernel dereferenced whatever it was
+/// given. The page table forbids exactly that: the guest's address space is
+/// four gigabytes and a host stack pointer is nowhere near it, so the kernel
+/// now answers `EFAULT` — correctly. So a test that hands over a pointer
+/// allocates the bytes where a guest's memory really is, low and inside the
+/// address space, and this is the allocation.
+///
+/// It dereferences to `[u8; N]`, so a test reads its result exactly as it
+/// read the array it replaced.
+#[cfg(not(target_arch = "wasm32"))]
+pub struct GuestBytes<const N: usize> {
+    arena: targum::arena::Arena,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl<const N: usize> Default for GuestBytes<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl<const N: usize> GuestBytes<N> {
+    pub fn new() -> Self {
+        let arena = targum::arena::Arena::new(N.max(1) as u64);
+        Self { arena }
+    }
+
+    /// The guest address the bytes live at, as a syscall argument.
+    pub fn address(&self) -> i64 {
+        self.arena.base() as i64
+    }
+}
+
+/// The same, with a length known only at run time — for the tests that hand
+/// the kernel a string or a buffer rather than a fixed-size record.
+#[cfg(not(target_arch = "wasm32"))]
+pub struct GuestBuffer {
+    arena: targum::arena::Arena,
+    length: usize,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl GuestBuffer {
+    /// A copy of `bytes`, at a guest address.
+    pub fn of(bytes: &[u8]) -> Self {
+        let arena = targum::arena::Arena::new(bytes.len().max(1) as u64);
+        // SAFETY: the arena committed at least this many bytes here.
+        unsafe {
+            (arena.base() as usize as *mut u8).copy_from(bytes.as_ptr(), bytes.len());
+        }
+        Self {
+            arena,
+            length: bytes.len(),
+        }
+    }
+
+    pub fn address(&self) -> i64 {
+        self.arena.base() as i64
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl core::ops::Deref for GuestBuffer {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        // SAFETY: the arena committed `length` bytes at this address.
+        unsafe { core::slice::from_raw_parts(self.arena.base() as usize as *const u8, self.length) }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl<const N: usize> core::ops::Deref for GuestBytes<N> {
+    type Target = [u8; N];
+
+    fn deref(&self) -> &Self::Target {
+        // SAFETY: the arena committed at least `N` bytes at this address.
+        unsafe { &*(self.arena.base() as usize as *const [u8; N]) }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl<const N: usize> core::ops::DerefMut for GuestBytes<N> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        // SAFETY: as above.
+        unsafe { &mut *(self.arena.base() as usize as *mut [u8; N]) }
     }
 }
 

@@ -192,8 +192,52 @@ pub const SYSCALL_RESERVATION: i64 = 136;
 /// know their own frame size; the driver is generic and must be told.
 pub const RED_ZONE_RESERVED: i64 = 1 << 63;
 
-/// The entry index of a resume ID, once the frame-size marker is removed.
-pub const RESUME_ENTRY_MASK: i64 = 0x7fff_ffff;
+/// Marks a value as a resume ID rather than an address.
+///
+/// What `longjmp` needs. `setjmp` saves the word at `(%rsp)` into its
+/// `jmp_buf`, which under resume is a resume ID, and `longjmp` then jumps to
+/// it — so the indirect transfer's operand is sometimes a continuation and
+/// sometimes an address, and the two have to be told apart. The check lives
+/// in the exec map's *miss* path, so a function pointer never pays for it.
+///
+/// Bit 62, which means the entry index gives up one of its thirty-one bits
+/// and keeps thirty. See [`resume_id_flags`] for the whole layout.
+pub const RESUME_ID_TAG: i64 = 1 << 62;
+
+/// The entry index of a resume ID, once the flags above are removed.
+pub const RESUME_ENTRY_MASK: i64 = 0x3fff_ffff;
+
+/// The half of a resume ID that is not the table slot.
+///
+/// **The layout, in one place, because it is written at two sites and read
+/// at two more.** A resume ID is sixty-four bits:
+///
+/// ```text
+///   63        62        61 .. 32                31 .. 0
+///   red zone  is an ID  entry index (30 bits)    table slot
+/// ```
+///
+/// The low half is a table index the linker fills, so an ID is never one
+/// constant: it is a relocated `i32` widened and OR'd with the plain `i64`
+/// this returns. Which is what makes the flags free — they ride the half
+/// that was already a literal.
+///
+/// The driver reads it back by shifting right thirty-two and masking with
+/// [`RESUME_ENTRY_MASK`], which drops both flags because they land above the
+/// mask. Narrowing the mask and adding a flag therefore have to move
+/// together, and that is why they are defined together here.
+pub fn resume_id_flags(entry: u32, red_zone: bool) -> i64 {
+    debug_assert!(
+        i64::from(entry) <= RESUME_ENTRY_MASK,
+        "resume entry {entry} does not fit the {} bits the ID leaves it",
+        RESUME_ENTRY_MASK.count_ones()
+    );
+    let mut flags = (i64::from(entry) << 32) | RESUME_ID_TAG;
+    if red_zone {
+        flags |= RED_ZONE_RESERVED;
+    }
+    flags
+}
 
 /// The three values a flag rule reads: an operation's two inputs and its
 /// result, each parked in a local by the time flags are computed.
@@ -1568,7 +1612,7 @@ impl<'a> FunctionTranslator<'a> {
                 // The driver has to give back the whole reservation, not the
                 // eight bytes a call site takes, and the only thing it has to
                 // decide that from is the ID it just popped.
-                body.i64_const(((entry as i64) << 32) | RED_ZONE_RESERVED);
+                body.i64_const(resume_id_flags(entry, true));
                 body.i64_or();
             }
         }
@@ -1690,7 +1734,7 @@ impl<'a> FunctionTranslator<'a> {
                 })?;
                 body.i32_const_table_index(resume.table_slot);
                 body.i64_extend_i32_unsigned();
-                body.i64_const((entry as i64) << 32);
+                body.i64_const(resume_id_flags(entry, false));
                 body.i64_or();
             }
         }

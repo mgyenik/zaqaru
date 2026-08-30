@@ -115,6 +115,15 @@ pub struct Program {
     pub dynamic: Option<(u64, u64)>,
 }
 
+/// A file read, parsed, and given somewhere to go.
+struct Loaded {
+    file: Vec<u8>,
+    program: Program,
+    /// Whether *this* kernel chose the base, rather than the bake or the
+    /// file itself. Only an unplaced file has to fit in a reserved region.
+    placed: bool,
+}
+
 /// Whether a file states its own addresses or is placed at a base.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
@@ -886,9 +895,8 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
         // to allocate this much at all because the bake put the allocator
         // above the region the program is about to occupy — see
         // `baker::layout`.
-        let (file, base) = self.read_whole(path)?;
-        let program = Program::parse_at(&file, base)?;
-        untranslated(&program, base)?;
+        let loaded = self.load(path)?;
+        let (file, program) = (loaded.file, loaded.program);
 
         // A dynamic program is not entered directly. `PT_INTERP` names the
         // loader that must run first — it maps the libraries, applies the
@@ -899,22 +907,35 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
         // the loader.
         let interpreter = match program.interpreter_path(&file) {
             Some(interpreter) => {
-                let (bytes, base) = self.read_whole(interpreter).map_err(|_| {
+                let loader = self.load(interpreter).map_err(|_| {
                     Error::NotLoadable(
                         "the dynamic loader its `PT_INTERP` names is not in the image",
                     )
                 })?;
-                let loader = Program::parse_at(&bytes, base)?;
-                untranslated(&loader, base)?;
-                Some((bytes, loader))
+                Some((loader.file, loader.program, loader.placed))
             }
             None => None,
         };
 
-        let top = interpreter
-            .as_ref()
-            .map_or(program.top(), |(_, loader)| loader.top().max(program.top()));
-        if top > module_data_base() {
+        // The region check applies to whatever the *bake* had to reserve
+        // room for, which is only a file that states its own addresses. A
+        // position-independent one was placed a moment ago by
+        // `reserve_object`, out of the address space above the module's own
+        // data — so checking it against the module's data base would be
+        // checking whether the address space is below itself, and a Python
+        // container fails that check by two hundred megabytes.
+        let stated = core::iter::once((&program, loaded.placed))
+            .chain(
+                interpreter
+                    .iter()
+                    .map(|(_, loader, placed)| (loader, *placed)),
+            )
+            .filter(|(_, placed)| !placed)
+            .map(|(program, _)| program.top())
+            .max();
+        if let Some(top) = stated
+            && top > module_data_base()
+        {
             return Err(Error::RegionOccupied {
                 top,
                 data: module_data_base(),
@@ -922,7 +943,7 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
         }
 
         for (file, program) in core::iter::once((&file, &program))
-            .chain(interpreter.iter().map(|(bytes, loader)| (bytes, loader)))
+            .chain(interpreter.iter().map(|(bytes, loader, _)| (bytes, loader)))
         {
             self.place(file, program)?;
         }
@@ -934,13 +955,13 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
             argv,
             envp,
             &program,
-            interpreter.as_ref().map(|(_, loader)| loader.base()),
+            interpreter.as_ref().map(|(_, loader, _)| loader.base()),
             &random,
         )?;
         // SAFETY: the region came from the address space, which grew memory
         // to cover it, and the block ends exactly at the region's top.
         unsafe {
-            self.memory()
+            self.memory_mut()
                 .write(built.address, &built.bytes)
                 .map_err(|_| Error::StackTooSmall {
                     needed: built.bytes.len() as u64,
@@ -961,7 +982,7 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
         }
         Ok(interpreter
             .as_ref()
-            .map_or(program.entry, |(_, loader)| loader.entry))
+            .map_or(program.entry, |(_, loader, _)| loader.entry))
     }
 
     /// Copies one file's segments to the addresses they belong at.
@@ -977,6 +998,8 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
             let start = load.address - load.address % crate::space::PAGE;
             let end = (load.address + load.memory_size).next_multiple_of(crate::space::PAGE);
             let machine = &mut self.machine;
+            let pages = &mut self.pages;
+            let enforcement = self.enforcement;
             let request = crate::space::Request {
                 hint: start,
                 length: end - start,
@@ -990,36 +1013,121 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
                 backing: crate::space::Backing::Anonymous,
             };
             self.space
-                .map(&request, &mut |to| machine.grow(to))
+                .map(&request, &mut |to| crate::syscall::grow_memory(machine, pages, enforcement, to))
                 .map_err(|_| Error::RegionOccupied {
                     top: program.top(),
                     data: module_data_base(),
                 })?;
+            // The page table learns the segment too, and with the
+            // protections the ELF asked for: a program's text is
+            // read-execute, and under the interpreter that is what makes an
+            // instruction fetch from its data a fault rather than a
+            // surprise.
+            self.sync_pages(start, end);
 
-            let memory = self.memory();
+            // Read before the address space is borrowed: the error path
+            // wants it, and the borrow lasts until the segment is placed.
+            let limit = self.machine.memory_limit();
+            let mut memory = self.memory_mut();
             memory
                 .check(load.address, load.memory_size)
                 .map_err(|_| Error::RegionOccupied {
                     top: program.top(),
-                    data: self.machine.memory_limit(),
+                    data: limit,
                 })?;
             // Zeros first, then the file's bytes over the top: the part of a
             // segment past its file size is `.bss`, and it has to read as
             // zeros whatever was there before.
-            // SAFETY: the whole segment was just bounds-checked.
-            unsafe {
-                memory
-                    .fill(load.address, load.memory_size, 0)
-                    .and_then(|()| {
-                        memory.write(
-                            load.address,
-                            &file[load.offset as usize..(load.offset + load.file_size) as usize],
-                        )
-                    })
-                    .map_err(|_| Error::NotLoadable("a segment does not fit in memory"))?;
-            }
+            //
+            // The kernel's own write, not the guest's: a program's text is
+            // read-execute and its rodata read-only, and both still have to
+            // be loaded.
+            memory
+                .place_fill(load.address, load.memory_size, 0)
+                .and_then(|()| {
+                    memory.place(
+                        load.address,
+                        &file[load.offset as usize..(load.offset + load.file_size) as usize],
+                    )
+                })
+                .map_err(|_| Error::NotLoadable("a segment does not fit in memory"))?;
         }
         Ok(())
+    }
+
+    /// Reads a file and decides where it goes.
+    ///
+    /// Two worlds meet here. In the ahead-of-time world a
+    /// position-independent file has one possible address — the one the bake
+    /// resolved its code at — so the base comes out of the image and a file
+    /// without one cannot be loaded at all: its operands point at nothing.
+    ///
+    /// Under the interpreter there is nothing to resolve. Code is data, so a
+    /// shared object goes wherever there is room, which is what a real
+    /// kernel does and what the prelink design existed to avoid having to
+    /// do. **This is where prelink disappears**: the bake stops assigning
+    /// bases, the image stops carrying them, and the address space answers
+    /// the question at load time instead.
+    fn load(&mut self, path: &[u8]) -> Result<Loaded, Error> {
+        let (file, recorded) = self.read_whole(path)?;
+        let program = Program::parse_at(&file, recorded)?;
+        if recorded != 0 || program.kind != Kind::PositionIndependent {
+            // Either the bake placed it, or it states its own addresses.
+            untranslated(&program, recorded)?;
+            return Ok(Loaded {
+                file,
+                program,
+                placed: false,
+            });
+        }
+        if self.enforcement != crate::syscall::Enforcement::Mapped {
+            // The ahead-of-time world, where an unplaced shared object has
+            // no address its code was resolved at.
+            untranslated(&program, recorded)?;
+            unreachable!("`untranslated` refuses exactly this case");
+        }
+        let base = self.reserve_object(&program)?;
+        let program = Program::parse_at(&file, base)?;
+        Ok(Loaded {
+            file,
+            program,
+            placed: true,
+        })
+    }
+
+    /// Finds room for a position-independent file, and answers the base.
+    ///
+    /// Reserved as one `PROT_NONE` mapping spanning the whole object, which
+    /// is what a real loader does and what makes the object's segments
+    /// contiguous: `place` then maps each segment over its part of the
+    /// reservation with the protections the ELF asked for, and the gaps
+    /// between segments stay unreachable rather than becoming somebody
+    /// else's mapping.
+    fn reserve_object(&mut self, program: &Program) -> Result<u64, Error> {
+        let span = program.top().saturating_sub(program.base());
+        if span == 0 {
+            return Err(Error::NotLoadable("it has no loadable segments"));
+        }
+        let request = crate::space::Request {
+            hint: 0,
+            length: span.next_multiple_of(crate::space::PAGE),
+            prot: crate::space::prot::NONE,
+            flags: crate::space::map::PRIVATE | crate::space::map::ANONYMOUS,
+            backing: crate::space::Backing::Anonymous,
+        };
+        let machine = &mut self.machine;
+        let pages = &mut self.pages;
+        let enforcement = self.enforcement;
+        let (address, _) = self
+            .space
+            .map(&request, &mut |to| {
+                crate::syscall::grow_memory(machine, pages, enforcement, to)
+            })
+            .map_err(|_| Error::NotLoadable("there is no room for it in the address space"))?;
+        // The base is the reservation's start less whatever the object's own
+        // lowest segment address is, so that a file whose segments start
+        // above zero still lands where its own addresses say.
+        Ok(address.wrapping_sub(program.base()))
     }
 
     /// The whole of a file, as bytes, and the base the bake placed it at.
@@ -1065,17 +1173,20 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
             backing: crate::space::Backing::Anonymous,
         };
         let machine = &mut self.machine;
+        let pages = &mut self.pages;
+        let enforcement = self.enforcement;
         let (address, fill) = self
             .space
-            .map(&request, &mut |to| machine.grow(to))
+            .map(&request, &mut |to| crate::syscall::grow_memory(machine, pages, enforcement, to))
             .map_err(|_| Error::StackTooSmall {
                 needed: STACK_BYTES,
                 region: 0,
             })?;
+        self.sync_pages(address, address + STACK_BYTES);
         if fill.length != 0 {
             // SAFETY: the range was just reserved inside the guest's memory.
             unsafe {
-                self.memory()
+                self.memory_mut()
                     .fill(fill.start, fill.length, 0)
                     .map_err(|_| Error::StackTooSmall {
                         needed: STACK_BYTES,

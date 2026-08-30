@@ -5,6 +5,7 @@
 //! spent on what only they can check. Every row kisal grows gets its routing
 //! and its errno tested at this level first.
 
+use kisal::machine::{GuestBuffer, GuestBytes};
 use kisal::abi::{Store, StoreOutcome};
 use kisal::errno::Errno;
 use kisal::machine::{Machine, Registers};
@@ -69,10 +70,12 @@ fn empty_image() -> kisal::image::Image<'static> {
 /// A `write(2)`'s arguments, with the buffer named by the address of a real
 /// slice — which is exactly what a guest address is inside the module, so the
 /// code under test here is the code that ships.
-fn write_of(descriptor: i64, buffer: &[u8]) -> Arguments {
+/// The bytes have to live at a *guest* address, so the caller keeps the
+/// buffer alive and this only names it.
+fn write_of(descriptor: i64, buffer: &GuestBuffer) -> Arguments {
     Arguments::new([
         descriptor,
-        buffer.as_ptr() as usize as i64,
+        buffer.address(),
         buffer.len() as i64,
         0,
         0,
@@ -84,11 +87,11 @@ fn write_of(descriptor: i64, buffer: &[u8]) -> Arguments {
 fn stdout_and_stderr_reach_their_own_console_paths() {
     let mut kernel = Kernel::new(Recording::default(), Registers::default(), empty_image());
     assert_eq!(
-        kernel.dispatch(number::WRITE, write_of(1, b"out")),
+        kernel.dispatch(number::WRITE, write_of(1, &GuestBuffer::of(b"out"))),
         Outcome::Done(3)
     );
     assert_eq!(
-        kernel.dispatch(number::WRITE, write_of(2, b"err")),
+        kernel.dispatch(number::WRITE, write_of(2, &GuestBuffer::of(b"err"))),
         Outcome::Done(3)
     );
     assert_eq!(kernel.store.contents(paths::CONSOLE_STDOUT), b"out");
@@ -99,7 +102,7 @@ fn stdout_and_stderr_reach_their_own_console_paths() {
 fn a_descriptor_with_no_backend_is_ebadf() {
     let mut kernel = Kernel::new(Recording::default(), Registers::default(), empty_image());
     assert_eq!(
-        kernel.dispatch(number::WRITE, write_of(3, b"nowhere")),
+        kernel.dispatch(number::WRITE, write_of(3, &GuestBuffer::of(b"nowhere"))),
         Outcome::Done(Errno::BadFile.as_result())
     );
     assert!(kernel.store.written.is_empty());
@@ -133,7 +136,7 @@ fn a_failing_store_becomes_an_errno() {
     store.refuse.push(Recording::key(paths::CONSOLE_STDOUT));
     let mut kernel = Kernel::new(store, Registers::default(), empty_image());
     assert_eq!(
-        kernel.dispatch(number::WRITE, write_of(1, b"lost")),
+        kernel.dispatch(number::WRITE, write_of(1, &GuestBuffer::of(b"lost"))),
         Outcome::Done(Errno::Io.as_result())
     );
 
@@ -155,7 +158,7 @@ fn a_failing_log_store_is_not_reported_through_itself() {
     store.refuse.push(Recording::key(paths::LOG_ERROR));
     let mut kernel = Kernel::new(store, Registers::default(), empty_image());
     assert_eq!(
-        kernel.dispatch(number::WRITE, write_of(1, b"lost")),
+        kernel.dispatch(number::WRITE, write_of(1, &GuestBuffer::of(b"lost"))),
         Outcome::Done(Errno::Io.as_result())
     );
     assert!(kernel.store.contents(paths::LOG_ERROR).is_empty());
@@ -268,8 +271,8 @@ fn getting_the_fs_base_writes_it_where_asked() {
     let mut kernel = Kernel::new(Recording::default(), Registers::default(), empty_image());
     kernel.machine.set_segment_base(0x0011_2233_4455_6677);
 
-    let mut destination = 0u64;
-    let address = &raw mut destination as usize as i64;
+    let destination = GuestBytes::<8>::new();
+    let address = destination.address();
     assert_eq!(
         kernel.dispatch(
             number::ARCH_PRCTL,
@@ -277,7 +280,7 @@ fn getting_the_fs_base_writes_it_where_asked() {
         ),
         Outcome::Done(0)
     );
-    assert_eq!(destination, 0x0011_2233_4455_6677);
+    assert_eq!(u64::from_le_bytes(*destination), 0x0011_2233_4455_6677);
 }
 
 #[test]
@@ -344,15 +347,30 @@ fn a_real_but_unimplemented_arch_prctl_request_is_a_named_fault() {
 
 // ---- guest memory: the bounds check POSIX requires -------------------------
 
-use kisal::memory::GuestMemory;
+use kisal::memory::GuestReader;
+use targum::space::{PAGE_SIZE, Protection, Space};
+
+/// An address space of `limit` bytes with everything in it reachable — the
+/// ahead-of-time world's arrangement, which is what these cases are about.
+/// What they check is the arithmetic that decides whether a range is inside
+/// the space at all, so they say the limit explicitly rather than taking
+/// whatever a particular module's memory happens to be.
+fn flat(limit: u64) -> Space {
+    let mut space = Space::new(limit);
+    // From the second page, as the kernel's own flattening does: page zero
+    // is never mapped, which is what makes a null pointer `EFAULT`.
+    space.protect(PAGE_SIZE, limit - PAGE_SIZE, Protection::ALL);
+    space
+}
 
 /// The check is pure arithmetic over (address, length, limit), so it is
 /// tested against explicit limits rather than against whatever a particular
 /// module's memory happens to be.
 #[test]
 fn a_range_inside_the_guest_is_accepted() {
-    let memory = GuestMemory::with_limit(0x1_0000);
-    assert_eq!(memory.check(0x100, 0x10), Ok(()));
+    let space = flat(0x1_0000);
+    let memory = GuestReader::new(&space);
+    assert_eq!(memory.check(0x1100, 0x10), Ok(()));
     assert_eq!(
         memory.check(0xfff0, 0x10),
         Ok(()),
@@ -362,7 +380,8 @@ fn a_range_inside_the_guest_is_accepted() {
 
 #[test]
 fn a_range_past_the_end_is_efault_not_a_trap() {
-    let memory = GuestMemory::with_limit(0x1_0000);
+    let space = flat(0x1_0000);
+    let memory = GuestReader::new(&space);
     assert_eq!(memory.check(0xfff8, 0x10), Err(Errno::Fault));
     assert_eq!(memory.check(0x1_0000, 1), Err(Errno::Fault));
 }
@@ -372,7 +391,8 @@ fn a_range_past_the_end_is_efault_not_a_trap() {
 /// simply out of range.
 #[test]
 fn a_length_that_would_truncate_is_refused() {
-    let memory = GuestMemory::with_limit(0x1_0000);
+    let space = flat(0x1_0000);
+    let memory = GuestReader::new(&space);
     assert_eq!(memory.check(0x1000, 0x1_0000_0000), Err(Errno::Fault));
     assert_eq!(memory.check(0x1000, 0x1_0000_0005), Err(Errno::Fault));
 }
@@ -381,7 +401,8 @@ fn a_length_that_would_truncate_is_refused() {
 /// written against the low half.
 #[test]
 fn an_address_that_would_truncate_is_refused() {
-    let memory = GuestMemory::with_limit(0x1_0000);
+    let space = flat(0x1_0000);
+    let memory = GuestReader::new(&space);
     assert_eq!(memory.check(0x1_0000_0000, 8), Err(Errno::Fault));
     assert_eq!(
         memory.check(0x1_0000_0000, 0),
@@ -393,17 +414,25 @@ fn an_address_that_would_truncate_is_refused() {
 /// `slice::from_raw_parts` is undefined for a range that wraps the address
 /// space. A guest can ask for one, so the check has to refuse it rather than
 /// overflow into a small end address.
+///
+/// The limit is an ordinary one: what makes this case dangerous is the
+/// *addition* overflowing, which happens whatever the limit is, and a limit
+/// of `u64::MAX` would only ask the page table for a bitmap covering an
+/// address space the machine does not have.
 #[test]
 fn a_range_that_wraps_the_address_space_is_refused() {
-    let memory = GuestMemory::with_limit(u64::MAX);
+    let space = flat(0x1_0000);
+    let memory = GuestReader::new(&space);
     assert_eq!(memory.check(u64::MAX - 4, 16), Err(Errno::Fault));
+    assert_eq!(memory.check(u64::MAX, 1), Err(Errno::Fault));
 }
 
 /// Linux answers `EFAULT` for a null buffer with a real length, and accepts
 /// one with no length.
 #[test]
 fn a_null_buffer_is_efault_only_when_it_would_be_read() {
-    let memory = GuestMemory::with_limit(0x1_0000);
+    let space = flat(0x1_0000);
+    let memory = GuestReader::new(&space);
     assert_eq!(memory.check(0, 1), Err(Errno::Fault));
     assert_eq!(memory.check(0, 0), Ok(()));
 }
@@ -582,7 +611,7 @@ fn clock_gettime_divides_the_hosts_nanoseconds() {
     };
     let mut kernel = Kernel::new(store, Registers::default(), empty_image());
 
-    let mut image = [0u8; 16];
+    let mut image = GuestBytes::<16>::new();
     assert_eq!(
         kernel.dispatch(number::CLOCK_GETTIME, clock_of(0, &mut image)),
         Outcome::Done(0)
@@ -646,7 +675,7 @@ fn clock_gettime_floors_a_time_before_the_epoch() {
     };
     let mut kernel = Kernel::new(store, Registers::default(), empty_image());
 
-    let mut image = [0u8; 16];
+    let mut image = GuestBytes::<16>::new();
     assert_eq!(
         kernel.dispatch(number::CLOCK_GETTIME, clock_of(0, &mut image)),
         Outcome::Done(0)
@@ -670,14 +699,15 @@ fn clock_gettime_floors_a_time_before_the_epoch() {
 #[test]
 fn clock_gettime_without_a_mount_is_refused_rather_than_invented() {
     let mut kernel = Kernel::new(Recording::default(), Registers::default(), empty_image());
-    let mut image = [0xa5u8; 16];
+    let mut image = GuestBytes::<16>::new();
+    *image = [0xa5u8; 16];
     for clock in [0i64, 1] {
         assert_eq!(
             kernel.dispatch(number::CLOCK_GETTIME, clock_of(clock, &mut image)),
             Outcome::Done(Errno::Invalid.as_result())
         );
     }
-    assert_eq!(image, [0xa5u8; 16], "the destination was written anyway");
+    assert_eq!(*image, [0xa5u8; 16], "the destination was written anyway");
 }
 
 /// A clock that answers something other than a number is a broken host, not
@@ -702,7 +732,7 @@ fn clock_gettime_refuses_what_it_cannot_parse() {
             monotonic: answer.to_vec(),
         };
         let mut kernel = Kernel::new(store, Registers::default(), empty_image());
-        let mut image = [0u8; 16];
+        let mut image = GuestBytes::<16>::new();
         assert_eq!(
             kernel.dispatch(number::CLOCK_GETTIME, clock_of(0, &mut image)),
             Outcome::Done(Errno::Invalid.as_result()),
@@ -717,8 +747,8 @@ fn clock_gettime_refuses_what_it_cannot_parse() {
 #[test]
 fn the_signal_mask_is_kept_and_read_back() {
     let mut kernel = Kernel::new(Recording::default(), Registers::default(), empty_image());
-    let mut set = 0u64.to_le_bytes();
-    let mut old = [0u8; 8];
+    let mut set = GuestBytes::<8>::new();
+    let mut old = GuestBytes::<8>::new();
     let mask = |how: i64, set: &mut [u8; 8], old: &mut [u8; 8]| {
         Arguments::new([
             how,
@@ -731,20 +761,20 @@ fn the_signal_mask_is_kept_and_read_back() {
     };
 
     // Block SIGABRT (6) and SIGKILL (9); only the first can be blocked.
-    set = (signal_bit(6) | signal_bit(9)).to_le_bytes();
+    *set = (signal_bit(6) | signal_bit(9)).to_le_bytes();
     assert_eq!(
         kernel.dispatch(number::RT_SIGPROCMASK, mask(0, &mut set, &mut old)),
         Outcome::Done(0)
     );
-    assert_eq!(u64::from_le_bytes(old), 0, "the mask started non-empty");
+    assert_eq!(u64::from_le_bytes(*old), 0, "the mask started non-empty");
 
-    set = 0u64.to_le_bytes();
+    *set = 0u64.to_le_bytes();
     assert_eq!(
         kernel.dispatch(number::RT_SIGPROCMASK, mask(2, &mut set, &mut old)),
         Outcome::Done(0)
     );
     assert_eq!(
-        u64::from_le_bytes(old),
+        u64::from_le_bytes(*old),
         signal_bit(6),
         "SIGKILL was blockable, or SIGABRT was not kept"
     );
@@ -774,8 +804,9 @@ fn a_fatal_signal_to_this_process_ends_it() {
     );
 
     // Blocked, so it stays pending and nothing delivers it.
-    let mut set = signal_bit(6).to_le_bytes();
-    let mut old = [0u8; 8];
+    let mut set = GuestBytes::<8>::new();
+    *set = signal_bit(6).to_le_bytes();
+    let mut old = GuestBytes::<8>::new();
     assert_eq!(
         kernel.dispatch(
             number::RT_SIGPROCMASK,

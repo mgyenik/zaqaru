@@ -33,6 +33,8 @@ pub mod mount;
 pub mod overlay;
 pub mod paths;
 pub mod random;
+pub mod run;
+pub mod vm;
 pub mod space;
 pub mod synthetic;
 pub mod syscall;
@@ -179,7 +181,7 @@ static mut TRACING: Option<bool> = None;
 /// purpose — the M6 oracle is a diff against a real `strace`, and a format
 /// that has to be translated first is a format that will disagree in ways
 /// nobody can attribute.
-fn trace(kernel: &mut Kernel<'_, HostStore, GuestMachine>, line: &str) {
+pub(crate) fn trace<S: Store, M: machine::Machine>(kernel: &mut Kernel<'_, S, M>, line: &str) {
     // SAFETY: one instance, one thread of execution, and this is reached
     // only from inside `with_kernel`, which is what serialises it.
     let tracing = unsafe {
@@ -207,8 +209,8 @@ fn trace(kernel: &mut Kernel<'_, HostStore, GuestMachine>, line: &str) {
 /// says what happened, and the same line with a pointer in it says only that
 /// something did not open. Every diagnosis this instrument was built for
 /// needs the string.
-fn traced(
-    kernel: &mut Kernel<'_, HostStore, GuestMachine>,
+pub(crate) fn traced<S: Store, M: machine::Machine>(
+    kernel: &mut Kernel<'_, S, M>,
     number: i64,
     arguments: &[i64; 6],
     outcome: &str,
@@ -243,8 +245,8 @@ fn traced(
 /// Bounded, because this is a diagnostic reading whatever a pointer happens
 /// to hold: a run of bytes that never terminates is truncated rather than
 /// walked to the end of memory.
-fn push_guest_string(
-    kernel: &mut Kernel<'_, HostStore, GuestMachine>,
+fn push_guest_string<S: Store, M: machine::Machine>(
+    kernel: &mut Kernel<'_, S, M>,
     into: &mut String,
     at: u64,
 ) {
@@ -278,7 +280,7 @@ fn push_guest_string(
     into.push('"');
 }
 
-fn push_decimal(into: &mut String, value: i64) {
+pub(crate) fn push_decimal(into: &mut String, value: i64) {
     if value < 0 {
         into.push('-');
     }
@@ -313,6 +315,15 @@ pub const LEAVE: i64 = 0x7a61_7161_7275_0001u64 as i64;
 /// Best-effort by design: if the log mount is unavailable there is nothing
 /// useful to do about it, and the panic that follows is the loud part.
 fn report(kernel: &mut Kernel<'_, HostStore, GuestMachine>, message: &str) {
+    report_to(kernel, message);
+}
+
+/// The same, for any kernel — the interpreted world's machine is not the
+/// ahead-of-time one.
+pub(crate) fn report_to<S: Store, M: machine::Machine>(
+    kernel: &mut Kernel<'_, S, M>,
+    message: &str,
+) {
     let _ = kernel.store.write(paths::LOG_ERROR, message.as_bytes());
 }
 
@@ -328,6 +339,13 @@ unsafe extern "C" {
     fn slot_of(address: i64) -> i32;
     #[link_name = "x86_run_thread"]
     fn run_thread(slot: i32) -> i32;
+    /// Where the resume driver sits in the function table, so that a thread
+    /// holding a continuation can be re-entered. A resume-on guest defines
+    /// it; the seam's weak answer is `-1`, which is what a container built
+    /// without resume reports and what makes a `longjmp` there impossible
+    /// rather than wrong.
+    #[link_name = "x86_resume_slot"]
+    fn resume_slot() -> i32;
 }
 
 /// Boots the container: loads the program, runs it, and reports how it went.
@@ -409,30 +427,63 @@ pub unsafe extern "C" fn kisal_boot() -> i32 {
         with_kernel(|kernel| report(kernel, message));
         panic!("{message}");
     }
-    let left = unsafe { run_thread(slot) };
-
-    with_kernel(|kernel| {
-        let status = match (left, kernel.status) {
+    // The degenerate run loop: one thread, and the only thing that can make
+    // it runnable again is its own `longjmp`.
+    //
+    // M7 replaces this with a scheduler that has a run queue and more than
+    // one thread to put on it; what it will not change is the shape, because
+    // the shape is already what a scheduler is — enter a continuation, catch
+    // what it throws, decide whether there is anything left to run. Without
+    // even this much, the first `longjmp` unwinds straight out of the
+    // container, which is what a throw with nothing recorded used to mean
+    // and no longer does.
+    let mut slot = slot;
+    let status = loop {
+        let left = unsafe { run_thread(slot) };
+        let next = with_kernel(|kernel| (left, kernel.status, kernel.continuation.take()));
+        match next {
+            // It threw, and the kernel recorded somewhere to go: a
+            // `longjmp`. The continuation goes where the resume driver looks
+            // for one — the word at `%rsp` — and the driver pops it, which
+            // leaves the stack exactly as the frame `setjmp` returned into
+            // expects it. Then round again.
+            (1, _, Some(continuation)) => {
+                        let entered = with_kernel(|kernel| enter_continuation(kernel, continuation));
+                if let Err(message) = entered {
+                    with_kernel(|kernel| report(kernel, message));
+                    panic!("{message}");
+                }
+                slot = unsafe { resume_slot() };
+                if slot < 0 {
+                    let message = "kisal: a `longjmp` arrived in a container built without \
+                                   checkpoint-resume, where no continuation can exist";
+                    with_kernel(|kernel| report(kernel, message));
+                    panic!("{message}");
+                }
+            }
             // It threw, and the kernel recorded why: the process exited.
-            (1, Some(status)) => status,
+            (1, Some(status), None) => break status,
             // It threw with nothing recorded, which is the scheduler's
             // block arriving before there is a scheduler to catch it.
-            (1, None) => {
+            (1, None, None) => {
                 let message = "kisal: the guest left without exiting, and there is no \
                                scheduler to have parked it";
-                report(kernel, message);
+                with_kernel(|kernel| report(kernel, message));
                 panic!("{message}");
             }
             // It returned. A program leaves through `exit_group`; running
             // off the end of `_start` means the entry point returned to a
             // caller that does not exist.
-            (_, _) => {
+            (_, _, _) => {
                 let message = "kisal: the guest returned from its entry point instead of \
                                exiting";
-                report(kernel, message);
+                with_kernel(|kernel| report(kernel, message));
                 panic!("{message}");
             }
-        };
+        }
+    };
+
+    with_kernel(|kernel| {
         let mut payload = String::new();
         push_status(&mut payload, status);
         let _ = kernel
@@ -480,6 +531,66 @@ fn push_status(into: &mut String, status: i32) {
 /// way the answer is the function's name rather than a bare trap.
 ///
 /// # Safety
+/// Puts a continuation where the resume driver looks for one.
+///
+/// The driver reads the word at `%rsp` and pops it, because that is what a
+/// suspended thread's stack holds — so entering a continuation that came
+/// from somewhere else means writing it there and moving `%rsp` down by the
+/// eight bytes the driver will give back. After the pop the stack is exactly
+/// what the frame being resumed expects, which is the whole reason this is a
+/// push rather than a second entry point into the driver.
+///
+/// **It cannot be read *out* of the stack instead, and the difference is the
+/// design.** `longjmp` has already restored `%rsp` to what `setjmp` saw, but
+/// the slot there was overwritten by every later call the same frame made at
+/// the same depth: in `if (setjmp(env)) return 1; g();` the slot holds
+/// `g()`'s call-site continuation, not `setjmp`'s. Entering that resumes as
+/// if the pending call had returned — silent wrong control flow. The
+/// `jmp_buf`'s saved word is the only surviving record.
+#[cfg(target_arch = "wasm32")]
+fn enter_continuation<S: abi::Store, M: machine::Machine>(
+    kernel: &mut syscall::Kernel<'_, S, M>,
+    continuation: i64,
+) -> Result<(), &'static str> {
+    let below = kernel
+        .machine
+        .stack_pointer()
+        .checked_sub(8)
+        .ok_or("kisal: a `longjmp` left the stack pointer with nowhere to put its continuation")?;
+    kernel
+        .memory()
+        .check(below as u64, 8)
+        .map_err(|_| "kisal: a `longjmp` restored a stack pointer outside the guest's memory")?;
+    // SAFETY: the eight bytes were bounds-checked immediately above.
+    unsafe { kernel.memory_mut().write(below as u64, &continuation.to_le_bytes()) }
+        .map_err(|_| "kisal: a `longjmp`'s continuation could not be written to the stack")?;
+    kernel.machine.set_stack_pointer(below);
+    Ok(())
+}
+
+/// `longjmp` has arrived: record where the thread is going.
+///
+/// Called from the exec map's miss path, which is the one place that can
+/// tell a continuation from an address — a resume ID carries a tag bit and
+/// an address cannot. All this does is write it down; the throw that
+/// discards the wasm frames between here and `setjmp`'s frame is the seam's,
+/// raised by the caller immediately afterwards, because a wasm exception
+/// must never cross a Rust frame.
+///
+/// It is a kernel row rather than a guest-side store because the thing being
+/// set is thread state, and at M7 the thread is the kernel's.
+///
+/// # Safety
+/// Called only from a generated body.
+#[cfg(target_arch = "wasm32")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kisal_longjmp(continuation: i64) {
+    with_kernel(|kernel| {
+
+        kernel.continuation = Some(continuation)
+    });
+}
+
 /// Called only from a generated body, with a pointer to that function's
 /// name in the module's own data.
 #[unsafe(no_mangle)]
@@ -526,7 +637,7 @@ pub unsafe extern "C" fn kisal_no_function_at(address: i64) -> ! {
 }
 
 /// Hexadecimal, because an address is only legible that way.
-fn push_hex(into: &mut String, value: u64) {
+pub(crate) fn push_hex(into: &mut String, value: u64) {
     into.push_str("0x");
     let mut started = false;
     for shift in (0..16).rev() {

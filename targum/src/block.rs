@@ -1,0 +1,530 @@
+//! The block cache: decode once, execute many times, and never execute a
+//! byte the guest has since overwritten.
+//!
+//! A block is a decoded run from a guest program counter to the first
+//! control transfer, capped so that pathological straight-line code cannot
+//! make one unbounded entry. The cache is what makes interpretation fast
+//! enough to be a floor at all — the spike measured decode-every-time at
+//! 61 MIPS in wasm against 125 for the cached variant — and the map probe it
+//! costs is paid once per *block*, never per instruction.
+//!
+//! Two properties are worth stating because getting either wrong is silent:
+//!
+//! **A block is a cache, not a claim about the program.** It is entered only
+//! through its entry address. A jump into the middle of a cached block
+//! simply creates a second, overlapping block, and that is correct by
+//! construction: two entries into the same bytes are two cache entries. The
+//! transpiler's whole splitting-and-sharing problem — which arm owns which
+//! byte, what a mid-instruction target means — does not arise, and it must
+//! not be reintroduced here in the name of saving memory nobody measured.
+//!
+//! **A block is registered against every page its bytes touch, not its
+//! first.** A block spanning a page boundary that is registered once is a
+//! stale-execution bug that shows up only when something writes the second
+//! page — which is to say, only under a JIT, only sometimes, and never with
+//! a diagnostic.
+
+use std::collections::HashMap;
+
+use iced_x86::{Decoder, DecoderError, DecoderOptions, FlowControl, Instruction, Mnemonic};
+
+use crate::space::{Access, Fault, PAGE_SHIFT, Space};
+
+/// How many instructions a block may hold.
+///
+/// The cap exists for straight-line code with no control transfer in it —
+/// a large unrolled loop body, a `memcpy` written as a thousand moves — which
+/// would otherwise decode into one enormous entry the first time it is
+/// touched. Sixty-four is enough that ordinary basic blocks are never split
+/// and small enough that the worst case is bounded.
+pub const MAX_INSTRUCTIONS: usize = 64;
+
+/// The longest an x86-64 instruction can be.
+const MAX_INSTRUCTION_BYTES: u64 = 15;
+
+/// How many blocks the cache holds before it is emptied and refilled.
+///
+/// A flush rather than an eviction policy: the cache is pure, so throwing all
+/// of it away costs only the decode work to rebuild what is still hot, and a
+/// least-recently-used structure would cost bookkeeping on the hit path,
+/// which is the one path that must stay cheap. Revisit when a measurement
+/// says a real workload thrashes it.
+pub const CAPACITY: usize = 64 * 1024;
+
+/// A decoded run of instructions, entered at one address.
+pub struct Block {
+    /// The guest address the block is entered at, and the key it is found by.
+    pub entry: u64,
+    /// One past the last byte the block decoded. A block that ends without a
+    /// control transfer falls through to here.
+    pub end: u64,
+    pub instructions: Vec<Instruction>,
+}
+
+impl Block {
+    /// The pages the block's bytes came from.
+    fn pages(&self) -> std::ops::RangeInclusive<u64> {
+        (self.entry >> PAGE_SHIFT)..=((self.end - 1) >> PAGE_SHIFT)
+    }
+}
+
+/// Why a block ended where it did. Nothing acts on this yet; it is what a
+/// hot-block tier will select traces by, and what a diagnostic prints.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Terminator {
+    /// The last instruction transfers control.
+    Transfer,
+    /// The last instruction is a `syscall`. The loop owns syscalls, so a
+    /// block never contains one anywhere but at its end — the same rule a
+    /// compiled trace will have to obey.
+    Syscall,
+    /// The block hit [`MAX_INSTRUCTIONS`], or ran out of executable bytes.
+    /// It falls through to [`Block::end`].
+    FellThrough,
+}
+
+/// What a fetch could not do.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FetchError {
+    /// The bytes are not there, or not executable. A real `SIGSEGV`.
+    Fault(Fault),
+    /// The bytes are there and they are not an instruction. A real `SIGILL`.
+    Undefined { address: u64 },
+}
+
+impl From<Fault> for FetchError {
+    fn from(fault: Fault) -> Self {
+        FetchError::Fault(fault)
+    }
+}
+
+/// Decoded blocks, keyed by entry address, and the page registry that
+/// invalidation hangs on.
+#[derive(Default)]
+pub struct BlockCache {
+    /// A slab: invalidated blocks leave a hole for the next one, so a block
+    /// index is stable for as long as the block lives.
+    blocks: Vec<Option<Block>>,
+    free: Vec<usize>,
+    entries: HashMap<u64, usize>,
+    /// Which blocks took bytes from each page. The list is short —
+    /// a page holds a few dozen blocks — so removal is a scan.
+    registry: HashMap<u64, Vec<usize>>,
+    /// How many blocks have been decoded since the cache was last emptied,
+    /// for the diagnostics that ask how much decoding a workload does.
+    pub decoded: u64,
+    pub flushes: u64,
+}
+
+impl BlockCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// How many blocks are cached.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// The block entered at `address`, decoding it if it is not cached.
+    ///
+    /// The returned index stays valid until something invalidates the block,
+    /// which nothing can do while the caller is executing it: the store path
+    /// only *queues* pages, and the loop drains the queue between blocks.
+    pub fn entry(&mut self, address: u64, space: &mut Space) -> Result<usize, FetchError> {
+        if let Some(index) = self.entries.get(&address) {
+            return Ok(*index);
+        }
+        let block = decode(address, space)?;
+        Ok(self.install(block, space))
+    }
+
+    pub fn block(&self, index: usize) -> &Block {
+        self.blocks[index]
+            .as_ref()
+            .expect("a block index outlived its block")
+    }
+
+    fn install(&mut self, block: Block, space: &mut Space) -> usize {
+        if self.entries.len() >= CAPACITY {
+            self.flush(space);
+        }
+        let pages: Vec<u64> = block.pages().collect();
+        let entry = block.entry;
+        let index = match self.free.pop() {
+            Some(index) => {
+                self.blocks[index] = Some(block);
+                index
+            }
+            None => {
+                self.blocks.push(Some(block));
+                self.blocks.len() - 1
+            }
+        };
+        self.entries.insert(entry, index);
+        for page in pages {
+            self.registry.entry(page).or_default().push(index);
+            space.mark_code(page);
+        }
+        self.decoded += 1;
+        index
+    }
+
+    /// Drops every block that took bytes from `page`.
+    ///
+    /// The pages of a dropped block are *all* deregistered, not just the one
+    /// that triggered this: a block straddling a boundary is stale on both
+    /// sides once either side changes.
+    pub fn invalidate_page(&mut self, page: u64, space: &mut Space) {
+        let Some(indices) = self.registry.remove(&page) else {
+            return;
+        };
+        for index in indices {
+            let Some(block) = self.blocks[index].take() else {
+                continue;
+            };
+            self.entries.remove(&block.entry);
+            for other in block.pages() {
+                if other == page {
+                    continue;
+                }
+                if let Some(list) = self.registry.get_mut(&other) {
+                    list.retain(|candidate| *candidate != index);
+                    if list.is_empty() {
+                        self.registry.remove(&other);
+                        space.clear_code(other);
+                    }
+                }
+            }
+            self.free.push(index);
+        }
+        // The store path already cleared this page's bit on its way to
+        // queueing it; unmapping clears it too. Saying so again is harmless
+        // and makes the invariant hold no matter who called.
+        space.clear_code(page);
+    }
+
+    /// Drains every page a write has landed on since the last drain.
+    ///
+    /// Called by the run loop between blocks, which is what guarantees the
+    /// next instruction is fetched from bytes that are current.
+    pub fn drain_invalidations(&mut self, space: &mut Space) {
+        while space.has_dirty_code() {
+            for page in space.take_dirty_code() {
+                self.invalidate_page(page, space);
+            }
+        }
+    }
+
+    /// Throws the whole cache away.
+    pub fn flush(&mut self, space: &mut Space) {
+        for page in self.registry.keys() {
+            space.clear_code(*page);
+        }
+        self.blocks.clear();
+        self.free.clear();
+        self.entries.clear();
+        self.registry.clear();
+        self.flushes += 1;
+    }
+}
+
+/// Decodes one block starting at `address`.
+fn decode(address: u64, space: &Space) -> Result<Block, FetchError> {
+    let cap = MAX_INSTRUCTION_BYTES * MAX_INSTRUCTIONS as u64;
+    let bytes = space.fetch(address, cap)?;
+    let mut decoder = Decoder::with_ip(64, bytes, address, DecoderOptions::NONE);
+    let mut instructions = Vec::new();
+    let mut end = address;
+    while instructions.len() < MAX_INSTRUCTIONS {
+        if !decoder.can_decode() {
+            break;
+        }
+        let instruction = decoder.decode();
+        if instruction.is_invalid() {
+            return match decoder.last_error() {
+                // The bytes ran out. Either the executable run ends here —
+                // in which case the *next* block will fetch from the page
+                // that refused and report the fault — or the block simply
+                // reached the cap. Both are "the block ends here", and the
+                // empty case cannot loop forever because the cap is longer
+                // than the longest instruction.
+                DecoderError::NoMoreBytes if !instructions.is_empty() => Ok(Block {
+                    entry: address,
+                    end,
+                    instructions,
+                }),
+                DecoderError::NoMoreBytes => Err(FetchError::Fault(Fault {
+                    address: address + bytes.len() as u64,
+                    access: Access::Fetch,
+                })),
+                _ => Err(FetchError::Undefined {
+                    address: instruction.ip(),
+                }),
+            };
+        }
+        end = instruction.next_ip();
+        let terminates = terminator(&instruction).is_some();
+        instructions.push(instruction);
+        if terminates {
+            break;
+        }
+    }
+    Ok(Block {
+        entry: address,
+        end,
+        instructions,
+    })
+}
+
+/// Whether an instruction ends its block, and why.
+///
+/// Control transfers, obviously. And `syscall`, deliberately: the loop owns
+/// syscalls, so no block ever holds one in its middle. That costs a map
+/// probe per syscall — against the thousands of instructions a syscall
+/// itself costs — and buys two things. The kernel writes guest memory, so a
+/// syscall is a moment when the cache may need to be invalidated, and having
+/// it at a block boundary means the drain that handles it is the same drain
+/// everything else uses. And it is the rule a compiled trace will have to
+/// obey anyway, so tier zero and tier one agree about where a block can end.
+pub fn terminator(instruction: &Instruction) -> Option<Terminator> {
+    if matches!(
+        instruction.mnemonic(),
+        Mnemonic::Syscall | Mnemonic::Sysenter | Mnemonic::Sysexit | Mnemonic::Sysret
+    ) {
+        return Some(Terminator::Syscall);
+    }
+    match instruction.flow_control() {
+        FlowControl::Next => None,
+        _ => Some(Terminator::Transfer),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use iced_x86::code_asm::*;
+
+    use super::*;
+    use crate::arena::Arena;
+    use crate::space::{PAGE_SIZE, Protection};
+    use crate::state::Width;
+
+    /// Assembles at `at` and returns the bytes.
+    fn assemble(at: u64, build: impl FnOnce(&mut CodeAssembler)) -> Vec<u8> {
+        let mut assembler = CodeAssembler::new(64).expect("assembler");
+        build(&mut assembler);
+        assembler.assemble(at).expect("assemble")
+    }
+
+    struct Fixture {
+        arena: Arena,
+        space: Space,
+        cache: BlockCache,
+    }
+
+    impl Fixture {
+        fn new(length: u64) -> Self {
+            let arena = Arena::new(length);
+            let mut space = Space::new(arena.limit());
+            space.protect(arena.base(), arena.length(), Protection::ALL);
+            Self {
+                arena,
+                space,
+                cache: BlockCache::new(),
+            }
+        }
+
+        fn place(&mut self, at: u64, bytes: &[u8]) {
+            self.space.write(at, bytes).expect("place code");
+            // Placing is not the guest storing: a harness writing a program
+            // into memory before it runs must not leave the pages queued for
+            // invalidation.
+            self.cache.drain_invalidations(&mut self.space);
+        }
+
+        fn base(&self) -> u64 {
+            self.arena.base()
+        }
+    }
+
+    #[test]
+    fn a_block_ends_at_the_first_control_transfer() {
+        let mut fixture = Fixture::new(0x2_0000);
+        let at = fixture.base();
+        let code = assemble(at, |assembler| {
+            assembler.mov(rax, 1u64).unwrap();
+            assembler.add(rax, rcx).unwrap();
+            assembler.ret().unwrap();
+            assembler.mov(rbx, 2u64).unwrap();
+        });
+        fixture.place(at, &code);
+        let index = fixture.cache.entry(at, &mut fixture.space).unwrap();
+        let block = fixture.cache.block(index);
+        assert_eq!(block.instructions.len(), 3);
+        assert_eq!(
+            block.instructions.last().unwrap().mnemonic(),
+            Mnemonic::Ret
+        );
+    }
+
+    #[test]
+    fn a_block_ends_at_a_syscall() {
+        let mut fixture = Fixture::new(0x2_0000);
+        let at = fixture.base();
+        let code = assemble(at, |assembler| {
+            assembler.mov(eax, 60u32).unwrap();
+            assembler.syscall().unwrap();
+            assembler.mov(ebx, 1u32).unwrap();
+        });
+        fixture.place(at, &code);
+        let index = fixture.cache.entry(at, &mut fixture.space).unwrap();
+        let block = fixture.cache.block(index);
+        assert_eq!(block.instructions.len(), 2);
+        assert_eq!(
+            terminator(block.instructions.last().unwrap()),
+            Some(Terminator::Syscall)
+        );
+    }
+
+    #[test]
+    fn a_straight_run_is_capped() {
+        let mut fixture = Fixture::new(0x2_0000);
+        let at = fixture.base();
+        let code = assemble(at, |assembler| {
+            for _ in 0..MAX_INSTRUCTIONS + 10 {
+                assembler.nop().unwrap();
+            }
+        });
+        fixture.place(at, &code);
+        let index = fixture.cache.entry(at, &mut fixture.space).unwrap();
+        let block = fixture.cache.block(index);
+        assert_eq!(block.instructions.len(), MAX_INSTRUCTIONS);
+        assert_eq!(block.end, at + MAX_INSTRUCTIONS as u64);
+    }
+
+    #[test]
+    fn a_second_entry_into_the_same_bytes_is_a_second_block() {
+        let mut fixture = Fixture::new(0x2_0000);
+        let at = fixture.base();
+        let code = assemble(at, |assembler| {
+            assembler.nop().unwrap();
+            assembler.nop().unwrap();
+            assembler.ret().unwrap();
+        });
+        fixture.place(at, &code);
+        let first = fixture.cache.entry(at, &mut fixture.space).unwrap();
+        let second = fixture.cache.entry(at + 1, &mut fixture.space).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(fixture.cache.block(first).instructions.len(), 3);
+        assert_eq!(fixture.cache.block(second).instructions.len(), 2);
+        assert_eq!(fixture.cache.len(), 2);
+    }
+
+    #[test]
+    fn a_store_to_a_cached_page_drops_the_block() {
+        let mut fixture = Fixture::new(0x2_0000);
+        let at = fixture.base();
+        let code = assemble(at, |assembler| {
+            assembler.nop().unwrap();
+            assembler.ret().unwrap();
+        });
+        fixture.place(at, &code);
+        fixture.cache.entry(at, &mut fixture.space).unwrap();
+        assert_eq!(fixture.cache.len(), 1);
+        fixture.space.store(at, Width::Byte, 0x90).unwrap();
+        assert!(fixture.space.has_dirty_code());
+        fixture.cache.drain_invalidations(&mut fixture.space);
+        assert_eq!(fixture.cache.len(), 0);
+        // And the page is no longer marked, so the next store to it is free.
+        fixture.space.store(at, Width::Byte, 0x90).unwrap();
+        assert!(!fixture.space.has_dirty_code());
+    }
+
+    /// The silent class: a block whose bytes straddle a page boundary, with
+    /// the write landing on the *second* page. Registering only the entry
+    /// page passes every other test in this file and fails this one.
+    #[test]
+    fn a_block_spanning_two_pages_is_registered_against_both() {
+        let mut fixture = Fixture::new(0x4_0000);
+        let at = fixture.base() + PAGE_SIZE - 3;
+        let code = assemble(at, |assembler| {
+            assembler.nop().unwrap();
+            assembler.nop().unwrap();
+            assembler.nop().unwrap();
+            assembler.nop().unwrap();
+            assembler.ret().unwrap();
+        });
+        fixture.place(at, &code);
+        fixture.cache.entry(at, &mut fixture.space).unwrap();
+        assert_eq!(fixture.cache.len(), 1);
+        // A store to the second page, which holds the block's tail.
+        fixture
+            .space
+            .store(fixture.base() + PAGE_SIZE, Width::Byte, 0x90)
+            .unwrap();
+        fixture.cache.drain_invalidations(&mut fixture.space);
+        assert_eq!(fixture.cache.len(), 0, "the tail page was not registered");
+    }
+
+    #[test]
+    fn a_fetch_from_a_non_executable_page_is_a_fault() {
+        let arena = Arena::new(0x2_0000);
+        let mut space = Space::new(arena.limit());
+        space.protect(arena.base(), PAGE_SIZE, Protection::READ_WRITE);
+        let mut cache = BlockCache::new();
+        assert_eq!(
+            cache.entry(arena.base(), &mut space),
+            Err(FetchError::Fault(Fault {
+                address: arena.base(),
+                access: Access::Fetch,
+            }))
+        );
+    }
+
+    #[test]
+    fn bytes_that_are_not_an_instruction_are_undefined_rather_than_a_fault() {
+        let mut fixture = Fixture::new(0x2_0000);
+        let at = fixture.base();
+        // `ud2`, decoded as an instruction, is not this case; a genuinely
+        // unassignable opcode is.
+        fixture.place(at, &[0x0f, 0x0b]);
+        let index = fixture.cache.entry(at, &mut fixture.space).unwrap();
+        assert_eq!(
+            fixture.cache.block(index).instructions[0].mnemonic(),
+            Mnemonic::Ud2
+        );
+        let elsewhere = at + 0x100;
+        fixture.place(elsewhere, &[0xff, 0xff]);
+        assert_eq!(
+            fixture.cache.entry(elsewhere, &mut fixture.space),
+            Err(FetchError::Undefined { address: elsewhere })
+        );
+    }
+
+    #[test]
+    fn a_block_at_the_end_of_the_executable_run_faults_on_the_next_page() {
+        let arena = Arena::new(0x4_0000);
+        let mut space = Space::new(arena.limit());
+        space.protect(arena.base(), PAGE_SIZE, Protection::ALL);
+        space.protect(arena.base() + PAGE_SIZE, PAGE_SIZE, Protection::READ_WRITE);
+        let mut cache = BlockCache::new();
+        // A `mov` with a four-byte immediate, straddling the boundary.
+        let at = arena.base() + PAGE_SIZE - 3;
+        let code = assemble(at, |assembler| {
+            assembler.mov(eax, 0x1234_5678u32).unwrap();
+        });
+        space.write(at, &code).unwrap();
+        cache.drain_invalidations(&mut space);
+        assert_eq!(
+            cache.entry(at, &mut space),
+            Err(FetchError::Fault(Fault {
+                address: arena.base() + PAGE_SIZE,
+                access: Access::Fetch,
+            }))
+        );
+    }
+}

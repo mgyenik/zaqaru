@@ -565,8 +565,13 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
         let from = offset.min(length);
         let to = from.saturating_add(count).min(length);
         let slice = &contents[from as usize..to as usize];
+        // The address space by its field rather than through `memory_mut`,
+        // because `contents` still borrows the filesystem and the two are
+        // disjoint parts of the kernel. Copying the bytes out to satisfy a
+        // whole-`self` borrow would put an allocation on the read path,
+        // which is the hottest path in the container.
         // SAFETY: bounds-checked against the guest's memory before writing.
-        unsafe { self.memory().write(buffer as u64, slice)? };
+        unsafe { crate::memory::GuestMemory::new(&mut self.pages).write(buffer as u64, slice)? };
         Ok(slice.len() as u64)
     }
 
@@ -611,7 +616,7 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
                     self.random.fill(&mut buffered[..take])?;
                     // SAFETY: bounds-checked against the guest's memory.
                     unsafe {
-                        self.memory()
+                        self.memory_mut()
                             .write(buffer as u64 + written, &buffered[..take])?
                     };
                     written += take as u64;
@@ -657,7 +662,7 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
             let take = ((count - written) as usize).min(DEVICE_CHUNK);
             // SAFETY: bounds-checked against the guest's memory.
             unsafe {
-                self.memory()
+                self.memory_mut()
                     .write(buffer as u64 + written, &buffered[..take])?
             };
             written += take as u64;
@@ -689,7 +694,7 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
         let to = from.saturating_add(count).min(length);
         let slice = &bytes[from as usize..to as usize];
         // SAFETY: bounds-checked against the guest's memory before writing.
-        unsafe { self.memory().write(buffer as u64, slice)? };
+        unsafe { self.memory_mut().write(buffer as u64, slice)? };
         Ok(slice.len() as u64)
     }
 
@@ -705,7 +710,7 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
         let to = from.saturating_add(count).min(length);
         let slice = &bytes[from as usize..to as usize];
         // SAFETY: bounds-checked against the guest's memory before writing.
-        unsafe { self.memory().write(buffer as u64, slice)? };
+        unsafe { self.memory_mut().write(buffer as u64, slice)? };
         Ok(slice.len() as u64)
     }
 
@@ -828,11 +833,11 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
         }
     }
 
-    fn write_console_stat(&self, stream: Console, destination: i64) -> Outcome {
+    fn write_console_stat(&mut self, stream: Console, destination: i64) -> Outcome {
         let mut buffer = [0u8; STAT_SIZE];
         encode_console_stat(&mut buffer, stream);
         // SAFETY: bounds-checked against the guest's memory.
-        match unsafe { self.memory().write(destination as u64, &buffer) } {
+        match unsafe { self.memory_mut().write(destination as u64, &buffer) } {
             Ok(()) => Outcome::Done(0),
             Err(errno) => Outcome::Done(errno.as_result()),
         }
@@ -867,7 +872,7 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
         }
     }
 
-    fn write_stat(&self, vnode: Vnode, destination: i64) -> Outcome {
+    fn write_stat(&mut self, vnode: Vnode, destination: i64) -> Outcome {
         let inode = match self.vfs.inode(vnode) {
             Ok(inode) => inode,
             Err(errno) => return Outcome::Done(errno.as_result()),
@@ -879,7 +884,7 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
         let mut buffer = [0u8; STAT_SIZE];
         encode_stat(&mut buffer, device, vnode.inode, &inode);
         // SAFETY: bounds-checked against the guest's memory.
-        match unsafe { self.memory().write(destination as u64, &buffer) } {
+        match unsafe { self.memory_mut().write(destination as u64, &buffer) } {
             Ok(()) => Outcome::Done(0),
             Err(errno) => Outcome::Done(errno.as_result()),
         }
@@ -907,7 +912,7 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
                     let mut buffer = [0u8; STATX_SIZE];
                     encode_console_statx(&mut buffer, stream);
                     // SAFETY: bounds-checked against guest memory.
-                    return match unsafe { self.memory().write(arguments.get(4) as u64, &buffer) } {
+                    return match unsafe { self.memory_mut().write(arguments.get(4) as u64, &buffer) } {
                         Ok(()) => Outcome::Done(0),
                         Err(errno) => Outcome::Done(errno.as_result()),
                     };
@@ -932,7 +937,7 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
         let mut buffer = [0u8; STATX_SIZE];
         encode_statx(&mut buffer, device, vnode.inode, &inode);
         // SAFETY: bounds-checked against the guest's memory.
-        match unsafe { self.memory().write(arguments.get(4) as u64, &buffer) } {
+        match unsafe { self.memory_mut().write(arguments.get(4) as u64, &buffer) } {
             Ok(()) => Outcome::Done(0),
             Err(errno) => Outcome::Done(errno.as_result()),
         }
@@ -1117,7 +1122,7 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
             record[19..19 + name.len()].copy_from_slice(name);
             // SAFETY: bounds-checked against the guest's memory.
             if let Err(errno) =
-                unsafe { self.memory().write(buffer as u64 + written as u64, record) }
+                unsafe { crate::memory::GuestMemory::new(&mut self.pages).write(buffer as u64 + written as u64, record) }
             {
                 memory_error = Some(errno);
                 break;
@@ -1220,7 +1225,7 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
         // ask again with a bigger one.
         let length = (target.len() as u64).min(capacity as u64) as usize;
         // SAFETY: bounds-checked against the guest's memory.
-        match unsafe { self.memory().write(buffer as u64, &target[..length]) } {
+        match unsafe { crate::memory::GuestMemory::new(&mut self.pages).write(buffer as u64, &target[..length]) } {
             Ok(()) => Outcome::Done(length as i64),
             Err(errno) => Outcome::Done(errno.as_result()),
         }
@@ -1423,7 +1428,7 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
                 return Outcome::Done(Errno::Range.as_result());
             }
             // SAFETY: bounds-checked against the guest's memory.
-            return match unsafe { self.memory().write(arguments.get(2) as u64, value) } {
+            return match unsafe { crate::memory::GuestMemory::new(&mut self.pages).write(arguments.get(2) as u64, value) } {
                 Ok(()) => Outcome::Done(length),
                 Err(errno) => Outcome::Done(errno.as_result()),
             };
@@ -1490,11 +1495,11 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
                 Err(errno) => return Outcome::Done(errno.as_result()),
             };
             // SAFETY: bounds-checked against the guest's memory.
-            if let Err(errno) = unsafe { self.memory().write(at, name) } {
+            if let Err(errno) = unsafe { crate::memory::GuestMemory::new(&mut self.pages).write(at, name) } {
                 return Outcome::Done(errno.as_result());
             }
             // SAFETY: as above, for the terminator.
-            if let Err(errno) = unsafe { self.memory().write(at + name.len() as u64, &[0u8]) } {
+            if let Err(errno) = unsafe { crate::memory::GuestMemory::new(&mut self.pages).write(at + name.len() as u64, &[0u8]) } {
                 return Outcome::Done(errno.as_result());
             }
             at += name.len() as u64 + 1;
@@ -1668,7 +1673,7 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
         }
         path[length] = 0;
         // SAFETY: bounds-checked against the guest's memory.
-        match unsafe { self.memory().write(buffer as u64, &path[..length + 1]) } {
+        match unsafe { self.memory_mut().write(buffer as u64, &path[..length + 1]) } {
             Ok(()) => Outcome::Done((length + 1) as i64),
             Err(errno) => Outcome::Done(errno.as_result()),
         }

@@ -22,3 +22,6 @@ zaqaru = { path = ".." }
 [dev-dependencies]
 libc = "0.2"
 flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
+# The `resumability` survey example reads decoded instructions out of
+# `zaqaru::lifter`'s types; the version has to match zaqaru's.
+iced-x86 = "1.21.0"

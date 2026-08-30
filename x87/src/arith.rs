@@ -31,6 +31,16 @@ impl Outcome {
     }
 }
 
+/// Whether either operand takes the NaN path, which decides more than which
+/// value comes out: a NaN operand *suppresses* the denormal-operand flag the
+/// other operand would otherwise have raised. `compare` has said so since it
+/// was probed against hardware; the arithmetic forms need it too, for the
+/// flag a memory operand's conversion raises before the operation is even
+/// reached.
+pub(crate) fn nan_present(a: F80, b: F80) -> bool {
+    is_invalid_operand(a.classify()) || is_invalid_operand(b.classify())
+}
+
 fn is_invalid_operand(class: Class) -> bool {
     matches!(
         class,
@@ -59,12 +69,22 @@ pub(crate) fn propagate(a: F80, b: F80) -> Outcome {
         F80::INDEFINITE
     } else {
         match (a.is_nan(), b.is_nan()) {
+            // The larger significand wins, which the manual states. What it
+            // does not state is the tie, and the tie is observable: with
+            // equal significands and opposite signs the hardware answers
+            // *positive*, whichever operand is the destination. Measured
+            // 2026-08-30 on AuthenticAMD by the lockstep oracle, which found
+            // it in a corpus probe rather than by anyone reading the table;
+            // the operand-order symmetry was then checked directly, both
+            // ways round and for both signs.
             (true, true) => {
-                if b.significand > a.significand {
-                    b.quieted()
-                } else {
-                    a.quieted()
-                }
+                let winner = match (b.significand.cmp(&a.significand), a.sign(), b.sign()) {
+                    (std::cmp::Ordering::Greater, _, _) => b,
+                    (std::cmp::Ordering::Less, _, _) => a,
+                    (std::cmp::Ordering::Equal, true, false) => b,
+                    (std::cmp::Ordering::Equal, _, _) => a,
+                };
+                winner.quieted()
             }
             (true, false) => a.quieted(),
             (false, true) => b.quieted(),

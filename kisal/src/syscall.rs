@@ -259,6 +259,71 @@ impl Arguments {
     }
 }
 
+/// Grows linear memory, and tells the page table about it.
+///
+/// Every growth path goes through here rather than calling `Machine::grow`
+/// directly, because a limit the table has not been told about is a range
+/// the kernel refuses and the guest expects. It takes the pieces rather
+/// than the kernel because the callers are closures handed to the VMA
+/// tree, which is itself a field of the kernel — so the borrow has to be
+/// split, and splitting it is what makes the two updates provably
+/// simultaneous.
+pub(crate) fn grow_memory<M: Machine>(
+    machine: &mut M,
+    pages: &mut targum::space::Space,
+    enforcement: Enforcement,
+    to: u64,
+) -> bool {
+    let was = pages.limit();
+    let grown = machine.grow(to);
+    if grown {
+        pages.set_limit(machine.memory_limit());
+        flatten(pages, enforcement, was);
+    }
+    grown
+}
+
+/// Under [`Enforcement::Flat`], marks the range that has just come into
+/// existence reachable.
+///
+/// Only that range, and the distinction matters: re-flattening the whole
+/// space would undo every `mprotect` the guest has made, because the rows
+/// narrow the table and this would widen it back. What is being said here
+/// is "memory that nothing has had a chance to map yet is reachable", which
+/// is exactly the ahead-of-time world's arrangement and nothing more.
+fn flatten(pages: &mut targum::space::Space, enforcement: Enforcement, from: u64) {
+    if enforcement != Enforcement::Flat {
+        return;
+    }
+    let limit = pages.limit();
+    // Page zero stays unmapped in both worlds, which is what makes "a null
+    // pointer is `EFAULT`" the general rule rather than a special case
+    // written into the bounds check — and it is what a real process has,
+    // where the first page is never mapped and dereferencing it is the
+    // segmentation fault everyone knows.
+    let first = from.max(targum::space::PAGE_SIZE).min(limit);
+    pages.protect(first, limit - first, targum::space::Protection::ALL);
+}
+
+/// Which world's rules the address space is enforced by.
+///
+/// Not a tuning knob: the two worlds genuinely differ in *who maps the
+/// guest's pages*, and the page table has to be told which.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Enforcement {
+    /// The mapping rows are the truth: a page is reachable only because
+    /// something mapped it, so an access to anything else is a fault. The
+    /// interpreter's world, and the one that makes a null dereference a real
+    /// `SIGSEGV`.
+    Mapped,
+    /// Everything below the limit is reachable. The ahead-of-time world,
+    /// where the guest's code and data are placed into linear memory by the
+    /// bake rather than by any `mmap` the kernel saw — so there is no row
+    /// that could have mapped them, and enforcing the table there would
+    /// refuse the program's own text.
+    Flat,
+}
+
 /// How a syscall ended.
 ///
 /// Three of the four variants are unreachable at M1 and exist anyway,
@@ -386,6 +451,27 @@ pub struct Kernel<'a, S: Store, M: Machine> {
     /// The boot path reads it after the unwind, which is the only moment
     /// there is anything to read.
     pub status: Option<i32>,
+    /// The page table: what each page of the guest's address space allows,
+    /// and which pages a decoded block came from.
+    ///
+    /// Beside `space`, which is the VMA tree, and under it: the tree
+    /// answers what a mapping *is*, the table is what every access tests.
+    /// The mapping rows write both, which is what keeps them agreeing.
+    pub pages: targum::space::Space,
+    /// See [`Enforcement`].
+    pub(crate) enforcement: Enforcement,
+    /// Whether syscalls are traced; see [`Kernel::tracing`].
+    tracing: Option<bool>,
+    /// Where the thread should resume, when something left in order to go
+    /// somewhere else rather than to stop.
+    ///
+    /// `longjmp` is the first writer and M7's scheduler is the second: both
+    /// are "this thread is runnable, and here is the continuation to enter
+    /// it at". Read by the boot path after the unwind, in the same breath as
+    /// `status` and distinguished from it — a thread that exited has a
+    /// status, a thread that jumped has a continuation, and one that has
+    /// neither left for a reason nothing recorded.
+    pub continuation: Option<i64>,
     /// The guest's address space: the arenas, and the tree of what is
     /// mapped where.
     pub space: crate::space::Space,
@@ -480,7 +566,17 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
     /// which is what mounting means: `mount` on a missing mount point fails
     /// on Linux as well, and inventing the directory would be inventing a
     /// filesystem the image did not ask for.
-    pub fn new(store: S, mut machine: M, image: crate::image::Image<'a>) -> Self {
+    pub fn new(store: S, machine: M, image: crate::image::Image<'a>) -> Self {
+        Self::with_enforcement(store, machine, image, Enforcement::Flat)
+    }
+
+    /// As [`Kernel::new`], saying which world this kernel is the sentry for.
+    pub fn with_enforcement(
+        store: S,
+        mut machine: M,
+        image: crate::image::Image<'a>,
+        enforcement: Enforcement,
+    ) -> Self {
         // The guest's arenas are a block reserved once, here, and not
         // whatever happens to lie above the module. They have to be: the
         // kernel's own allocator takes its pages from the end of linear
@@ -501,6 +597,10 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             clock: 1,
             status: None,
             clear_child_tid: 0,
+            pages: targum::space::Space::new(0),
+            enforcement,
+            tracing: None,
+            continuation: None,
             blocked_signals: 0,
             dispositions: [Disposition::DEFAULT; 64],
             robust_list: 0,
@@ -520,9 +620,63 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
                 crate::space::Space::new(space_start)
             },
         };
+        kernel.pages.set_limit(kernel.machine.memory_limit());
+        kernel.flatten(0);
         kernel.seed_random();
         kernel.mount_synthetics();
         kernel
+    }
+
+    /// Under [`Enforcement::Flat`], marks everything below the limit
+    /// reachable. Under [`Enforcement::Mapped`] this does nothing, because
+    /// the mapping rows are the only thing that may map a page.
+    fn flatten(&mut self, from: u64) {
+        flatten(&mut self.pages, self.enforcement, from);
+    }
+
+    /// Rewrites the page table for a range, from the VMA tree.
+    ///
+    /// The tree says what a mapping *is*; the table is what every access
+    /// tests. They have to agree, and a disagreement is either an access the
+    /// kernel refuses that the guest expects to work or — worse — one it
+    /// allows that the guest mapped away.
+    ///
+    /// **Derived rather than mirrored, and that is the point.** Every row
+    /// that changes the tree calls this for the range it changed, so the two
+    /// cannot drift: there is no second place that decides what a page
+    /// allows, and a row added later that forgets to call this fails loudly
+    /// (its mapping is unreachable) rather than quietly (its protections are
+    /// wrong). The first version of this *was* mirrored, one call per row,
+    /// and it had already missed the stack by the time the first program
+    /// tried to start on one.
+    ///
+    /// Unmapping the range first is what makes gaps come out right: a VMA
+    /// that shrank leaves pages no mapping covers, and those have to become
+    /// unreachable rather than keep the permissions they had. It also drops
+    /// the decoded blocks in the range, which is correct whenever the range
+    /// changed at all.
+    pub(crate) fn sync_pages(&mut self, start: u64, end: u64) {
+        use crate::space::prot;
+        if end <= start {
+            return;
+        }
+        self.pages.unmap(start, end - start);
+        for vma in self.space.vmas() {
+            let from = vma.start.max(start);
+            let to = vma.end().min(end);
+            if to <= from {
+                continue;
+            }
+            self.pages.protect(
+                from,
+                to - from,
+                targum::space::Protection {
+                    read: vma.prot & prot::READ != 0,
+                    write: vma.prot & prot::WRITE != 0,
+                    execute: vma.prot & prot::EXEC != 0,
+                },
+            );
+        }
     }
 
     /// Takes the boot seed, once.
@@ -604,11 +758,95 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
 
     /// The guest's address space as it stands right now. Read per syscall
     /// rather than cached, because memory grows.
-    pub(crate) fn memory(&self) -> GuestMemory {
-        GuestMemory::with_limit(self.machine.memory_limit())
+    /// Guest memory, to read.
+    pub(crate) fn memory(&self) -> crate::memory::GuestReader<'_> {
+        crate::memory::GuestReader::new(&self.pages)
+    }
+
+    /// Guest memory, to write.
+    ///
+    /// A separate name so that "which rows write guest memory" is a
+    /// question `grep` answers. Every one of them must go through here:
+    /// a write that reaches around the address space is a decoded block
+    /// left executing bytes that no longer exist.
+    pub(crate) fn memory_mut(&mut self) -> GuestMemory<'_> {
+        GuestMemory::new(&mut self.pages)
+    }
+
+    /// Checks that the page table still says what the VMA tree says.
+    ///
+    /// Drift between the two is the silent failure this design has to make
+    /// impossible, and "every row remembers to call `sync_pages`" is a rule,
+    /// not a proof. So in a build with debug assertions the rule is
+    /// *checked*, after every syscall, against the whole tree — which turns
+    /// a row that forgot into a panic naming the range instead of a fault a
+    /// hundred million instructions later, in a mapping that looks fine.
+    ///
+    /// `mremap` and `madvise` are how this was found: both change the tree,
+    /// neither synced, and the symptom was numpy's import taking a
+    /// segmentation fault on a page `/proc/self/maps` said was readable and
+    /// writable.
+    #[cfg(debug_assertions)]
+    fn verify_pages(&self) {
+        use crate::space::prot;
+        for vma in self.space.vmas() {
+            let wanted = targum::space::Protection {
+                read: vma.prot & prot::READ != 0,
+                write: vma.prot & prot::WRITE != 0,
+                execute: vma.prot & prot::EXEC != 0,
+            };
+            let mut address = vma.start;
+            while address < vma.end() {
+                let held = self.pages.protection(address);
+                if held != wanted {
+                    let mut tree = String::new();
+                    for entry in self.space.vmas() {
+                        tree.push_str(&format!(
+                            "\n  {:#x}..{:#x} prot {:#x}",
+                            entry.start,
+                            entry.end(),
+                            entry.prot
+                        ));
+                    }
+                    panic!(
+                        "the page table and the VMA tree disagree about {address:#x}, \
+                         which is inside the mapping {:#x}..{:#x}: the table says \
+                         {held:?} and the tree says {wanted:?}{tree}",
+                        vma.start,
+                        vma.end()
+                    );
+                }
+                address += targum::space::PAGE_SIZE;
+            }
+        }
+    }
+
+    #[cfg(not(debug_assertions))]
+    fn verify_pages(&self) {}
+
+    /// Whether this container is tracing its syscalls, decided once.
+    ///
+    /// `None` until something asks, because the store is not reachable
+    /// before the kernel exists and the answer cannot change afterwards.
+    pub fn tracing(&mut self) -> bool {
+        if let Some(tracing) = self.tracing {
+            return tracing;
+        }
+        let mut answer = Vec::new();
+        let asked = self.store.read(crate::paths::CONFIG_TRACE, &mut answer)
+            == crate::abi::StoreOutcome::Present
+            && answer.first().is_some_and(|byte| *byte != b'0');
+        self.tracing = Some(asked);
+        asked
     }
 
     pub fn dispatch(&mut self, number: i64, arguments: Arguments) -> Outcome {
+        let outcome = self.dispatch_row(number, arguments);
+        self.verify_pages();
+        outcome
+    }
+
+    fn dispatch_row(&mut self, number: i64, arguments: Arguments) -> Outcome {
         match number {
             number::WRITE => self.write(arguments),
             number::WRITEV => self.vectored(arguments, Direction::Out),
@@ -828,7 +1066,7 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
                 comm[..kept].copy_from_slice(&base[..kept]);
 
                 let at = arguments.get(1) as u64;
-                let memory = self.memory();
+                let mut memory = self.memory_mut();
                 if memory.check(at, COMM_LEN as u64).is_err() {
                     return Outcome::Done(Errno::Fault.as_result());
                 }
@@ -872,7 +1110,7 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             b"(none)",
         ];
         let at = arguments.get(0) as u64;
-        let memory = self.memory();
+        let mut memory = self.memory_mut();
         if memory.check(at, FIELD * FIELDS.len() as u64).is_err() {
             return Outcome::Done(Errno::Fault.as_result());
         }
@@ -935,7 +1173,7 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
         bytes[..8].copy_from_slice(&soft.to_le_bytes());
         bytes[8..].copy_from_slice(&hard.to_le_bytes());
         // SAFETY: bounds-checked against the guest's memory before writing.
-        match unsafe { self.memory().write(old_limit, &bytes) } {
+        match unsafe { self.memory_mut().write(old_limit, &bytes) } {
             Ok(()) => Outcome::Done(0),
             Err(errno) => Outcome::Done(errno.as_result()),
         }
@@ -980,7 +1218,7 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             }
             // SAFETY: the whole range was bounds-checked above, and this is
             // a part of it.
-            if let Err(errno) = unsafe { self.memory().write(buffer + written, &chunk[..want]) } {
+            if let Err(errno) = unsafe { self.memory_mut().write(buffer + written, &chunk[..want]) } {
                 return Outcome::Done(errno.as_result());
             }
             written += want as u64;
@@ -1092,7 +1330,7 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
         if old != 0 {
             let bytes = self.dispositions[index].to_bytes();
             // SAFETY: the range was bounds-checked immediately above.
-            if let Err(errno) = unsafe { self.memory().write(old, &bytes) } {
+            if let Err(errno) = unsafe { self.memory_mut().write(old, &bytes) } {
                 return Outcome::Done(errno.as_result());
             }
         }
@@ -1141,8 +1379,12 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             }
             // SAFETY: the eight bytes were bounds-checked immediately above.
             if let Err(errno) = unsafe {
-                self.memory()
-                    .write(old, &self.blocked_signals.to_le_bytes())
+                // Read out before the address space is borrowed; the
+                // write's argument cannot borrow the kernel the write is
+                // reached through.
+                let blocked = self.blocked_signals.to_le_bytes();
+                self.memory_mut()
+                    .write(old, &blocked)
             } {
                 return Outcome::Done(errno.as_result());
             }
@@ -1285,7 +1527,7 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
         image[..8].copy_from_slice(&seconds.to_le_bytes());
         image[8..].copy_from_slice(&remainder.to_le_bytes());
         // SAFETY: the sixteen bytes were bounds-checked above.
-        if let Err(errno) = unsafe { self.memory().write(destination, &image) } {
+        if let Err(errno) = unsafe { self.memory_mut().write(destination, &image) } {
             return Outcome::Done(errno.as_result());
         }
         Outcome::Done(0)
@@ -1399,7 +1641,7 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             at => {
                 // SAFETY: the eight bytes were bounds-checked above.
                 if let Err(errno) =
-                    unsafe { self.memory().write(at, &(start + moved).to_le_bytes()) }
+                    unsafe { self.memory_mut().write(at, &(start + moved).to_le_bytes()) }
                 {
                     return Outcome::Done(errno.as_result());
                 }
@@ -1441,7 +1683,7 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             }
             // SAFETY: the eight bytes were just bounds-checked.
             if let Err(errno) =
-                unsafe { self.memory().write(destination, &seconds.to_le_bytes()) }
+                unsafe { self.memory_mut().write(destination, &seconds.to_le_bytes()) }
             {
                 return Outcome::Done(errno.as_result());
             }
@@ -1476,7 +1718,7 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
                 // SAFETY: the store is bounds-checked against the guest's
                 // current memory size, and refuses rather than dereferences
                 // anything outside it.
-                match unsafe { self.memory().store_u64(arguments.get(1) as u64, value) } {
+                match unsafe { self.memory_mut().store_u64(arguments.get(1) as u64, value) } {
                     Ok(()) => Outcome::Done(0),
                     Err(errno) => Outcome::Done(errno.as_result()),
                 }

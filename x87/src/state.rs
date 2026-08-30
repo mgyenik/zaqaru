@@ -24,6 +24,19 @@ pub const ENVIRONMENT_SIZE: usize = 28;
 /// Environment plus the eight registers in logical order (`fnsave`).
 pub const SAVE_SIZE: usize = 108;
 
+/// How much of an `fxsave` area belongs to the floating-point unit.
+///
+/// The whole area is 512 bytes; the first 160 are the unit's — the control
+/// and status words, the tag byte, the instruction and data pointers, and
+/// the eight stack registers — and everything above is `MXCSR` and the
+/// vector registers, which are not this crate's.
+pub const FX_FPU_SIZE: usize = 160;
+
+/// Cloneable because the interpreter's thread control block owns one per
+/// thread: a context switch is a struct move and a snapshot is a copy, and
+/// both need this to come along. Nothing in the crate's own FFI arrangement
+/// changes — the wasm statics are still the statics.
+#[derive(Clone)]
 pub struct X87State {
     control: u16,
     /// Sticky exception flags, ES, SF and the condition codes — everything
@@ -54,10 +67,32 @@ impl X87State {
         }
     }
 
-    /// FNINIT: also what `execve` resets to, since it is what Linux hands
-    /// a fresh process.
+    /// What `execve` hands a fresh process: the control word at its
+    /// default, no exceptions, an empty stack — *and* the register data
+    /// zeroed, because one process must not be handed another's bytes.
+    ///
+    /// This is deliberately not `FNINIT`. See [`X87State::reinitialize`]
+    /// for the difference, which is small, guest-observable, and was found
+    /// by comparing against hardware rather than by reading the manual.
     pub fn reset(&mut self) {
         *self = Self::new();
+    }
+
+    /// `FNINIT`, and the reinitialization half of `FNSAVE`: the control
+    /// word to its default, the status word cleared, the stack marked
+    /// empty — and the register *data* left exactly where it was.
+    ///
+    /// Hardware does not erase the eighty bytes; it marks them unreachable.
+    /// The difference is observable, because a second `fnsave` stores the
+    /// contents of registers the first one emptied, and because `frstor`
+    /// of a tag word that claims occupancy resurrects whatever is there.
+    /// Zeroing here instead is the kind of divergence that is invisible
+    /// until a `feholdexcept`-and-restore sequence answers wrongly.
+    pub fn reinitialize(&mut self) {
+        self.control = CONTROL_INIT;
+        self.status = 0;
+        self.top = 0;
+        self.tags = 0;
     }
 
     pub fn rounding(&self) -> Rounding {
@@ -257,7 +292,7 @@ impl X87State {
             let offset = ENVIRONMENT_SIZE + logical as usize * 10;
             image[offset..offset + 10].copy_from_slice(&bytes);
         }
-        self.reset();
+        self.reinitialize();
     }
 
     /// `frstor`.
@@ -271,6 +306,50 @@ impl X87State {
             let physical = self.physical(logical);
             self.registers[physical] = F80::from_bytes(bytes);
         }
+    }
+
+    /// The floating-point half of an `fxsave` area.
+    ///
+    /// A different layout from [`X87State::store_and_reinitialize`] in three
+    /// ways that all matter: the tag *word* becomes a tag *byte*, one
+    /// abridged bit per physical register rather than two bits of class;
+    /// each stack register occupies sixteen bytes of which ten are used; and
+    /// the registers are in logical order, `ST(0)` first, so a rotation by
+    /// `TOP` stands between this and how they are held.
+    ///
+    /// `FIP` and `FDP` are stored as zeros, as they are for `fnstenv` and
+    /// for the same reason: they are the address of the last x87 instruction
+    /// and of its operand, nothing in either libc reads them, and the one
+    /// caller that matters — `_dl_runtime_resolve`, which saves and restores
+    /// the whole unit around a symbol lookup — only ever hands them back.
+    pub fn store_fx(&self, image: &mut [u8; FX_FPU_SIZE]) {
+        image.fill(0);
+        image[0..2].copy_from_slice(&self.control.to_le_bytes());
+        image[2..4].copy_from_slice(&self.status_word().to_le_bytes());
+        image[4] = self.tags;
+        for logical in 0..8u32 {
+            let bytes = self.peek(logical).to_bytes();
+            let offset = 32 + logical as usize * 16;
+            image[offset..offset + 10].copy_from_slice(&bytes);
+        }
+    }
+
+    /// The inverse: `fxrstor`.
+    pub fn load_fx(&mut self, image: &[u8; FX_FPU_SIZE]) {
+        self.set_control(u16::from_le_bytes(image[0..2].try_into().unwrap()));
+        let status = u16::from_le_bytes(image[2..4].try_into().unwrap());
+        self.top = ((status >> 11) & 7) as u8;
+        self.status = status & !(7 << 11);
+        self.tags = image[4];
+        // The registers are logical, and `TOP` has just been set from the
+        // status word, so `physical` means the right thing here.
+        for logical in 0..8u32 {
+            let offset = 32 + logical as usize * 16;
+            let bytes: [u8; 10] = image[offset..offset + 10].try_into().unwrap();
+            let physical = self.physical(logical);
+            self.registers[physical] = F80::from_bytes(bytes);
+        }
+        self.refresh_summary();
     }
 
     /// The context-switch image: everything, byte-faithful, in physical

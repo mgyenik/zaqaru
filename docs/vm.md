@@ -1,11 +1,12 @@
 # The userspace VM: interpretation as the floor
 
-Status: **proposed** — a design for an alternative execution path, written
-after the 2026-08-30 throughput spike said the floor is viable. Nothing in
-this document is built except where a measurement is quoted with its date.
-Adoption is gated, not assumed: gates G2 and G3 below are the facts this
-design stands on that have not been verified yet, and the decision point is
-named in the milestones. `container-plan.md` remains the design authority
+Status: **in progress** — a design for an alternative execution path,
+written after the 2026-08-30 throughput spike said the floor is viable, and
+now partly built. **V1's engine and its oracle exist** (`targum/`, 2026-08-30);
+everything from V2 on does not, and section 12 says exactly which is which.
+Adoption is still gated, not assumed: G2 and G3 are unanswered, no MIPS
+number for the real dispatch breadth has been measured, and the decision
+point is where it always was. `container-plan.md` remains the design authority
 for the kernel; this document is the design authority for the machine that
 executes instructions, and where the two disagree about the seam between
 them, this one is wrong until the disagreement is resolved in both.
@@ -63,6 +64,11 @@ thing correctness rests on to a thing speed benefits from.
     decision sits relative to the current roadmap.
 13. **Risks, boundaries, and open questions.**
 14. **Pitfalls index** — seeded now, grown as they are hit.
+15. **Open questions from the build** — the decisions V1 raised and the
+    seam waits on: how the kernel reaches thread state and guest memory,
+    what the address-space default costs, the fidelity choices already
+    made that want confirming, and where V1 actually ends. Thirteen
+    questions, each now answered in place.
 
 ## 1. Why: the case for an interpreter floor
 
@@ -616,6 +622,12 @@ Gates first, M0-style — hours each, a recorded verdict, a named reroute.
 variant clears 125 MIPS on friendly code. The reroute ("if under ~20
 MIPS, tier 1 is load-bearing from day one") was not needed.
 
+**G2 — breadth does not collapse dispatch. ANSWERED, 2026-08-30: 29 MIPS
+in wasm**, measured on CPython importing numpy — 3.04 G instructions at
+full dispatch breadth, lazy flags and page bitmaps on. The verdict line
+asked for ≥ 25 MIPS and the reroute is not needed; tier 1 stays at V5.
+The original text follows.
+
 **G2 — breadth does not collapse dispatch.** Extend the spike's engine to
 the real corpus: the integer/branch/flags surface the differential corpus
 already exercises (~a hundred-plus mnemonics), lazy flags, the page
@@ -634,13 +646,114 @@ not fatal.
 Then the milestones. Each ships with its acceptance list; the standing
 suite grows, never shrinks.
 
-**V1 — the engine, against the corpus.** The interpreter crate (tier 0
-core: block cache, lazy flags, loud-error dispatch), the x87 crate linked
-in, and the **lockstep oracle** from section 10. Acceptance: every
-existing corpus program runs interpreted with output byte-identical to
-native; the lockstep harness passes over the corpus and *fails when a
-semantics arm is deliberately broken* (the negative control that proves
-the oracle sees); an unimplemented mnemonic names itself.
+**V1 — the engine, against the corpus. PARTLY BUILT, 2026-08-30.** The
+interpreter crate (tier 0 core: block cache, lazy flags, loud-error
+dispatch), the x87 crate linked in, and the **lockstep oracle** from
+section 10. Acceptance: every existing corpus *function* runs interpreted
+under the lockstep oracle with the register file identical to native at
+every retirement; the harness *fails when a semantics arm is deliberately
+broken* (the negative control that proves the oracle sees); an
+unimplemented mnemonic names itself. (This line originally said "corpus
+program … output byte-identical to native" — corrected per Q10 in section
+15: running a *program* needs the seam, which is V2's first item, so the
+ladder is V2's, and the oracle is the stronger check.)
+
+What exists, in `targum/`: the thread control block, the lazy-flag record, the
+address space with its page permissions and its code bitmap, the block
+cache with page-granular invalidation, and the interpreter — the integer
+core, the SSE surface transcribed from `translate/vector.rs`, and the x87
+reached by calling the crate directly. It builds for wasm32 and for the
+host from one source with no second address model. An unimplemented
+mnemonic names itself, with its exact encoding.
+
+**The oracle exists and works, which is the part worth reporting.** It runs
+a corpus probe in the interpreter and in a `ptrace`d process at once and
+compares the general-purpose registers, the defined flags, the sixteen XMM
+registers and all eighty bits of every x87 stack register after *every*
+retired instruction. Its negative control passes: a deliberately
+desynchronised machine is caught. Its coverage is asserted rather than
+hoped for — 73 integer, 99 vector and 70 x87 mnemonics were put through
+both machines, and the corpus fails if a probe's point gets folded away.
+In its first hours it found five real defects, four of them in code that
+had already passed a hardware oracle of its own: `inc` reading a stale
+carry out of the lazy record, `fstp m80` leaking the previous operation's
+C1, `fninit` erasing register data that hardware only marks unreachable,
+the NaN tie-break on equal significands, and the denormal-operand flag not
+being suppressed on the NaN path. See the pitfalls index.
+
+**The seam is half built (2026-08-30).** kisal owns the page table, every
+kernel access to guest memory goes through it, the mapping rows write it,
+and the `PROT_EXEC` refusal — the AOT deal's clause about runtime-arriving
+code — is now gated to the ahead-of-time world, which is the repeal
+section 5 promised, expressed as a deletion. See Q1, Q3 and Q4 in
+section 15.
+
+**And a real program runs (2026-08-30).** `kisal::run::Process` is the
+loop — fetch a quantum, serve what stopped it, go round — and six static
+glibc programs boot and run to completion under it, each compared against
+the *same binary* run natively rather than against a constant:
+`write`/`exit`; `printf`, which is format parsing over a buffered stream
+with an `ifunc`-selected `memcpy`; `malloc`/`free`/`calloc` across `brk`
+and a megabyte through `mmap`; the string routines, which are the
+hand-written assembly the discovery front end has the hardest time with
+and which the interpreter never has to find; double arithmetic with
+`sqrt` and `%f`; and `strtold`/`%.21Lg`, which is glibc's own
+extended-precision path — `fprem`-driven scaling and control-word
+manipulation — through the x87 crate.
+
+**The whole breadth bill for those six programs was one instruction**:
+`rdssp`, the shadow-stack probe, which on a processor without CET does
+nothing and leaves its destination alone — exactly the answer glibc reads
+as "no shadow stack". The loud error named it, with its encoding, at the
+first program that reached it.
+
+**V2's ladder is climbed, and the deliverable exists (2026-08-30).**
+
+Dynamic loading works, with prelink absent rather than disabled: a
+position-independent file arrives with no base, the *address space*
+finds room for it as a `PROT_NONE` reservation and the segments are
+mapped over it — which is what a kernel does and what the prelink design
+existed to avoid having to do. `ld.so` runs interpreted, maps `libc` for
+itself, and writes relocations into pages it is about to execute. So does
+`dlopen`: a shared object nobody named at link time, opened by path,
+relocated into a fresh mapping and called. That is the AOT deal's clause
+about runtime-arriving code, repealed and demonstrated rather than
+claimed — and expressed in the code as a *deletion*, the `PROT_EXEC`
+refusal now gated to the ahead-of-time world.
+
+And the artifact: **engine + image, linked into one `.wasm`, carrying a
+program the bake never read.** `examples/bake-vm.rs` is the whole bake —
+a directory becomes an image, the image becomes one object, and the
+object is linked with three staticlibs that are identical in every
+container.
+
+| | AOT CPython container | interpreted |
+|---|---|---|
+| module | 211 MB (317 MB with resume) | **121 MB**, of which 119 MB is the filesystem |
+| the engine itself | — | **2.2 MB**, the same in every container |
+| bake | minutes of translation | **2.1 s** (0.2 s image, 0.13 s link) |
+| host compile | 12.2 s (20.5 s with resume) | **0.24 s** |
+
+**The measurements, 2026-08-30.** A static glibc `hello`: 3.0 MB module,
+compiled in 0.07 s, run in 0.01 s. CPython 3.12 printing a string: 51.1 M
+instructions at **55.7 MIPS** native. CPython importing **numpy 1.26.4**
+and doing array arithmetic through BLAS — `arange`, `reshape`, `sum`,
+`mean`, a matrix multiply — 3.04 G instructions at **50.7 MIPS** native
+and **~29 MIPS under wasmtime**, 105 s wall.
+
+That last number is the one section 11 owed. **G2's verdict line was
+"≥ 25 MIPS in wasm keeps tier 0 self-sufficient for the floor", and the
+measurement is 29 MIPS — on a real workload at full dispatch breadth,
+with lazy flags and the page bitmaps on**, not on the spike's eight
+mnemonics. The wasm tax measures 1.7×, at the top of the 1.3–1.7× band
+G1 predicted. The section-11 discount can stop being an estimate: the
+working estimate was 40–80 MIPS and the answer is 50 native, 29 in wasm.
+
+What does *not* exist yet, and so is not claimed: threads, signal
+*delivery* (an unhandled fault ends the process, which is already more
+than the ahead-of-time path can do), tier 1, and the strace diff against
+a native run that V2's acceptance asks for — the trace itself is wired
+through the loop, but nothing has diffed it. G3 is untouched.
 
 **V2 — the boot ladder, again, on the floor.** kisal linked under the
 interpreter with the direct-call seam; the bake's engine+image link path.
@@ -718,18 +831,38 @@ carries them, and their kisal halves are identical either way.
   (some serverless runtimes) gets the floor only; the design degrades
   rather than fails, but the performance promise is host-conditional and
   every published number must name its host.
-- **Determinism must be defended, not assumed.** The quantum makes
-  scheduling deterministic only if retired counts are — which bans
-  host-observable time from leaking into the loop's decisions anywhere
-  outside `/iso`. This is the existing nondeterminism-inventory
-  discipline extended to one new consumer.
-- **Open: what the engine is called.** This document says "the engine"
-  and "the VM"; a crate needs a name (`vm/` is the placeholder). Naming
-  is deliberately not decided here.
-- **Open: the wasm-EH dependency in mixed builds.** Tier 0/1 need no EH;
-  a tier-2-carrying build keeps it. Whether the engine ships one build or
-  two (a floor-only engine with wider host reach, a full engine for
-  tier-2 images) is a packaging question V2 can answer with real sizes.
+- **Determinism must be defended, not assumed — and it must be
+  tier-invariant.** The quantum makes scheduling deterministic only if
+  retired counts are — which bans host-observable time from leaking into
+  the loop's decisions anywhere outside `/iso`. And it makes the schedule
+  reproducible across *tiering states* only if every tier preempts at the
+  same points: a compiled trace that checks the quantum only at its end
+  lets a quantum expire mid-trace and switch threads at a different
+  retirement point than the interpreter would — same tape, different
+  interleaving, record/replay broken the first time a warmed run tiers
+  differently from a cold one. The rule: **preemption points are per
+  source block in every tier**, and a compiled block's retired-count
+  contribution is a compile-time constant it charges as it goes — one
+  decrement-and-branch per block, the cost the transpiled-path poll
+  design already priced. The test: same tape, tier 1 off and forced on,
+  bit-identical interleaving. (This is also what makes Q7's `rdtsc`
+  answer free — section 15.)
+- ~~Open: what the engine is called.~~ **Resolved, 2026-08-30:
+  `targumannu`, crate directory `targum/`** — see Q13 in section 15 for
+  the reasoning.
+- ~~Open: the wasm-EH dependency in mixed builds.~~ **Resolved,
+  2026-08-30: one build, floor-only, no EH.** What settles it is Q2's
+  answer in section 15 — translations are caches: tier-2 output arrives
+  as an install-contract companion, and the install contract already
+  forbids EH (section 8), so no engine build ever carries it. The
+  consequence is binding on tier 2: a companion cannot ship today's
+  structured-body-plus-resume shape, whose blocking needs a throw the
+  engine no longer catches; it ships loop-compatible bodies — enterable
+  at post-call blocks, yielding at suspension points — which is the
+  dispatcher/resume shape the transpiler already emits, re-pointed at
+  the loop instead of at a catch. The welded single-file container with
+  EH remains what the standing AOT path builds; it is not this design's
+  mixed build.
 
 ## 14. Pitfalls index
 
@@ -776,4 +909,409 @@ Seeded from the design work and the spike; grown as they are earned.
     lives on it; nothing about guest `%rsp` constrains it. The moment
     those mix — a helper "borrowing" guest stack for scratch — the red
     zone class returns from the dead.
+11. **A flag that is *preserved* must be read from the record being
+    replaced, not from the materialized bits.** `inc` and `dec` keep the
+    carry; the carry they keep is the one the lazy record would have
+    computed, and the bits left over from some earlier materialization are
+    only accidentally the same. Getting this wrong is correct whenever
+    nothing lazy happened in between, which is most of the time. The
+    lockstep oracle found it at the ninth instruction of the first probe
+    it ever ran.
+12. **An undefined flag stays in the register.** Masking a comparison at
+    the instruction that left a flag undefined is not enough — the bit
+    persists, and the divergence surfaces at the next instruction that
+    writes no flags at all and therefore looks innocent. The mask has to
+    be carried until something defines the bit again.
+13. **A single-stepped machine has its trap flag set, and the guest can
+    see it.** `ptrace` hides it from the register block but not from the
+    guest's own `pushf`, so an oracle that does not carry the bit on both
+    sides reports a divergence that is the debugger's, not the engine's.
+14. **A per-operation oracle and a per-sequence oracle find different
+    bugs.** The x87 crate's hardware oracle drives each operation from a
+    fresh state, so every defect that is about what an operation *leaves
+    behind* for the next one is invisible to it: a condition code not
+    written, a flag not suppressed, register data erased where hardware
+    only marks it empty. Three of the four x87 defects found on 2026-08-30
+    were of exactly that shape. Neither oracle replaces the other.
 
+
+## 15. Open questions from the build
+
+Section 13 lists the risks the *design* carries. These are the questions
+building V1 raised — decisions that have to be made before the seam is
+written, and choices already made that want confirming rather than
+discovering later. Each says what turns on it. **All thirteen are now
+answered (2026-08-30).** The original recommendations are kept where the
+answer says more than they did, so what was proposed and what was decided
+stay separately readable, and an answer that changes text elsewhere in
+this document says where.
+
+### The seam
+
+**Q1. How does the kernel reach thread state?** This is the decision the
+rest of the seam waits on. `Kernel<S, M>` owns its `M: Machine` by value
+and lives in a static; `Machine`'s accessors are undefined symbols the
+seam object resolves to wasm globals. The interpreter's state is a `Tcb`
+owned by the engine, and section 6 says the call is
+`kernel.dispatch(&mut tcb)`. Three arrangements:
+
+1. **Pass it.** `dispatch` takes `&mut Tcb`, and `Machine` becomes a trait
+   whose methods take one. Cleanest, matches section 6 — and touches every
+   kisal call site, including the AOT path, which has no `Tcb` to pass.
+2. **Point at it.** The `Machine` impl holds a raw pointer to the current
+   `Tcb`, which the loop swaps before each dispatch. kisal's signatures do
+   not move at all. It reintroduces exactly the aliasing question the
+   `BORROWED` flag exists to turn into a panic.
+3. **Own it.** The `Tcb` lives in the kernel — which section 3 already says
+   it should ("the TCB, owned by kisal as M7 always intended") — and the
+   engine borrows it for the duration of a quantum.
+
+Recommendation: **(3)**, because the design already says the kernel owns
+the control block and because it is the arrangement that survives more than
+one thread without a second mechanism. (2) is the tempting one and should
+be refused: a raw pointer swapped by the loop is a correct-today,
+silent-tomorrow arrangement of precisely the kind this project keeps paying
+for.
+
+**Answered: (3), taken all the way.** The engine is already halfway
+there — its own header says the loop "stops and hands the caller a
+`&mut Tcb`", so the dispatch inversion exists and only ownership is
+misplaced. The concrete shape: the kernel owns *all* machine state — a
+process is `{ space, cache, threads: Vec<Tcb> }` in kisal — and the
+engine becomes pure mechanism:
+`Engine::run(&mut Tcb, &mut Space, &mut BlockCache, quantum)`, shedding
+its `tcb` field. That dissolves the (1)-versus-(3) distinction — the
+kernel owns *and* the seam call passes `&mut`, both at once,
+borrow-checked — and it settles `Space`'s ownership in the same move,
+which Q3 needs anyway: the `mmap` rows and the kernel's guest-memory
+writes want `&mut Space` from the same owner the scheduler is. The
+`Machine` trait's methods get their VM implementation over the kernel's
+own state; the AOT accessor implementation is untouched. (2) is refused,
+for the recommendation's reason.
+
+**Built, 2026-08-30.** `Engine` holds nothing: `Engine::run(&mut Tcb,
+&mut Space, &mut BlockCache, quantum)`, and the kernel owns the pieces —
+`Kernel` has a `pages` field, which is the page table. kisal now depends
+on targum, which is the direction the ownership decides. The lockstep
+harness plays the kernel's part and owns the three itself, which is a
+small piece of evidence that the split is the natural one.
+
+**Q2. Does tier 2 keep the globals, or does everything move to the TCB?**
+Downstream of Q1. If the transpiler survives, there are two
+representations of machine state and the 412-byte image is the bridge
+(pitfall 6). The question is whether `Machine` gets implemented twice — the
+globals for tier 2, the `Tcb` for tiers 0 and 1 — or whether tier 2 also
+reads a `Tcb` with the globals demoted to a per-call cache. Two impls is
+less work now and one more place for the two engines to drift. Not
+recommended either way here: it is a question about how long tier 2 lives,
+which section 9 deliberately leaves open.
+
+**Answered: the TCB is the only home in the VM build, and the two-impl
+question is moot.** What settles it is a delivery decision taken since
+this question was written (2026-08-30): **translations are caches, not
+artifact content.** The canonical artifact is engine + image; all
+acceleration — runtime tier 1 and baked tier-2 output alike — arrives as
+a companion module through the one `install` door, per host, never
+welded into the deliverable. So the register globals are a convention of
+the *AOT deliverable* only: the VM build never links the seam accessor
+object and never defines them, and `Machine` is implemented once per
+world, not twice in one. A companion body's storage class is "locals
+inside, TCB at the seams" — the promotion machinery re-pointed from
+`global.get`/`global.set` to loads and stores at `tcb_ptr + offset`, a
+mechanical third storage class beside the two that exist. Pitfall 6's
+412-byte bridge governs only an artifact where both representations
+coexist, and under the caches model none does. This same decision
+resolves section 13's EH question; the resolution is recorded there.
+
+**Q3. How does kisal reach guest memory?** `kisal/src/memory.rs` turns a
+guest address into a pointer and dereferences it. Under the VM that is
+unsound in two directions: a `read(2)` landing on a page some cached block
+was decoded from has to hit the invalidation hook, and a write to a page
+the guest mapped read-only has to fault rather than succeed. Every kernel
+write has to pass through `Space`. The question is the mechanics, because
+`GuestMemory` is `Copy`, is constructed ad hoc in `file.rs` and `write.rs`,
+and threading a `&mut Space` through all of that is a wide change:
+
+1. Thread the borrow, and let the compiler enumerate the sites.
+2. Make `Space` a process-global the helpers reach, matching kisal's
+   existing one-instance-one-actor arrangement.
+
+Recommendation: **(1)**, on the strength of pitfall 3 — "a new writer
+bypassing it should be structurally hard, not merely discouraged". A global
+makes the hook available; a borrow makes it unavoidable. The width of the
+change is the price of that, and it is a one-time price.
+
+**Answered: (1) — and further: `GuestMemory` is retired in the VM
+build.** `space.rs` already states the invariant — "nothing outside this
+module turns a guest address into a pointer" — and `kisal/src/memory.rs`
+is precisely the second door that sentence forbids. Rows take
+`&mut Space`, which is natural under Q1's answer because it comes from
+the same owner, and the one genuinely new decision is the fault mapping:
+the same `Fault` serves both consumers — at a syscall row it becomes
+`Errno::Fault`, an `EFAULT` to one call, exactly what `GuestMemory`
+answers today; at the loop it becomes a SIGSEGV. The null-page rule
+folds in for free: page zero is never mapped, so the special case
+becomes the general one. The width of the change is the price of the
+closed writer set, paid once.
+
+**Built, 2026-08-30**, and it turned out to have a second half nobody had
+named. `GuestMemory` is retired: what is left is an adapter with no way to
+reach memory the address space does not, split in two along the line that
+matters — `GuestReader` for rows that only read, `GuestMemory` for rows
+that write. The split is not tidiness; it means "which rows write guest
+memory" is a question `grep` answers.
+
+The second half: **there are two kinds of kernel write, and Linux
+distinguishes them too.** A write *on the guest's behalf* — `read(2)`
+filling a user buffer, a signal frame — is a user access and answers to
+the guest's protections, so a read-only destination is `EFAULT`.
+*Populating* memory the kernel is in the middle of handing over is not a
+user access at all: zero-filling a fresh mapping, copying a file's bytes
+into a mapping the guest asked to be read-only, loading a program's text
+into a read-execute segment. A real kernel does those through the direct
+map, where the process's page table has no say. Conflating them makes
+`mmap` of a read-only file fail with `EFAULT` — which is how this was
+found, eight tests at once. So `Space::place`/`place_fill` are the
+kernel's own write: they check that the range is inside linear memory,
+they skip the permission test, and they **still take the invalidation
+hook**, which is the whole reason they live in the address space instead
+of being a raw pointer at three call sites.
+
+The mapping rows now write both structures: the VMA tree says what a
+mapping *is*, the page table is what every access tests, and `mmap`,
+`mprotect` and `munmap` update them together. `munmap` drops the decoded
+blocks with them, which is what makes unmap-then-remap safe.
+
+One thing the rewire had to give the native tests: they used to hand the
+kernel the host address of a stack array. The page table refuses that
+correctly — a host pointer is nowhere near the four gigabytes the machine
+has — so a test that hands over a pointer now allocates it low, where a
+guest's memory really is (`GuestBytes`, `GuestBuffer`, and the two test
+arenas). 178 kisal tests pass over the new path.
+
+**Q4. What does `Machine::grow` do natively?** Inside the module it is
+`memory.grow`. Natively the arena is a reservation, so growth is commitment
+rather than allocation. Reserve the whole four gigabytes up front with
+`MAP_NORESERVE` and let `grow` only move the limit, or commit in steps?
+Recommendation: **reserve up front** — it makes the native and module paths
+differ in one line instead of in a policy, and an untouched reservation
+costs nothing but address space this process has in abundance.
+
+**Answered: reserve up front — `PROT_NONE`, committed on `grow`.** The
+whole four gigabytes reserved at start, with `set_limit` committing
+`[0, limit)` to readable-writable. Host page protection does not mirror
+guest protections — the bitmaps are the guest's truth — but keeping the
+*uncommitted* tail `PROT_NONE` means an engine defect that touches past
+`limit` natively faults instead of working on the host and trapping in
+the module, and it makes the identity `Space::pointer` sound for every
+address the harness can ever hand it.
+
+**Built, 2026-08-30.** The reservation is process-wide and taken once;
+arenas are commits inside it rather than mappings beside it, and dropping
+one puts the range back to `PROT_NONE` so a pointer that outlived it
+faults instead of finding the next test's memory. `Space::set_limit` now
+refuses a limit past the ceiling, which caught a test double whose
+"unbounded" default would have asked the page table for a bitmap covering
+half a petabyte.
+
+### The address space
+
+**Q5. Is "everything is a mapping" the right default?** `Space` starts with
+nothing mapped and every access faulting, which is what makes a null
+dereference a real `SIGSEGV` (section 5). The consequence is that the boot
+path must map every region before anything runs, and that the engine's own
+data — kisal's heap, the image blob, Rust statics — is *not* mapped from
+the guest's point of view, so a wild guest pointer into it faults. That is
+the correct answer, and it means kisal's writes to its own heap must not go
+through `Space` while its writes to guest memory must. Worth confirming
+that split is wanted before it is built into a hundred call sites.
+
+**Answered: confirmed — and the split has a name, which is the reason to
+want it.** This is guest/kernel isolation, the thing `container-plan.md`
+states the AOT design cannot have ("no isolation between guest and
+kernel … everything inside is one trust domain", named once and
+accepted). The nothing-mapped default reverses that cost: kisal's heap,
+the image blob and the Rust statics are absent from the guest's page
+maps, so a wild guest pointer into kernel state *faults* instead of
+corrupting the kernel silently. The split — kernel writes to its own
+heap bypass `Space`, writes to guest memory cannot — is enforced by
+Q3's types, and it is one of the strongest upgrades the VM buys. Build
+it into the hundred call sites.
+
+**Q6. Four bitmaps, or one packed one?** Readable, writable, executable and
+code are four bits per 4 KiB page — 512 KiB in total for a full four
+gigabytes, grown as linear memory grows. Cheap enough not to think about,
+and the four separate maps keep the hot path a single load and test. A
+packed two-bits-per-page alternative halves it at the cost of a shift on
+every access. Recommendation: **leave it**, and revisit only if a
+measurement says the working set matters.
+
+There is a consequence worth writing down now: the maps are dense and
+indexed by absolute page number, so the native lockstep harness is bounded
+to the low four gigabytes. That is free today, because the harness moves
+`%rsp` into the corpus program's own static stack and every address the
+compared region touches is in its image. It becomes a wall the day the
+oracle wants to compare a position-independent binary at the address the
+kernel actually loaded it at, and the fix then is a sparse map for the
+native build only.
+
+**Answered: leave it, as recommended.** 512 KiB dense is noise and the
+single load-and-test on the hot path is not. Q4's up-front reservation
+keeps the low-address arrangement coherent, and the recorded wall — a
+position-independent binary compared at the address the kernel really
+loaded it — has its fix bounded and native-only when the day comes.
+
+### Fidelity choices already made
+
+These are built. Each is a defensible reading of the design that somebody
+else might have read differently, so they are named rather than left to be
+discovered by a divergence.
+
+**Q7. `rdtsc` answers `retired × step`.** Section 4 says the counter is
+"the deterministic time base (`rdtsc` answers a function of it)", so the
+interpreter multiplies the retired count by the transpiler's odd step. The
+transpiler instead advances a cell by that step *per read*. Both are
+deterministic; they are not the same sequence, and the tier-divergence test
+section 13 asks for would flag it on the first program that reads the
+counter twice. One of them has to become the other. Recommendation: **the
+interpreter's**, because a counter derived from execution is monotone
+across threads for free, where a read-counting cell has to be told about
+them — but this is a change to the transpiler and so is not one to make
+quietly.
+
+**Answered: the interpreter's semantics are the specification — and the
+transpiler change rides work it owes anyway.** The piece that makes this
+no longer a quiet unilateral edit: tier-invariant determinism (section
+13's entry, now stated there as a rule) requires compiled code to charge
+retired counts per source block — otherwise a quantum expires at
+different retirement points warmed versus cold, and record/replay breaks
+across tiering states. Once compiled code carries that per-block counter
+for preemption, `rdtsc` as a function of retired count falls out of the
+same counter in both engines. Until a build mixes engines, the AOT
+deliverable's per-read cell stays and no divergence is observable — the
+cross-engine test only exists where both engines coexist, which is
+exactly when the counter arrives.
+
+**Q8. Undefined flags are left unspecified, and the oracle masks them.**
+The architecture says nothing about them and the two vendors differ, so
+pinning them would be pinning *this* machine. The oracle carries a poison
+mask (pitfall 12) rather than comparing them. The open half: a guest that
+depends on the AMD behaviour would diverge from us and from an Intel host
+alike, and we would not find out. Is that acceptable, or does the engine
+eventually want to match measured hardware for the undefined bits, and
+whose? No recommendation — it is a question about what "faithful" is for.
+
+**Answered: unspecified, deterministic, masked — permanently, with a
+named trigger.** "Faithful" here is faithful to the *architecture*, and
+the architecture says nothing; the house precedent is the x87
+transcendentals, which deliberately match neither vendor because there
+is no "the hardware" to match, and measure instead of pin. A guest
+branching on an AMD-undefined bit is broken on half the real machines it
+could run on — matching a die would pin this engine to a vendor forever
+in exchange for conformance nothing conforming needs. Two obligations
+survive: the engine's actual values stay deterministic (they are — the
+lazy record computes them), and the poison mask stays scrupulous
+(pitfall 12). The trigger for reopening is the standard one: a real
+binary observed depending on an undefined bit — then both vendors get
+measured and the decision is made from a case.
+
+**Q9. A repeated string instruction retires one iteration at a time.**
+`rep movsb` leaves `%rip` where it is until the count runs out, so a
+preemption or a signal can land inside a `memcpy` exactly as it does on
+hardware, and single-stepping matches `PTRACE_SINGLESTEP` iteration for
+iteration. The price is a dispatch per iteration rather than per
+instruction, which on a large copy is the difference between one loop and
+one loop plus a block-cache position check. Recommendation: **keep it** —
+the alternative makes a signal undeliverable inside a gigabyte copy, which
+is a real program's real behaviour — but the price is real and belongs in
+the G2 measurement rather than being discovered inside it.
+
+**Answered: keep it, as recommended — and answering it found a defect
+next to it.** The run loop's staying-put arm (`rip` unchanged, the
+repeated-instruction case) `continue`s past the dirty-code check at the
+bottom of the inner loop. A `rep movsb` whose destination overwrites
+*its own instruction bytes* therefore keeps executing the cached decode
+for the rest of the count — the exact stale execution `space.rs`'s
+header promises impossible, where hardware executes the new bytes at the
+next iteration boundary. The fix is one line — the staying-put path
+checks `has_dirty_code()` too and breaks to the drain, whose re-fetch
+decodes the freshly written bytes at `rip` — plus the SMC corpus case
+that pins it: a rep store landing on its own page. Named here rather
+than fixed silently; open until the fix and its test land.
+
+**Fixed, 2026-08-30.** The check moved above the program-counter arms, so
+it runs whatever `%rip` did. Pinned by a unit test whose guest turns its
+own `rep stosb` into a `ret` with the first byte it stores: correct
+behaviour is that exactly one iteration retires and the re-fetch runs the
+`ret`. The test was checked against the defect — with the check back in
+its old place the count runs to zero, on a hundred iterations of bytes
+that no longer exist.
+
+### Scope and sequencing
+
+**Q10. What is a "corpus program" in V1's acceptance?** V1 asks that "every
+existing corpus program runs interpreted with output byte-identical to
+native". The lockstep oracle runs corpus *functions*, entered on a
+synthetic frame with the harness choosing the registers; running a
+*program* needs the seam, which is V2's first item. So either V1 closes on
+the oracle plus the function corpus and the ladder is entirely V2's, or V1
+does not close until the seam exists and the boundary between the two
+milestones moves. Recommendation: **the former**, with the acceptance line
+in section 12 corrected to say "function" — the oracle is a stronger check
+than the output comparison it replaces, and pretending the milestone is
+still open is worse than moving the line and saying so.
+
+**Answered: the former.** V1 closes on the oracle plus the function
+corpus; the ladder is V2's entirely. Section 12's acceptance line is
+corrected in this edit, with the correction recorded there. The oracle
+compares the whole register file at every retirement, which is strictly
+stronger evidence than the output comparison the old line asked for —
+holding the milestone open on the weaker phrasing would teach the wrong
+lesson.
+
+**Q11. When is block chaining built?** Section 4 says "taken when
+measured", and the cache today probes a map once per block transition,
+never per instruction (pitfall 1 is satisfied). The measurement that would
+justify chaining is G2 — which needs the seam, which is V2. So chaining
+cannot honestly be decided before V2 even though it is a tier-0 concern.
+Recommendation: **leave it unbuilt** and let G2 say.
+
+**Answered: leave it unbuilt; G2 decides.** Pitfall 1 is satisfied as
+built — the map is probed once per block transition, never per
+instruction. One thing can run before the seam exists: a **G2a** on the
+original spike, adding the lazy-flag record and the bitmap tests — the
+two known per-instruction taxes — and re-measuring. Hours, and it
+brackets section 11's discount without touching the chaining question,
+which stays behind real G2.
+
+**Q12. MMX and `fxsave`.** Both are on the x87 crate's own roadmap as "not
+yet", and both are reachable from a real libc — `fxsave` in particular sits
+on the signal-frame path. Do they get built during V2's breadth grind, or
+does the engine refuse them loudly and the ladder route around until
+something actually needs them? Recommendation: **refuse loudly and wait**,
+which is the policy everywhere else here, with the note that the sigframe
+work in V3 is the moment `fxsave` stops being optional.
+
+**Answered: refuse loudly and wait — through one tracker, not two.** The
+x87 crate's tier table is already the ledger for `fxsave` (X7c) and MMX
+(X7d), so the engine's refusals name those rows rather than opening a
+VM-side list that can drift from it. The recommendation's note stands
+and is the schedule: V3's sigframe render is `fxsave`'s first real
+consumer on any path — the `_dl_runtime_resolve` trio stores pointers it
+never calls under `DF_1_NOW`.
+
+**Q13. What is the engine called?** Section 13 already asks this and it is
+still open; it is repeated here because the crate now exists as `vm/` and
+every day it stays there is a day the placeholder gets harder to move.
+
+**Answered: `targumannu`, crate directory `targum/`.** The Akkadian for
+interpreter — and, through Aramaic and Arabic *tarjumān*, the ancestor
+of English "dragoman": the professional who stands between two tongues
+and renders one in the other, which is this crate's whole function. It
+keeps the house register (*zaqāru*, *kisallu*) and follows the house
+shortening (kisallu → kisal, targumannu → targum). The rename belongs in
+the commit that lands V1, while `vm/` is still untracked and the
+placeholder is still cheap to move. Section 13's naming entry is
+resolved by this answer.
+
+**Renamed, 2026-08-30**, while it was still untracked and free.

@@ -363,6 +363,18 @@ impl Space {
                 return Err(Errno::NoMemory);
             }
             self.punch(start, length);
+            // And take the range out of the free pool, which `punch` does
+            // not: `punch` removes overlapping *mappings*, and the pool is
+            // the other half of what the address space knows. A fixed
+            // mapping over a range the pool still holds is a range
+            // `allocate` will hand out again — two mappings at one address,
+            // and the second one's writes landing in the first one's memory.
+            //
+            // Found by the interpreter's page table, which enforces what the
+            // tree records and therefore noticed the tree recording two
+            // overlapping mappings; on the ahead-of-time path nothing
+            // enforced protections, so the overlap was invisible.
+            self.take(start, length);
             start
         } else {
             // A hint is honoured when it is free, and silently ignored when
@@ -494,6 +506,32 @@ impl Space {
     }
 
     /// Gives a range back to the free pool, joined to any neighbour.
+    /// Removes a range from the free pool, splitting whatever held it.
+    ///
+    /// The inverse of [`Space::release`], for a caller that is taking an
+    /// address rather than being given one.
+    fn take(&mut self, start: u64, length: u64) {
+        let end = start.saturating_add(length);
+        let mut index = 0;
+        let mut remainders = Vec::new();
+        while index < self.free.len() {
+            let (other_start, other_length) = self.free[index];
+            let other_end = other_start + other_length;
+            if other_end <= start || other_start >= end {
+                index += 1;
+                continue;
+            }
+            self.free.remove(index);
+            if other_start < start {
+                remainders.push((other_start, start - other_start));
+            }
+            if other_end > end {
+                remainders.push((end, other_end - end));
+            }
+        }
+        self.free.extend(remainders);
+    }
+
     fn release(&mut self, start: u64, length: u64) {
         let mut start = start;
         let mut end = start.saturating_add(length);

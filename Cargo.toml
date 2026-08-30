@@ -1,5 +1,5 @@
 [workspace]
-members = ["baker", "kisal", "runner", "x87"]
+members = ["baker", "kisal", "runner", "targum", "x87"]
 # The interpreter-throughput spike (docs/vm.md, gate G1) is a standalone
 # instrument, not a member: it must not add its dependencies or build time
 # to the workspace.
@@ -52,3 +52,12 @@ harness = false
 # on one test, not a tax on every run.
 [profile.dev.package."*"]
 opt-level = 2
+
+# And the interpreter, which is not a dependency but is the same kind of
+# cost. Every test that runs a real program retires tens of millions of
+# instructions through `targum::exec`, and an unoptimised dispatch loop is
+# an order of magnitude of that — the difference between a suite that runs
+# after every edit and one nobody runs. `debug-assertions` is untouched, so
+# every `debug_assert!` in the engine still fires.
+[profile.dev.package.targum]
+opt-level = 3

@@ -23,7 +23,28 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
     pub(crate) fn brk(&mut self, arguments: Arguments) -> Outcome {
         let requested = arguments.get(0) as u64;
         let machine = &mut self.machine;
-        let (result, fill) = self.space.brk(requested, &mut |to| machine.grow(to));
+        let pages = &mut self.pages;
+        let enforcement = self.enforcement;
+        let was = self.space.brk_current();
+        let (result, fill) = self.space.brk(requested, &mut |to| {
+            crate::syscall::grow_memory(machine, pages, enforcement, to)
+        });
+        // The break is a bump pointer with no VMA behind it, so the page
+        // table cannot be derived from the tree here the way it is
+        // everywhere else — the heap is exactly `[brk_start, brk_current)`
+        // and this is the only place that knows it moved. Both directions:
+        // a shrunk break makes its pages unreachable, as Linux does, so a
+        // program that frees its way down and then reads what it freed
+        // faults rather than finding its own old bytes.
+        match result.cmp(&was) {
+            core::cmp::Ordering::Greater => self.pages.protect(
+                was,
+                result - was,
+                targum::space::Protection::READ_WRITE,
+            ),
+            core::cmp::Ordering::Less => self.pages.unmap(result, was - result),
+            core::cmp::Ordering::Equal => {}
+        }
         if let Err(errno) = self.zero(fill) {
             return Outcome::Done(errno.as_result());
         }
@@ -108,7 +129,17 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
         // half-done. The design names this a loud error precisely because
         // the alternative is a container that runs until it calls into the
         // mapping and then reports a miss on an address with no story.
-        if prot_bits & prot::EXEC != 0
+        //
+        // **This is the ahead-of-time deal, and only that world pays it.**
+        // A bake can translate only code that existed at bake time, so a
+        // mapping of anything else has nowhere to run — which is why Node,
+        // the JVM and every other JITted runtime cannot exist there. The
+        // interpreter has no such clause: it executes whatever bytes are at
+        // the program counter, including ones the guest wrote a microsecond
+        // ago, so under `Mapped` the pages simply get their permission bits
+        // and the first fetch decodes them.
+        if self.enforcement == crate::syscall::Enforcement::Flat
+            && prot_bits & prot::EXEC != 0
             && matches!(backing, Backing::File { .. })
             && !self.is_translated(&backing).unwrap_or(false)
         {
@@ -128,10 +159,15 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
             backing,
         };
         let machine = &mut self.machine;
-        let (address, fill) = match self.space.map(&request, &mut |to| machine.grow(to)) {
+        let pages = &mut self.pages;
+        let enforcement = self.enforcement;
+        let (address, fill) = match self.space.map(&request, &mut |to| crate::syscall::grow_memory(machine, pages, enforcement, to)) {
             Ok(answer) => answer,
             Err(errno) => return Outcome::Done(errno.as_result()),
         };
+        // The page table learns the mapping before anything is written into
+        // it, because everything written into it goes through the table.
+        self.sync_pages(address, address + length);
         // Zeroed first, then the file's bytes over the top: the tail of the
         // last page past the file's end reads as zeros on Linux, and a copy
         // alone would leave whatever was there.
@@ -226,16 +262,21 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
             return Ok(());
         }
         let slice = &contents[from as usize..to as usize];
-        // SAFETY: the mapping was just reserved inside the guest's memory,
-        // and `write` bounds-checks the destination again.
-        unsafe { self.memory().write(address, slice) }
+        // The kernel's own write: a guest may map a file read-only, and the
+        // bytes still have to be there when it looks. The address space by
+        // its field because `contents` still borrows the filesystem, and the
+        // two are disjoint parts of the kernel.
+        crate::memory::GuestMemory::new(&mut self.pages).place(address, slice)
     }
 
     pub(crate) fn munmap(&mut self, arguments: Arguments) -> Outcome {
         let start = arguments.get(0) as u64;
         let length = arguments.get(1) as u64;
         Outcome::Done(match self.space.unmap(start, length) {
-            Ok(()) => 0,
+            Ok(()) => {
+                self.sync_pages(start, start + length);
+                0
+            }
             Err(errno) => errno.as_result(),
         })
     }
@@ -245,7 +286,10 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
         let length = arguments.get(1) as u64;
         let prot_bits = arguments.get(2) as i32;
         Outcome::Done(match self.space.protect(start, length, prot_bits) {
-            Ok(()) => 0,
+            Ok(()) => {
+                self.sync_pages(start, start + length);
+                0
+            }
             Err(errno) => errno.as_result(),
         })
     }
@@ -258,6 +302,8 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
             Ok(fill) => fill,
             Err(errno) => return Outcome::Done(errno.as_result()),
         };
+        // Advice can split a mapping, and a split is a change to the tree.
+        self.sync_pages(start, start + length);
         Outcome::Done(match self.zero(fill) {
             Ok(()) => 0,
             Err(errno) => errno.as_result(),
@@ -270,31 +316,31 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
         let new_length = arguments.get(2) as u64;
         let flags = arguments.get(3) as i32;
         let machine = &mut self.machine;
+        let pages = &mut self.pages;
+        let enforcement = self.enforcement;
         let moved = match self
             .space
             .remap(start, old_length, new_length, flags, &mut |to| {
-                machine.grow(to)
+                crate::syscall::grow_memory(machine, pages, enforcement, to)
             }) {
             Ok(moved) => moved,
             Err(errno) => return Outcome::Done(errno.as_result()),
         };
+        // Both ends: the range it left, which may now be a hole, and the
+        // range it arrived at. Growing in place moves only the second.
+        self.sync_pages(start, start + old_length.max(new_length));
+        self.sync_pages(moved.to, moved.to + moved.length.max(new_length));
         if moved.to != moved.from && moved.length > 0 {
-            // SAFETY: both ranges are inside the guest's memory, and the
-            // copy is overlapping-safe because a moved mapping may land on
-            // a range the old one touched.
-            let memory = self.memory();
-            if let Err(errno) = memory
-                .check(moved.from, moved.length)
-                .and_then(|()| memory.check(moved.to, moved.length))
-            {
-                return Outcome::Done(errno.as_result());
-            }
-            unsafe {
-                core::ptr::copy(
-                    moved.from as usize as *const u8,
-                    moved.to as usize as *mut u8,
-                    moved.length as usize,
-                );
+            // The kernel moving its own mapping, not a copy on the guest's
+            // behalf — the source mapping does not exist any more, because
+            // the tree has already moved it, so asking whether the guest may
+            // read there would be asking about a mapping that was released a
+            // few lines ago. That question used to be answerable because the
+            // check only asked "is this inside linear memory"; now that it
+            // asks "is this mapped", the honest answer is no and the copy
+            // has to say what it actually is.
+            if let Err(errno) = self.pages.relocate(moved.to, moved.from, moved.length) {
+                return Outcome::Done(crate::errno::Errno::from(errno).as_result());
             }
         }
         if let Err(errno) = self.zero(moved.fill) {
@@ -316,13 +362,14 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
         Outcome::Done(0)
     }
 
+    /// Zeroing a range the kernel is handing over, which is the kernel's
+    /// own write rather than the guest's: the mapping may be read-only, and
+    /// it still has to arrive zeroed.
     fn zero(&mut self, fill: Fill) -> Result<(), Errno> {
         if fill.length == 0 {
             return Ok(());
         }
-        // SAFETY: the range was just reserved inside the guest's memory,
-        // and `fill` bounds-checks it again.
-        unsafe { self.memory().fill(fill.start, fill.length, 0) }
+        self.memory_mut().place_fill(fill.start, fill.length, 0)
     }
 
     /// `/proc/self/maps`, rendered from the tree on each read.

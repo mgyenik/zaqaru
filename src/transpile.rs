@@ -34,7 +34,8 @@ use crate::machine::{MachineState, RETURN_ADDRESS_SENTINEL, STACK_POINTER_REGIST
 use crate::reader::{ObjectFile, SectionRole, SymbolBinding, SymbolRole};
 use crate::structurer;
 use crate::translate::{
-    FunctionTranslator, RED_ZONE_RESERVED, RESUME_ENTRY_MASK, ResumeSites, SYSCALL_RESERVATION,
+    FunctionTranslator, RED_ZONE_RESERVED, RESUME_ENTRY_MASK, RESUME_ID_TAG, ResumeSites,
+    SYSCALL_RESERVATION,
     SymbolResolver, SymbolValue,
 };
 
@@ -48,6 +49,26 @@ pub const GUEST_SUFFIX: &str = "_guest";
 /// weakly, so that objects transpiled separately link into one module with
 /// one driver.
 pub const RESUME_DRIVER: &str = "x86_resume";
+
+/// The table slot [`RESUME_DRIVER`] occupies, as a function anything can
+/// call.
+///
+/// The kernel needs it to re-enter a thread whose continuation it holds —
+/// `longjmp`'s case, and M7's — and a linked module cannot be asked for a
+/// table index from outside. Defined here when resume is on and weakly by
+/// the seam otherwise, exactly as [`EXEC_MAP_LOOKUP`] is, so a container
+/// built without resume answers `-1` rather than failing to link.
+pub const RESUME_SLOT: &str = "x86_resume_slot";
+
+/// What the exec map calls when a missed value turns out to be a resume ID
+/// rather than an address: `longjmp` arriving at the one place that can tell
+/// the difference.
+///
+/// The kernel records the continuation and the seam's throw discards the
+/// wasm frames between here and the frame `setjmp` was called from — which
+/// is the blocking-syscall leave path, used verbatim, because those frames
+/// are as redundant here as they are there.
+pub const LONGJMP_ENTRY: &str = "kisal_longjmp";
 
 /// The kernel seam: what a translated `syscall` calls.
 ///
@@ -77,6 +98,10 @@ struct SymbolTable<'a> {
     /// Functions by where they start, for calls the assembler already
     /// resolved into a bare offset.
     functions_by_location: HashMap<(usize, u64), FunctionReference>,
+    /// Where the resume driver sits in the table, once it has a slot.
+    resume_driver_slot: Option<TableReference>,
+    /// The function that reports that slot across the link.
+    resume_slot_accessor: Option<FunctionReference>,
     /// Slots in the indirect function table, for functions whose address is
     /// taken. Keyed the same way as `functions_by_location`, plus by symbol
     /// for functions another object defines.
@@ -92,6 +117,9 @@ struct SymbolTable<'a> {
     untranslated: Option<FunctionReference>,
     /// The imported [`NO_FUNCTION_AT`], present for a linked input.
     no_function_at: Option<FunctionReference>,
+    /// The kernel's `longjmp` row and the seam's throw, present together or
+    /// not at all: a missed resume ID is meaningless without both.
+    longjmp: Option<(FunctionReference, FunctionReference)>,
     /// The x87 helpers, indexed by [`crate::translate::x87::X87Helper`],
     /// present when anything in the object uses the stack.
     x87_helpers: [Option<FunctionReference>; crate::translate::x87::X87Helper::ALL.len()],
@@ -478,11 +506,14 @@ impl<'a> Transpiler<'a> {
             object: self.object,
             functions: HashMap::new(),
             functions_by_location: HashMap::new(),
+            resume_driver_slot: None,
+            resume_slot_accessor: None,
             table_slots_by_location: HashMap::new(),
             table_slots_by_symbol: HashMap::new(),
             exec_map: None,
             untranslated: None,
             no_function_at: None,
+            longjmp: None,
             x87_helpers: [None; crate::translate::x87::X87Helper::ALL.len()],
             x87_stack: None,
             wide_division: None,
@@ -535,7 +566,7 @@ impl<'a> Transpiler<'a> {
 
         // Table slots have to exist before anything can refer to one, and
         // they are only known once every function has a symbol.
-        self.assign_table_slots(&mut wasm, &mut symbols, &references, &mut plans);
+        self.assign_table_slots(&mut wasm, &mut symbols, &references, &mut plans, driver);
         // The static exec map, which only a linked input needs: a function
         // pointer there is a virtual address, and this is what turns one
         // into a slot.
@@ -562,6 +593,7 @@ impl<'a> Transpiler<'a> {
                     symbols
                         .no_function_at
                         .expect("a linked input declares the reporter"),
+                    symbols.longjmp,
                 ),
             )
         });
@@ -746,8 +778,21 @@ impl<'a> Transpiler<'a> {
                 build_resume_driver(
                     &machine,
                     resume_type.expect("the driver exists only when the type does"),
+                    symbols.no_function_at,
                 ),
             ));
+        }
+
+        if let (Some(accessor), Some(slot)) =
+            (symbols.resume_slot_accessor, symbols.resume_driver_slot)
+        {
+            let slot_type = wasm.intern_type(FunctionType {
+                parameters: vec![],
+                results: vec![ValueType::I32],
+            });
+            let mut body = FunctionBodyBuilder::new(0);
+            body.i32_const_table_index(slot);
+            bodies.push((accessor.function_index, slot_type, body.finish()));
         }
 
         if let (Some(reference), Some((lookup_type, body))) = (exec_map, exec_map_body) {
@@ -1008,6 +1053,7 @@ impl<'a> Transpiler<'a> {
         symbols: &mut SymbolTable<'_>,
         references: &TextReferences,
         plans: &mut [FunctionPlan],
+        driver: Option<FunctionReference>,
     ) {
         let mut next_slot = FIRST_TABLE_INDEX;
         let mut claim = |function: FunctionReference| {
@@ -1056,6 +1102,14 @@ impl<'a> Transpiler<'a> {
             let Some(resume) = plan.resume else { continue };
             plan.resume_slot = Some(claim(resume));
             wasm.table_functions.push(resume.function_index);
+        }
+
+        // And the driver itself, which is how the kernel re-enters a thread
+        // it holds a continuation for. It is an ordinary guest-convention
+        // function, so the slot goes through the same table as any other.
+        if let Some(driver) = driver {
+            symbols.resume_driver_slot = Some(claim(driver));
+            wasm.table_functions.push(driver.function_index);
         }
     }
 
@@ -1163,6 +1217,32 @@ impl<'a> Transpiler<'a> {
                 symbol_index,
                 function_index,
             });
+        }
+
+        // `longjmp`'s two halves, which exist only where resume IDs do — with
+        // resume off no value can carry the tag, so the arm would be dead
+        // code and two imports a link without a kernel would have to answer.
+        if self.object.layout == crate::reader::Layout::Linked && self.resume {
+            let mut import = |field: &str, type_index: u32| {
+                let function_index = wasm.imported_functions.len() as u32;
+                wasm.imported_functions.push(ImportedFunction {
+                    module: ENVIRONMENT_MODULE.to_string(),
+                    field: field.to_string(),
+                    type_index,
+                });
+                let symbol_index = wasm.add_symbol(Symbol {
+                    name: field.to_string(),
+                    target: SymbolTarget::Function(function_index),
+                    flags: symbol_flags::UNDEFINED,
+                });
+                FunctionReference {
+                    symbol_index,
+                    function_index,
+                }
+            };
+            let record = import(LONGJMP_ENTRY, address_type);
+            let throw = import(crate::seam::YIELD_THROW, guest_type);
+            symbols.longjmp = Some((record, throw));
         }
 
         // The seam is an import like any other undefined callee, but it is
@@ -1554,6 +1634,23 @@ impl<'a> Transpiler<'a> {
             next_index += 1;
         }
 
+        // The accessor that reports the driver's slot. Strong, so that it
+        // wins over the seam's weak `-1` wherever a resume-on guest is in
+        // the link.
+        if driver.is_some() {
+            let index = next_index;
+            next_index += 1;
+            let symbol = wasm.add_symbol(Symbol {
+                name: RESUME_SLOT.to_string(),
+                target: SymbolTarget::Function(index),
+                flags: 0,
+            });
+            symbols.resume_slot_accessor = Some(FunctionReference {
+                symbol_index: symbol,
+                function_index: index,
+            });
+        }
+
         // The exec map's lookup takes an index here too, so that every
         // definition's index is reserved in one place and the bodies can be
         // pushed in the order they were claimed.
@@ -1782,7 +1879,11 @@ fn resume_entries(lifted: &LiftedFunction, graph: &ControlFlowGraph) -> Result<H
 /// resume body runs its frame to completion and yields the ID above it,
 /// until the sentinel the entry wrapper planted says the chain is done. The
 /// program's result is where it always is, in the register globals.
-fn build_resume_driver(machine: &MachineState, resume_type: u32) -> FunctionBody {
+fn build_resume_driver(
+    machine: &MachineState,
+    resume_type: u32,
+    report: Option<FunctionReference>,
+) -> FunctionBody {
     let mut body = FunctionBodyBuilder::new(0);
     let id = body.declare_local(ValueType::I64);
 
@@ -1815,6 +1916,25 @@ fn build_resume_driver(machine: &MachineState, resume_type: u32) -> FunctionBody
     body.if_();
     body.branch(2);
     body.end();
+
+    // Anything that is not an ID and not the sentinel means the walk has
+    // left the chain — a frame whose return slot never held a continuation,
+    // which is a fact about the guest's stack rather than about this loop.
+    // Named here rather than dispatched on: the low half of a stray value is
+    // a table index, and `call_indirect` on one is either an out-of-bounds
+    // trap with nothing to say or, worse, an in-bounds call to an unrelated
+    // resume body.
+    if let Some(report) = report {
+        body.local_get(id);
+        body.i64_const(RESUME_ID_TAG);
+        body.i64_and();
+        body.i64_eqz();
+        body.if_();
+        body.local_get(id);
+        body.call(report);
+        body.unreachable();
+        body.end();
+    }
 
     // A resume ID: entry index in the high half, table slot in the low, and
     // the frame-size marker riding above the index.
@@ -2475,6 +2595,7 @@ fn build_exec_map_lookup(
     table: DataReference,
     count: u32,
     report: FunctionReference,
+    longjmp: Option<(FunctionReference, FunctionReference)>,
 ) -> FunctionBody {
     let mut body = FunctionBodyBuilder::new(1);
     let low = body.declare_local(ValueType::I32);
@@ -2551,9 +2672,36 @@ fn build_exec_map_lookup(
     body.end(); // loop
     body.end(); // block
 
-    // Not a function. The address is the whole of what is worth knowing,
-    // so it is named rather than trapped on anonymously.
+    // Not a function — and one of two things.
+    //
+    // A *resume ID* is `longjmp` arriving: `setjmp` saved the word at
+    // `(%rsp)`, which under resume is the continuation of its caller's call
+    // site, and `longjmp` jumped to it. The kernel is told which
+    // continuation to run and the seam's throw discards the wasm frames in
+    // between, which is the blocking-syscall leave path used verbatim.
+    //
+    // Anything else is an address nothing translated, which stays the loud
+    // miss it has always been. The check is here, in the path that has
+    // already failed, so a function pointer that hits the map never pays for
+    // it.
     body.local_get(0);
+    if let Some((record, throw)) = longjmp {
+        body.i64_const(RESUME_ID_TAG);
+        body.i64_and();
+        body.i64_eqz();
+        body.if_();
+        body.local_get(0);
+        body.call(report);
+        body.unreachable();
+        body.else_();
+        body.local_get(0);
+        body.call(record);
+        body.call(throw);
+        body.unreachable();
+        body.end();
+        body.unreachable();
+        return body.finish();
+    }
     body.call(report);
     body.unreachable();
     body.finish()

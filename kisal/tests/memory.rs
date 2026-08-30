@@ -39,28 +39,43 @@ impl Drop for Tree {
     }
 }
 
-/// The guest's whole address space, as a buffer this process owns.
+/// The guest's whole address space, mapped at guest addresses.
+///
+/// It used to be a `Box<[u8]>` whose host address the kernel was handed as a
+/// guest address. The page table forbids that — a host heap pointer is far
+/// outside the four gigabytes the machine has — so the region is mapped
+/// low, where a guest's memory really is.
 struct Space_ {
-    bytes: Box<[u8]>,
+    region: targum::arena::Arena,
 }
 
 impl Space_ {
     fn base(&self) -> u64 {
-        self.bytes.as_ptr() as usize as u64
+        self.region.base()
     }
 
     fn end(&self) -> u64 {
-        self.base() + self.bytes.len() as u64
+        self.region.limit()
     }
 
     fn read(&self, address: u64, length: usize) -> &[u8] {
-        let offset = (address - self.base()) as usize;
-        &self.bytes[offset..offset + length]
+        assert!(
+            address >= self.base() && address + length as u64 <= self.end(),
+            "{address:#x} is outside the guest's memory"
+        );
+        // SAFETY: inside the committed region, checked above.
+        unsafe { core::slice::from_raw_parts(address as usize as *const u8, length) }
     }
 
     fn write(&mut self, address: u64, bytes: &[u8]) {
-        let offset = (address - self.base()) as usize;
-        self.bytes[offset..offset + bytes.len()].copy_from_slice(bytes);
+        assert!(
+            address >= self.base() && address + bytes.len() as u64 <= self.end(),
+            "{address:#x} is outside the guest's memory"
+        );
+        // SAFETY: as above.
+        unsafe {
+            (address as usize as *mut u8).copy_from(bytes.as_ptr(), bytes.len());
+        }
     }
 }
 
@@ -111,7 +126,7 @@ fn fixture(label: &str) -> Fixture {
     let image = kisal::image::Image::parse(&baked.index, &baked.blob).expect("parse");
 
     let memory = Space_ {
-        bytes: vec![0u8; ARENA].into_boxed_slice(),
+        region: targum::arena::Arena::new(ARENA as u64),
     };
     let scratch = memory.base();
     let arena_start = scratch + SCRATCH;
@@ -1265,4 +1280,52 @@ fn a_guest_reads_proc_self_maps_as_a_file() {
 
     // Reading on returns nothing more: the offset advanced past the end.
     assert_eq!(fixture.call(number::READ, [fd, buffer, 4096, 0, 0, 0]), 0);
+}
+
+/// A range a fixed mapping took must not be handed out again.
+///
+/// The address space knows two things: which mappings exist, and which
+/// ranges are free to give away. `MAP_FIXED` used to update only the first —
+/// it removed the mappings it replaced, and left the range sitting in the
+/// free pool. The next `mmap` with no hint could then be handed an address a
+/// mapping already occupied, and the two would share memory: one program's
+/// writes landing in another's buffer, with `/proc/self/maps` showing both.
+///
+/// It stayed invisible because nothing enforced what the tree recorded. The
+/// interpreter's page table does, so it noticed the tree holding two
+/// overlapping mappings at once.
+#[test]
+fn a_fixed_mapping_is_not_handed_out_twice() {
+    let mut fixture = fixture("fixed-reuse");
+    // A region, then most of it given back, so the pool holds a big range.
+    let base = fixture.anonymous(4 * PAGE);
+    let shrunk = fixture.call(
+        number::MUNMAP,
+        [base as i64 + PAGE, 3 * PAGE, 0, 0, 0, 0],
+    );
+    assert_eq!(shrunk, 0);
+
+    // A fixed mapping inside what the pool now holds.
+    let claimed = base + PAGE as u64;
+    let fixed = fixture.map(
+        claimed as i64,
+        PAGE,
+        prot::READ,
+        map::PRIVATE | map::ANONYMOUS | map::FIXED,
+    );
+    assert_eq!(fixed, claimed as i64);
+
+    // Now ask for memory repeatedly. None of it may land on the fixed
+    // mapping, and no two answers may overlap each other either.
+    let mut taken: Vec<(u64, u64)> = vec![(claimed, PAGE as u64)];
+    for _ in 0..4 {
+        let address = fixture.anonymous(PAGE);
+        for (start, length) in &taken {
+            assert!(
+                address + PAGE as u64 <= *start || address >= start + length,
+                "{address:#x} overlaps the mapping at {start:#x}"
+            );
+        }
+        taken.push((address, PAGE as u64));
+    }
 }

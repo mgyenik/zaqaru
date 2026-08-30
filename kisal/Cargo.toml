@@ -11,8 +11,18 @@ description = "The in-guest Linux-personality kernel: syscalls handled inside th
 crate-type = ["staticlib", "rlib"]
 
 [dependencies]
+# The address space. `targum/src/space.rs` is the page table — one bit per
+# page per permission, plus the bitmap that says which pages a decoded block
+# came from — and `kisal/src/space.rs` is the VMA tree above it: what a
+# mapping *is*, what it is called, and what `/proc/self/maps` says about it.
+# Real kernels keep both for the same reason. The tree answers questions;
+# the table is what every access tests, so it has to be a load and a shift.
+targum = { path = "../targum" }
 
 [dev-dependencies]
+# The tests name the address space directly, because some of them are about
+# what it does rather than about a row that uses it.
+targum = { path = "../targum" }
 # A cycle Cargo allows, and the honest one: the kernel's tests drive real
 # baked images rather than a hand-written stand-in for one.
 baker = { path = "../baker" }

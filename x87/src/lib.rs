@@ -36,6 +36,23 @@
 //! Exception *flags* are recorded faithfully (including ES and the stack
 //! fault); exception *traps* are not delivered yet — everything behaves
 //! as-if-masked, which is also why `fwait` is currently a no-op.
+//!
+//! # Two oracles
+//!
+//! The hardware oracle in `tests/oracle.rs` drives each operation from a
+//! fresh state, which is what makes it able to sweep millions of operands.
+//! It is structurally blind to one class of defect: what an operation
+//! leaves behind for the *next* one. A condition code that should have been
+//! written to zero and was left alone, a flag that should have been
+//! suppressed because the other operand was a NaN, register data erased
+//! where hardware only marks it unreachable — each of those is invisible
+//! from a fresh state and visible in a sequence.
+//!
+//! The VM's lockstep oracle (`targum/tests/lockstep.rs`) supplies the sequence:
+//! it compares all eighty bits of every stack register and both descriptive
+//! words against a `ptrace`d process after every retired instruction. Four
+//! defects of that shape were found and fixed on 2026-08-30. Neither oracle
+//! replaces the other, and a change to this crate should answer to both.
 
 pub mod arith;
 pub mod compare;

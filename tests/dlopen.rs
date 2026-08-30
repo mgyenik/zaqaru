@@ -105,20 +105,21 @@ int main(void) {
 /// The failure path, which is a different question and gets its own test.
 ///
 /// `dlopen` of something absent leaves `ld.so` by `longjmp`, out of
-/// `_dl_catch_exception` — and `longjmp` jumps to the return address
-/// `setjmp` saved, which in a translated program is the sentinel a call site
-/// stores where a return address would be. That is the parked thorn
-/// `container-plan.md` names, reached here on purpose so the shape is on
-/// record rather than met in anger.
+/// `_dl_catch_exception` — which was the parked thorn, and is now the
+/// setjmp design's gate. It reports through `dlerror`, so the text is part
+/// of the answer: a `dlopen` that returned `NULL` for the wrong reason would
+/// pass a check on the pointer alone.
 const MISSING_SOURCE: &str = r##"
 #include <dlfcn.h>
 #include <stdio.h>
 
 int main(void) {
     printf("before\n");
-    fflush(stdout);
     void *missing = dlopen("/lib/libnothing.so", RTLD_NOW);
     printf("missing:%s\n", missing ? "loaded" : "refused");
+    if (!missing) {
+        printf("dlerror:%s\n", dlerror());
+    }
     return 0;
 }
 "##;
@@ -369,66 +370,37 @@ fn sweeping_an_image_with_nothing_in_it_changes_nothing() {
     );
 }
 
-/// `dlopen` of something absent stops on the setjmp/longjmp thorn, and this
-/// records exactly how — which is now the *design's premise*, demonstrated.
+/// `dlopen` of something absent returns `NULL` and says why — which is
+/// where the setjmp design started and what it was for.
 ///
-/// `ld.so` reports a load failure by `longjmp`ing out of
-/// `_dl_catch_exception`, and `longjmp` jumps to the return address `setjmp`
-/// saved. With the container pipeline building with `--resume`, that word is
-/// not a return address at all: it is the **resume ID** the call site stored,
-/// a materialized continuation saved by code that has no idea that is what
-/// it is doing. Which is the whole of `container-plan.md`'s setjmp design,
-/// observed rather than argued.
+/// This test used to assert the opposite: that the container *died*, on a
+/// miss whose address was the value `setjmp` had saved. That was the thorn's
+/// signature, recorded so the day it was designed away something would say
+/// so. This is that day, and the test says what the design bought instead:
+/// ordinary control flow, and the same `dlerror` text Linux produces.
 ///
-/// So what this asserts is the *discrimination* the design turns on: the
-/// value that misses is not an address. A resume ID is a table slot in its
-/// low half and an entry index in its high one, so it is either a small
-/// integer or larger than any address a guest can hold — never in between,
-/// where code lives. When the design is built this stops being a miss at
-/// all, and this test is what says so.
+/// It is not an incidental case. `ctypes.util.find_library` and every
+/// package wrapping a C library *probe* by dlopening candidates and catching
+/// the failure, so this is the common path rather than the error path.
 #[test]
-fn a_failed_dlopen_stops_on_the_longjmp_thorn() {
+fn a_failed_dlopen_returns_null_with_its_error() {
     let workspace = WorkingDirectory::new("dlopen-missing");
-    let report = match run(&workspace, "dlopen-missing", MISSING_SOURCE) {
-        Err(report) => report,
-        Ok(written) => panic!(
-            "`dlopen` of an absent library completed — the setjmp/longjmp \
-             thorn has been designed away, and this test is what says so. \
-             Delete it, and give `dlerror` a real test. The guest wrote:\n{written}"
-        ),
-    };
+    let written = run(&workspace, "dlopen-missing", MISSING_SOURCE)
+        .unwrap_or_else(|report| panic!("the container did not finish: {report}"));
 
-    // It got as far as the call, so what stopped it is the load and not
-    // something before it.
     assert!(
-        report.contains("before\n"),
-        "the program did not reach the `dlopen`:\n{report}"
+        written.contains("before\n"),
+        "the program did not reach the `dlopen`:\n{written}"
     );
-
-    // And it stopped on something that is not an address. The kernel names
-    // it in hexadecimal; pull it back out and check its shape.
-    let missed = report
-        .split("0x")
-        .filter_map(|rest| {
-            let digits: String = rest.chars().take_while(char::is_ascii_hexdigit).collect();
-            u64::from_str_radix(&digits, 16).ok().filter(|_| !digits.is_empty())
-        })
-        .find(|value| *value != 0)
-        .unwrap_or_else(|| panic!("the kernel named no address:\n{report}"));
-
-    let sentinel = zaqaru::machine::RETURN_ADDRESS_SENTINEL as u64;
-    assert_ne!(
-        missed, sentinel,
-        "the saved return address is still the sentinel, so the container was \
-         built without `--resume` — which is work item zero of the setjmp \
-         design, not a property of `longjmp`:\n{report}"
-    );
-    // A slot alone, or a slot with an entry index above it. Nothing a guest
-    // could mistake for a function's address, which is what lets the miss
-    // path tell the two apart at no cost to the calls that hit.
     assert!(
-        missed < 0x1_0000 || missed >= 1 << 32,
-        "{missed:#x} is in the range guest code lives in, so it is not a \
-         resume ID and this is a different failure:\n{report}"
+        written.contains("missing:refused\n"),
+        "`dlopen` of an absent library did not return NULL:\n{written}"
+    );
+    // The text as well as the pointer: a `NULL` for the wrong reason would
+    // pass a check on the pointer alone, and `ld.so` reaching its error path
+    // at all is the thing that used to be impossible.
+    assert!(
+        written.contains("cannot open shared object file"),
+        "`dlerror` did not report what went wrong:\n{written}"
     );
 }

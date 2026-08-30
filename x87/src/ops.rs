@@ -40,6 +40,22 @@ impl Binary {
     }
 }
 
+/// The flags a memory operand's *conversion* contributes, given what it is
+/// about to meet.
+///
+/// A denormal `m32`/`m64` raises the denormal-operand exception on its way
+/// into the eighty-bit format — but not when the other operand is a NaN,
+/// because the NaN path is taken before the denormal one is signalled.
+/// Measured 2026-08-30 against hardware, for `fadd`, `fmul` and `fcom`
+/// alike, in the register form as well as the memory form; it is the same
+/// precedence [`compare::compare`] was probed for two days earlier.
+fn operand_flags(other: F80, operand: &Outcome) -> u16 {
+    match arith::nan_present(other, operand.value) {
+        true => operand.flags & !crate::flags::DENORMAL,
+        false => operand.flags,
+    }
+}
+
 impl X87State {
     fn modes(&self) -> (Rounding, Precision) {
         (self.rounding(), self.precision())
@@ -69,6 +85,7 @@ impl X87State {
 
     pub fn fld_sti(&mut self, index: u32) {
         let value = self.read(index);
+        self.merge_arithmetic(0);
         self.push(value);
     }
 
@@ -86,8 +103,15 @@ impl X87State {
     // --- stores ---
 
     /// `fstp m80`: verbatim bytes out; only an empty source objects.
+    ///
+    /// It still *writes* C1, to zero — nothing was rounded, because nothing
+    /// was converted. Leaving the bit alone instead leaks the previous
+    /// operation's rounding answer into the status word, where a `fnstsw`
+    /// can read it; found by the lockstep oracle, which sees a status word
+    /// after every instruction rather than after each one in isolation.
     pub fn fstp_m80(&mut self) -> [u8; 10] {
         let value = self.read(0);
+        self.merge_arithmetic(0);
         self.pop();
         value.to_bytes()
     }
@@ -160,7 +184,7 @@ impl X87State {
         let a = self.read(0);
         let (rounding, precision) = self.modes();
         let out = op.apply(a, operand.value, rounding, precision);
-        self.merge_arithmetic(operand.flags | out.flags);
+        self.merge_arithmetic(operand_flags(a, &operand) | out.flags);
         self.write(0, out.value);
     }
 
@@ -320,13 +344,15 @@ impl X87State {
 
     pub fn fcom_m64(&mut self, bits: u64, pops: u32) {
         let operand = convert::from_f64(bits);
-        self.merge_arithmetic(operand.flags);
+        let flags = operand_flags(self.peek(0), &operand);
+        self.merge_arithmetic(flags);
         self.compared(operand.value, NanPolicy::Signalling, pops);
     }
 
     pub fn fcom_m32(&mut self, bits: u32, pops: u32) {
         let operand = convert::from_f32(bits);
-        self.merge_arithmetic(operand.flags);
+        let flags = operand_flags(self.peek(0), &operand);
+        self.merge_arithmetic(flags);
         self.compared(operand.value, NanPolicy::Signalling, pops);
     }
 

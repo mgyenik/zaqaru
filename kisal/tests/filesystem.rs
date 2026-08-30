@@ -197,31 +197,51 @@ impl Store for ConsoleStore {
     }
 }
 
-/// The guest's memory, as far as these tests are concerned: one buffer, with
+/// The guest's memory, as far as these tests are concerned: one region, with
 /// the kernel's limit set to its end so that every bounds check is real.
+///
+/// Mapped at a *guest* address rather than allocated on the host heap. It
+/// used to be a `Box<[u8]>` whose host address was handed over as a guest
+/// address, which worked while the kernel dereferenced whatever it was
+/// given. The page table does not: the guest's address space is four
+/// gigabytes and a host heap pointer is nowhere near it, so every one of
+/// these tests would answer `EFAULT` — correctly. Low addresses are where a
+/// guest's memory really is.
 struct Arena {
-    bytes: Box<[u8]>,
+    region: targum::arena::Arena,
     used: usize,
 }
 
 impl Arena {
+    const LENGTH: usize = 64 * 1024;
+
     fn new() -> Self {
         Self {
-            bytes: vec![0u8; 64 * 1024].into_boxed_slice(),
+            region: targum::arena::Arena::new(Self::LENGTH as u64),
             used: 0,
         }
     }
 
+    fn base(&self) -> usize {
+        self.region.base() as usize
+    }
+
+    fn bytes(&mut self) -> &mut [u8] {
+        // SAFETY: the region committed `LENGTH` bytes at this address, and
+        // the borrow is exclusive because `self` is.
+        unsafe { core::slice::from_raw_parts_mut(self.base() as *mut u8, Self::LENGTH) }
+    }
+
     fn limit(&self) -> u64 {
-        self.bytes.as_ptr() as usize as u64 + self.bytes.len() as u64
+        self.region.limit()
     }
 
     fn place(&mut self, bytes: &[u8]) -> i64 {
         let start = self.used.next_multiple_of(8);
-        assert!(start + bytes.len() <= self.bytes.len(), "arena exhausted");
-        self.bytes[start..start + bytes.len()].copy_from_slice(bytes);
+        assert!(start + bytes.len() <= Self::LENGTH, "arena exhausted");
+        self.bytes()[start..start + bytes.len()].copy_from_slice(bytes);
         self.used = start + bytes.len();
-        self.bytes.as_ptr() as usize as i64 + start as i64
+        self.base() as i64 + start as i64
     }
 
     /// A NUL-terminated path, as a guest would pass one.
@@ -238,26 +258,28 @@ impl Arena {
     /// Non-zero bytes with no terminator, with room to spare after them.
     fn unterminated(&mut self, length: usize) -> i64 {
         let start = self.used.next_multiple_of(8);
-        assert!(start + length <= self.bytes.len(), "arena exhausted");
-        self.bytes[start..start + length].fill(b'x');
+        assert!(start + length <= Self::LENGTH, "arena exhausted");
+        self.bytes()[start..start + length].fill(b'x');
         self.used = start + length;
-        self.bytes.as_ptr() as usize as i64 + start as i64
+        self.base() as i64 + start as i64
     }
 
     /// Non-zero bytes with no terminator, ending exactly at the end of the
     /// guest's memory — the case where the reachable span is shorter than
     /// the limit the caller asked for.
     fn unterminated_to_end(&mut self, length: usize) -> i64 {
-        let start = self.bytes.len() - length;
+        let start = Self::LENGTH - length;
         assert!(start >= self.used, "arena exhausted");
-        self.bytes[start..].fill(b'x');
-        self.used = self.bytes.len();
-        self.bytes.as_ptr() as usize as i64 + start as i64
+        self.bytes()[start..].fill(b'x');
+        self.used = Self::LENGTH;
+        self.base() as i64 + start as i64
     }
 
     fn read(&self, address: i64, length: usize) -> &[u8] {
-        let offset = address as usize - self.bytes.as_ptr() as usize;
-        &self.bytes[offset..offset + length]
+        let offset = address as usize - self.base();
+        assert!(offset + length <= Self::LENGTH, "outside the arena");
+        // SAFETY: inside the committed region, checked above.
+        unsafe { core::slice::from_raw_parts((self.base() + offset) as *const u8, length) }
     }
 }
 

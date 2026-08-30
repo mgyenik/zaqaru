@@ -1093,6 +1093,47 @@ pub unsafe fn native_function<'library, Signature: Copy>(
 /// Its own target directory, for the reason `kisal_staticlib` has one:
 /// cargo takes a lock per directory and these tests are themselves running
 /// under cargo.
+/// Builds a workspace crate for wasm32 and answers its staticlib.
+///
+/// One helper rather than one per crate: the engine made the third, and a
+/// third copy of the same twenty lines is a copy too many.
+pub fn wasm_staticlib(crate_name: &'static str, library: &'static str) -> PathBuf {
+    use std::sync::{Mutex, OnceLock};
+    static BUILT: OnceLock<Mutex<std::collections::HashMap<&'static str, PathBuf>>> =
+        OnceLock::new();
+    let built = BUILT.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    let mut built = built.lock().unwrap_or_else(|poison| poison.into_inner());
+    if let Some(path) = built.get(crate_name) {
+        return path.clone();
+    }
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let target = root.join("target").join(format!("wasm-{crate_name}"));
+    let output = Command::new(env!("CARGO"))
+        .current_dir(root)
+        .env("CARGO_TARGET_DIR", &target)
+        .args([
+            "build",
+            "-p",
+            crate_name,
+            "--target",
+            "wasm32-unknown-unknown",
+            "--release",
+        ])
+        .output()
+        .unwrap_or_else(|error| panic!("run cargo to build {crate_name} for wasm32: {error}"));
+    assert!(
+        output.status.success(),
+        "building {crate_name} for wasm32 failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let path = target
+        .join("wasm32-unknown-unknown")
+        .join("release")
+        .join(library);
+    built.insert(crate_name, path.clone());
+    path
+}
+
 pub fn x87_staticlib() -> PathBuf {
     static BUILT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     BUILT
@@ -1331,6 +1372,91 @@ pub fn program_agrees_with_native(
         "[{label}] the transpiled program exited differently"
     );
     native_status
+}
+
+/// Builds a C source as an ordinary dynamic program, bakes it with
+/// everything it loads, runs it, and requires the container and Linux to
+/// agree on both what it wrote and how it ended.
+///
+/// The default on every distribution this decade is a dynamic
+/// position-independent executable, which is the input the container tier
+/// exists for — and the one that has a libc, which anything using `setjmp`
+/// or `dlopen` needs.
+pub fn dynamic_program_agrees_with_native(
+    workspace: &WorkingDirectory,
+    source: &Path,
+    label: &str,
+) -> String {
+    let elf = workspace.path().join(format!("{label}.elf"));
+    run_tool(
+        "gcc",
+        &[
+            "-O2",
+            &source.to_string_lossy(),
+            "-o",
+            &elf.to_string_lossy(),
+        ],
+    );
+
+    let native = std::process::Command::new(&elf)
+        .env_clear()
+        .output()
+        .expect("run the program natively");
+    let native_status = native.status.code().expect("a native exit status");
+
+    let mut tree = baker::tree::Tree::new();
+    tree.resolve_or_create(b"/tmp").expect("a /tmp in the image");
+    let baked = baker::bake::container(&elf, Path::new("/"), tree)
+        .expect("bake the program and what it loads");
+    let guest = workspace.write(&format!("{label}.wasm.o"), &baked.module);
+    let module = link_container_for_program(
+        workspace,
+        std::slice::from_ref(&guest),
+        &baked.image,
+        label,
+        Some(baked.top),
+    );
+    let mut mounts = mounts_seeded(&[0x77; 32]);
+    mounts.mount(&[b"iso", b"shutdown"], Box::new(runner::store::Sink::new()));
+    mounts.mount(&[b"iso", b"time"], Box::new(runner::store::Clock::new()));
+    let mut container = runner::Container::instantiate(
+        &std::fs::read(&module).expect("read the container"),
+        mounts,
+    )
+    .expect("instantiate");
+
+    let finished = container.boot();
+    let written = container
+        .mounts()
+        .read(&[b"iso".to_vec(), b"console".to_vec(), b"stdout".to_vec()])
+        .expect("the console mount failed")
+        .unwrap_or_default();
+    let written = String::from_utf8(written).expect("the guest wrote something unreadable");
+    let status = finished.unwrap_or_else(|error| {
+        let log = container
+            .mounts()
+            .read(&[b"iso".to_vec(), b"log".to_vec(), b"error".to_vec()])
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        panic!(
+            "[{label}] the container did not finish: {error:?}\nkernel log: {}\n\
+             stdout so far:\n{written}",
+            String::from_utf8_lossy(&log)
+        )
+    });
+
+    assert_eq!(
+        written,
+        String::from_utf8_lossy(&native.stdout),
+        "[{label}] the container and the native run wrote different things"
+    );
+    assert_eq!(
+        i64::from(status),
+        i64::from(native_status),
+        "[{label}] the container and the native run ended differently"
+    );
+    written
 }
 
 pub fn mounts_seeded(seed: &[u8]) -> runner::store::MountTable {
