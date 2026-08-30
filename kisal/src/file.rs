@@ -1805,6 +1805,121 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
         }
     }
 
+    /// `fadvise64(2)`: what the caller expects to do with a file next.
+    ///
+    /// Advice, and the kernel is free to do nothing with it — which is what
+    /// this one does, because there is no page cache to manage: the image's
+    /// bytes are already in linear memory and there is nothing to read ahead
+    /// or drop. Answering zero is the honest reply, not a stub: Linux's own
+    /// answer for a filesystem with no `fadvise` operation is also zero.
+    ///
+    /// The *checks* are not skipped, because they are the whole of what a
+    /// program can observe here. A bad descriptor is `EBADF`, an advice this
+    /// kernel does not know is `EINVAL`, and a pipe is `ESPIPE` — a call
+    /// that cheerfully accepted all three would be a call that hides a bug
+    /// in whatever asked.
+    pub(crate) fn fadvise(&mut self, arguments: Arguments) -> Outcome {
+        /// `POSIX_FADV_NORMAL` through `NOREUSE`, in Linux's order.
+        const HIGHEST: i64 = 5;
+        let fd = arguments.get(0) as i32;
+        let advice = arguments.get(3);
+        let Ok(file) = self.files.description(fd) else {
+            return Outcome::Done(Errno::BadFile.as_result());
+        };
+        if !(0..=HIGHEST).contains(&advice) {
+            return Outcome::Done(Errno::Invalid.as_result());
+        }
+        match file.backing {
+            Backing::Pipe { .. } => Outcome::Done(Errno::NotSeekable.as_result()),
+            _ => Outcome::Done(0),
+        }
+    }
+
+    /// `statfs(2)` and `fstatfs(2)`: what filesystem is this, and how much
+    /// room is on it.
+    ///
+    /// Both questions are answered from what is actually true here rather
+    /// than with plausible constants, because both are branched on. `ls`
+    /// reads the type to decide whether `d_type` can be trusted; anything
+    /// that writes reads the free count before it starts.
+    ///
+    /// The type is `OVERLAYFS_SUPER_MAGIC`, and it is not a costume: a
+    /// container's root *is* a read-only image with a writable layer over
+    /// it, which is the filesystem overlayfs describes. Saying `ext4` would
+    /// be a claim that unlinking a file in the lower layer frees space, and
+    /// it does not.
+    ///
+    /// The room is the guest's address space, because that is where the
+    /// writable layer lives. A container that fills its overlay stops
+    /// because linear memory ran out, so the number a program reads before
+    /// writing should be the number that will stop it.
+    pub(crate) fn statfs(&mut self, number: i64, arguments: Arguments) -> Outcome {
+        /// `OVERLAYFS_SUPER_MAGIC`.
+        const OVERLAY: u64 = 0x794c_7630;
+        /// `struct statfs` on x86-64.
+        const SIZE: usize = 120;
+        /// `ST_VALID`, which Linux sets to say `f_flags` was filled in at
+        /// all — without it a caller ignores the field.
+        const VALID: u64 = 0x0020;
+
+        let destination = match number == number::FSTATFS {
+            // `fstatfs` takes a descriptor, and every descriptor this kernel
+            // has is on the one filesystem — but a closed one is still
+            // `EBADF`, which is the whole of what it can tell you apart.
+            true => {
+                if self.files.description(arguments.get(0) as i32).is_err() {
+                    return Outcome::Done(Errno::BadFile.as_result());
+                }
+                arguments.get(1)
+            }
+            false => {
+                let root = self.vfs.root();
+                let Ok(path) = self.path_at(arguments.get(0)) else {
+                    return Outcome::Done(Errno::Fault.as_result());
+                };
+                if let Err(errno) = self.vfs.resolve(root, path, Lookup::FOLLOW) {
+                    return Outcome::Done(errno.as_result());
+                }
+                arguments.get(1)
+            }
+        };
+        let used = self.machine.memory_limit();
+        let free = targum::space::CEILING.saturating_sub(used);
+        let blocks = (used + free) / BLOCK_SIZE as u64;
+        let available = free / BLOCK_SIZE as u64;
+        let inodes = match self.vfs.filesystem_of(self.vfs.root()) {
+            Ok(filesystem) => u64::from(filesystem.lower().inode_count()),
+            Err(_) => 0,
+        };
+
+        let mut bytes = [0u8; SIZE];
+        let mut put = |at: usize, value: u64| {
+            bytes[at..at + 8].copy_from_slice(&value.to_le_bytes());
+        };
+        put(0, OVERLAY);
+        put(8, BLOCK_SIZE as u64);
+        put(16, blocks);
+        put(24, available);
+        put(32, available);
+        put(40, inodes);
+        // A new file needs a block for its contents and a record for its
+        // name, so the number of files that can still be made is bounded by
+        // the same memory the blocks are.
+        put(48, available);
+        // `f_fsid` is two words and identifies the filesystem across a
+        // `mount`; there is one here and it does not move.
+        put(56, 0);
+        put(64, MAX_NAME as u64);
+        put(72, BLOCK_SIZE as u64);
+        put(80, VALID);
+
+        // SAFETY: bounds-checked by the write itself.
+        match unsafe { self.memory_mut().write(destination as u64, &bytes) } {
+            Ok(()) => Outcome::Done(0),
+            Err(errno) => Outcome::Done(errno.as_result()),
+        }
+    }
+
     pub(crate) fn dup(&mut self, arguments: Arguments) -> Outcome {
         let before = self.shared_census();
         let answer = match self.files.duplicate(arguments.get(0) as i32, 0, false) {

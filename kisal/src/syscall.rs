@@ -94,6 +94,9 @@ pub mod number {
     pub const PPOLL: i64 = 271;
     pub const EPOLL_PWAIT2: i64 = 441;
     pub const CLOSE_RANGE: i64 = 436;
+    pub const FADVISE64: i64 = 221;
+    pub const STATFS: i64 = 137;
+    pub const FSTATFS: i64 = 138;
     pub const GETRANDOM: i64 = 318;
     pub const STATX: i64 = 332;
     pub const RSEQ: i64 = 334;
@@ -196,6 +199,9 @@ pub mod number {
             EPOLL_PWAIT => "epoll_pwait",
             EPOLL_PWAIT2 => "epoll_pwait2",
             CLOSE_RANGE => "close_range",
+            FADVISE64 => "fadvise64",
+            STATFS => "statfs",
+            FSTATFS => "fstatfs",
             PIPE => "pipe",
             PIPE2 => "pipe2",
             DUP => "dup",
@@ -769,7 +775,7 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
         // bytes, with the guest's `brk` memory and the kernel's heap
         // silently the same. Growing to the ceiling now puts every later
         // kernel allocation above it, permanently.
-        let start = machine.memory_limit();
+        let start = machine.guest_base();
         let ceiling = start.saturating_add(GUEST_ADDRESS_SPACE);
         let reserved = machine.grow(ceiling);
         // Carved from the top of whatever the module already occupies: the
@@ -1872,6 +1878,8 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             }
             number::EPOLL_CTL => self.epoll_control(arguments),
             number::CLOSE_RANGE => self.close_range(arguments),
+            number::FADVISE64 => self.fadvise(arguments),
+            number::STATFS | number::FSTATFS => self.statfs(number, arguments),
             number::EPOLL_WAIT | number::EPOLL_PWAIT => self.epoll_wait(arguments),
             number::DUP => self.dup(arguments),
             number::DUP2 => self.dup2(arguments),
@@ -1998,8 +2006,26 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
         /// `TASK_COMM_LEN`: fifteen bytes and a terminator, fixed by Linux
         /// and by the buffer every caller passes.
         const COMM_LEN: usize = 16;
+        /// `PR_CAPBSET_READ`: is this capability in the bounding set?
+        const CAPBSET_READ: i64 = 23;
+        /// `CAP_LAST_CAP`, measured on this machine's kernel — and the only
+        /// part of the answer a program can check, because everything up to
+        /// it is in the set and everything past it is `EINVAL`.
+        const LAST_CAPABILITY: i64 = 40;
 
         match arguments.get(0) {
+            // The whole bounding set is present, which is what a container
+            // started as root has and what this image expects — and there is
+            // no privilege boundary here for the answer to be a claim about:
+            // the guest is alone in its own kernel, with its own filesystem
+            // and its own address space, and nothing it could be permitted
+            // to do is denied it by a capability. Coreutils' `ls` asks this
+            // before deciding whether to colour by capability, which is how
+            // it turned up.
+            CAPBSET_READ => Outcome::Done(match arguments.get(1) {
+                capability if (0..=LAST_CAPABILITY).contains(&capability) => 1,
+                _ => Errno::Invalid.as_result(),
+            }),
             GET_NAME => {
                 // Linux sets `comm` from the basename of what was exec'd and
                 // truncates it to fit, so that is what this answers. A

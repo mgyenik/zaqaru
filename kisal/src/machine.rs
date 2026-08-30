@@ -107,6 +107,17 @@ pub trait Machine {
         true
     }
 
+    /// Where a new process's address space starts.
+    ///
+    /// The top of memory by default, which is right whenever a process's
+    /// bytes live somewhere of their own — natively they are a file per
+    /// process, and on the ahead-of-time path there is one process. It is
+    /// wrong inside the module, where they share the one linear memory, and
+    /// [`Interpreted`] overrides it there. See `GUEST_BASE`.
+    fn guest_base(&mut self) -> u64 {
+        self.memory_limit()
+    }
+
     /// Puts this process's address space at the guest's addresses, and
     /// takes it down again.
     ///
@@ -368,25 +379,87 @@ pub struct Dormant {
 #[cfg(target_arch = "wasm32")]
 const PAGE_BYTES: usize = targum::space::PAGE_SIZE as usize;
 
+/// Where the guest's address space starts inside the module — decided once,
+/// at the first process, and the same for every process after it.
+///
+/// **Every process uses the same range**, which it can because only one
+/// process's bytes are at the guest's addresses at a time: that is the
+/// invariant `activate` and `deactivate` maintain between them, and a fork
+/// already depends on it, since a child needs the parent's addresses.
+///
+/// Carving a *fresh* region off the top of memory for each one instead —
+/// which is what the boot path does, correctly, when the bytes live
+/// somewhere of their own — spends half a gigabyte of the module's four per
+/// `execve`. It works, and then a container that runs its eighth program
+/// gets `ENOEXEC` from a load that had nowhere to go. Which is exactly how
+/// this was found: `python`, a captured subprocess, a shell pipeline,
+/// `uname`, `ls | wc`, and then nothing.
+#[cfg(target_arch = "wasm32")]
+static GUEST_BASE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+#[cfg(target_arch = "wasm32")]
+fn guest_base() -> u64 {
+    use core::sync::atomic::Ordering;
+    let recorded = GUEST_BASE.load(Ordering::Relaxed);
+    if recorded != 0 {
+        return recorded;
+    }
+    // The top of whatever the module already occupies: the linker's data,
+    // the shadow stack, and anything the kernel's own allocator has taken
+    // before the first process exists.
+    let base = core::arch::wasm32::memory_size(0) as u64 * 65536;
+    GUEST_BASE.store(base, Ordering::Relaxed);
+    base
+}
+
 #[cfg(target_arch = "wasm32")]
 impl Dormant {
-    /// Takes a copy of everything the page table says is mapped.
+    /// A copy of everything the page table says is mapped, leaving it where
+    /// it is. What a `fork` takes, because the parent goes on running.
+    pub(crate) fn copied(pages: &targum::space::Space) -> Self {
+        Self::gather(pages, false)
+    }
+
+    /// The same, and then **zeroes what it took**. What `deactivate` does,
+    /// because the process is leaving.
     ///
+    /// Not tidiness. Every process shares one range — see `GUEST_BASE` — and
+    /// [`crate::space::Space`] states its invariant plainly: above a fresh
+    /// address space's high-water mark, memory "is freshly grown and
+    /// therefore zero", so nothing there is filled before the guest sees it.
+    /// Inside the module that is only true if whoever left made it true.
+    /// Leaving the bytes hands the next program's `brk`, its initial stack
+    /// and its anonymous `mmap`s whatever the last one had there — which is
+    /// not a subtle wrongness: CPython's second process died with `SIGSEGV`
+    /// at once.
+    ///
+    /// Restoring only one's own pages does not cover it, because the pages
+    /// the *outgoing* process had and the incoming one does not are exactly
+    /// the ones nobody would rewrite. Zeroing on the way out is the local
+    /// rule that covers every case, and a switch, an `execve` and a process
+    /// ending are all the same case: somebody left.
+    pub(crate) fn taken(pages: &targum::space::Space) -> Self {
+        Self::gather(pages, true)
+    }
+
     /// # Safety
     /// A guest address is a linear-memory offset, so a mapped page is
     /// `PAGE_BYTES` readable bytes at that offset — which is the identity
     /// the whole design rests on, and the same one every load and store in
     /// [`targum::space`] uses.
-    pub(crate) fn taken(pages: &targum::space::Space) -> Self {
+    fn gather(pages: &targum::space::Space, clear: bool) -> Self {
         let mut held = Vec::new();
         for address in pages.mapped_pages() {
             let mut bytes = [0u8; PAGE_BYTES];
             // SAFETY: the page is inside the limit and mapped, which is what
             // `mapped_pages` answered.
-            let from = unsafe {
-                core::slice::from_raw_parts(address as usize as *const u8, PAGE_BYTES)
+            let there = unsafe {
+                core::slice::from_raw_parts_mut(address as usize as *mut u8, PAGE_BYTES)
             };
-            bytes.copy_from_slice(from);
+            bytes.copy_from_slice(there);
+            if clear {
+                there.fill(0);
+            }
             held.push((address, bytes));
         }
         Self { pages: held }
@@ -517,6 +590,11 @@ impl Machine for Interpreted {
     fn park_on_watch(&mut self, watching: crate::thread::Watching) -> bool {
         self.threads.current_mut().state = crate::thread::State::Watching(watching);
         true
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn guest_base(&mut self) -> u64 {
+        guest_base()
     }
 
     fn wake(&mut self, word: u64, bitset: u32, count: usize) -> usize {

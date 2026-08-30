@@ -850,3 +850,119 @@ fn a_fatal_signal_to_this_process_ends_it() {
 fn signal_bit(signal: i64) -> u64 {
     1u64 << (signal - 1)
 }
+
+/// `statfs` says what filesystem this is and how much room is on it, and
+/// both are branched on: `ls` reads the type to decide whether `d_type` can
+/// be trusted, and anything that writes reads the free count first.
+///
+/// The type is `OVERLAYFS_SUPER_MAGIC` because a container's root *is* a
+/// read-only image with a writable layer over it. Saying `ext4` would be a
+/// claim that unlinking a file in the lower layer frees space, and it does
+/// not.
+#[test]
+fn statfs_describes_the_overlay_and_the_room_left() {
+    /// `OVERLAYFS_SUPER_MAGIC`.
+    const OVERLAY: u64 = 0x794c_7630;
+    let mut kernel = Kernel::new(Recording::default(), Registers::default(), empty_image());
+    let mut buffer = GuestBytes::<120>::new();
+    let path = GuestBuffer::of(b"/\0");
+    assert_eq!(
+        kernel.dispatch(
+            number::STATFS,
+            Arguments::new([path.address(), buffer.address(), 0, 0, 0, 0])
+        ),
+        Outcome::Done(0)
+    );
+    let field = |at: usize| u64::from_le_bytes(buffer[at..at + 8].try_into().expect("eight bytes"));
+    assert_eq!(field(0), OVERLAY, "f_type");
+    assert_eq!(field(8), 4096, "f_bsize");
+    assert_eq!(field(64), 255, "f_namelen");
+    assert_eq!(field(72), 4096, "f_frsize");
+    // Free blocks, and the same number available to a caller with no
+    // reservation — there is no reserve here for one to be exempt from.
+    assert_eq!(field(24), field(32), "f_bfree and f_bavail");
+    assert!(field(16) >= field(24), "more blocks than free ones");
+    // `ST_VALID`, without which a caller ignores `f_flags` entirely.
+    assert_eq!(field(80) & 0x20, 0x20, "ST_VALID in f_flags");
+}
+
+/// A path that is not there is `ENOENT`, and a descriptor that is not open
+/// is `EBADF` — the two things `statfs` and `fstatfs` can tell apart, and
+/// the whole reason they are separate calls here rather than one.
+#[test]
+fn statfs_refuses_what_is_not_there() {
+    let mut kernel = Kernel::new(Recording::default(), Registers::default(), empty_image());
+    let mut buffer = GuestBytes::<120>::new();
+    let path = GuestBuffer::of(b"/nowhere\0");
+    assert_eq!(
+        kernel.dispatch(
+            number::STATFS,
+            Arguments::new([path.address(), buffer.address(), 0, 0, 0, 0])
+        ),
+        Outcome::Done(Errno::NoEntry.as_result())
+    );
+    assert_eq!(
+        kernel.dispatch(
+            number::FSTATFS,
+            Arguments::new([9, buffer.address(), 0, 0, 0, 0])
+        ),
+        Outcome::Done(Errno::BadFile.as_result())
+    );
+}
+
+/// `fadvise64` does nothing, and the checks are the whole of what a program
+/// can observe about it: a call that cheerfully accepted a bad descriptor or
+/// an unknown advice would hide a bug in whatever asked.
+#[test]
+fn fadvise_checks_what_it_cannot_act_on() {
+    let mut kernel = Kernel::new(Recording::default(), Registers::default(), empty_image());
+    let advise = |fd: i64, advice: i64| Arguments::new([fd, 0, 0, advice, 0, 0]);
+    // Standard output is open, and `POSIX_FADV_SEQUENTIAL` is advice this
+    // kernel knows and has nothing to do with.
+    assert_eq!(kernel.dispatch(number::FADVISE64, advise(1, 2)), Outcome::Done(0));
+    assert_eq!(
+        kernel.dispatch(number::FADVISE64, advise(9, 2)),
+        Outcome::Done(Errno::BadFile.as_result())
+    );
+    assert_eq!(
+        kernel.dispatch(number::FADVISE64, advise(1, 6)),
+        Outcome::Done(Errno::Invalid.as_result())
+    );
+    // And a pipe has no position to advise about.
+    let mut ends = GuestBytes::<8>::new();
+    assert_eq!(
+        kernel.dispatch(number::PIPE, Arguments::new([ends.address(), 0, 0, 0, 0, 0])),
+        Outcome::Done(0)
+    );
+    let reader = i32::from_le_bytes(ends[0..4].try_into().expect("four bytes"));
+    assert_eq!(
+        kernel.dispatch(number::FADVISE64, advise(i64::from(reader), 2)),
+        Outcome::Done(Errno::NotSeekable.as_result())
+    );
+}
+
+/// `PR_CAPBSET_READ`: every capability up to `CAP_LAST_CAP` is in the set
+/// and everything past it is `EINVAL`, which is the whole of what a program
+/// can check. Measured against this machine's kernel, where `cap_last_cap`
+/// is 40 and 41 is refused.
+#[test]
+fn the_capability_bounding_set_is_whole() {
+    /// `PR_CAPBSET_READ`.
+    const CAPBSET_READ: i64 = 23;
+    let mut kernel = Kernel::new(Recording::default(), Registers::default(), empty_image());
+    let ask = |capability: i64| Arguments::new([CAPBSET_READ, capability, 0, 0, 0, 0]);
+    for capability in [0, 21, 32, 40] {
+        assert_eq!(
+            kernel.dispatch(number::PRCTL, ask(capability)),
+            Outcome::Done(1),
+            "capability {capability} should be in the bounding set"
+        );
+    }
+    for capability in [41, 63, -1] {
+        assert_eq!(
+            kernel.dispatch(number::PRCTL, ask(capability)),
+            Outcome::Done(Errno::Invalid.as_result()),
+            "capability {capability} is not a capability"
+        );
+    }
+}

@@ -663,7 +663,7 @@ impl Interpreted {
             // The bytes the parent has right now, which is what `fork`
             // means.
             #[cfg(target_arch = "wasm32")]
-            dormant: Some(crate::machine::Dormant::taken(pages)),
+            dormant: Some(crate::machine::Dormant::copied(pages)),
         })
     }
 

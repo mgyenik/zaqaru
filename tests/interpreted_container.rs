@@ -198,3 +198,172 @@ int main(void) {
     assert_eq!(status, 0, "the container did not exit cleanly");
     assert_eq!(out, "loaded 42 9\n");
 }
+
+/// **Twelve programs in a row, each seeing a clean address space.**
+///
+/// A property only the module can lose, so only the module can test it.
+/// Natively a process's bytes live in a file of its own and a fresh one is
+/// genuinely fresh. Inside the module every process shares the one linear
+/// memory, so the range is *reused* — and `kisal::space::Space` states the
+/// invariant its fill discipline rests on: above a fresh address space's
+/// high-water mark, memory "is freshly grown and therefore zero", so nothing
+/// there is zeroed before the guest sees it.
+///
+/// Two ways that was broken, and both negative controls were run rather
+/// than reasoned about:
+///
+/// - Carving a *fresh* region off the top of memory per process instead of
+///   sharing one spends half a gigabyte of the module's four per `execve`.
+///   With `Machine::guest_base` put back to `memory_limit()`, this fails
+///   with "generation 1 could not reserve" — the ninth program has nowhere
+///   to put its address space. Which is how the defect was found in the
+///   first place, in a container that ran `python`, a captured subprocess,
+///   a shell pipeline, `uname` and `ls | wc`, and then stopped.
+/// - Sharing the range without clearing it hands the next program's `brk`,
+///   its stack and its anonymous `mmap`s whatever the last one left there.
+///   With `Dormant::taken` no longer zeroing, this fails with "generation 8
+///   found bytes in a fresh mapping".
+///
+/// So each generation checks that its `.bss` and a fresh mapping are zero,
+/// reserves enough address space that a per-process region would run out,
+/// and then fills both with a pattern for the next generation to find if it
+/// can.
+#[test]
+fn a_chain_of_programs_each_get_a_clean_address_space() {
+    let (status, out) = run(
+        "exec-chain",
+        r#"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
+
+/* A quarter-megabyte, which is enough to reach past whatever the last
+   program's own start left behind and small enough that twelve rounds of
+   it stay inside a unit test's second. */
+#define SPAN (1 << 18)
+
+/* Zero by the C standard — so a non-zero byte here is somebody else's. */
+static unsigned char zeroed[SPAN];
+
+/* A word at a time, not a byte: the byte loop is the whole cost of this
+   test when it is run twelve times through an interpreter. */
+static int all_zero(const void *bytes, size_t length) {
+    const unsigned long *words = bytes;
+    for (size_t index = 0; index < length / sizeof *words; index++) {
+        if (words[index] != 0) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+int main(int count, char **arguments) {
+    long left = count > 1 ? strtol(arguments[1], 0, 10) : 9;
+
+    /* A reservation big enough that the region a process is given is
+       genuinely spent. Unreadable, so nothing is copied when this process
+       stops being the current one — the point is the *address space*, which
+       is what a scheme that hands every process a fresh region runs out of.
+       Without sharing, the eighth program has nowhere to load. */
+    if (mmap(0, 200 << 20, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
+             -1, 0) == MAP_FAILED) {
+        printf("generation %ld could not reserve\n", left);
+        return 1;
+    }
+    unsigned char *fresh = mmap(0, SPAN, PROT_READ | PROT_WRITE,
+                                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (fresh == MAP_FAILED) {
+        printf("generation %ld could not map\n", left);
+        return 1;
+    }
+    if (!all_zero(zeroed, SPAN)) {
+        printf("generation %ld found bytes in its bss\n", left);
+        return 1;
+    }
+    if (!all_zero(fresh, SPAN)) {
+        printf("generation %ld found bytes in a fresh mapping\n", left);
+        return 1;
+    }
+    /* Leave something for the next one to find, if it can. */
+    memset(zeroed, 0x5a, SPAN);
+    memset(fresh, 0xa5, SPAN);
+
+    if (left > 0) {
+        char next[16];
+        snprintf(next, sizeof next, "%ld", left - 1);
+        char *forward[] = {arguments[0], next, 0};
+        execv("/init", forward);
+        printf("generation %ld could not exec\n", left);
+        return 1;
+    }
+    printf("twelve generations, every page clean\n");
+    return 0;
+}
+"#,
+    );
+    assert_eq!(status, 0, "the container did not exit cleanly: {out}");
+    assert_eq!(out, "twelve generations, every page clean\n");
+}
+
+/// **A fork and a pipe, inside the module.**
+///
+/// The other half of the same machinery. Natively a switch between two
+/// processes is one `MAP_FIXED` of a file; here it is a copy of the pages
+/// the page table describes, and a fork is a copy taken while the parent
+/// goes on running. So this fails if the child got a *reference* to the
+/// parent's memory rather than a copy, if the copy was taken destructively,
+/// or if what a process writes while it is not the current one goes
+/// anywhere at all.
+#[test]
+fn a_fork_and_a_pipe_run_in_a_module() {
+    let (status, out) = run(
+        "fork-pipe",
+        r#"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+static char shared_by_copy[64] = "the parent's";
+
+int main(void) {
+    int ends[2];
+    if (pipe(ends) != 0) {
+        printf("no pipe\n");
+        return 1;
+    }
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        close(ends[0]);
+        /* Only the child sees this, and the parent prints its own after. */
+        strcpy(shared_by_copy, "the child's");
+        write(ends[1], shared_by_copy, strlen(shared_by_copy));
+        close(ends[1]);
+        _exit(7);
+    }
+    close(ends[1]);
+    char buffer[64] = {0};
+    size_t total = 0;
+    ssize_t got;
+    while ((got = read(ends[0], buffer + total, sizeof buffer - 1 - total)) > 0) {
+        total += (size_t)got;
+    }
+    close(ends[0]);
+    int status = 0;
+    waitpid(child, &status, 0);
+    printf("child said %s, parent still has %s, exited %d\n",
+           buffer, shared_by_copy, WEXITSTATUS(status));
+    return 0;
+}
+"#,
+    );
+    assert_eq!(status, 0, "the container did not exit cleanly: {out}");
+    assert_eq!(
+        out,
+        "child said the child's, parent still has the parent's, exited 7\n"
+    );
+}

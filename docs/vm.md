@@ -2,14 +2,17 @@
 
 Status: **in progress** — a design for an alternative execution path,
 written after the 2026-08-30 throughput spike said the floor is viable, and
-now partly built. **V1's engine and its oracle exist** (`targum/`, 2026-08-30);
-everything from V2 on does not, and section 12 says exactly which is which.
-Adoption is still gated, not assumed: G2 and G3 are unanswered, no MIPS
-number for the real dispatch breadth has been measured, and the decision
-point is where it always was. `container-plan.md` remains the design authority
-for the kernel; this document is the design authority for the machine that
-executes instructions, and where the two disagree about the seam between
-them, this one is wrong until the disagreement is resolved in both.
+now built through V3. **V1, V2 and V3 exist** (`targum/`, `kisal/`,
+2026-08-30): the engine and its lockstep oracle, the kernel seam, dynamic
+loading with prelink absent, the engine+image bake, threads and preemption,
+signal delivery with faults as signals, and — since section 7a — the
+process table: `fork`, `execve`, `wait4`, pipes, `poll` and `epoll`. G1 and
+G2 are answered; **G3 is not**, and V4 (runtime code under a real JIT) and
+V5 (tier 1) are not built. Section 12 says which is which, line by line.
+`container-plan.md` remains the design authority for the kernel; this
+document is the design authority for the machine that executes
+instructions, and where the two disagree about the seam between them, this
+one is wrong until the disagreement is resolved in both.
 
 The one-sentence shape: **virtualize at the syscall boundary, like gVisor —
 but the CPU under the kernel is an interpreter compiled to wasm, so the
@@ -912,8 +915,14 @@ switch is choosing a different index — which is the sentence this design
 made about threads, now a `clone3` row. `futex` has both halves, `exit`
 ends a thread where `exit_group` ends the process, and the word
 `set_tid_address` named is cleared and woken on the way out, which is the
-whole of how `pthread_join` returns. `fork` is refused by name rather than
-deferred: a second address space is a thing this machine does not have.
+whole of how `pthread_join` returns.
+
+*(When this was first written `fork` was refused by name here, on the
+grounds that a second address space is a thing this machine does not have.
+That was wrong twice over — `container-plan.md` specifies fork in detail
+and treats it as critical, and the address space was a thing the machine
+could be given. Section 7a is what replaced it, and the process table is
+built.)*
 
 Preemption is the quantum, and it is what section 7 promised. Two threads
 spinning on words the other writes finish, which a scheduler that switches
@@ -945,11 +954,36 @@ address space had page permissions.
 CPython runs four threads under a lock and gets the right total, and
 `signal.signal` with `os.kill` reaches its handler.
 
-What does *not* exist yet, and so is not claimed: tier 1, the timed futex
-wait (a timeout needs a clock to expire against, and it is a named fault),
-and the strace diff against a native run that V2's acceptance asks for —
-the trace is wired through the loop, but nothing has diffed it. G3 is
-untouched.
+**And processes (2026-08-30).** `kisal/src/system.rs` is the process
+table; section 7a is the design and the reasoning. `fork`, `vfork` and
+`clone`-with-process-flags duplicate an address space and the kernel's
+structures; `execve` replaces one in place and a *failed* one returns to
+its caller, because `execvp` walks `PATH` calling it once per directory;
+`wait4` parks and is completed after the switch back to the waiter;
+`SIGCHLD` goes through the same disposition check a `kill` does; an
+exiting process's children are reparented to the container's first
+process, and the process itself lets go of its descriptors and its address
+space before it is a zombie. Pipes are the first thing behind a descriptor
+that two processes genuinely share, so they are the fd hoisting the plan
+describes, made structural: one arena the whole tree shares, and a
+descriptor holds an index into it. `poll` and `epoll` answer readiness
+from kernel state alone, because readiness is asked while deciding *which*
+process to run.
+
+The deliverable that follows: **the official `python:3.12-slim` OCI image,
+baked into a 119.8 MB `.wasm`**, running CPython 3.12.14 which forks and
+execs a captured subprocess, runs `echo hello | tr a-z A-Z` through
+`/bin/sh` — which itself forks twice and builds a pipe — runs `uname` and
+`ls | wc -l` over 261 programs, reads back an exit status, and then runs
+eight more programs.
+
+What does *not* exist yet, and so is not claimed: tier 1, sockets, the
+timed futex wait (a timeout needs a clock to expire against, and it is a
+named fault), and the strace diff against a native run that V2's
+acceptance asks for — the trace is wired through the loop, but nothing has
+diffed it. A `poll` with a *timeout* spins rather than sleeping, because
+there is nothing to sleep on: the host boundary is two `ll-store` imports
+and neither of them waits. G3 is untouched.
 
 **V2 — the boot ladder, again, on the floor.** kisal linked under the
 interpreter with the direct-call seam; the bake's engine+image link path.

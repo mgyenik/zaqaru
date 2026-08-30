@@ -36,12 +36,16 @@ Current documents:
   SMC/page-permission design that repeals the AOT deal, the collapsed
   thread/signal machinery, the subsystem-by-subsystem reuse inventory,
   and gates G1–G3 with milestones V1–V5; the adoption decision sits at
-  V2. **Built through V2** (`targum/`): the engine, the lockstep oracle,
-  the kernel seam, dynamic loading with prelink absent, and the bake that
-  links engine plus image into a `.wasm` — CPython imports numpy and runs
-  array arithmetic from one. G2 is answered at 29 MIPS in wasm. Threads,
-  signal delivery and tier 1 are not built, and the document says which is
-  which.
+  V2. **Built through V3** (`targum/`, `kisal/`): the engine, the lockstep
+  oracle, the kernel seam, dynamic loading with prelink absent, the bake
+  that links engine plus image into a `.wasm`, threads with a
+  retired-instruction quantum, signal delivery with faults delivered as
+  signals a handler can catch, and the process table of section 7a —
+  `fork`, `execve`, `wait4`, `SIGCHLD`, pipes as structural fd hoisting,
+  and `poll`/`epoll`. G2 is answered at 29 MIPS in wasm. The deliverable:
+  the official `python:3.12-slim` OCI image as a 119.8 MB `.wasm`, running
+  CPython that forks subprocesses and shell pipelines. G3, tier 1, sockets
+  and V4's JIT trophy are not built, and the document says which is which.
 - [x87-plan.md](x87-plan.md) — the plan that finishes the x87: symbol
   plumbing and the translator lowering (X1–X2), linking the staticlib
   into every build (X3), corpus differentials (X4), the refusal-tail
