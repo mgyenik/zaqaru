@@ -504,6 +504,58 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
         unsafe { self.memory().slice(buffer as u64, count) }
     }
 
+    /// Writes bytes the kernel is holding to a descriptor.
+    ///
+    /// The ordinary `write` row moves bytes *from guest memory*, which is
+    /// what a guest asking to write always has. `sendfile` is the one call
+    /// that does not: its source is a file, so the bytes exist here and the
+    /// destination has to be reached without pretending they came from a
+    /// buffer the guest named.
+    pub(crate) fn send_bytes(&mut self, descriptor: i32, bytes: &[u8]) -> Result<u64, Errno> {
+        let file = *self.files.description(descriptor)?;
+        if file.flags & open_flags::ACCESS_MODE == open_flags::READ_ONLY {
+            return Err(Errno::BadFile);
+        }
+        let path = match file.backing {
+            crate::fd::Backing::Console(crate::fd::Console::Output) => {
+                crate::paths::CONSOLE_STDOUT
+            }
+            crate::fd::Backing::Console(crate::fd::Console::Error) => crate::paths::CONSOLE_STDERR,
+            crate::fd::Backing::Console(crate::fd::Console::Input) => return Err(Errno::BadFile),
+            crate::fd::Backing::Image(vnode) => {
+                let inode = self.vfs.inode(vnode)?;
+                return match inode.file_type() {
+                    crate::image::file_type::CHARACTER => {
+                        self.device_write_bytes(inode.payload, bytes.len() as u64)
+                    }
+                    crate::image::file_type::REGULAR => {
+                        if !crate::overlay::is_upper(vnode.inode) {
+                            return Err(Errno::BadFile);
+                        }
+                        let offset = match file.flags & open_flags::APPEND != 0 {
+                            true => self.vfs.inode(vnode)?.size,
+                            false => file.offset,
+                        };
+                        let now = self.now();
+                        let overlay = self.overlay_of(vnode)?;
+                        let written = overlay.write_at(vnode.inode, offset, bytes)?;
+                        overlay.set_times(vnode.inode, now, 0)?;
+                        if let Ok(description) = self.files.description_mut(descriptor) {
+                            description.offset = offset + written;
+                        }
+                        Ok(written)
+                    }
+                    crate::image::file_type::DIRECTORY => Err(Errno::BadFile),
+                    _ => Err(Errno::NoDevice),
+                };
+            }
+        };
+        match self.store.write(path, bytes) {
+            crate::abi::StoreOutcome::Failed => Err(Errno::Io),
+            _ => Ok(bytes.len() as u64),
+        }
+    }
+
     /// `write` to a regular file in the writable layer.
     pub(crate) fn write_regular(
         &mut self,

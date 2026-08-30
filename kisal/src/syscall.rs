@@ -50,6 +50,8 @@ pub mod number {
     pub const GETEUID: i64 = 107;
     pub const GETEGID: i64 = 108;
     pub const GETPPID: i64 = 110;
+    pub const TIME: i64 = 201;
+    pub const SENDFILE: i64 = 40;
     pub const CLONE: i64 = 56;
     pub const GETCWD: i64 = 79;
     pub const CHDIR: i64 = 80;
@@ -197,6 +199,8 @@ pub mod number {
             GETEUID => "geteuid",
             GETEGID => "getegid",
             GETPPID => "getppid",
+            TIME => "time",
+            SENDFILE => "sendfile",
             CLONE => "clone",
             EXIT => "exit",
             ARCH_PRCTL => "arch_prctl",
@@ -696,6 +700,8 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             number::PRLIMIT64 => self.prlimit64(arguments),
             number::GETRANDOM => self.getrandom(arguments),
             number::CLOCK_GETTIME => self.clock_gettime(arguments),
+            number::TIME => self.time(arguments),
+            number::SENDFILE => self.sendfile(arguments),
             number::RT_SIGPROCMASK => self.signal_mask(arguments),
             number::TGKILL => self.tgkill(arguments),
             // Restartable sequences, refused for real. glibc asks once at
@@ -1116,6 +1122,164 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             return Outcome::Done(errno.as_result());
         }
         Outcome::Done(0)
+    }
+
+    /// `sendfile(2)`: bytes from one descriptor to another without the
+    /// guest holding them.
+    ///
+    /// Implemented rather than refused, and the distinction is worth stating
+    /// because `ENOSYS` would have "worked": busybox tries `sendfile` first
+    /// and falls back to `read`/`write` when a kernel does not have it, so
+    /// the ladder would have climbed either way. But this is a call that
+    /// moves data, and a kernel that answers "I do not have that" to
+    /// something it could do is a kernel that will be believed by the next
+    /// program without a fallback. `rseq` is refused for real because there
+    /// is nothing behind it; this has something behind it.
+    ///
+    /// The copy goes through the kernel, which is not a compromise here —
+    /// there is no page cache to splice and no zero-copy to forfeit, and
+    /// the source is already a slice of the image.
+    ///
+    /// Linux requires the *input* to be mmap-able, which in practice means a
+    /// regular file, and refuses a pipe or socket with `EINVAL`. The output
+    /// has no such rule. A short answer is allowed and expected: the return
+    /// value is what moved, and a caller loops.
+    fn sendfile(&mut self, arguments: Arguments) -> Outcome {
+        let out = arguments.get(0) as i32;
+        let input = arguments.get(1) as i32;
+        let position = arguments.get(2) as u64;
+        let count = arguments.get(3);
+        if count < 0 {
+            return Outcome::Done(Errno::Invalid.as_result());
+        }
+
+        let source = match self.files.description(input) {
+            Ok(file) => *file,
+            Err(errno) => return Outcome::Done(errno.as_result()),
+        };
+        if source.flags & crate::file::open_flags::ACCESS_MODE
+            == crate::file::open_flags::WRITE_ONLY
+        {
+            return Outcome::Done(Errno::BadFile.as_result());
+        }
+        let crate::fd::Backing::Image(vnode) = source.backing else {
+            // A console stream is not a file `sendfile` can read from,
+            // which is what Linux says about a pipe.
+            return Outcome::Done(Errno::Invalid.as_result());
+        };
+
+        // An explicit offset is read from the guest, and is where the
+        // transfer starts *without* moving the description's own position —
+        // the same distinction `pread` exists for. The pointer is written
+        // back afterwards, which is the only way a caller learns how far it
+        // got when it passed one.
+        let start = match position {
+            0 => source.offset,
+            at => {
+                if let Err(errno) = self.memory().check(at, 8) {
+                    return Outcome::Done(errno.as_result());
+                }
+                // SAFETY: the eight bytes were just bounds-checked.
+                let bytes = match unsafe { self.memory().slice(at, 8) } {
+                    Ok(bytes) => bytes,
+                    Err(errno) => return Outcome::Done(errno.as_result()),
+                };
+                let offset = i64::from_le_bytes(bytes.try_into().expect("eight bytes"));
+                if offset < 0 {
+                    return Outcome::Done(Errno::Invalid.as_result());
+                }
+                offset as u64
+            }
+        };
+
+        let moving = {
+            let inode = match self.vfs.inode(vnode) {
+                Ok(inode) => inode,
+                Err(errno) => return Outcome::Done(errno.as_result()),
+            };
+            if !inode.is_regular() {
+                return Outcome::Done(Errno::Invalid.as_result());
+            }
+            let contents = match self
+                .vfs
+                .filesystem_of(vnode)
+                .and_then(|filesystem| filesystem.contents(&inode, vnode.inode))
+            {
+                Ok(contents) => contents,
+                Err(errno) => return Outcome::Done(errno.as_result()),
+            };
+            let from = start.min(contents.len() as u64) as usize;
+            let to = (start.saturating_add(count as u64)).min(contents.len() as u64) as usize;
+            // Copied because the write borrows the same tree mutably. There
+            // is nothing to be saved by not copying: the bytes are going
+            // into another file or out through the store either way.
+            contents[from..to].to_vec()
+        };
+
+        let moved = match self.send_bytes(out, &moving) {
+            Ok(moved) => moved,
+            Err(errno) => return Outcome::Done(errno.as_result()),
+        };
+
+        match position {
+            // No pointer: the description's own position advances, exactly
+            // as a `read` of the same bytes would have left it.
+            0 => {
+                if let Ok(description) = self.files.description_mut(input) {
+                    description.offset = start + moved;
+                }
+            }
+            at => {
+                // SAFETY: the eight bytes were bounds-checked above.
+                if let Err(errno) =
+                    unsafe { self.memory().write(at, &(start + moved).to_le_bytes()) }
+                {
+                    return Outcome::Done(errno.as_result());
+                }
+            }
+        }
+        Outcome::Done(moved as i64)
+    }
+
+    /// `time(2)`: the wall clock, in whole seconds.
+    ///
+    /// The oldest shape of the same question `clock_gettime` answers, and it
+    /// reads the same clock through the same path — a container whose two
+    /// time syscalls disagreed would be worse than one that answered
+    /// neither. The seconds field is floored rather than truncated for the
+    /// reason given there: only the wall clock can be negative, and the
+    /// arithmetic is written correctly once.
+    ///
+    /// The result is both returned *and* stored, when a pointer is given.
+    /// Linux does both, and a caller is entitled to read either.
+    fn time(&mut self, arguments: Arguments) -> Outcome {
+        let mut bytes = Vec::new();
+        if self.store.read(crate::paths::TIME_REALTIME, &mut bytes)
+            != crate::abi::StoreOutcome::Present
+        {
+            // No clock mounted. Refused by name rather than answered with
+            // zero, which would be a time — the epoch — and would be
+            // believed.
+            return Outcome::Done(Errno::Invalid.as_result());
+        }
+        let Some(nanoseconds) = parse_nanoseconds(&bytes) else {
+            return Outcome::Done(Errno::Invalid.as_result());
+        };
+        let seconds = nanoseconds.div_euclid(1_000_000_000);
+
+        let destination = arguments.get(0) as u64;
+        if destination != 0 {
+            if let Err(errno) = self.memory().check(destination, 8) {
+                return Outcome::Done(errno.as_result());
+            }
+            // SAFETY: the eight bytes were just bounds-checked.
+            if let Err(errno) =
+                unsafe { self.memory().write(destination, &seconds.to_le_bytes()) }
+            {
+                return Outcome::Done(errno.as_result());
+            }
+        }
+        Outcome::Done(seconds)
     }
 
     /// `arch_prctl(2)`: the only way the thread pointer moves.
