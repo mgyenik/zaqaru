@@ -451,6 +451,90 @@ per the rule that a disagreement is resolved in both documents:
 
 Gate first, M0-style: hours, a verdict line, a reroute.
 
+**N0 — trace the actual stack. DONE, 2026-08-30.** The image is
+`demo/hello-django`, the tracing variant is `Dockerfile.trace`, the run is
+`demo/hello-django/trace.sh`, and the extracted surface is
+`demo/hello-django/baseline/n0-surface.txt` — which is both the worklist
+and the baseline N5 diffs against. **Five processes, 88 distinct
+syscalls, 9,365 calls**, boot through two `curl` requests to a `SIGTERM`
+shutdown every process exits 0 from. **58 of the 88 already have rows in
+kisal; 24 do not.** The original text follows the verdict.
+
+Two mechanical notes, because both cost a run to find. The shutdown has
+to be signalled from *inside* the container: `docker stop` signals pid 1,
+which is `strace`, and the tracer dies taking the shutdown half of the
+trace with it. And the tracing image is separate from the demo image on
+purpose — a tracing tool in the image is a syscall surface of its own
+inside the measurement.
+
+**The 24 missing rows, and what they are.** Twelve are the sockets this
+plan is about (`socket` has a refusing row already): `bind`, `listen`,
+`accept4`, `connect`, `socketpair`, `shutdown`, `recvfrom`, `sendto`,
+`recvmsg`, `sendmsg`, `getsockname`, `getpeername`, `setsockopt`,
+`getsockopt`. One is readiness (`pselect6` — and note it is `pselect6`,
+not `select`). One is an in-guest object section 9 already listed
+(`eventfd2`). **The remaining eight were not in section 9 at all**, and
+they are the gate's actual finding:
+
+- **`chown`, `umask`, `setuid`, `setgid`, `setgroups`, `prctl`
+  (`PR_SET_DUMPABLE`) — nginx drops privileges.** The master `chown`s
+  `/var/lib/nginx/{body,fastcgi,proxy,scgi}` to uid 65534 and the worker
+  `setgid`/`setgroups`/`setuid`s to it. `container-plan.md` answers
+  `getuid` and friends with a constant zero on the grounds that "a
+  container has one user and it is the one that started it" — which was
+  true until a program in the container changed users. The honest
+  minimum is to record the ids and answer from them; whether any
+  permission check *enforces* them is a separate decision that must be
+  stated rather than left implied, because nginx will believe it has
+  dropped privileges either way.
+- **`rt_sigsuspend`, `clock_nanosleep`, `setitimer` — three more wait
+  shapes.** Section 6 assumed one ("gunicorn's one-second `select`
+  heartbeat"). The real stack waits five ways at once: nginx's worker in
+  `epoll_wait` with a 60-second timeout, gunicorn's arbiter in
+  `pselect6` with 15 seconds, its worker in `poll` with 2 seconds,
+  nginx's master in `rt_sigsuspend` with an empty mask, and gunicorn's
+  threads in `clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME)`. Plus
+  `setitimer(ITIMER_REAL, 50ms)`, which nginx's master arms during
+  shutdown to poll for worker exit — so `SIGALRM` delivery is on the
+  shutdown path.
+
+**And the timed futex wait is not optional.** `vm.md`'s V3 lists it as a
+named fault — "a timeout needs a clock to expire against" — and
+gunicorn calls `FUTEX_WAIT_BITSET_PRIVATE` with a deadline seven times in
+one boot. N4 retires it along with the rest of the spin, and this is the
+evidence that it must.
+
+**Corrections to section 9 in the other direction**, where reality was
+narrower than the guess: no `sendfile` (nginx proxies here and serves
+nothing static), no `select` (only `pselect6`), no `SCM_RIGHTS` (the
+pinned single worker works, as designed — but the master→worker channel
+socketpair still carries the shutdown command by `sendmsg`/`recvmsg`, so
+those two rows are on the *shutdown* path and not optional). The
+`ioctl` traffic is 583 calls of which 566 are `TCGETS`/`TIOCGWINSZ`
+isatty probing that already has a row; the socket-relevant ones are
+`FIONBIO` ×13 — nginx setting non-blocking by ioctl, exactly as
+pitfall 6 warned — plus one each of `FIOCLEX`, `FIONCLEX`, `FIOASYNC`.
+
+**One correction to section 4.** It says non-blocking `connect` on
+loopback "completes immediately … so `EINPROGRESS` arises only at the
+edge". nginx connects to its upstream non-blocking and then calls
+`getsockopt(SO_ERROR)` *regardless* of whether the connect completed —
+twice in this trace, both on loopback. So `SO_ERROR` is a loopback row,
+not an edge row, and pitfall 4's asymmetry is about `EINPROGRESS` alone.
+
+**Also observed, and cheap:** `getpeername` on a listening socket must
+answer `ENOTCONN` (gunicorn probes it); `bind` is to `0.0.0.0:80` and
+not to a specific address, so the edge listener registration must handle
+a wildcard; backlogs are 511 (nginx), 2048 (gunicorn) and 100 (its
+control socket); `accept4` is called with `SOCK_CLOEXEC` and with
+`SOCK_NONBLOCK`; and glibc's `/var/run/nscd/socket` probe is a real
+`AF_UNIX` `connect` four times over, so `connect` to an unbound path
+must answer rather than the VFS answering before socket code is reached
+— which is a small correction to `container-plan.md`'s reading of the
+same probe.
+
+The original text follows.
+
 **N0 — trace the actual stack.** Build the demo image, run it natively
 under `strace -f`, and extract the deduplicated syscall surface of all
 five processes from boot through one request and a `SIGTERM` shutdown.

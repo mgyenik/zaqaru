@@ -1,0 +1,16 @@
+# The demo image plus `strace`, for gate N0 of `docs/network-plan.md`.
+#
+# Separate from the demo image on purpose: what gets baked into a `.wasm`
+# should be the stack and nothing else, and a tracing tool in the image
+# would be a syscall surface of its own inside the measurement.
+FROM hello-django
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends strace \
+    && rm -rf /var/lib/apt/lists/*
+
+# `-f` to follow every process in the tree — the whole point is that this
+# container is five of them. `-yy` decodes descriptors to the paths and
+# socket addresses behind them, which is what makes the trace readable as
+# a *baseline* rather than as a list of numbers.
+ENTRYPOINT ["strace", "-f", "-yy", "-s", "160", "-o", "/trace/native.txt", "/app/init.sh"]

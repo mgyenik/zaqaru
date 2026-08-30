@@ -1,0 +1,130 @@
+# N0 — the traced syscall surface of nginx + gunicorn + django
+#
+# Gate N0 of `docs/network-plan.md`. The image is `demo/hello-django`;
+# the trace is `strace -f -yy` over the whole process tree from boot,
+# through two `curl` requests, to a `SIGTERM` shutdown every process
+# exits 0 from. Regenerate with `demo/hello-django/trace.sh`.
+#
+# This is the worklist, and it is the baseline N5 diffs the interpreted
+# run against.
+#
+# processes: 5   distinct syscalls: 88   calls: 9365
+# signals delivered: SIGCHLD×2, SIGTERM×4
+
+[surface]
+
+    2264  newfstatat           row
+    1136  fstat                row
+    1002  read                 row
+     938  lseek                row
+     748  openat               row
+     698  close                row
+     611  mmap                 row
+     583  ioctl                row
+     360  munmap               row
+     136  getdents64           row
+     133  rt_sigaction         row
+     117  brk                  row
+      89  write                row
+      62  rename               row
+      61  mprotect             row
+      57  futex                row
+      28  fcntl                row
+      26  rt_sigprocmask       row
+      25  epoll_wait           row
+      21  getpid               row
+      19  gettid               row
+      14  epoll_ctl            row
+      12  recvfrom             MISSING
+       9  socket               row
+       9  getsockname          MISSING
+       8  utimensat            row
+       7  pread64              row
+       7  set_robust_list      row
+       7  geteuid              row
+       7  mkdir                row
+       7  accept4              MISSING
+       6  execve               row
+       6  getrandom            row
+       6  getcwd               row
+       6  readlink             row
+       6  connect              MISSING
+       6  rt_sigreturn         row
+       6  wait4                row
+       5  prlimit64            row
+       5  getppid              row
+       5  chown                MISSING
+       5  setsockopt           MISSING
+       5  sendto               MISSING
+       4  rseq                 row
+       4  getegid              row
+       4  listen               MISSING
+       4  unlink               row
+       4  clock_nanosleep      MISSING
+       4  pselect6             MISSING
+       4  writev               row
+       4  exit_group           row
+       3  access               row
+       3  arch_prctl           row
+       3  set_tid_address      row
+       3  clone                row
+       3  uname                row
+       3  bind                 MISSING
+       3  socketpair           MISSING
+       3  mremap               row
+       2  getuid               row
+       2  getgid               row
+       2  epoll_create         row
+       2  rt_sigsuspend        MISSING
+       2  epoll_create1        row
+       2  chdir                row
+       2  umask                MISSING
+       2  getsockopt           MISSING
+       2  shutdown             MISSING
+       2  readv                row
+       2  poll                 row
+       2  recvmsg              MISSING
+       1  readlinkat           row
+       1  pwrite64             row
+       1  dup2                 row
+       1  setgid               MISSING
+       1  setgroups            MISSING
+       1  setuid               MISSING
+       1  prctl                row
+       1  eventfd2             MISSING
+       1  pipe2                row
+       1  clone3               row
+       1  chmod                row
+       1  sendmsg              MISSING
+       1  setitimer            MISSING
+       1  madvise              row
+       1  exit                 row
+       1  kill                 row
+       1  getpeername          MISSING
+
+[missing]  24 rows the stack calls and kisal has none for
+
+      12  recvfrom
+       9  getsockname
+       7  accept4
+       6  connect
+       5  chown
+       5  sendto
+       5  setsockopt
+       4  clock_nanosleep
+       4  listen
+       4  pselect6
+       3  bind
+       3  socketpair
+       2  getsockopt
+       2  recvmsg
+       2  rt_sigsuspend
+       2  shutdown
+       2  umask
+       1  eventfd2
+       1  getpeername
+       1  sendmsg
+       1  setgid
+       1  setgroups
+       1  setitimer
+       1  setuid
