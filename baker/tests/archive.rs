@@ -509,3 +509,121 @@ fn describe(
         ),
     );
 }
+
+// ---- the image config ------------------------------------------------------
+
+/// Builds a `docker save`-shaped archive by hand: a manifest naming a config
+/// blob and one layer, the config, and the layer's tar.
+///
+/// By hand because the alternative is a test that needs a container runtime
+/// and a registry, which is a test nobody runs. What is being checked here
+/// is the *reading*, and the reading does not care who wrote the bytes.
+fn saved_image(config: &str, layer: &[(&str, &[u8])]) -> Vec<u8> {
+    fn member(path: &str, contents: &[u8]) -> Vec<u8> {
+        let mut header = [0u8; 512];
+        let name = path.as_bytes();
+        header[..name.len()].copy_from_slice(name);
+        header[100..107].copy_from_slice(b"0000644");
+        header[108..115].copy_from_slice(b"0000000");
+        header[116..123].copy_from_slice(b"0000000");
+        let size = format!("{:011o}", contents.len());
+        header[124..135].copy_from_slice(size.as_bytes());
+        header[136..147].copy_from_slice(b"00000000000");
+        header[156] = b'0';
+        header[257..262].copy_from_slice(b"ustar");
+        header[263..265].copy_from_slice(b"00");
+        // The checksum is computed with its own field read as spaces.
+        header[148..156].copy_from_slice(b"        ");
+        let sum: u32 = header.iter().map(|byte| u32::from(*byte)).sum();
+        let rendered = format!("{sum:06o}\0 ");
+        header[148..156].copy_from_slice(rendered.as_bytes());
+
+        let mut bytes = header.to_vec();
+        bytes.extend_from_slice(contents);
+        bytes.resize(bytes.len().next_multiple_of(512), 0);
+        bytes
+    }
+
+    let mut inner = Vec::new();
+    for (path, contents) in layer {
+        inner.extend(member(path, contents));
+    }
+    inner.extend([0u8; 1024]);
+
+    let manifest = r#"[{"Config":"config.json","Layers":["layer.tar"]}]"#;
+    let mut archive = Vec::new();
+    archive.extend(member("manifest.json", manifest.as_bytes()));
+    archive.extend(member("config.json", config.as_bytes()));
+    archive.extend(member("layer.tar", &inner));
+    archive.extend([0u8; 1024]);
+    archive
+}
+
+/// An image says what to run and in what environment, and both are read.
+///
+/// `Entrypoint` and `Cmd` compose in that order — the entrypoint is the
+/// program and the command its default arguments — which is what the runtime
+/// spec says and what `docker run` does.
+#[test]
+fn an_image_config_says_what_to_run() {
+    let archive = saved_image(
+        r#"{"config":{
+            "Entrypoint":["/usr/bin/python3"],
+            "Cmd":["-c","print(1)"],
+            "Env":["PATH=/usr/bin:/bin","LANG=C.UTF-8"],
+            "WorkingDir":"/app"
+        }}"#,
+        &[("./init", b"placeholder")],
+    );
+    let invocation = baker::layers::invocation_from_archive(&archive).expect("read the config");
+    assert_eq!(
+        invocation.argv,
+        vec![
+            b"/usr/bin/python3".to_vec(),
+            b"-c".to_vec(),
+            b"print(1)".to_vec()
+        ]
+    );
+    assert_eq!(
+        invocation.environment,
+        vec![b"PATH=/usr/bin:/bin".to_vec(), b"LANG=C.UTF-8".to_vec()]
+    );
+    assert_eq!(invocation.working_directory, b"/app".to_vec());
+}
+
+/// An image with only a `Cmd` is the common shape, and an image with neither
+/// genuinely does not say what to run — which is reported as nothing rather
+/// than guessed at.
+#[test]
+fn a_config_without_an_entrypoint_is_still_read() {
+    let only_command = saved_image(
+        r#"{"config":{"Cmd":["python3"]}}"#,
+        &[("./init", b"placeholder")],
+    );
+    let invocation = baker::layers::invocation_from_archive(&only_command).expect("read");
+    assert_eq!(invocation.argv, vec![b"python3".to_vec()]);
+    assert!(invocation.environment.is_empty());
+
+    let silent = saved_image(r#"{"config":{}}"#, &[("./init", b"placeholder")]);
+    let invocation = baker::layers::invocation_from_archive(&silent).expect("read");
+    assert!(invocation.argv.is_empty(), "nothing to run, and it says so");
+}
+
+/// The command a caller gives overrides the image's, which is what
+/// `docker run image cmd...` means — and the layers are read either way.
+#[test]
+fn a_given_command_overrides_the_images() {
+    let archive = saved_image(
+        r#"{"config":{"Cmd":["python3"],"Env":["LANG=C.UTF-8"]}}"#,
+        &[("./init", b"placeholder")],
+    );
+    let (image, invocation) =
+        baker::bake_archive_as_configured(&archive, &[b"/bin/sh".to_vec()]).expect("bake");
+    assert_eq!(invocation.argv, vec![b"/bin/sh".to_vec()]);
+    assert_eq!(
+        invocation.environment,
+        vec![b"LANG=C.UTF-8".to_vec()],
+        "the environment is the image's whatever the command is"
+    );
+    assert!(!image.blob.is_empty(), "the layers were read too");
+}

@@ -1,14 +1,24 @@
-//! Bakes a directory into a container that carries an interpreter.
+//! Bakes a directory or an OCI image into a container that carries an
+//! interpreter.
 //!
 //! The whole bake, and what is *not* in it is the point: no translation, no
 //! discovery, no witnesses, no jump tables, no prelink, no resume bodies. A
-//! directory becomes an image, the image becomes one object file, and the
+//! filesystem becomes an image, the image becomes one object file, and the
 //! object is linked with three staticlibs that were compiled once and are
-//! the same in every container. What comes out runs whatever is at `/init`.
+//! the same in every container.
 //!
 //! ```text
-//! cargo run --release --example bake-vm -- <root> <output.wasm>
+//! cargo run --release --example bake-vm -- <root|image.tar> <out.wasm> [argv...]
 //! ```
+//!
+//! A `docker save` tarball is read whole: the layer stack in order, with its
+//! whiteouts and opaque directories applied, *and* the config — entrypoint,
+//! command and environment — so the container starts the way the image says
+//! it should. Arguments given here override the image's command, which is
+//! what `docker run image cmd...` means.
+//!
+//! A directory has no config to read, so it runs `/init` and whatever
+//! arguments follow.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -25,13 +35,45 @@ fn main() -> anyhow::Result<()> {
     // The invocation is a fact about the container, recorded in the image:
     // the same module booted twice runs the same program the same way,
     // which is what makes a run reproducible.
-    let argv: Vec<Vec<u8>> = match arguments.map(|a| a.into_bytes()).collect::<Vec<_>>() {
-        empty if empty.is_empty() => vec![b"/init".to_vec()],
-        given => given,
-    };
+    let given: Vec<Vec<u8>> = arguments.map(|a| a.into_bytes()).collect();
 
     let started = std::time::Instant::now();
-    let baked = baker::bake_tree_with_command(&baker::tree::Tree::from_directory(&root)?, &argv)?;
+    let baked = if root.is_dir() {
+        let argv = match given.is_empty() {
+            true => vec![b"/init".to_vec()],
+            false => given,
+        };
+        eprintln!("baking the directory {}", root.display());
+        baker::bake_tree_with_command(&baker::tree::Tree::from_directory(&root)?, &argv)?
+    } else {
+        let archive = std::fs::read(&root)?;
+        let (image, invocation) = baker::bake_archive_as_configured(&archive, &given)?;
+        anyhow::ensure!(
+            !invocation.argv.is_empty(),
+            "the image says no entrypoint and no command, and none was given \
+             on the command line, so there is nothing to run"
+        );
+        eprintln!(
+            "image says: {}{}",
+            invocation
+                .argv
+                .iter()
+                .map(|a| String::from_utf8_lossy(a).into_owned())
+                .collect::<Vec<_>>()
+                .join(" "),
+            match invocation.environment.is_empty() {
+                true => String::new(),
+                false => format!("  ({} environment entries)", invocation.environment.len()),
+            }
+        );
+        if !invocation.working_directory.is_empty() {
+            eprintln!(
+                "  working directory {:?}",
+                String::from_utf8_lossy(&invocation.working_directory)
+            );
+        }
+        image
+    };
     let object = baker::object::emit(&baked)?;
     let image = output.with_extension("image.o");
     std::fs::write(&image, &object)?;

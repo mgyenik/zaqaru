@@ -71,6 +71,30 @@ pub fn bake_archive(archive: &[u8]) -> Result<Image> {
     bake_tree(&layers::tree_from_archive(archive)?)
 }
 
+/// The same, taking the image at its word about what to run.
+///
+/// An OCI image says two things and this reads both: the layer stack *and*
+/// the config's entrypoint, command and environment. That is the difference
+/// between a bake somebody has to be told how to start and one that takes a
+/// `docker save` tarball and nothing else.
+///
+/// `argv` overrides the image's command when it is non-empty, which is what
+/// `docker run image cmd...` means.
+pub fn bake_archive_as_configured(archive: &[u8], argv: &[Vec<u8>]) -> Result<(Image, layers::Invocation)> {
+    let tree = layers::tree_from_archive(archive)?;
+    let mut invocation = layers::invocation_from_archive(archive)?;
+    if !argv.is_empty() {
+        invocation.argv = argv.to_vec();
+    }
+    let image = bake_tree_as_configured(
+        &tree,
+        &invocation.argv,
+        &invocation.environment,
+        &invocation.working_directory,
+    )?;
+    Ok((image, invocation))
+}
+
 /// Flattens an image tree, whatever produced it.
 pub fn bake_tree(tree: &tree::Tree) -> Result<Image> {
     bake_tree_with_command(tree, &[])
@@ -92,9 +116,24 @@ pub fn bake_tree_with_invocation(
     argv: &[Vec<u8>],
     envp: &[Vec<u8>],
 ) -> Result<Image> {
+    bake_tree_as_configured(tree, argv, envp, &[])
+}
+
+/// The same, with the directory the container starts in.
+///
+/// An OCI image's `WorkingDir`, which is not decoration: `CMD ["python",
+/// "app.py"]` beside `WORKDIR /app` names a file that exists only relative
+/// to somewhere.
+pub fn bake_tree_as_configured(
+    tree: &tree::Tree,
+    argv: &[Vec<u8>],
+    envp: &[Vec<u8>],
+    working_directory: &[u8],
+) -> Result<Image> {
     let mut builder = Builder::default();
     builder.command = joined("argument", argv)?;
     builder.environment = joined("environment entry", envp)?;
+    builder.working_directory = working_directory.to_vec();
     let root = builder.add_node(tree, tree::ROOT)?;
     builder.finish(root)
 }
@@ -165,6 +204,8 @@ struct Builder {
     command: Vec<u8>,
     /// The boot environment, NUL-separated `NAME=value` strings.
     environment: Vec<u8>,
+    /// The directory the container starts in, or empty.
+    working_directory: Vec<u8>,
 }
 
 impl Builder {
@@ -456,13 +497,14 @@ impl Builder {
         let module_offset = xattr_offset + self.xattrs.len();
         let command_offset = module_offset + module_records.len();
         let environment_offset = command_offset + self.command.len();
+        let working_directory_offset = environment_offset + self.environment.len();
 
         // Every region's extent is a `u32` in the index, so a bake that
         // overflows one has to fail rather than record a length modulo 2^32 —
         // which would validate against a shorter blob and read zeros for
         // every file above the wrap. A rootfs over four gigabytes is routine
         // for the images this is aimed at.
-        let total = environment_offset + self.environment.len();
+        let total = working_directory_offset + self.working_directory.len();
         for (what, size) in [
             ("the file contents", blob.len()),
             ("the directory entries", dirents.len()),
@@ -499,6 +541,8 @@ impl Builder {
                 command_size: self.command.len() as u32,
                 environment_offset: environment_offset as u32,
                 environment_size: self.environment.len() as u32,
+                working_directory_offset: working_directory_offset as u32,
+                working_directory_size: self.working_directory.len() as u32,
             },
         );
         index.extend_from_slice(&header);
@@ -513,6 +557,7 @@ impl Builder {
         index.extend_from_slice(&module_records);
         index.extend_from_slice(&self.command);
         index.extend_from_slice(&self.environment);
+        index.extend_from_slice(&self.working_directory);
 
         Ok(Image { blob, index })
     }

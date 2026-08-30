@@ -62,6 +62,11 @@ pub mod number {
     pub const FUTEX: i64 = 202;
     pub const GETDENTS64: i64 = 217;
     pub const SET_TID_ADDRESS: i64 = 218;
+    pub const SOCKET: i64 = 41;
+    pub const SCHED_GETAFFINITY: i64 = 204;
+    pub const MBIND: i64 = 237;
+    pub const SET_MEMPOLICY: i64 = 238;
+    pub const GET_MEMPOLICY: i64 = 239;
     pub const GETTID: i64 = 186;
     pub const TGKILL: i64 = 234;
     pub const CLOCK_GETTIME: i64 = 228;
@@ -142,6 +147,11 @@ pub mod number {
     /// number prints as its number, never as a guess.
     pub fn name(number: i64) -> Option<&'static str> {
         Some(match number {
+            SOCKET => "socket",
+            SCHED_GETAFFINITY => "sched_getaffinity",
+            MBIND => "mbind",
+            SET_MEMPOLICY => "set_mempolicy",
+            GET_MEMPOLICY => "get_mempolicy",
             READ => "read",
             WRITE => "write",
             OPEN => "open",
@@ -462,6 +472,12 @@ pub struct Kernel<'a, S: Store, M: Machine> {
     pub(crate) enforcement: Enforcement,
     /// Whether syscalls are traced; see [`Kernel::tracing`].
     tracing: Option<bool>,
+    /// What the image says the container's working directory should be.
+    ///
+    /// Kept as the path rather than resolved here, because resolution needs
+    /// a mounted filesystem and this is recorded while one is being built.
+    /// Empty when the image did not say, which is most images.
+    pub image_working_directory: Vec<u8>,
     /// Where the thread should resume, when something left in order to go
     /// somewhere else rather than to stop.
     ///
@@ -587,6 +603,7 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
         let space_start = machine.memory_limit();
         let space_ceiling = space_start.saturating_add(GUEST_ADDRESS_SPACE);
         let reserved = machine.grow(space_ceiling);
+        let image_working_directory = image.working_directory().to_vec();
         let mut kernel = Self {
             store,
             machine,
@@ -600,6 +617,7 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             pages: targum::space::Space::new(0),
             enforcement,
             tracing: None,
+            image_working_directory,
             continuation: None,
             blocked_signals: 0,
             dispositions: [Disposition::DEFAULT; 64],
@@ -824,6 +842,71 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
     #[cfg(not(debug_assertions))]
     fn verify_pages(&self) {}
 
+    // The memory-policy family — `mbind`, `set_mempolicy`, `get_mempolicy` —
+    // answers `ENOSYS`, which is what Linux itself answers on a kernel built
+    // without NUMA. This machine has one node by construction, so there is
+    // no policy to set and none to report: the answer is a fact about the
+    // machine rather than a gap in the kernel, which is the same distinction
+    // the `socket` row draws below.
+    //
+    // OpenBLAS asks, on the way to allocating its buffers, and takes the
+    // refusal as "no NUMA here" and carries on.
+    /// `sched_getaffinity`: one processor, which is the only honest answer.
+    ///
+    /// This machine reports one processor through `cpuid` and has one thread
+    /// of execution under the loop, so a mask with one bit set is not a
+    /// simplification — it is what the machine is. Passing the host's answer
+    /// through would make a container's behaviour depend on which machine
+    /// ran it, which is the same reason `cpuid` is fixed.
+    ///
+    /// What asks is every numerical library there is: OpenBLAS counts the
+    /// processors before it decides how many threads to start, and a refusal
+    /// here stops `import numpy` on any image that ships one.
+    ///
+    /// The return value is the number of bytes *written*, which is what
+    /// `CPU_COUNT` iterates over — not the size the caller offered.
+    fn sched_getaffinity(&mut self, arguments: Arguments) -> Outcome {
+        /// The kernel's mask is a whole number of longs, and one is enough
+        /// for the processors this machine has.
+        const WRITTEN: u64 = 8;
+        let size = arguments.get(1) as u64;
+        let mask = arguments.get(2) as u64;
+        if size < WRITTEN {
+            return Outcome::Done(Errno::Invalid.as_result());
+        }
+        // SAFETY: bounds-checked by the write, which answers `EFAULT`.
+        match unsafe { self.memory_mut().write(mask, &1u64.to_le_bytes()) } {
+            Ok(()) => Outcome::Done(WRITTEN as i64),
+            Err(errno) => Outcome::Done(errno.as_result()),
+        }
+    }
+
+    /// `socket`: this container has none.
+    ///
+    /// **Answered rather than refused, and the distinction is the whole
+    /// point of the loud-error policy rather than an exception to it.** A
+    /// named fault is right when the kernel does not implement something a
+    /// guest reasonably expects to work — a silent `ENOSYS` there is a hang
+    /// three layers away. This is the other case: a container with no
+    /// network and no unix sockets genuinely does not have the address
+    /// family, and `EAFNOSUPPORT` is exactly what Linux says about a family
+    /// it does not have. Saying so is not a stub.
+    ///
+    /// It matters because of what asks. glibc's NSS opens a unix socket to
+    /// probe `nscd` before it will read `/etc/passwd`, so `getpwuid` — which
+    /// CPython reaches through `expanduser` whenever `HOME` is unset — goes
+    /// through here on the way to working. A refusal stops the container; an
+    /// honest failure makes the library fall back to the files it was going
+    /// to read anyway. Found booting the official `python:3.12-slim` image,
+    /// whose environment sets no `HOME`.
+    ///
+    /// When sockets arrive they arrive as a capability under `/iso`, and
+    /// this row becomes the place that reports whether the container was
+    /// given one.
+    fn socket(&mut self, _arguments: Arguments) -> Outcome {
+        Outcome::Done(Errno::AddressFamily.as_result())
+    }
+
     /// Whether this container is tracing its syscalls, decided once.
     ///
     /// `None` until something asks, because the store is not reachable
@@ -852,6 +935,11 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             number::WRITEV => self.vectored(arguments, Direction::Out),
             number::READV => self.vectored(arguments, Direction::In),
             number::ARCH_PRCTL => self.arch_prctl(arguments),
+            number::SOCKET => self.socket(arguments),
+            number::SCHED_GETAFFINITY => self.sched_getaffinity(arguments),
+            number::MBIND | number::SET_MEMPOLICY | number::GET_MEMPOLICY => {
+                Outcome::Done(Errno::NoSys.as_result())
+            }
 
             // The read-only filesystem. Eighty per cent of a real
             // application's traffic, and none of it leaves the module.

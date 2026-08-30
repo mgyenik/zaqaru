@@ -40,6 +40,11 @@ pub enum Errno {
     NotEmpty = 39,
     Loop = 40,
     NotSupported = 95,
+    /// `EAFNOSUPPORT`: the address family is not one this machine has.
+    ///
+    /// The honest answer for a container with no sockets. See the `socket`
+    /// row for why refusing by name would be the wrong loudness.
+    AddressFamily = 97,
     /// Not a Linux errno: this kernel cannot reach a file by descriptor
     /// alone in order to change it. Distinct so that the one row that can
     /// produce it turns into a named fault rather than a plausible answer.
@@ -88,6 +93,7 @@ impl Errno {
             Self::NoSys => "ENOSYS",
             Self::Loop => "ELOOP",
             Self::NotSupported => "ENOTSUP",
+            Self::AddressFamily => "EAFNOSUPPORT",
             Self::NameNeeded => "a name this kernel did not keep",
         }
     }

@@ -17,7 +17,7 @@ use std::collections::BTreeMap;
 use anyhow::{Context, Result, bail};
 use kisal::image::file_type;
 
-use crate::json;
+use crate::json::{self, Value};
 use crate::tar::{self, Entry, Kind};
 use crate::tree::{Body, Meta, NodeId, ROOT, Tree};
 
@@ -56,6 +56,99 @@ pub fn tree_from_archive(archive: &[u8]) -> Result<Tree> {
         apply(&mut tree, &entries).with_context(|| format!("applying the layer `{name}`"))?;
     }
     Ok(tree)
+}
+
+/// What an image says it should be run as.
+///
+/// An OCI image is two things: a stack of filesystem layers, and a *config*
+/// saying how to start what is in them. Reading only the first gives a
+/// container with no idea what to run — which is why a bake that ignores the
+/// config has to be told the command by hand, and why a bake that reads it
+/// can take a `docker save` tarball and nothing else.
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
+pub struct Invocation {
+    /// `Entrypoint` followed by `Cmd`, which is what the runtime spec says
+    /// composing them means: the entrypoint is the program and the command
+    /// is its default arguments, and an image may carry either, both, or
+    /// neither.
+    pub argv: Vec<Vec<u8>>,
+    /// `Env`, as `NAME=value` strings.
+    ///
+    /// Not decoration. The environment decides which *path* a program takes:
+    /// CPython with no `HOME` falls through `expanduser` into `getpwuid`,
+    /// which is glibc's NSS, which probes a socket this kernel does not
+    /// have. An image that sets `PATH` and `LANG` is an image whose Python
+    /// takes the path its author tested.
+    pub environment: Vec<Vec<u8>>,
+    /// `WorkingDir`, empty when the image does not say.
+    pub working_directory: Vec<u8>,
+}
+
+/// Reads the image's config: what to run, and in what environment.
+///
+/// The manifest names a config blob; the blob is the image's own statement
+/// of its entrypoint, command, environment and working directory. Absent
+/// fields are absent rather than guessed — an image with no `Entrypoint` and
+/// no `Cmd` genuinely does not say what to run, and inventing `/bin/sh`
+/// would be inventing it.
+pub fn invocation_from_archive(archive: &[u8]) -> Result<Invocation> {
+    let members = tar::read(archive).context("reading the image archive")?;
+    let manifest = members
+        .iter()
+        .find(|member| normalise(&member.path) == b"manifest.json")
+        .ok_or_else(|| anyhow::anyhow!("the archive has no `manifest.json`"))?;
+    let document = json::parse(&manifest.contents).context("parsing `manifest.json`")?;
+    let images = document
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("`manifest.json` is not an array of images"))?;
+    let [image] = images else {
+        bail!("`manifest.json` describes {} images, not one", images.len());
+    };
+    let Some(name) = image.get("Config").and_then(Value::as_str) else {
+        // A layer-only archive. Every field stays empty and the caller says
+        // what to run, which is what it had to do before this existed.
+        return Ok(Invocation::default());
+    };
+    let blob = members
+        .iter()
+        .find(|member| normalise(&member.path) == name.as_bytes())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "the manifest names the config `{name}`, which the archive does \
+                 not contain"
+            )
+        })?;
+    let config = json::parse(&blob.contents)
+        .with_context(|| format!("parsing the image config `{name}`"))?;
+    let Some(inner) = config.get("config").or_else(|| config.get("Config")) else {
+        return Ok(Invocation::default());
+    };
+
+    let strings = |key: &str| -> Vec<Vec<u8>> {
+        inner
+            .get(key)
+            .and_then(Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(|text| text.as_bytes().to_vec())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let mut argv = strings("Entrypoint");
+    argv.extend(strings("Cmd"));
+    Ok(Invocation {
+        argv,
+        environment: strings("Env"),
+        working_directory: inner
+            .get("WorkingDir")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .as_bytes()
+            .to_vec(),
+    })
 }
 
 /// The layer paths, in the order they must be applied.

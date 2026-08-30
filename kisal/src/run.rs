@@ -106,6 +106,36 @@ impl<'a, S: Store> Process<'a, S> {
         argv: &[&[u8]],
         envp: &[&[u8]],
     ) -> Result<Self, crate::exec::Error> {
+        // An image's entrypoint is usually a bare name — `python3`, not
+        // `/usr/local/bin/python3` — because a container runtime resolves it
+        // the way a shell does. `execve` does not, and must not: that is
+        // `execvpe`'s job and the distinction is the guest's to see. So the
+        // search happens here, at the one moment there is no guest yet.
+        let resolved = Self::resolve(&mut kernel, path, envp)?;
+        let path = resolved.as_slice();
+
+        // The directory the image says to start in, before anything runs —
+        // because a relative path in the command line is relative to it.
+        // `WORKDIR /app` beside `CMD ["python", "app.py"]` is the shape
+        // every application image has.
+        let directory = kernel.image_working_directory.clone();
+        if !directory.is_empty() {
+            let root = kernel.vfs.root();
+            let vnode = kernel
+                .vfs
+                .resolve(root, &directory, crate::vfs::Lookup::FOLLOW)
+                .map_err(|_| {
+                    crate::exec::Error::NotLoadable(
+                        "the image asks to start in a directory the image does not have",
+                    )
+                })?;
+            kernel.vfs.set_working_directory(vnode).map_err(|_| {
+                crate::exec::Error::NotLoadable(
+                    "the image asks to start somewhere that is not a directory",
+                )
+            })?;
+        }
+
         // The environment is the caller's, unchanged.
         //
         // Worth saying because the ahead-of-time boot prepends
@@ -127,6 +157,50 @@ impl<'a, S: Store> Process<'a, S> {
             kernel,
             cache: BlockCache::new(),
         })
+    }
+
+    /// Finds the program a container was told to start.
+    ///
+    /// A name with a slash in it is a path and is used as one. A bare name
+    /// is searched for along `PATH`, first match wins, exactly as `execvp`
+    /// does — and the failure names every directory it looked in, because
+    /// "no such file" about a name that was never a path sends the reader
+    /// looking for the wrong thing.
+    fn resolve(
+        kernel: &mut Kernel<'a, S, Interpreted>,
+        path: &[u8],
+        envp: &[&[u8]],
+    ) -> Result<Vec<u8>, crate::exec::Error> {
+        if path.contains(&b'/') {
+            return Ok(path.to_vec());
+        }
+        let search = envp
+            .iter()
+            .find_map(|entry| entry.strip_prefix(b"PATH=".as_slice()))
+            .unwrap_or(b"/usr/local/bin:/usr/bin:/bin");
+        for directory in search.split(|byte| *byte == b':') {
+            let mut candidate = match directory.is_empty() {
+                // An empty element means the working directory, which for a
+                // container that has not started is the root.
+                true => b"/".to_vec(),
+                false => directory.to_vec(),
+            };
+            if !candidate.ends_with(b"/") {
+                candidate.push(b'/');
+            }
+            candidate.extend_from_slice(path);
+            let root = kernel.vfs.root();
+            if kernel
+                .vfs
+                .resolve(root, &candidate, crate::vfs::Lookup::FOLLOW)
+                .is_ok()
+            {
+                return Ok(candidate);
+            }
+        }
+        Err(crate::exec::Error::NotLoadable(
+            "the entrypoint is a bare name and no directory on `PATH` has it",
+        ))
     }
 
     /// Runs until the process finishes.

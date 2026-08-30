@@ -75,6 +75,10 @@ pub mod ioctl_request {
     pub const TIOCSPGRP: u64 = 0x5410;
     pub const TIOCGWINSZ: u64 = 0x5413;
     pub const TIOCSWINSZ: u64 = 0x5414;
+    /// Set close-on-exec, and clear it — `fcntl(F_SETFD, FD_CLOEXEC)`
+    /// spelled as an `ioctl`, and the spelling CPython uses.
+    pub const FIONCLEX: u64 = 0x5450;
+    pub const FIOCLEX: u64 = 0x5451;
 }
 
 pub mod fcntl_command {
@@ -428,6 +432,18 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
             | ioctl_request::TIOCSPGRP
             | ioctl_request::TIOCGWINSZ
             | ioctl_request::TIOCSWINSZ => Outcome::Done(Errno::NoTty.as_result()),
+            // Not a terminal question at all: these are the descriptor's
+            // close-on-exec flag under another name, and the fd table
+            // already holds it. CPython sets it this way rather than through
+            // `fcntl` on every descriptor it opens, so an image whose Python
+            // opens a file reaches here before it reaches anything else.
+            ioctl_request::FIOCLEX | ioctl_request::FIONCLEX => {
+                let value = request == ioctl_request::FIOCLEX;
+                Outcome::Done(match self.files.set_close_on_exec(fd, value) {
+                    Ok(()) => 0,
+                    Err(errno) => errno.as_result(),
+                })
+            }
             _ => Outcome::Fault(Fault::detailed(
                 number::IOCTL,
                 arguments,

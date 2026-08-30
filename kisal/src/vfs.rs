@@ -110,6 +110,7 @@ impl<'a> Vfs<'a> {
         self.working_directory
     }
 
+
     pub fn inode(&self, vnode: Vnode) -> Result<Inode, Errno> {
         self.mounts.filesystem(vnode.mount)?.inode(vnode.inode)
     }

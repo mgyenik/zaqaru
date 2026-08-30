@@ -35,6 +35,7 @@
 //! modules   sorted (inode, prelink base) pairs, one per translated ELF
 //! command   the boot command line: NUL-separated argument strings
 //! environ   the boot environment: NUL-separated `NAME=value` strings
+//! workdir   the directory the container starts in, or nothing
 //! ```
 //!
 //! The command line and the environment are regions rather than files
@@ -62,9 +63,9 @@
 
 /// `KISI` — kisal image.
 pub const MAGIC: u32 = u32::from_le_bytes(*b"KISI");
-pub const VERSION: u32 = 4;
+pub const VERSION: u32 = 5;
 
-pub const HEADER_SIZE: usize = 72;
+pub const HEADER_SIZE: usize = 80;
 /// Fixed and packed: `stat` is `inode_offset + index * INODE_SIZE`.
 pub const INODE_SIZE: usize = 64;
 pub const DIRENT_SIZE: usize = 12;
@@ -288,6 +289,89 @@ pub struct Header {
     pub command_size: u32,
     pub environment_offset: u32,
     pub environment_size: u32,
+    /// The directory the container starts in.
+    ///
+    /// An OCI image says this and it is not decoration: `CMD ["python",
+    /// "app.py"]` beside `WORKDIR /app` names a file that only exists
+    /// relative to somewhere. Empty means the image did not say, and the
+    /// container starts at the root.
+    pub working_directory_offset: u32,
+    pub working_directory_size: u32,
+}
+
+impl Header {
+    /// Reads a header without validating it against an index.
+    ///
+    /// Shared by [`Image::parse`], which then validates, and by
+    /// [`index_length`], which has only the header to work from.
+    fn read(header: &[u8]) -> Self {
+        Self {
+            inode_count: word(header, 8),
+            inode_offset: word(header, 12),
+            dirent_offset: word(header, 16),
+            dirent_size: word(header, 20),
+            string_offset: word(header, 24),
+            string_size: word(header, 28),
+            xattr_offset: word(header, 32),
+            xattr_size: word(header, 36),
+            root_inode: word(header, 40),
+            blob_size: word(header, 44),
+            module_offset: word(header, 48),
+            module_count: word(header, 52),
+            command_offset: word(header, 56),
+            command_size: word(header, 60),
+            environment_offset: word(header, 64),
+            environment_size: word(header, 68),
+            working_directory_offset: word(header, 72),
+            working_directory_size: word(header, 76),
+        }
+    }
+
+    /// Every region the index contains: its name, where it starts, and how
+    /// long it is.
+    ///
+    /// **One list, and both consumers read it.** Validation needs it to
+    /// refuse an index that does not contain what its header claims, and
+    /// [`index_length`] needs it to say how many bytes an index is. Those
+    /// used to be two lists, and a region added to one and not the other is
+    /// an image that parses at the bake and is refused inside the kernel's
+    /// own construction, where there is no kernel yet to report it. That has
+    /// now happened twice — the modules region, and the working directory —
+    /// which is twice more than a comment saying "remember to update both"
+    /// was worth.
+    ///
+    /// Sizes are `u64` and *not* narrowed on the way: an inode count of 2^26
+    /// makes the byte count 2^32, which as a `u32` is zero — a region of
+    /// nothing, which validates against any index at all and then traps the
+    /// first time an inode is read.
+    fn regions(&self) -> [(&'static str, u32, u64); 8] {
+        [
+            (
+                "inodes",
+                self.inode_offset,
+                (self.inode_count as u64) * (INODE_SIZE as u64),
+            ),
+            ("dirents", self.dirent_offset, self.dirent_size as u64),
+            ("strings", self.string_offset, self.string_size as u64),
+            ("xattrs", self.xattr_offset, self.xattr_size as u64),
+            (
+                "modules",
+                self.module_offset,
+                (self.module_count as u64) * (MODULE_SIZE as u64),
+            ),
+            ("command", self.command_offset, self.command_size as u64),
+            (
+                "environment",
+                self.environment_offset,
+                self.environment_size as u64,
+            ),
+            (
+                "working directory",
+                self.working_directory_offset,
+                self.working_directory_size as u64,
+            ),
+        ]
+    }
 }
 
 /// A baked image: the index and the blob its regular files live in.
@@ -318,49 +402,11 @@ impl<'a> Image<'a> {
         if version != VERSION {
             return Err(ImageError::UnsupportedVersion(version));
         }
-        let header = Header {
-            inode_count: word(index, 8),
-            inode_offset: word(index, 12),
-            dirent_offset: word(index, 16),
-            dirent_size: word(index, 20),
-            string_offset: word(index, 24),
-            string_size: word(index, 28),
-            xattr_offset: word(index, 32),
-            xattr_size: word(index, 36),
-            root_inode: word(index, 40),
-            blob_size: word(index, 44),
-            module_offset: word(index, 48),
-            module_count: word(index, 52),
-            command_offset: word(index, 56),
-            command_size: word(index, 60),
-            environment_offset: word(index, 64),
-            environment_size: word(index, 68),
-        };
+        let header = Header::read(index);
 
         // Validate the regions once, here, so that everything after is an
         // offset within a region already known to exist.
-        // At full width, and *not* narrowed to `u32` on the way: an inode
-        // count of 2^26 makes the byte count 2^32, which as a `u32` is zero —
-        // a region of nothing, which validates against any index at all and
-        // then traps the first time an inode is read.
-        let inode_bytes = (header.inode_count as u64) * (INODE_SIZE as u64);
-        for (name, offset, size) in [
-            ("inodes", header.inode_offset, inode_bytes),
-            ("dirents", header.dirent_offset, header.dirent_size as u64),
-            ("strings", header.string_offset, header.string_size as u64),
-            ("xattrs", header.xattr_offset, header.xattr_size as u64),
-            (
-                "modules",
-                header.module_offset,
-                (header.module_count as u64) * (MODULE_SIZE as u64),
-            ),
-            ("command", header.command_offset, header.command_size as u64),
-            (
-                "environment",
-                header.environment_offset,
-                header.environment_size as u64,
-            ),
-        ] {
+        for (name, offset, size) in header.regions() {
             let end = (offset as u64)
                 .checked_add(size)
                 .ok_or(ImageError::TruncatedRegion(name))?;
@@ -442,6 +488,22 @@ impl<'a> Image<'a> {
         region
             .split(|byte| *byte == 0)
             .filter(|entry| !entry.is_empty())
+    }
+
+    /// The directory the container starts in, or empty when the image did
+    /// not say.
+    ///
+    /// A fact about the container rather than a file in it, which is why it
+    /// is a region and not a path somebody has to know to read — the same
+    /// reasoning as the command line and the environment.
+    pub fn working_directory(&self) -> &'a [u8] {
+        self.index
+            .get(
+                self.header.working_directory_offset as usize
+                    ..self.header.working_directory_offset as usize
+                        + self.header.working_directory_size as usize,
+            )
+            .unwrap_or(&[])
     }
 
     /// The base the bake placed a translated ELF at, if this inode is one.
@@ -670,6 +732,8 @@ pub fn write_header(into: &mut [u8; HEADER_SIZE], header: &Header) {
     into[60..64].copy_from_slice(&header.command_size.to_le_bytes());
     into[64..68].copy_from_slice(&header.environment_offset.to_le_bytes());
     into[68..72].copy_from_slice(&header.environment_size.to_le_bytes());
+    into[72..76].copy_from_slice(&header.working_directory_offset.to_le_bytes());
+    into[76..80].copy_from_slice(&header.working_directory_size.to_le_bytes());
 }
 
 /// The total length of an index whose header is `header`.
@@ -685,26 +749,16 @@ pub fn index_length(header: &[u8]) -> Result<usize, ImageError> {
         return Err(ImageError::BadMagic);
     }
     // The end of the region that ends last, rather than of whichever region
-    // the writer happens to put last. An earlier version read exactly the
-    // xattr region's end, which was true until the modules region was added
-    // after it — and then the slice was eight bytes short, `parse` refused
-    // it, and the refusal happened inside the kernel's own construction,
-    // where there is no kernel yet to report it. A length that has to be
-    // updated whenever a region is added is a length that will not be.
-    let inodes = (word(header, 12) as u64) + (word(header, 8) as u64) * (INODE_SIZE as u64);
-    let end = [
-        inodes,
-        word(header, 16) as u64 + word(header, 20) as u64,
-        word(header, 24) as u64 + word(header, 28) as u64,
-        word(header, 32) as u64 + word(header, 36) as u64,
-        word(header, 48) as u64 + word(header, 52) as u64 * (MODULE_SIZE as u64),
-        word(header, 56) as u64 + word(header, 60) as u64,
-        word(header, 64) as u64 + word(header, 68) as u64,
-    ]
-    .into_iter()
-    .max()
-    .expect("the array is not empty")
-    .max(HEADER_SIZE as u64);
+    // the writer happens to put last — and taken from `Header::regions`, so
+    // that a region added to the format is accounted for here without
+    // anybody having to remember to come back.
+    let end = Header::read(header)
+        .regions()
+        .into_iter()
+        .map(|(_, offset, size)| offset as u64 + size)
+        .max()
+        .expect("the array is not empty")
+        .max(HEADER_SIZE as u64);
     usize::try_from(end).map_err(|_| ImageError::TruncatedRegion("index"))
 }
 
