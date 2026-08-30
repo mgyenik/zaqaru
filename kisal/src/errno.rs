@@ -26,6 +26,30 @@ pub enum Errno {
     /// tells a `while (wait(...) > 0)` loop to stop.
     NoChild = 10,
     Busy = 16,
+    /// `ENOTSOCK`: the descriptor is open and is not a socket, which is a
+    /// different fact from `EBADF` and one every socket row has to keep
+    /// apart — a program that passes a file where a socket was wanted has a
+    /// bug, and a program that passes a closed descriptor has a different
+    /// one.
+    NotSocket = 88,
+    /// `EADDRINUSE`: something already holds that address. There is no
+    /// `TIME_WAIT` here to relax it with, because there is no TCP — see
+    /// [`crate::socket::Options::reuse_address`].
+    AddressInUse = 98,
+    /// `EADDRNOTAVAIL`: the address is not one this machine answers to.
+    AddressUnavailable = 99,
+    /// `ECONNREFUSED`: nothing is listening there, or its backlog is full.
+    ConnectionRefused = 111,
+    /// `ENOTCONN`: the socket is not connected, which `getpeername` on a
+    /// listener answers — gunicorn asks, in the traced baseline.
+    NotConnected = 107,
+    /// `EISCONN`: it already is.
+    AlreadyConnected = 106,
+    /// `EPROTONOSUPPORT`: the family is one this kernel has and the protocol
+    /// inside it is not.
+    ProtocolUnsupported = 93,
+    /// `EDESTADDRREQ`: a send with nowhere to send it.
+    DestinationRequired = 89,
     /// `EINTR`: a signal arrived while the call was waiting. Never an
     /// outcome a call *chose* — it is the wait being cut short, which is
     /// why `pause` answers it every single time it returns at all.
@@ -56,6 +80,9 @@ pub enum Errno {
     NoSys = 38,
     NotEmpty = 39,
     Loop = 40,
+    /// `ENOTSUP`, and `EOPNOTSUPP`, which Linux gives the same number: the
+    /// operation does not apply to this object — `listen` on a connected
+    /// socket, `accept` on one that never listened.
     NotSupported = 95,
     /// `EAFNOSUPPORT`: the address family is not one this machine has.
     ///
@@ -114,6 +141,14 @@ impl Errno {
             Self::Loop => "ELOOP",
             Self::NotSupported => "ENOTSUP",
             Self::AddressFamily => "EAFNOSUPPORT",
+            Self::NotSocket => "ENOTSOCK",
+            Self::AddressInUse => "EADDRINUSE",
+            Self::AddressUnavailable => "EADDRNOTAVAIL",
+            Self::ConnectionRefused => "ECONNREFUSED",
+            Self::NotConnected => "ENOTCONN",
+            Self::AlreadyConnected => "EISCONN",
+            Self::ProtocolUnsupported => "EPROTONOSUPPORT",
+            Self::DestinationRequired => "EDESTADDRREQ",
             Self::TryAgain => "EAGAIN",
             Self::NoChild => "ECHILD",
             Self::NameNeeded => "a name this kernel did not keep",

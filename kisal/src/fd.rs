@@ -52,6 +52,11 @@ pub enum Backing {
         ring: u32,
         end: crate::ring::End,
     },
+    /// A socket: an index into the socket arena the whole process tree
+    /// shares. Which rings it holds is *not* here, because a socket
+    /// acquires them at `connect` or `accept` and a descriptor's backing
+    /// does not change — the arena is asked. See [`crate::socket`].
+    Socket(u32),
     /// An `epoll` instance, named the same way and shared for the same
     /// reason. A descriptor that *is* a set rather than a file is the whole
     /// idea of `epoll`, and it is why it needs a backing of its own.
@@ -283,6 +288,20 @@ impl FdTable {
             })
     }
 
+    /// The same for sockets. What *rings* those sockets hold is not here,
+    /// because only the arena knows — see
+    /// [`crate::syscall::Kernel::shared_census`].
+    pub fn socket_ids(&self) -> impl Iterator<Item = u32> + '_ {
+        self.descriptors
+            .iter()
+            .flatten()
+            .filter_map(|descriptor| self.descriptions[descriptor.description].as_ref())
+            .filter_map(|file| match file.backing {
+                Backing::Socket(id) => Some(id),
+                _ => None,
+            })
+    }
+
     /// The same for `epoll` instances, once per descriptor.
     pub fn epoll_sets(&self) -> impl Iterator<Item = u32> + '_ {
         self.descriptors
@@ -320,6 +339,7 @@ impl FdTable {
                     Backing::Image(vnode) => format!("file:{}", vnode.inode),
                     Backing::Console(stream) => format!("console:{stream:?}"),
                     Backing::Pipe { ring, end } => format!("pipe{ring}:{end:?}"),
+                    Backing::Socket(id) => format!("socket{id}"),
                     Backing::Epoll(id) => format!("epoll{id}"),
                 };
                 Some((fd, what))

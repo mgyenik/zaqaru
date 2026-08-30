@@ -227,7 +227,10 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
     fn image_inode(&self, fd: i32, not_a_file: Errno) -> Result<Vnode, Errno> {
         match self.files.description(fd)?.backing {
             Backing::Image(inode) => Ok(inode),
-            Backing::Console(_) | Backing::Pipe { .. } | Backing::Epoll(_) => Err(not_a_file),
+            Backing::Console(_)
+            | Backing::Pipe { .. }
+            | Backing::Epoll(_)
+            | Backing::Socket(_) => Err(not_a_file),
         }
     }
 
@@ -462,7 +465,10 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
         let held = match self.files.description(fd) {
             Ok(file) => match file.backing {
                 Backing::Image(vnode) => Some(vnode),
-                Backing::Console(_) | Backing::Pipe { .. } | Backing::Epoll(_) => None,
+                Backing::Console(_)
+                | Backing::Pipe { .. }
+                | Backing::Epoll(_)
+                | Backing::Socket(_) => None,
             },
             Err(_) => None,
         };
@@ -495,11 +501,28 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
         // Before anything that keeps an offset, because a pipe has none and
         // because a pipe read can park — which `read_at`'s signature has no
         // way to say.
-        if let Some((pipe, end, flags)) = self.pipe_of(fd) {
+        if let Some((ring, end, flags)) = self.pipe_of(fd) {
             if end == crate::ring::End::Write {
                 return Outcome::Done(Errno::BadFile.as_result());
             }
-            return self.transfer_ring(pipe, end, flags, arguments.get(1) as u64, count as u64);
+            return self.transfer_ring(ring, end, flags, arguments.get(1) as u64, count as u64);
+        }
+        // And a socket, for the same reason and through the same transfer.
+        match self.socket_ring(fd, crate::ring::End::Read) {
+            crate::socket::Reach::Ring { ring, flags } => {
+                return self.transfer_ring(
+                    ring,
+                    crate::ring::End::Read,
+                    flags,
+                    arguments.get(1) as u64,
+                    count as u64,
+                );
+            }
+            crate::socket::Reach::Finished => return Outcome::Done(0),
+            crate::socket::Reach::Refused(errno) => {
+                return Outcome::Done(errno.as_result());
+            }
+            crate::socket::Reach::Elsewhere => {}
         }
         let offset = match self.files.description(fd) {
             Ok(file) => file.offset,
@@ -566,6 +589,10 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
             // An `epoll` descriptor is a set, not a stream; reading it is
             // `epoll_wait` and nothing else.
             Backing::Epoll(_) => return Err(Errno::Invalid),
+            // `read` answers a socket before reaching here, for the same
+            // reason it answers a pipe: the transfer can park. `pread` on
+            // a socket has no position to read at.
+            Backing::Socket(_) => return Err(Errno::NotSeekable),
         };
         // An `O_PATH` descriptor refers to a file without opening it, so
         // there is nothing to read from.
@@ -875,6 +902,7 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
                 Backing::Console(stream) => self.write_console_stat(stream, arguments.get(1)),
                 Backing::Pipe { ring, .. } => self.write_pipe_stat(ring, arguments.get(1)),
                 Backing::Epoll(id) => self.write_epoll_stat(id, arguments.get(1)),
+                Backing::Socket(id) => self.write_socket_stat(id, arguments.get(1)),
             },
             Err(errno) => Outcome::Done(errno.as_result()),
         }
@@ -904,6 +932,29 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
     /// `epoll_create1` descriptor answers `0600`, where a pipe answers
     /// `010600`. A program that branches on `S_ISREG` must not be told this
     /// is a file.
+    /// `fstat` on a socket: `S_IFSOCK`, and `st_size` is what is waiting to
+    /// be read — which is what a program calling `FIONREAD` by another name
+    /// would want, and what Linux answers.
+    fn write_socket_stat(&mut self, id: u32, destination: i64) -> Outcome {
+        let mut buffer = [0u8; STAT_SIZE];
+        let queued = match self.sockets.borrow().endpoint(id) {
+            Some(endpoint) => self.rings.borrow().queued(endpoint.receive) as u64,
+            None => 0,
+        };
+        let number = SOCKET_INODE_BASE + u64::from(id);
+        buffer[0..8].copy_from_slice(&SOCKET_DEVICE.to_le_bytes());
+        buffer[8..16].copy_from_slice(&number.to_le_bytes());
+        buffer[16..24].copy_from_slice(&1u64.to_le_bytes());
+        buffer[24..28].copy_from_slice(&(file_type::SOCKET | 0o777).to_le_bytes());
+        buffer[48..56].copy_from_slice(&queued.to_le_bytes());
+        buffer[56..64].copy_from_slice(&BLOCK_SIZE.to_le_bytes());
+        // SAFETY: bounds-checked against the guest's memory.
+        match unsafe { self.memory_mut().write(destination as u64, &buffer) } {
+            Ok(()) => Outcome::Done(0),
+            Err(errno) => Outcome::Done(errno.as_result()),
+        }
+    }
+
     fn write_epoll_stat(&mut self, id: u32, destination: i64) -> Outcome {
         let mut buffer = [0u8; STAT_SIZE];
         let number = EPOLL_INODE_BASE + u64::from(id);
@@ -951,6 +1002,7 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
                 Ok(Backing::Console(stream)) => self.write_console_stat(stream, arguments.get(2)),
                 Ok(Backing::Pipe { ring, .. }) => self.write_pipe_stat(ring, arguments.get(2)),
                 Ok(Backing::Epoll(id)) => self.write_epoll_stat(id, arguments.get(2)),
+                Ok(Backing::Socket(id)) => self.write_socket_stat(id, arguments.get(2)),
                 Err(errno) => Outcome::Done(errno.as_result()),
             };
         }
@@ -996,6 +1048,30 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
         let vnode = if path.is_empty() && flags & at::EMPTY_PATH != 0 {
             match self.empty_path_target(arguments.get(0)) {
                 Ok(Backing::Image(vnode)) => vnode,
+                Ok(Backing::Socket(id)) => {
+                    let mut buffer = [0u8; STATX_SIZE];
+                    let number = SOCKET_INODE_BASE + u64::from(id);
+                    let queued = match self.sockets.borrow().endpoint(id) {
+                        Some(endpoint) => self.rings.borrow().queued(endpoint.receive) as u64,
+                        None => 0,
+                    };
+                    buffer[0..4].copy_from_slice(&STATX_BASIC_STATS.to_le_bytes());
+                    buffer[4..8].copy_from_slice(&(BLOCK_SIZE as u32).to_le_bytes());
+                    buffer[16..20].copy_from_slice(&1u32.to_le_bytes());
+                    buffer[28..30].copy_from_slice(&((file_type::SOCKET | 0o777) as u16).to_le_bytes());
+                    buffer[32..40].copy_from_slice(&number.to_le_bytes());
+                    buffer[40..48].copy_from_slice(&queued.to_le_bytes());
+                    let (major, minor) = split_device(SOCKET_DEVICE);
+                    buffer[136..140].copy_from_slice(&major.to_le_bytes());
+                    buffer[140..144].copy_from_slice(&minor.to_le_bytes());
+                    // SAFETY: bounds-checked against guest memory.
+                    return match unsafe {
+                        self.memory_mut().write(arguments.get(4) as u64, &buffer)
+                    } {
+                        Ok(()) => Outcome::Done(0),
+                        Err(errno) => Outcome::Done(errno.as_result()),
+                    };
+                }
                 Ok(Backing::Epoll(id)) => {
                     let mut buffer = [0u8; STATX_SIZE];
                     let number = EPOLL_INODE_BASE + u64::from(id);
@@ -1303,7 +1379,10 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
                 // A console stream is not a symlink, and neither is the
                 // working directory; both fall out as `EINVAL` below.
                 Ok(Backing::Image(vnode)) => vnode,
-                Ok(Backing::Console(_)) | Ok(Backing::Pipe { .. }) | Ok(Backing::Epoll(_)) => {
+                Ok(Backing::Console(_))
+                | Ok(Backing::Pipe { .. })
+                | Ok(Backing::Epoll(_))
+                | Ok(Backing::Socket(_)) => {
                     return Outcome::Done(Errno::Invalid.as_result());
                 }
                 Err(errno) => return Outcome::Done(errno.as_result()),
@@ -1404,6 +1483,14 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
                 Ok(Backing::Console(stream)) => {
                     return Outcome::Done(console_access(stream, mode));
                 }
+                // A socket is readable and writable and never executable,
+                // whichever direction it is currently able to move bytes in.
+                Ok(Backing::Socket(_)) => {
+                    return Outcome::Done(match mode & access_mode::EXECUTE != 0 {
+                        true => Errno::Access.as_result(),
+                        false => 0,
+                    });
+                }
                 // A pipe end may be read or written by direction, and never
                 // executed.
                 Ok(Backing::Pipe { end, .. }) => {
@@ -1498,7 +1585,10 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
             number::FGETXATTR | number::FLISTXATTR => {
                 match self.files.description(first as i32)?.backing {
                     Backing::Image(inode) => Ok(Some(inode)),
-                    Backing::Console(_) | Backing::Pipe { .. } | Backing::Epoll(_) => Ok(None),
+                    Backing::Console(_)
+                    | Backing::Pipe { .. }
+                    | Backing::Epoll(_)
+                    | Backing::Socket(_) => Ok(None),
                 }
             }
             number::LGETXATTR | number::LLISTXATTR => self
@@ -1941,8 +2031,31 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
     /// also point at — once per *descriptor*, because that is the unit both
     /// counts are kept in.
     pub(crate) fn shared_census(&self) -> Census {
+        // Ring ends from pipes come straight off the table; a socket's have
+        // to be asked of the arena, because a socket acquires its rings at
+        // `connect` or `accept` and its descriptor's backing does not
+        // change. A direction already given up by `shutdown` contributes
+        // nothing, which is what keeps a census from handing back a
+        // reference the guest deliberately dropped.
+        let mut rings: Vec<(u32, crate::ring::End)> = self.files.pipe_ends().collect();
+        let sockets: Vec<u32> = self.files.socket_ids().collect();
+        if !sockets.is_empty() {
+            let arena = self.sockets.borrow();
+            for id in &sockets {
+                let Some(endpoint) = arena.endpoint(*id) else {
+                    continue;
+                };
+                if !endpoint.read_shut {
+                    rings.push((endpoint.receive, crate::ring::End::Read));
+                }
+                if !endpoint.write_shut {
+                    rings.push((endpoint.transmit, crate::ring::End::Write));
+                }
+            }
+        }
         Census {
-            pipes: self.files.pipe_ends().collect(),
+            pipes: rings,
+            sockets,
             epolls: self.files.epoll_sets().collect(),
         }
     }
@@ -1989,6 +2102,19 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
                 }
                 for _ in now..was {
                     rings.release(held.0, held.1);
+                }
+            }
+        }
+        {
+            let mut arena = self.sockets.borrow_mut();
+            for held in distinct(&before.sockets, &after.sockets) {
+                let was = count(&before.sockets, &held);
+                let now = count(&after.sockets, &held);
+                for _ in was..now {
+                    arena.acquire(held);
+                }
+                for _ in now..was {
+                    arena.release(held);
                 }
             }
         }
@@ -2170,6 +2296,10 @@ fn encode_stat(into: &mut [u8; STAT_SIZE], device: u64, number: u32, inode: &Ino
 const PIPE_DEVICE: u64 = 15;
 const PIPE_INODE_BASE: u64 = 0x9000_0000;
 
+/// And sockets, on a third.
+const SOCKET_DEVICE: u64 = 17;
+const SOCKET_INODE_BASE: u64 = 0x9200_0000;
+
 /// The same for `epoll` instances, which are on a different anonymous
 /// filesystem again — measured on this machine, where a pipe reports device
 /// 15 and an `epoll` descriptor reports 16.
@@ -2184,7 +2314,10 @@ const EPOLL_INODE_BASE: u64 = 0x9100_0000;
 /// neither allocates. What is per-process is handled where it happens; see
 /// [`crate::syscall::Kernel::forget_description`].
 pub struct Census {
+    /// Every ring end the table holds, from pipes and sockets alike — which
+    /// is why the field outlived its name.
     pipes: Vec<(u32, crate::ring::End)>,
+    sockets: Vec<u32>,
     epolls: Vec<u32>,
 }
 

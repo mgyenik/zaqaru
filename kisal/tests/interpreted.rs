@@ -1886,3 +1886,121 @@ int main(void) {
         Linkage::Dynamic,
     );
 }
+
+/// **A `socketpair` across a fork**, which is the simplest connection there
+/// is and the one gunicorn's master uses to tell its worker to shut down.
+///
+/// Two rings crossed: what one endpoint writes the other reads, in both
+/// directions at once. So this fails if the pair is not bidirectional, if
+/// the fork copied the rings instead of sharing them, or if the reference
+/// census does not count what a socket holds — a socket descriptor is a
+/// reference on the socket *and* one on each ring it can still move bytes
+/// through, and a child that gets the socket but not the rings leaves the
+/// parent reading an end-of-file that has not happened.
+#[test]
+fn a_socketpair_carries_both_ways_across_a_fork() {
+    agrees_with_native(
+        "socketpair",
+        r#"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+int main(void) {
+    int ends[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, ends) != 0) {
+        perror("socketpair");
+        return 1;
+    }
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        close(ends[0]);
+        char question[64] = {0};
+        ssize_t got = read(ends[1], question, sizeof question - 1);
+        /* And answer back down the same pair, which a pipe could not do. */
+        char answer[96];
+        int length = snprintf(answer, sizeof answer, "heard %zd bytes: %s", got, question);
+        write(ends[1], answer, length);
+        close(ends[1]);
+        _exit(0);
+    }
+    close(ends[1]);
+    write(ends[0], "quit", 4);
+    char reply[128] = {0};
+    size_t total = 0;
+    ssize_t piece;
+    while ((piece = read(ends[0], reply + total, sizeof reply - 1 - total)) > 0) {
+        total += (size_t)piece;
+    }
+    close(ends[0]);
+    waitpid(child, 0, 0);
+    printf("%s\n", reply);
+    return 0;
+}
+"#,
+        Linkage::Dynamic,
+    );
+}
+
+/// **The half-close matrix, on a socketpair.**
+///
+/// `shutdown` is what `close` is only the both-directions case of, and each
+/// direction is a reference on a ring — so giving one up is exactly what the
+/// last writer of a pipe closing already does. `SHUT_WR` makes the peer
+/// drain and then read zero; a write to a peer that has `SHUT_RD` is
+/// `EPIPE`; and the endpoint that shut a direction sees its own side of that
+/// too. Each cell is a different rule getting the same answer, which is the
+/// claim the ring split was made for.
+#[test]
+fn shutting_one_direction_leaves_the_other() {
+    agrees_with_native(
+        "half-close",
+        r#"
+#include <errno.h>
+#include <signal.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+int main(void) {
+    signal(SIGPIPE, SIG_IGN);
+    int ends[2];
+    socketpair(AF_UNIX, SOCK_STREAM, 0, ends);
+
+    /* Bytes already sent survive the shutdown that follows them. */
+    write(ends[0], "queued", 6);
+    shutdown(ends[0], SHUT_WR);
+
+    char buffer[32] = {0};
+    printf("drained %zd: %s\n", read(ends[1], buffer, sizeof buffer - 1), buffer);
+    printf("then eof %zd\n", read(ends[1], buffer, sizeof buffer - 1));
+
+    /* The direction the other way is untouched. */
+    write(ends[1], "still open", 10);
+    memset(buffer, 0, sizeof buffer);
+    printf("other way %zd: %s\n", read(ends[0], buffer, sizeof buffer - 1), buffer);
+
+    /* Writing into a direction this endpoint gave up. */
+    errno = 0;
+    ssize_t refused = write(ends[0], "no", 2);
+    printf("own shut %zd errno %d\n", refused, errno);
+
+    /* And a write to a peer that has stopped reading. */
+    shutdown(ends[0], SHUT_RD);
+    errno = 0;
+    ssize_t broken = write(ends[1], "nobody home", 11);
+    printf("peer shut %zd errno %d\n", broken, errno);
+
+    close(ends[0]);
+    close(ends[1]);
+    return 0;
+}
+"#,
+        Linkage::Dynamic,
+    );
+}

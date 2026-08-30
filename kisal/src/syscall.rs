@@ -96,6 +96,19 @@ pub mod number {
     pub const CLOSE_RANGE: i64 = 436;
     pub const FADVISE64: i64 = 221;
     pub const PAUSE: i64 = 34;
+    pub const CONNECT: i64 = 42;
+    pub const ACCEPT: i64 = 43;
+    pub const SENDTO: i64 = 44;
+    pub const RECVFROM: i64 = 45;
+    pub const SHUTDOWN: i64 = 48;
+    pub const BIND: i64 = 49;
+    pub const LISTEN: i64 = 50;
+    pub const GETSOCKNAME: i64 = 51;
+    pub const GETPEERNAME: i64 = 52;
+    pub const SOCKETPAIR: i64 = 53;
+    pub const SETSOCKOPT: i64 = 54;
+    pub const GETSOCKOPT: i64 = 55;
+    pub const ACCEPT4: i64 = 288;
     pub const STATFS: i64 = 137;
     pub const FSTATFS: i64 = 138;
     pub const GETRANDOM: i64 = 318;
@@ -202,6 +215,19 @@ pub mod number {
             CLOSE_RANGE => "close_range",
             FADVISE64 => "fadvise64",
             PAUSE => "pause",
+            CONNECT => "connect",
+            ACCEPT => "accept",
+            ACCEPT4 => "accept4",
+            SENDTO => "sendto",
+            RECVFROM => "recvfrom",
+            SHUTDOWN => "shutdown",
+            BIND => "bind",
+            LISTEN => "listen",
+            GETSOCKNAME => "getsockname",
+            GETPEERNAME => "getpeername",
+            SOCKETPAIR => "socketpair",
+            SETSOCKOPT => "setsockopt",
+            GETSOCKOPT => "getsockopt",
             STATFS => "statfs",
             FSTATFS => "fstatfs",
             PIPE => "pipe",
@@ -549,6 +575,11 @@ pub struct Kernel<'a, S: Store, M: Machine> {
     /// `container-plan.md`'s fd hoisting lands once the shared thing lives
     /// somewhere both processes can reach.
     pub rings: crate::ring::Shared,
+    /// Every socket in the container, shared for the same reason the rings
+    /// are — and this is where `container-plan.md`'s port table lives,
+    /// because a port table is network-namespace state and a namespace
+    /// spans processes. See [`crate::socket`].
+    pub sockets: crate::socket::Shared,
     /// Every `epoll` instance in *this* process. See [`crate::poll::Epolls`]
     /// for why this one is not shared where the pipes are.
     pub epolls: crate::poll::Held,
@@ -758,6 +789,7 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             parent: 0,
             files: crate::fd::FdTable::with_standard_streams(),
             rings: crate::ring::Shared::default(),
+            sockets: crate::socket::Shared::default(),
             epolls: crate::poll::Held::default(),
             clock: 1,
             status: None,
@@ -1052,8 +1084,24 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
         // have a copy of every one of them.
         {
             let mut rings = self.rings.borrow_mut();
-            for (pipe, end) in self.files.pipe_ends() {
-                rings.acquire(pipe, end);
+            for (ring, end) in self.files.pipe_ends() {
+                rings.acquire(ring, end);
+            }
+            // A socket descriptor is a reference on the socket *and* one on
+            // each ring it is still able to move bytes through — which is
+            // pitfall 1 of `docs/network-plan.md`: the shutdown bits are not
+            // references, so a direction already given up raises nothing.
+            let mut sockets = self.sockets.borrow_mut();
+            for id in self.files.socket_ids() {
+                sockets.acquire(id);
+                if let Some(endpoint) = sockets.endpoint(id) {
+                    if !endpoint.read_shut {
+                        rings.acquire(endpoint.receive, crate::ring::End::Read);
+                    }
+                    if !endpoint.write_shut {
+                        rings.acquire(endpoint.transmit, crate::ring::End::Write);
+                    }
+                }
             }
             let mut epolls = self.epolls.borrow_mut();
             for id in self.files.epoll_sets() {
@@ -1096,6 +1144,7 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             // Shared, not copied — see the field. The counts were raised
             // above, once per descriptor the copied table holds.
             rings: crate::ring::Shared::clone(&self.rings),
+            sockets: crate::socket::Shared::clone(&self.sockets),
             // Copied, and marked: a registration names a description, and
             // a description is an index into a table the child has its own
             // copy of. See [`crate::poll::Epolls`].
@@ -1207,6 +1256,7 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             // how every shell wires a pipeline: the descriptors survive and
             // so must what is behind them.
             rings: crate::ring::Shared::clone(&self.rings),
+            sockets: crate::socket::Shared::clone(&self.sockets),
             // The same process, so not inherited: `execve` keeps the
             // descriptor table it did not close, and the indices with it.
             epolls: crate::poll::Held::new(self.epolls.borrow().clone()),
@@ -1814,32 +1864,6 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
         }
     }
 
-    /// `socket`: this container has none.
-    ///
-    /// **Answered rather than refused, and the distinction is the whole
-    /// point of the loud-error policy rather than an exception to it.** A
-    /// named fault is right when the kernel does not implement something a
-    /// guest reasonably expects to work — a silent `ENOSYS` there is a hang
-    /// three layers away. This is the other case: a container with no
-    /// network and no unix sockets genuinely does not have the address
-    /// family, and `EAFNOSUPPORT` is exactly what Linux says about a family
-    /// it does not have. Saying so is not a stub.
-    ///
-    /// It matters because of what asks. glibc's NSS opens a unix socket to
-    /// probe `nscd` before it will read `/etc/passwd`, so `getpwuid` — which
-    /// CPython reaches through `expanduser` whenever `HOME` is unset — goes
-    /// through here on the way to working. A refusal stops the container; an
-    /// honest failure makes the library fall back to the files it was going
-    /// to read anyway. Found booting the official `python:3.12-slim` image,
-    /// whose environment sets no `HOME`.
-    ///
-    /// When sockets arrive they arrive as a capability under `/iso`, and
-    /// this row becomes the place that reports whether the container was
-    /// given one.
-    fn socket(&mut self, _arguments: Arguments) -> Outcome {
-        Outcome::Done(Errno::AddressFamily.as_result())
-    }
-
     /// Whether this container is tracing its syscalls, decided once.
     ///
     /// `None` until something asks, because the store is not reachable
@@ -1868,7 +1892,9 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             number::WRITEV => self.vectored(arguments, Direction::Out),
             number::READV => self.vectored(arguments, Direction::In),
             number::ARCH_PRCTL => self.arch_prctl(arguments),
-            number::SOCKET => self.socket(arguments),
+            number::SOCKET => self.make_socket(arguments),
+            number::SOCKETPAIR => self.make_socketpair(arguments),
+            number::SHUTDOWN => self.shutdown(arguments),
             number::SCHED_GETAFFINITY => self.sched_getaffinity(arguments),
             number::MBIND | number::SET_MEMPOLICY | number::GET_MEMPOLICY => {
                 Outcome::Done(Errno::NoSys.as_result())
@@ -2905,11 +2931,42 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
         }
         // Before the console and the filesystem, because a pipe write can
         // *park* and the paths below it answer with a value or an errno.
-        if let Some((pipe, end, flags)) = self.pipe_of(descriptor) {
+        if let Some((ring, end, flags)) = self.pipe_of(descriptor) {
             if end == crate::ring::End::Read {
                 return Outcome::Done(Errno::BadFile.as_result());
             }
-            return self.transfer_ring(pipe, end, flags, buffer, count as u64);
+            return self.transfer_ring(ring, end, flags, buffer, count as u64);
+        }
+        match self.socket_ring(descriptor, crate::ring::End::Write) {
+            crate::socket::Reach::Ring { ring, flags } => {
+                return self.transfer_ring(
+                    ring,
+                    crate::ring::End::Write,
+                    flags,
+                    buffer,
+                    count as u64,
+                );
+            }
+            // The direction is shut, which for a write is `EPIPE` and a
+            // `SIGPIPE` — raised by the transfer itself when the ring says
+            // so, and here when this endpoint is the one that gave up.
+            crate::socket::Reach::Finished => {
+                const SIGPIPE: i32 = 13;
+                if self.signal_process(SIGPIPE) {
+                    return Outcome::Exit(128 + SIGPIPE);
+                }
+                return Outcome::Done(crate::ring::BROKEN.as_result());
+            }
+            crate::socket::Reach::Refused(errno) => {
+                if errno == crate::ring::BROKEN {
+                    const SIGPIPE: i32 = 13;
+                    if self.signal_process(SIGPIPE) {
+                        return Outcome::Exit(128 + SIGPIPE);
+                    }
+                }
+                return Outcome::Done(errno.as_result());
+            }
+            crate::socket::Reach::Elsewhere => {}
         }
         let path = match file.backing {
             crate::fd::Backing::Console(crate::fd::Console::Output) => paths::CONSOLE_STDOUT,
@@ -2929,6 +2986,10 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             // version of `epoll_ctl`; it is nothing.
             crate::fd::Backing::Epoll(_) => {
                 return Outcome::Done(Errno::Invalid.as_result());
+            }
+            // Answered before this row is reached; see `write_socket`.
+            crate::fd::Backing::Socket(_) => {
+                return Outcome::Done(Errno::NotSeekable.as_result());
             }
             crate::fd::Backing::Image(vnode) => {
                 return Outcome::Done(

@@ -35,6 +35,7 @@ pub mod paths;
 pub mod pipe;
 pub mod poll;
 pub mod ring;
+pub mod socket;
 pub mod random;
 pub mod signal;
 pub mod run;

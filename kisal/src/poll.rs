@@ -278,6 +278,10 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
             // something, which is what makes nesting one inside another
             // work — and what a program does when it wants one wait to cover
             // two sets it keeps separately.
+            // A socket answers from its rings, which is the whole of why
+            // `poll.rs` was built to compute readiness from kernel state:
+            // sockets were the case that made the rule have to be strict.
+            Backing::Socket(id) => self.socket_readiness(id),
             Backing::Epoll(id) => match self.epoll_ready(id).is_empty() {
                 true => 0,
                 false => event::IN | event::RDNORM,
