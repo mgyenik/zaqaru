@@ -24,8 +24,14 @@ fn main() -> Result<()> {
     let mut program: Option<PathBuf> = None;
     let mut output: Option<PathBuf> = None;
     let mut root: Option<PathBuf> = None;
+    let mut argv: Vec<Vec<u8>> = Vec::new();
     let mut arguments = arguments.iter();
     while let Some(argument) = arguments.next() {
+        // Everything after `--` is the guest's command line, not ours.
+        if argument == "--" {
+            argv = arguments.map(|rest| rest.as_bytes().to_vec()).collect();
+            break;
+        }
         match argument.as_str() {
             "-o" | "--output" => {
                 output = Some(PathBuf::from(
@@ -40,7 +46,7 @@ fn main() -> Result<()> {
             "-h" | "--help" => {
                 println!(
                     "usage: zaqaru-bake <program> [-o <container.wasm>] \
-                     [--root <directory>]"
+                     [--root <directory>] [-- <argv>...]"
                 );
                 return Ok(());
             }
@@ -74,7 +80,16 @@ fn main() -> Result<()> {
     let tree = baker::tree::Tree::from_directory(&image_root).context("reading the image tree")?;
 
     let search = root.clone().unwrap_or_else(|| PathBuf::from("/"));
-    let baked = baker::bake::container(&program, &search, tree)?;
+    let baked = baker::bake::container_with_command(&program, &search, tree, &argv)?;
+    if !argv.is_empty() {
+        eprintln!(
+            "zaqaru-bake: command line: {}",
+            argv.iter()
+                .map(|argument| String::from_utf8_lossy(argument).into_owned())
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+    }
 
     if baked.placed.len() > 1 {
         eprintln!(

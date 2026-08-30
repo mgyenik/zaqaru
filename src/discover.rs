@@ -344,7 +344,7 @@ pub fn discover(
     if layout == Layout::Linked {
         functions.sort_by_key(|function| (function.section, function.offset));
     }
-    split_at_interior_entries(sections, &mut functions)?;
+    split_at_interior_entries(sections, layout, &mut functions)?;
     make_names_unique(sections, &mut functions);
     Ok(functions)
 }
@@ -1064,7 +1064,11 @@ fn fill_from_transfers(coverage: &mut Coverage, sections: &[Section]) -> Result<
     Ok(())
 }
 
-fn split_at_interior_entries(sections: &[Section], functions: &mut Vec<Function>) -> Result<()> {
+fn split_at_interior_entries(
+    sections: &[Section],
+    layout: Layout,
+    functions: &mut Vec<Function>,
+) -> Result<()> {
     // To a fixpoint, because a cut makes boundaries that were not there
     // before: a branch that stayed inside one function may cross two of its
     // pieces, and that is a second entry the first pass could not see.
@@ -1072,7 +1076,7 @@ fn split_at_interior_entries(sections: &[Section], functions: &mut Vec<Function>
     // branch into the tail, which exposes another.
     const ROUNDS: usize = 16;
     for round in 0..=ROUNDS {
-        if !split_once(sections, functions)? {
+        if !split_once(sections, layout, functions)? {
             return Ok(());
         }
         if round == ROUNDS {
@@ -1087,7 +1091,7 @@ fn split_at_interior_entries(sections: &[Section], functions: &mut Vec<Function>
 
 /// One pass of [`split_at_interior_entries`], reporting whether it cut
 /// anything.
-fn split_once(sections: &[Section], functions: &mut Vec<Function>) -> Result<bool> {
+fn split_once(sections: &[Section], layout: Layout, functions: &mut Vec<Function>) -> Result<bool> {
     use std::collections::{BTreeSet, HashMap};
 
     // Where each function's instructions begin, and everywhere anything
@@ -1095,7 +1099,7 @@ fn split_once(sections: &[Section], functions: &mut Vec<Function>) -> Result<boo
     // Targets carry the function they came *from*: a function's own
     // branches are ordinary control flow and say nothing about entries.
     let mut starts: HashMap<usize, BTreeSet<u64>> = HashMap::new();
-    let mut targets: HashMap<usize, Vec<(u64, usize)>> = HashMap::new();
+    let mut targets: HashMap<usize, Vec<(u64, usize, bool)>> = HashMap::new();
     for (index, function) in functions.iter().enumerate() {
         let section = &sections[function.section];
         let from = function.offset as usize;
@@ -1132,10 +1136,11 @@ fn split_once(sections: &[Section], functions: &mut Vec<Function>) -> Result<boo
                         | iced_x86::FlowControl::Call
                 )
             {
-                targets
-                    .entry(function.section)
-                    .or_default()
-                    .push((instruction.near_branch64(), index));
+                targets.entry(function.section).or_default().push((
+                    instruction.near_branch64(),
+                    index,
+                    instruction.flow_control() == iced_x86::FlowControl::Call,
+                ));
             }
         }
         starts.insert(index, boundaries);
@@ -1176,15 +1181,34 @@ fn split_once(sections: &[Section], functions: &mut Vec<Function>) -> Result<boo
         let Some(placed) = by_section.get(section) else {
             continue;
         };
-        for (target, from) in section_targets {
-            // A branch that stays inside its own body is ordinary control
-            // flow. Compared by extent rather than by index, because one
-            // body often carries several symbols: `__memcpy_avx_unaligned`
-            // and `__memmove_avx_unaligned` are the same ten instructions
-            // under two names, and each one's loops would otherwise look
-            // like entries into the other.
+        for (target, from, is_call) in section_targets {
+            // A *jump* that stays inside its own body is ordinary control
+            // flow — a loop back-edge is not an entry. Compared by extent
+            // rather than by index, because one body often carries several
+            // symbols: `__memcpy_avx_unaligned` and
+            // `__memmove_avx_unaligned` are the same ten instructions under
+            // two names, and each one's loops would otherwise look like
+            // entries into the other.
+            //
+            // A *call* is different, and exempting it undid the rule above:
+            // where a weak witness guessed an extent that ran on for tens of
+            // kilobytes, the function it swallowed and the call reaching
+            // that function both ended up inside the same guessed body, so
+            // the call looked internal and the cut that would have fixed the
+            // extent never happened. Compilers do not call into the interior
+            // of a function they emitted, whether or not the caller appears
+            // to be that function — busybox has one such call, and it is a
+            // real entry a 0x378-byte guess had swallowed.
+            //
+            // Only where an operand is the address it means. In a
+            // relocatable object a call's displacement is a placeholder a
+            // relocation will fill, so it decodes as a branch to the *next
+            // instruction* — inside its own body, every time. Letting that
+            // cut would split every function in a `gcc -c` object at each of
+            // its calls.
             let source = &functions[*from];
-            if (source.offset..source.offset + source.size).contains(target) {
+            let internal = (source.offset..source.offset + source.size).contains(target);
+            if internal && !(*is_call && layout == Layout::Linked) {
                 continue;
             }
             let mut at = placed.partition_point(|(offset, _, _)| *offset <= *target);

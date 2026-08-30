@@ -243,7 +243,10 @@ fn assemble(index: &mut Vec<u8>, inodes: &[Inode], dirents: &[u8], strings: &[u8
         0,
         0,
         0,
-        // A synthetic mount holds no ELF, so there is nothing to prelink.
+        // A synthetic mount holds no ELF, so there is nothing to prelink,
+        // and it is not what a container boots.
+        0,
+        0,
         0,
         0,
     );

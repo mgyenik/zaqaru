@@ -191,11 +191,23 @@ unsafe extern "C" {
 #[cfg(target_arch = "wasm32")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kisal_boot() -> i32 {
+    // The command line the bake recorded, or the default. It comes from the
+    // image rather than from the host because an invocation is a fact about
+    // the container: the same module booted twice runs the same program the
+    // same way, which is what makes a run reproducible.
+    //
+    // The environment is still empty. Nothing has needed one — every binary
+    // tried so far is already `BIND_NOW`, so even the loader hint the design
+    // names as a belt has had nothing to fasten.
+    let baked = image::baked()
+        .unwrap_or_else(|error| panic!("kisal: the linked image is not readable: {error:?}"));
+    let recorded: Vec<&[u8]> = baked.command_line().collect();
+    let argv: &[&[u8]] = match recorded.is_empty() {
+        true => &[b"/init"],
+        false => &recorded,
+    };
     let program = with_kernel(|kernel| {
-        // Neither is configurable yet: M6 runs one program with a fixed
-        // invocation, and where the arguments come from is the baker's
-        // question rather than the kernel's.
-        kernel.exec(b"/init", &[b"/init"], &[]).map_err(|error| {
+        kernel.exec(b"/init", argv, &[]).map_err(|error| {
             let mut message = String::new();
             error.message(&mut message);
             report(kernel, &message);

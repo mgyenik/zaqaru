@@ -33,7 +33,14 @@
 //!           owner names, xattr names and values
 //! xattrs    per-inode blocks referencing the strings region
 //! modules   sorted (inode, prelink base) pairs, one per translated ELF
+//! command   the boot command line: NUL-separated argument strings
 //! ```
+//!
+//! The command line is a region rather than a file because it is a fact
+//! about the container and not part of the guest's filesystem — the same
+//! argument the process-and-thread model makes about `/iso`, which the
+//! guest cannot see either. The baker owns what it says; an empty region
+//! means the default.
 //!
 //! The modules region is small on purpose. A prelink base is a fact about
 //! the handful of files that are translated ELFs, not about every inode, so
@@ -44,9 +51,9 @@
 
 /// `KISI` — kisal image.
 pub const MAGIC: u32 = u32::from_le_bytes(*b"KISI");
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 
-pub const HEADER_SIZE: usize = 56;
+pub const HEADER_SIZE: usize = 64;
 /// Fixed and packed: `stat` is `inode_offset + index * INODE_SIZE`.
 pub const INODE_SIZE: usize = 64;
 pub const DIRENT_SIZE: usize = 12;
@@ -258,6 +265,8 @@ struct Header {
     blob_size: u32,
     module_offset: u32,
     module_count: u32,
+    command_offset: u32,
+    command_size: u32,
 }
 
 /// A baked image: the index and the blob its regular files live in.
@@ -301,6 +310,8 @@ impl<'a> Image<'a> {
             blob_size: word(index, 44),
             module_offset: word(index, 48),
             module_count: word(index, 52),
+            command_offset: word(index, 56),
+            command_size: word(index, 60),
         };
 
         // Validate the regions once, here, so that everything after is an
@@ -320,6 +331,7 @@ impl<'a> Image<'a> {
                 header.module_offset,
                 (header.module_count as u64) * (MODULE_SIZE as u64),
             ),
+            ("command", header.command_offset, header.command_size as u64),
         ] {
             let end = (offset as u64)
                 .checked_add(size)
@@ -364,6 +376,25 @@ impl<'a> Image<'a> {
             INODE_SIZE as u64,
             "inode",
         )?))
+    }
+
+    /// The command line the bake recorded: the arguments, in order.
+    ///
+    /// Empty when the bake said nothing, which is what leaves the boot path
+    /// at its default. Strings are NUL-separated and the region's own length
+    /// is the end, so an argument containing no NUL is the only thing that
+    /// can be represented — which is exactly what an argument is.
+    pub fn command_line(&self) -> impl Iterator<Item = &'a [u8]> {
+        let region = self
+            .index
+            .get(
+                self.header.command_offset as usize
+                    ..self.header.command_offset as usize + self.header.command_size as usize,
+            )
+            .unwrap_or(&[]);
+        region
+            .split(|byte| *byte == 0)
+            .filter(|argument| !argument.is_empty())
     }
 
     /// The base the bake placed a translated ELF at, if this inode is one.
@@ -588,6 +619,8 @@ pub fn write_header(
     blob_size: u32,
     module_offset: u32,
     module_count: u32,
+    command_offset: u32,
+    command_size: u32,
 ) {
     into[0..4].copy_from_slice(&MAGIC.to_le_bytes());
     into[4..8].copy_from_slice(&VERSION.to_le_bytes());
@@ -603,6 +636,8 @@ pub fn write_header(
     into[44..48].copy_from_slice(&blob_size.to_le_bytes());
     into[48..52].copy_from_slice(&module_offset.to_le_bytes());
     into[52..56].copy_from_slice(&module_count.to_le_bytes());
+    into[56..60].copy_from_slice(&command_offset.to_le_bytes());
+    into[60..64].copy_from_slice(&command_size.to_le_bytes());
 }
 
 /// The total length of an index whose header is `header`.
@@ -631,6 +666,7 @@ pub fn index_length(header: &[u8]) -> Result<usize, ImageError> {
         word(header, 24) as u64 + word(header, 28) as u64,
         word(header, 32) as u64 + word(header, 36) as u64,
         word(header, 48) as u64 + word(header, 52) as u64 * (MODULE_SIZE as u64),
+        word(header, 56) as u64 + word(header, 60) as u64,
     ]
     .into_iter()
     .max()

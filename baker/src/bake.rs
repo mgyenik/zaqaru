@@ -44,7 +44,21 @@ pub struct Bake {
 /// for a program on this machine, or an unpacked image root. `tree` is the
 /// filesystem the container will have; the translated files are placed into
 /// it, so anything already there is kept.
-pub fn container(program: &Path, search: &Path, mut tree: crate::tree::Tree) -> Result<Bake> {
+pub fn container(program: &Path, search: &Path, tree: crate::tree::Tree) -> Result<Bake> {
+    container_with_command(program, search, tree, &[])
+}
+
+/// The same, with the command line the container boots with.
+///
+/// Empty leaves kisal at its default invocation, which is the program under
+/// the one name the boot path knows. A program that reads `argv[0]` to
+/// decide what to be — busybox is the whole family — needs this.
+pub fn container_with_command(
+    program: &Path,
+    search: &Path,
+    mut tree: crate::tree::Tree,
+    argv: &[Vec<u8>],
+) -> Result<Bake> {
     let modules = crate::dynamic::closure(program, search)
         .with_context(|| format!("finding what {} loads", program.display()))?;
     let bases = crate::dynamic::assign_bases(&modules).context("placing the modules")?;
@@ -113,8 +127,10 @@ pub fn container(program: &Path, search: &Path, mut tree: crate::tree::Tree) -> 
         place(&mut tree, module, placed, base)?;
     }
 
-    let image = crate::object::emit(&crate::bake_tree(&tree).context("baking the image")?)
-        .context("emitting the image object")?;
+    let image = crate::object::emit(
+        &crate::bake_tree_with_command(&tree, argv).context("baking the image")?,
+    )
+    .context("emitting the image object")?;
 
     Ok(Bake {
         module: translation.module,

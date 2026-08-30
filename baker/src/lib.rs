@@ -73,7 +73,27 @@ pub fn bake_archive(archive: &[u8]) -> Result<Image> {
 
 /// Flattens an image tree, whatever produced it.
 pub fn bake_tree(tree: &tree::Tree) -> Result<Image> {
+    bake_tree_with_command(tree, &[])
+}
+
+/// The same, recording the command line the container boots with.
+///
+/// The arguments are a fact about the container rather than part of its
+/// filesystem, so they go in the index beside the other things the guest
+/// cannot see. An empty list leaves kisal at its default invocation.
+pub fn bake_tree_with_command(tree: &tree::Tree, argv: &[Vec<u8>]) -> Result<Image> {
     let mut builder = Builder::default();
+    for argument in argv {
+        if argument.contains(&0) {
+            bail!(
+                "the argument `{}` contains a NUL, which is not something an \
+                 argument can contain",
+                String::from_utf8_lossy(argument)
+            );
+        }
+        builder.command.extend_from_slice(argument);
+        builder.command.push(0);
+    }
     let root = builder.add_node(tree, tree::ROOT)?;
     builder.finish(root)
 }
@@ -118,6 +138,8 @@ struct Builder {
     /// Which inode a tree node became, so that a node named twice — a
     /// hardlink — becomes one record with two names.
     by_node: HashMap<tree::NodeId, u32>,
+    /// The boot command line, NUL-separated.
+    command: Vec<u8>,
 }
 
 impl Builder {
@@ -407,13 +429,14 @@ impl Builder {
         let string_offset = dirent_offset + dirents.len();
         let xattr_offset = string_offset + self.strings.len();
         let module_offset = xattr_offset + self.xattrs.len();
+        let command_offset = module_offset + module_records.len();
 
         // Every region's extent is a `u32` in the index, so a bake that
         // overflows one has to fail rather than record a length modulo 2^32 —
         // which would validate against a shorter blob and read zeros for
         // every file above the wrap. A rootfs over four gigabytes is routine
         // for the images this is aimed at.
-        let total = module_offset + module_records.len();
+        let total = command_offset + self.command.len();
         for (what, size) in [
             ("the file contents", blob.len()),
             ("the directory entries", dirents.len()),
@@ -445,6 +468,8 @@ impl Builder {
             blob.len() as u32,
             module_offset as u32,
             modules.len() as u32,
+            command_offset as u32,
+            self.command.len() as u32,
         );
         index.extend_from_slice(&header);
         for pending in &self.inodes {
@@ -456,6 +481,7 @@ impl Builder {
         index.extend_from_slice(&self.strings);
         index.extend_from_slice(&self.xattrs);
         index.extend_from_slice(&module_records);
+        index.extend_from_slice(&self.command);
 
         Ok(Image { blob, index })
     }

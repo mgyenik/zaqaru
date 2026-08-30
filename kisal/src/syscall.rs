@@ -44,6 +44,12 @@ pub mod number {
     pub const MSYNC: i64 = 26;
     pub const GETPID: i64 = 39;
     pub const UNAME: i64 = 63;
+    pub const PRCTL: i64 = 157;
+    pub const GETUID: i64 = 102;
+    pub const GETGID: i64 = 104;
+    pub const GETEUID: i64 = 107;
+    pub const GETEGID: i64 = 108;
+    pub const GETPPID: i64 = 110;
     pub const CLONE: i64 = 56;
     pub const GETCWD: i64 = 79;
     pub const CHDIR: i64 = 80;
@@ -185,6 +191,12 @@ pub mod number {
             MSYNC => "msync",
             GETPID => "getpid",
             UNAME => "uname",
+            PRCTL => "prctl",
+            GETUID => "getuid",
+            GETGID => "getgid",
+            GETEUID => "geteuid",
+            GETEGID => "getegid",
+            GETPPID => "getppid",
             CLONE => "clone",
             EXIT => "exit",
             ARCH_PRCTL => "arch_prctl",
@@ -665,7 +677,20 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             // first in its own namespace, which is what makes the answer a
             // constant rather than something to derive.
             number::GETPID | number::GETTID => Outcome::Done(PROCESS_ID),
+            // Root, and the same root the initial stack already told the
+            // program about: `build_stack` puts zero in `AT_UID` and its
+            // three companions, and a libc that read one number there and a
+            // different one here would be right to be confused. A container
+            // has one user and it is the one that started it.
+            number::GETUID | number::GETGID | number::GETEUID | number::GETEGID => {
+                Outcome::Done(0)
+            }
+            // The entry process of a container has no parent inside it.
+            // Linux answers zero for a process whose parent is outside its
+            // namespace, which is exactly this case.
+            number::GETPPID => Outcome::Done(0),
             number::UNAME => self.uname(arguments),
+            number::PRCTL => self.prctl(arguments),
             number::SET_TID_ADDRESS => self.set_tid_address(arguments),
             number::SET_ROBUST_LIST => self.set_robust_list(arguments),
             number::PRLIMIT64 => self.prlimit64(arguments),
@@ -724,6 +749,65 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
         }
         self.robust_list = arguments.get(0) as u64;
         Outcome::Done(0)
+    }
+
+    /// `prctl(2)`: one row per option, and a loud refusal for the rest.
+    ///
+    /// `prctl` is not a syscall so much as sixty of them behind one number,
+    /// and implementing it as an API would be implementing sixty things
+    /// nothing has asked for. So it is demand-driven exactly like the
+    /// instruction set: an option a program actually issues gets an honest
+    /// answer, and every other one faults *naming the option*, which makes
+    /// the fault a worklist entry rather than a dead end.
+    ///
+    /// Not `EINVAL`, which is what Linux answers for an option it does not
+    /// know. Returning it here would be indistinguishable from Linux for a
+    /// program that probes — and silently wrong for the far more common one
+    /// that asks the kernel to do something and is told, in effect, that it
+    /// did not happen. The unknown-syscall policy is the same policy, for
+    /// the same reason.
+    fn prctl(&mut self, arguments: Arguments) -> Outcome {
+        /// `PR_GET_NAME`. What busybox asks, once, to find out what it is.
+        const GET_NAME: i64 = 16;
+        /// `TASK_COMM_LEN`: fifteen bytes and a terminator, fixed by Linux
+        /// and by the buffer every caller passes.
+        const COMM_LEN: usize = 16;
+
+        match arguments.get(0) {
+            GET_NAME => {
+                // Linux sets `comm` from the basename of what was exec'd and
+                // truncates it to fit, so that is what this answers. A
+                // container that execs `/init` therefore says `init`, which
+                // is the truth about this process rather than about the file
+                // it was built from — and the way to make it say something
+                // else is to exec the program under its own name.
+                let name = self.executable.as_bytes();
+                let base = name
+                    .iter()
+                    .rposition(|byte| *byte == b'/')
+                    .map_or(name, |slash| &name[slash + 1..]);
+                let mut comm = [0u8; COMM_LEN];
+                let kept = base.len().min(COMM_LEN - 1);
+                comm[..kept].copy_from_slice(&base[..kept]);
+
+                let at = arguments.get(1) as u64;
+                let memory = self.memory();
+                if memory.check(at, COMM_LEN as u64).is_err() {
+                    return Outcome::Done(Errno::Fault.as_result());
+                }
+                // SAFETY: the buffer was just bounds-checked.
+                match unsafe { memory.write(at, &comm) } {
+                    Ok(()) => Outcome::Done(0),
+                    Err(_) => Outcome::Done(Errno::Fault.as_result()),
+                }
+            }
+            _ => Outcome::Fault(Fault::detailed(
+                number::PRCTL,
+                arguments,
+                "a `prctl` option with no row here; the number is in the \
+                 first argument",
+            )),
+        }
     }
 
     /// `uname(2)`: what kind of machine this is.
