@@ -102,7 +102,7 @@ fn main() {
     let running = std::time::Instant::now();
     let exit = process.run();
     let elapsed = running.elapsed().as_secs_f64();
-    let retired = process.kernel.machine.thread.retired;
+    let retired = process.kernel.machine.thread().retired;
     eprintln!(
         "\n{retired} instructions in {elapsed:.2}s = {:.1} MIPS",
         retired as f64 / elapsed / 1e6

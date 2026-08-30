@@ -168,21 +168,27 @@ fn a_failing_log_store_is_not_reported_through_itself() {
 ///
 /// This needs a syscall the table *names* and does not implement, so its
 /// choice has to move as the grind proceeds — `getpid` was it until `getpid`
-/// was implemented. `clone3` is the furthest out of the named ones, and the
-/// premise is asserted, so the day it gains a row this fails and says so
+/// was implemented, then `clone3` until threads arrived. Every number the
+/// table *names* now has a row, so this uses one it does not name, which is
+/// the case that will outlive every particular choice: `setuid`, which a
+/// container with one user has no business implementing.
+///
+/// The premise is asserted, so the day it gains a row this fails and says so
 /// rather than passing quietly.
 #[test]
 fn an_unimplemented_syscall_faults_and_names_itself() {
+    /// `setuid(2)`.
+    const UNIMPLEMENTED: i64 = 105;
     let mut kernel = Kernel::new(Recording::default(), Registers::default(), empty_image());
-    let outcome = kernel.dispatch(number::CLONE3, Arguments::new([0; 6]));
+    let outcome = kernel.dispatch(UNIMPLEMENTED, Arguments::new([0; 6]));
     let Outcome::Fault(fault) = outcome else {
         panic!("an unimplemented syscall produced {outcome:?} instead of a fault");
     };
     assert_eq!(
         fault,
         Fault {
-            number: number::CLONE3,
-            name: Some("clone3"),
+            number: UNIMPLEMENTED,
+            name: None,
             arguments: [0; 6],
             detail: None,
         }
@@ -191,7 +197,7 @@ fn an_unimplemented_syscall_faults_and_names_itself() {
     fault.message(&mut message);
     assert_eq!(
         message,
-        "kisal: unimplemented syscall clone3 (435) with (0, 0, 0, 0, 0, 0)"
+        "kisal: unimplemented syscall 105 with (0, 0, 0, 0, 0, 0)"
     );
 }
 

@@ -67,7 +67,7 @@ pub enum Exit {
     Unimplemented(Fault),
     /// The engine does not implement an instruction the guest reached.
     Unsupported(targum::exec::Unsupported),
-    /// A syscall blocked and there is no second thread to run.
+    /// Every thread is parked on a futex nothing will wake.
     Deadlocked,
 }
 
@@ -90,7 +90,7 @@ impl<'a, S: Store> Process<'a, S> {
     /// It lives inside the machine, which lives inside the kernel — one
     /// owner, and the borrow checker to prove it.
     pub fn thread(&mut self) -> &mut Tcb {
-        &mut self.kernel.machine.thread
+        self.kernel.machine.thread_mut()
     }
 
     /// Loads a program and leaves the thread ready to enter it.
@@ -152,7 +152,7 @@ impl<'a, S: Store> Process<'a, S> {
         // `exec` already wrote the stack pointer and reset the unit through
         // the machine, which in this world *is* the control block — so the
         // only thing left is where to start.
-        kernel.machine.thread.rip = entry;
+        kernel.machine.thread_mut().rip = entry;
         Ok(Self {
             kernel,
             cache: BlockCache::new(),
@@ -222,19 +222,42 @@ impl<'a, S: Store> Process<'a, S> {
         // Three disjoint fields of one owner, which is what makes the
         // engine able to hold no state of its own.
         let outcome = Engine::run(
-            &mut self.kernel.machine.thread,
+            self.kernel.machine.thread_mut(),
             &mut self.kernel.pages,
             &mut self.cache,
             quantum,
         );
-        match outcome {
-            // The thread is still runnable. With one thread there is nobody
-            // else to pick, so this is where a scheduler would choose and
-            // this loop simply continues.
-            Step::Preempted => None,
-            Step::Syscall => self.serve(),
-            Step::Trap(trap) => Some(self.fault(trap)),
+        let (finished, reschedule) = match outcome {
+            // The quantum ran out with the thread still runnable, which is
+            // the only reason this loop ever takes a thread off the
+            // processor against its will. Denominated in *retired
+            // instructions*, so the switch happens at the same point in
+            // every run of the same container: preemptive and deterministic
+            // at once, which a wall-clock quantum could not be.
+            Step::Preempted => (None, true),
+            Step::Syscall => {
+                let finished = self.serve();
+                // A syscall that parked or ended the thread leaves it not
+                // runnable, and somebody else has to be chosen. One that
+                // returned normally does not: switching on every syscall
+                // would be a scheduler that never lets a thread finish
+                // anything.
+                let runnable = self.kernel.machine.threads.current().is_runnable();
+                (finished, !runnable)
+            }
+            Step::Trap(trap) => (Some(self.fault(trap)), false),
+        };
+        if finished.is_some() {
+            return finished;
         }
+        if reschedule && !self.kernel.machine.threads.schedule() {
+            // Nothing can run. Every thread is parked on a futex nothing
+            // will wake, which is a deadlock in the guest — and reporting it
+            // is better than spinning, because spinning looks the same as
+            // working.
+            return Some(Exit::Deadlocked);
+        }
+        None
     }
 
     /// Serves one syscall.
@@ -247,7 +270,7 @@ impl<'a, S: Store> Process<'a, S> {
         // is about thirty-eight seconds in and looks like the host refusing
         // a forty-four byte read.
         crate::abi::reset_transfer_arena();
-        let thread = &self.kernel.machine.thread;
+        let thread = self.kernel.machine.thread();
         let number = thread.registers[NUMBER] as i64;
         let raw = ARGUMENTS.map(|index| thread.registers[index] as i64);
         let arguments = Arguments::new(raw);
@@ -255,14 +278,15 @@ impl<'a, S: Store> Process<'a, S> {
         self.record(number, &raw, &answer);
         match answer {
             Outcome::Done(value) => {
-                self.kernel.machine.thread.registers[NUMBER] = value as u64;
+                self.kernel.machine.thread_mut().registers[NUMBER] = value as u64;
                 None
             }
             Outcome::Exit(status) => Some(Exit::Status(status)),
             Outcome::Fault(fault) => Some(Exit::Unimplemented(fault)),
-            // Reachable only once there is more than one thread: with one,
-            // a wait that cannot be satisfied has nothing to wait for.
-            Outcome::Blocked => Some(Exit::Deadlocked),
+            // The thread parked on a futex, or ended. Either way it is not
+            // runnable and the caller picks somebody else; there is nothing
+            // to write back, because a parked thread has not returned yet.
+            Outcome::Blocked => None,
         }
     }
 
@@ -295,7 +319,7 @@ impl<'a, S: Store> Process<'a, S> {
     /// dereference reads whatever happens to be at address zero and carries
     /// on. What is missing is the handler path, not the fault.
     fn fault(&mut self, trap: Trap) -> Exit {
-        let rip = self.kernel.machine.thread.rip;
+        let rip = self.kernel.machine.thread().rip;
         /// The numbers a shell reports and a `siginfo` carries.
         const SIGILL: i32 = 4;
         const SIGTRAP: i32 = 5;

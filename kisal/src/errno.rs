@@ -19,6 +19,9 @@ pub enum Errno {
     NoMemory = 12,
     Access = 13,
     Fault = 14,
+    /// `EAGAIN`: a futex whose value has already changed, which is the
+    /// answer that closes the window between deciding to sleep and sleeping.
+    TryAgain = 11,
     Busy = 16,
     CrossDevice = 18,
     Exists = 17,
@@ -94,6 +97,7 @@ impl Errno {
             Self::Loop => "ELOOP",
             Self::NotSupported => "ENOTSUP",
             Self::AddressFamily => "EAFNOSUPPORT",
+            Self::TryAgain => "EAGAIN",
             Self::NameNeeded => "a name this kernel did not keep",
         }
     }

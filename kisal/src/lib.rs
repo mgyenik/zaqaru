@@ -38,6 +38,7 @@ pub mod vm;
 pub mod space;
 pub mod synthetic;
 pub mod syscall;
+pub mod thread;
 pub mod vfs;
 pub mod write;
 
@@ -82,7 +83,7 @@ fn with_kernel<R>(body: impl FnOnce(&mut Kernel<'static, HostStore, GuestMachine
             let image = image::baked().unwrap_or_else(|error| {
                 panic!("kisal: the linked image is not readable: {error:?}")
             });
-            Kernel::new(HostStore::default(), GuestMachine, image)
+            Kernel::new(HostStore::default(), GuestMachine::default(), image)
         });
         let result = body(kernel);
         BORROWED = false;

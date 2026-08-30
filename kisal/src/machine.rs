@@ -38,6 +38,51 @@ pub trait Machine {
     /// takes a pointer is bounded by this before it dereferences anything.
     fn memory_limit(&self) -> u64;
 
+    /// The kernel's own per-thread cells — the signal mask, the
+    /// `clear_child_tid` word, the robust list.
+    ///
+    /// Reached through the machine for the same reason `%fs` is: they belong
+    /// to *a thread*, and the machine is what knows which thread is running.
+    /// A world with one thread keeps one of these inline; a world with a
+    /// scheduler hands back the current one's.
+    fn owned(&mut self) -> &mut crate::thread::Owned;
+
+    /// This thread's identifier.
+    ///
+    /// The defaults below are a *world with one thread*, which is exactly
+    /// what the ahead-of-time machine is: its registers are wasm globals and
+    /// there is nowhere to put a second set. Every answer here is true of
+    /// such a world rather than a stand-in for a better one — one thread has
+    /// the first identifier, cannot create a second, cannot park (nothing
+    /// could wake it), and wakes nobody.
+    fn current_tid(&self) -> i32 {
+        crate::thread::FIRST
+    }
+
+    /// Creates a thread, and answers its identifier — or `None` where a
+    /// second thread cannot exist.
+    fn spawn(&mut self, _request: &crate::thread::Spawn) -> Option<i32> {
+        None
+    }
+
+    /// Parks this thread on a futex word, and reports whether it could be.
+    fn park(&mut self, _word: u64, _bitset: u32) -> bool {
+        false
+    }
+
+    /// Wakes up to `count` threads parked on `word`, and answers how many.
+    fn wake(&mut self, _word: u64, _bitset: u32, _count: usize) -> usize {
+        0
+    }
+
+    /// Ends this thread, and answers how many are left.
+    ///
+    /// Zero from the default: the one thread ending *is* the process ending,
+    /// which is what the caller reads it as.
+    fn exit_current(&mut self, _status: i32) -> usize {
+        0
+    }
+
     /// Makes the address space reach at least `to`, and reports whether it
     /// does now.
     ///
@@ -54,7 +99,11 @@ pub trait Machine {
 /// Declared as plain undefined symbols rather than as host imports, because
 /// they are neither — the seam defines them inside the same link, and
 /// `wasm-ld` resolves them there.
-pub struct GuestMachine;
+#[derive(Default)]
+pub struct GuestMachine {
+    /// See [`Machine::owned`]. One, because this world has one thread.
+    owned: crate::thread::Owned,
+}
 
 #[cfg(target_arch = "wasm32")]
 unsafe extern "C" {
@@ -74,6 +123,10 @@ unsafe extern "C" {
 
 #[cfg(target_arch = "wasm32")]
 impl Machine for GuestMachine {
+    fn owned(&mut self) -> &mut crate::thread::Owned {
+        &mut self.owned
+    }
+
     fn segment_base(&self) -> i64 {
         unsafe { get_segment_base() }
     }
@@ -124,6 +177,10 @@ impl Machine for GuestMachine {
 /// double of their own.
 #[cfg(not(target_arch = "wasm32"))]
 impl Machine for GuestMachine {
+    fn owned(&mut self) -> &mut crate::thread::Owned {
+        &mut self.owned
+    }
+
     fn segment_base(&self) -> i64 {
         unreachable!("the guest machine exists only inside the wasm module")
     }
@@ -176,6 +233,8 @@ pub struct Registers {
     /// can observe — and it is what makes "`execve` resets the FPU" a
     /// statement a test can check rather than a comment.
     pub floating_point_resets: usize,
+    /// See [`Machine::owned`].
+    pub owned: crate::thread::Owned,
 }
 
 impl Default for Registers {
@@ -186,6 +245,7 @@ impl Default for Registers {
             memory_limit: targum::space::CEILING,
             ceiling: targum::space::CEILING,
             floating_point_resets: 0,
+            owned: crate::thread::Owned::default(),
         }
     }
 }
@@ -203,7 +263,9 @@ impl Default for Registers {
 /// because the mapping rows write it, and the block cache, which is the
 /// scheduler's. See [`crate::run::Process`].
 pub struct Interpreted {
-    pub thread: targum::state::Tcb,
+    /// Every thread this process has, and which one is running. A context
+    /// switch is choosing a different index.
+    pub threads: crate::thread::Threads,
     /// Linear memory. Inside the module there is nothing to hold — the
     /// module *is* the memory — and natively it is a reservation with a
     /// committed prefix. One line of difference, which is what the design
@@ -237,6 +299,15 @@ impl Default for Interpreted {
 pub const PROGRAM_REGION: u64 = 64 << 20;
 
 impl Interpreted {
+    /// The thread the loop is advancing.
+    pub fn thread(&self) -> &targum::state::Tcb {
+        &self.threads.current().tcb
+    }
+
+    pub fn thread_mut(&mut self) -> &mut targum::state::Tcb {
+        &mut self.threads.current_mut().tcb
+    }
+
     pub fn new() -> Self {
         #[cfg(not(target_arch = "wasm32"))]
         let memory = {
@@ -248,7 +319,7 @@ impl Interpreted {
             memory
         };
         Self {
-            thread: targum::state::Tcb::new(),
+            threads: crate::thread::Threads::new(),
             #[cfg(not(target_arch = "wasm32"))]
             memory,
         }
@@ -256,27 +327,75 @@ impl Interpreted {
 }
 
 impl Machine for Interpreted {
+    fn owned(&mut self) -> &mut crate::thread::Owned {
+        &mut self.threads.current_mut().owned
+    }
+
+    fn current_tid(&self) -> i32 {
+        self.threads.current().tid
+    }
+
+    /// A thread is a control block with `%rsp` and `%rip` set.
+    ///
+    /// That sentence is the design's whole claim about threads, and this is
+    /// it: the child is a copy of the caller's registers with a new stack, a
+    /// return value of zero, and — because `syscall` already advanced it —
+    /// the same program counter, so both sides return from the same call to
+    /// different answers exactly as they do on Linux.
+    fn spawn(&mut self, request: &crate::thread::Spawn) -> Option<i32> {
+        let mut tcb = self.thread().clone();
+        tcb.set_stack_pointer(request.stack);
+        // The child's `clone` returns zero; the parent's returns the tid.
+        tcb.registers[0] = 0;
+        if let Some(tls) = request.tls {
+            tcb.fs_base = tls;
+        }
+        // A fresh unit, not the caller's: the x87 stack is per-thread, and
+        // handing a new thread the parent's is the cross-thread corruption
+        // the thread design was written to avoid.
+        tcb.x87.reset();
+        let tid = self.threads.spawn(tcb);
+        if let Some(thread) = self.threads.find_mut(tid) {
+            thread.owned.clear_child_tid = request.clear_child_tid;
+        }
+        Some(tid)
+    }
+
+    fn park(&mut self, word: u64, bitset: u32) -> bool {
+        self.threads.current_mut().state = crate::thread::State::Waiting { word, bitset };
+        true
+    }
+
+    fn wake(&mut self, word: u64, bitset: u32, count: usize) -> usize {
+        self.threads.wake(word, bitset, count)
+    }
+
+    fn exit_current(&mut self, status: i32) -> usize {
+        self.threads.current_mut().state = crate::thread::State::Exited { status };
+        self.threads.live()
+    }
+
     fn segment_base(&self) -> i64 {
-        self.thread.fs_base as i64
+        self.thread().fs_base as i64
     }
 
     fn set_segment_base(&mut self, value: i64) {
-        self.thread.fs_base = value as u64;
+        self.thread_mut().fs_base = value as u64;
     }
 
     fn stack_pointer(&self) -> i64 {
-        self.thread.stack_pointer() as i64
+        self.thread().stack_pointer() as i64
     }
 
     fn set_stack_pointer(&mut self, value: i64) {
-        self.thread.set_stack_pointer(value as u64);
+        self.thread_mut().set_stack_pointer(value as u64);
     }
 
     /// A fresh process gets a fresh unit — and *erased*, not merely emptied.
     /// `fninit` marks the stack unreachable and leaves the bytes; `execve`
     /// must not hand one program another's.
     fn reset_floating_point(&mut self) {
-        self.thread.x87.reset();
+        self.thread_mut().x87.reset();
     }
 
     #[cfg(target_arch = "wasm32")]
@@ -286,7 +405,7 @@ impl Machine for Interpreted {
 
     #[cfg(target_arch = "wasm32")]
     fn grow(&mut self, to: u64) -> bool {
-        GuestMachine.grow(to)
+        GuestMachine::default().grow(to)
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -395,6 +514,10 @@ impl<const N: usize> core::ops::DerefMut for GuestBytes<N> {
 }
 
 impl Machine for Registers {
+    fn owned(&mut self) -> &mut crate::thread::Owned {
+        &mut self.owned
+    }
+
     fn segment_base(&self) -> i64 {
         self.segment_base
     }

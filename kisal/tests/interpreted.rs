@@ -78,6 +78,7 @@ const COMMON: &[&str] = &[
     "-fno-asynchronous-unwind-tables",
     "-fno-math-errno",
     "-lm",
+    "-pthread",
 ];
 
 /// How a program is linked, which decides what has to work to run it.
@@ -265,7 +266,7 @@ fn report(label: &str, exit: &Exit, process: &mut Process<'static, Console>) {
         return;
     }
     eprintln!("--- {label}: {exit:?}");
-    eprintln!("rsp {:#x}", process.kernel.machine.thread.stack_pointer());
+    eprintln!("rsp {:#x}", process.kernel.machine.thread().stack_pointer());
     for vma in process.kernel.space.vmas() {
         eprintln!(
             "  {:#012x}-{:#012x} prot {:#x}",
@@ -315,7 +316,14 @@ fn agrees_with_native(label: &str, source: &str, linkage: Linkage) {
     let mut process = boot(label, image);
     let exit = process.run();
     report(label, &exit, &mut process);
-    assert_eq!(exit, Exit::Status(0), "{label} did not exit cleanly");
+    let complaints =
+        String::from_utf8_lossy(&process.kernel.store.contents(kisal::paths::CONSOLE_STDERR))
+            .into_owned();
+    assert_eq!(
+        exit,
+        Exit::Status(0),
+        "{label} did not exit cleanly; it wrote to stderr:\n{complaints}"
+    );
     let out =
         String::from_utf8(process.kernel.store.contents(kisal::paths::CONSOLE_STDOUT))
             .expect("utf-8");
@@ -534,8 +542,209 @@ int answer(int value) { return value * 7; }
     let mut process = boot_with(label, image, &[b"/init", b"/plugin.so"]);
     let exit = process.run();
     report(label, &exit, &mut process);
-    assert_eq!(exit, Exit::Status(0), "{label} did not exit cleanly");
+    let complaints =
+        String::from_utf8_lossy(&process.kernel.store.contents(kisal::paths::CONSOLE_STDERR))
+            .into_owned();
+    assert_eq!(
+        exit,
+        Exit::Status(0),
+        "{label} did not exit cleanly; it wrote to stderr:\n{complaints}"
+    );
     let out = String::from_utf8(process.kernel.store.contents(kisal::paths::CONSOLE_STDOUT))
         .expect("utf-8");
     assert_eq!(out, expected);
+}
+
+/// Threads, which the ahead-of-time path defers and the loop gets by
+/// scheduling a different control block.
+///
+/// Four of them, each doing arithmetic and returning a value the joiner
+/// collects — so the test fails if a thread never ran, if two threads shared
+/// a stack, if thread-local storage was the parent's, or if `pthread_join`
+/// returned before the thread did. All four are the same defect from a
+/// distance: a context switch that carried the wrong state.
+#[test]
+fn threads_run_and_are_joined() {
+    agrees_with_native(
+        "threads",
+        r#"
+#include <pthread.h>
+#include <stdio.h>
+
+/* Thread-local, so a thread that was handed the parent's `%fs` base reads
+   somebody else's counter and the total comes out wrong. */
+static __thread long mine;
+
+static void *work(void *argument) {
+    long index = (long)argument;
+    mine = 0;
+    for (long step = 1; step <= 1000; step++)
+        mine += index * step;
+    return (void *)mine;
+}
+
+int main(void) {
+    pthread_t threads[4];
+    long total = 0;
+    for (long index = 0; index < 4; index++)
+        pthread_create(&threads[index], 0, work, (void *)(index + 1));
+    for (int index = 0; index < 4; index++) {
+        void *answer;
+        pthread_join(threads[index], &answer);
+        total += (long)answer;
+    }
+    printf("total %ld\n", total);
+    return 0;
+}
+"#,
+        Linkage::Dynamic,
+    );
+}
+
+/// A mutex, which is where a futex actually blocks.
+///
+/// Uncontended locking never reaches the kernel — the fast path is a
+/// compare-and-swap and nothing else — so this contends deliberately: four
+/// threads incrementing one counter a thousand times each. The final count
+/// is the assertion, and it is only right if every increment happened under
+/// the lock.
+#[test]
+fn a_contended_mutex_blocks_and_wakes() {
+    agrees_with_native(
+        "mutex",
+        r#"
+#include <pthread.h>
+#include <stdio.h>
+
+static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+static long counter;
+
+static void *work(void *unused) {
+    (void)unused;
+    for (int step = 0; step < 1000; step++) {
+        pthread_mutex_lock(&lock);
+        counter++;
+        pthread_mutex_unlock(&lock);
+    }
+    return 0;
+}
+
+int main(void) {
+    pthread_t threads[4];
+    for (int index = 0; index < 4; index++)
+        pthread_create(&threads[index], 0, work, 0);
+    for (int index = 0; index < 4; index++)
+        pthread_join(threads[index], 0);
+    printf("counter %ld\n", counter);
+    return 0;
+}
+"#,
+        Linkage::Dynamic,
+    );
+}
+
+/// Two compute-bound threads making progress against each other.
+///
+/// The capability the ahead-of-time path defers: it switches only at
+/// syscalls, so a thread that spins without making one holds the processor
+/// for ever. Here the quantum is denominated in retired instructions and the
+/// loop takes the thread off at the count, whatever it was doing.
+///
+/// Written so that *nothing but preemption* can finish it. Each side spins
+/// on a word the other writes, and neither makes a syscall while spinning —
+/// so a scheduler that switches only at syscalls hangs, and one that
+/// switches on the quantum returns.
+#[test]
+fn two_spinning_threads_take_turns() {
+    agrees_with_native(
+        "preemption",
+        r#"
+#include <pthread.h>
+#include <stdio.h>
+
+static volatile int ready;
+static volatile int done;
+
+static void *other(void *unused) {
+    (void)unused;
+    ready = 1;
+    while (!done) { }
+    return 0;
+}
+
+int main(void) {
+    pthread_t thread;
+    pthread_create(&thread, 0, other, 0);
+    /* Only a preemption can let the other thread reach `ready = 1`. */
+    while (!ready) { }
+    done = 1;
+    pthread_join(thread, 0);
+    printf("both threads ran\n");
+    return 0;
+}
+"#,
+        Linkage::Dynamic,
+    );
+}
+
+/// The same container, twice, byte for byte.
+///
+/// **This is what a quantum in retired instructions buys**, and it is not
+/// something a real machine can offer: two threads racing on an unlocked
+/// counter lose updates, and *how many* they lose is decided by exactly when
+/// the scheduler switched. On Linux that is the wall clock and two runs
+/// disagree. Here the switch is a pure function of how many instructions
+/// have retired, so the same container with the same inputs loses the same
+/// updates in the same places.
+///
+/// Compared against *itself* rather than against a native run, deliberately:
+/// the native answer is not stable, and requiring the two to match would be
+/// requiring a race to come out the same way twice on hardware.
+#[test]
+fn a_racing_container_runs_the_same_way_twice() {
+    let source = r#"
+#include <pthread.h>
+#include <stdio.h>
+
+static volatile long shared;
+
+static void *work(void *unused) {
+    (void)unused;
+    /* Deliberately unlocked: a read-modify-write that loses updates when a
+       switch lands inside it, which is what makes the total observable. */
+    for (long step = 0; step < 200000; step++)
+        shared = shared + 1;
+    return 0;
+}
+
+int main(void) {
+    pthread_t threads[3];
+    for (int index = 0; index < 3; index++)
+        pthread_create(&threads[index], 0, work, 0);
+    for (int index = 0; index < 3; index++)
+        pthread_join(threads[index], 0);
+    printf("%ld\n", shared);
+    return 0;
+}
+"#;
+    let (tree, baked) = image_of("determinism", source, Linkage::Dynamic);
+    let _ = &tree;
+
+    let mut answers = Vec::new();
+    for _ in 0..2 {
+        let image = Image::parse(&baked.index, &baked.blob).expect("parse the image");
+        let mut process = boot("determinism", image);
+        let exit = process.run();
+        assert_eq!(exit, Exit::Status(0), "the container did not exit cleanly");
+        answers.push(
+            String::from_utf8(process.kernel.store.contents(kisal::paths::CONSOLE_STDOUT))
+                .expect("utf-8"),
+        );
+    }
+    assert_eq!(answers[0], answers[1], "two runs disagreed");
+    let total: i64 = answers[0].trim().parse().expect("a number");
+    assert!(
+        total > 0 && total < 600000,
+        "the threads did not actually race: {total}"
+    );
 }

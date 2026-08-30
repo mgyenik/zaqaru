@@ -491,15 +491,12 @@ pub struct Kernel<'a, S: Store, M: Machine> {
     /// The guest's address space: the arenas, and the tree of what is
     /// mapped where.
     pub space: crate::space::Space,
-    /// Where the kernel would write a zero when this thread ends, from
-    /// `set_tid_address`. Recorded until M7 has a thread whose ending
-    /// something could be waiting for.
-    pub clear_child_tid: u64,
-    /// Which signals this thread has blocked, one bit each, signal one at
-    /// bit zero. Only self-directed signals can ever be affected by it —
-    /// nothing outside a container can send one.
-    blocked_signals: u64,
     /// What each signal is set to do, indexed by signal minus one.
+    ///
+    /// Process-wide, unlike the mask: Linux gives every thread its own
+    /// blocked set and all of them one table of dispositions, because
+    /// `signal(2)` is about the program and `sigprocmask(2)` is about the
+    /// caller.
     ///
     /// Recorded from M6 and delivered at M10, which is the build plan's own
     /// sequencing and not a deferral invented here: CPython installs its
@@ -509,9 +506,6 @@ pub struct Kernel<'a, S: Store, M: Machine> {
     /// questions a program can ask before then — what is this signal set to,
     /// and what happens when I raise it at myself.
     dispositions: [Disposition; 64],
-    /// The head of this thread's robust futex list, from
-    /// `set_robust_list`. Recorded with the same horizon.
-    pub robust_list: u64,
 }
 
 /// Which way a vectored transfer moves.
@@ -533,6 +527,33 @@ pub const PROCESS_ID: i64 = 1;
 /// else, so a generous block is close to free and a stingy one is an
 /// `ENOMEM` a guest did not deserve.
 pub const GUEST_ADDRESS_SPACE: u64 = 512 * 1024 * 1024;
+
+/// `clone`'s flags, for the ones this kernel reads.
+pub mod clone_flag {
+    /// The two that together mean "a thread of this process" rather than a
+    /// new process. Both are required, and a call without them is `fork` —
+    /// which is out of scope and says so.
+    pub const VM: u64 = 0x0000_0100;
+    pub const THREAD: u64 = 0x0001_0000;
+    /// Write the new thread's id where the caller asked.
+    pub const PARENT_SETTID: u64 = 0x0010_0000;
+    pub const CHILD_SETTID: u64 = 0x0100_0000;
+    /// Clear that word when the thread ends, and wake anything waiting on
+    /// it — which is the whole of how `pthread_join` returns.
+    pub const CHILD_CLEARTID: u64 = 0x0020_0000;
+    /// The new thread's `%fs` base: its thread-local storage.
+    pub const SETTLS: u64 = 0x0008_0000;
+    /// Flags that change nothing here, because there is one address space,
+    /// one filesystem view, one descriptor table and one signal table
+    /// whatever a caller says. Accepting them silently is right; they are
+    /// what a thread *is* on this machine.
+    pub const SHARED: u64 = 0x0000_0200 // FS
+        | 0x0000_0400                    // FILES
+        | 0x0000_0800                    // SIGHAND
+        | 0x0004_0000                    // SYSVSEM
+        | 0x0000_2000                    // DETACHED, ignored by Linux too
+        | 0x0000_1000;                   // PTRACE, refused by the fault below
+}
 
 /// The size Linux requires of a `struct robust_list_head`, and refuses any
 /// other. A caller passing a different one was built against a different
@@ -613,15 +634,12 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             files: crate::fd::FdTable::with_standard_streams(),
             clock: 1,
             status: None,
-            clear_child_tid: 0,
             pages: targum::space::Space::new(0),
             enforcement,
             tracing: None,
             image_working_directory,
             continuation: None,
-            blocked_signals: 0,
             dispositions: [Disposition::DEFAULT; 64],
-            robust_list: 0,
             // Carved from the top of whatever the module already occupies:
             // the linker's data, the shadow stack, and anything the
             // kernel's own allocator has taken. Everything the guest is
@@ -851,6 +869,162 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
     //
     // OpenBLAS asks, on the way to allocating its buffers, and takes the
     // refusal as "no NUMA here" and carries on.
+    /// `clone(2)`: a thread, and only a thread.
+    ///
+    /// **`fork` is refused by name.** A new *process* means a second address
+    /// space, and this machine has one — copying it is not a thing the
+    /// design defers, it is a thing the design does not do. A call without
+    /// `CLONE_VM|CLONE_THREAD` is that call, and saying so is more useful
+    /// than an `ENOSYS` the caller reads as "not on this kernel, try again
+    /// differently".
+    ///
+    /// What a thread needs is a stack, thread-local storage, and the two
+    /// words `pthread_join` is built on — and the flags that say the address
+    /// space, the descriptor table and the signal handlers are shared are
+    /// accepted without doing anything, because on this machine they are
+    /// shared whatever anyone says.
+    fn clone_thread(&mut self, arguments: Arguments) -> Outcome {
+        let flags = arguments.get(0) as u64;
+        let stack = arguments.get(1) as u64;
+        let parent_tid = arguments.get(2) as u64;
+        let child_tid = arguments.get(3) as u64;
+        let tls = arguments.get(4) as u64;
+        self.spawn_thread(arguments, flags, stack, parent_tid, child_tid, tls)
+    }
+
+    /// `clone3(2)`: the same, with the arguments in a structure.
+    ///
+    /// Which is how a current glibc creates a thread — `clone` is the
+    /// fallback. The structure is versioned by its own size, and a caller
+    /// passing a smaller one gets zeros for the fields it did not set,
+    /// exactly as Linux does.
+    fn clone3(&mut self, arguments: Arguments) -> Outcome {
+        /// `struct clone_args`, as of the version this reads.
+        const MINIMUM: u64 = 64;
+        let at = arguments.get(0) as u64;
+        let size = arguments.get(1) as u64;
+        if size < MINIMUM {
+            return Outcome::Done(Errno::Invalid.as_result());
+        }
+        let mut raw = [0u8; MINIMUM as usize];
+        // SAFETY: read through the address space, which bounds-checks.
+        let read = unsafe { self.memory().slice(at, MINIMUM) };
+        match read {
+            Ok(bytes) => raw.copy_from_slice(bytes),
+            Err(errno) => return Outcome::Done(errno.as_result()),
+        }
+        let word = |offset: usize| {
+            u64::from_le_bytes(raw[offset..offset + 8].try_into().expect("eight bytes"))
+        };
+        let flags = word(0);
+        let child_tid = word(16);
+        let parent_tid = word(24);
+        // `clone3` names the stack's *base* and its size; the stack grows
+        // down, so the pointer a thread starts on is the top. `clone` is
+        // given the top directly, which is the one real difference between
+        // the two calls.
+        let stack = word(40).wrapping_add(word(48));
+        let tls = word(56);
+        self.spawn_thread(arguments, flags, stack, parent_tid, child_tid, tls)
+    }
+
+    fn spawn_thread(
+        &mut self,
+        arguments: Arguments,
+        flags: u64,
+        stack: u64,
+        parent_tid: u64,
+        child_tid: u64,
+        tls: u64,
+    ) -> Outcome {
+        use clone_flag as flag;
+        const THREAD: u64 = flag::VM | flag::THREAD;
+        if flags & THREAD != THREAD {
+            return Outcome::Fault(Fault::detailed(
+                number::CLONE,
+                arguments,
+                "a new process rather than a thread — this machine has one \
+                 address space, so `fork` has nothing to copy it into",
+            ));
+        }
+        let known = THREAD
+            | flag::SHARED
+            | flag::SETTLS
+            | flag::PARENT_SETTID
+            | flag::CHILD_SETTID
+            | flag::CHILD_CLEARTID;
+        if flags & !known != 0 {
+            return Outcome::Fault(Fault::detailed(
+                number::CLONE,
+                arguments,
+                "a `clone` flag this kernel does not read, which would change \
+                 what the new thread is",
+            ));
+        }
+        if stack == 0 {
+            // Without `CLONE_VM` Linux would give the child the parent's
+            // stack; with it, a thread sharing the parent's stack is two
+            // threads writing one frame.
+            return Outcome::Done(Errno::Invalid.as_result());
+        }
+        let request = crate::thread::Spawn {
+            stack,
+            tls: (flags & flag::SETTLS != 0).then_some(tls),
+            clear_child_tid: match flags & flag::CHILD_CLEARTID != 0 {
+                true => child_tid,
+                false => 0,
+            },
+        };
+        let Some(tid) = self.machine.spawn(&request) else {
+            return Outcome::Fault(Fault::detailed(
+                number::CLONE,
+                arguments,
+                "a second thread, which this container's machine cannot have",
+            ));
+        };
+        for (wanted, address) in [
+            (flags & flag::PARENT_SETTID != 0, parent_tid),
+            (flags & flag::CHILD_SETTID != 0, child_tid),
+        ] {
+            if !wanted {
+                continue;
+            }
+            // SAFETY: bounds-checked by the write.
+            if let Err(errno) = unsafe { self.memory_mut().write(address, &tid.to_le_bytes()) } {
+                return Outcome::Done(errno.as_result());
+            }
+        }
+        Outcome::Done(i64::from(tid))
+    }
+
+    /// `exit(2)`: this thread, not the process.
+    ///
+    /// The difference matters exactly once per program and then constantly:
+    /// every `pthread_exit` ends here, and ending the process instead would
+    /// take the other threads with it. When the last one goes the process
+    /// goes, which is what the zero means.
+    ///
+    /// On the way out the thread clears the word `set_tid_address` or
+    /// `CLONE_CHILD_CLEARTID` named and wakes anything parked on it. That is
+    /// the whole of how `pthread_join` returns — the joiner is waiting on a
+    /// futex whose address is that word.
+    fn exit_thread(&mut self, arguments: Arguments) -> Outcome {
+        let status = (arguments.get(0) & 0xff) as i32;
+        let word = self.machine.owned().clear_child_tid;
+        if word != 0 {
+            // SAFETY: bounds-checked by the write; a bad address here is the
+            // guest's problem and does not stop the thread ending.
+            let _ = unsafe { self.memory_mut().write(word, &0u32.to_le_bytes()) };
+            self.machine.wake(word, u32::MAX, usize::MAX);
+        }
+        match self.machine.exit_current(status) {
+            // The last thread. A process whose threads have all ended has
+            // ended, and its status is the last one's.
+            0 => Outcome::Exit(status),
+            _ => Outcome::Blocked,
+        }
+    }
+
     /// `sched_getaffinity`: one processor, which is the only honest answer.
     ///
     /// This machine reports one processor through `cpuid` and has one thread
@@ -1035,7 +1209,11 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             // Everything here is fixed. A container's entry process is the
             // first in its own namespace, which is what makes the answer a
             // constant rather than something to derive.
-            number::GETPID | number::GETTID => Outcome::Done(PROCESS_ID),
+            number::GETPID => Outcome::Done(PROCESS_ID),
+            // Not the same number once there is more than one thread, which
+            // is the whole reason glibc asks: `pthread_self` and every
+            // recursive mutex compare them.
+            number::GETTID => Outcome::Done(i64::from(self.machine.current_tid())),
             // Root, and the same root the initial stack already told the
             // program about: `build_stack` puts zero in `AT_UID` and its
             // three companions, and a libc that read one number there and a
@@ -1074,7 +1252,10 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             // the process. Once there are threads they part company —
             // `exit` will end one and `exit_group` all of them — and the
             // difference belongs there, not in a status code.
-            number::EXIT | number::EXIT_GROUP => {
+            number::CLONE => self.clone_thread(arguments),
+            number::CLONE3 => self.clone3(arguments),
+            number::EXIT => self.exit_thread(arguments),
+            number::EXIT_GROUP => {
                 // Linux takes the low byte, which is what `wait` reports and
                 // what a shell prints.
                 Outcome::Exit((arguments.get(0) & 0xff) as i32)
@@ -1094,7 +1275,7 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
     ///
     /// It never fails, and it answers with the caller's thread id.
     fn set_tid_address(&mut self, arguments: Arguments) -> Outcome {
-        self.clear_child_tid = arguments.get(0) as u64;
+        self.machine.owned().clear_child_tid = arguments.get(0) as u64;
         Outcome::Done(PROCESS_ID)
     }
 
@@ -1110,7 +1291,7 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
         if arguments.get(1) as u64 != ROBUST_LIST_HEAD_SIZE {
             return Outcome::Done(Errno::Invalid.as_result());
         }
-        self.robust_list = arguments.get(0) as u64;
+        self.machine.owned().robust_list = arguments.get(0) as u64;
         Outcome::Done(0)
     }
 
@@ -1338,30 +1519,90 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
     fn futex(&mut self, arguments: Arguments) -> Outcome {
         const PRIVATE: i64 = 128;
         const CLOCK_REALTIME: i64 = 256;
+        const WAIT: i64 = 0;
         const WAKE: i64 = 1;
+        const WAIT_BITSET: i64 = 9;
         const WAKE_BITSET: i64 = 10;
 
         // The two flags say where the futex lives and which clock a timeout
-        // is against. Neither changes what an operation *is*, and with one
-        // thread neither changes its answer.
+        // is against. Neither changes what an operation *is*: this machine
+        // has one address space, so private and shared are the same futex.
         let operation = arguments.get(1) & !(PRIVATE | CLOCK_REALTIME);
+        let word = arguments.get(0) as u64;
+        // The address has to be one the guest owns, whatever the operation:
+        // Linux answers `EFAULT` for a futex word outside the address space,
+        // and a caller that passed a bad pointer should hear about it here
+        // rather than at the first real contention.
+        if let Err(errno) = self.memory().check(word, 4) {
+            return Outcome::Done(errno.as_result());
+        }
         match operation {
             WAKE | WAKE_BITSET => {
-                // The address still has to be one the guest owns: Linux
-                // answers `EFAULT` for a futex word outside the address
-                // space, and a caller that passed a bad pointer should hear
-                // about it here rather than at the first real contention.
-                let word = arguments.get(0) as u64;
-                match self.memory().check(word, 4) {
-                    Ok(()) => Outcome::Done(0),
-                    Err(errno) => Outcome::Done(errno.as_result()),
+                let count = arguments.get(2).max(0) as usize;
+                let bitset = match operation {
+                    WAKE_BITSET => arguments.get(5) as u32,
+                    _ => u32::MAX,
+                };
+                if bitset == 0 {
+                    return Outcome::Done(Errno::Invalid.as_result());
+                }
+                Outcome::Done(self.machine.wake(word, bitset, count) as i64)
+            }
+            WAIT | WAIT_BITSET => {
+                // A timed wait needs a clock to expire against, and time
+                // reaches this container as a resource rather than as
+                // something the kernel keeps. Named rather than silently
+                // waited forever, which is what ignoring the timeout would
+                // be: a `pthread_cond_timedwait` that never returns is a
+                // hang with no diagnosis.
+                if arguments.get(3) != 0 {
+                    return Outcome::Fault(Fault::detailed(
+                        number::FUTEX,
+                        arguments,
+                        "a wait with a timeout, which needs a clock to expire \
+                         against",
+                    ));
+                }
+                let bitset = match operation {
+                    WAIT_BITSET => arguments.get(5) as u32,
+                    _ => u32::MAX,
+                };
+                if bitset == 0 {
+                    return Outcome::Done(Errno::Invalid.as_result());
+                }
+                // The comparison is the whole point of the call: it closes
+                // the window between a thread deciding to sleep and going to
+                // sleep. If the value has already changed, the wake it was
+                // going to wait for has happened.
+                let expected = arguments.get(2) as u32;
+                let held = match self.memory().check(word, 4) {
+                    // SAFETY: checked immediately above.
+                    Ok(()) => match unsafe { self.memory().slice(word, 4) } {
+                        Ok(bytes) => u32::from_le_bytes(bytes.try_into().expect("four bytes")),
+                        Err(errno) => return Outcome::Done(errno.as_result()),
+                    },
+                    Err(errno) => return Outcome::Done(errno.as_result()),
+                };
+                if held != expected {
+                    return Outcome::Done(Errno::TryAgain.as_result());
+                }
+                match self.machine.park(word, bitset) {
+                    // Parked. The scheduler picks somebody else; when a wake
+                    // names this word the thread becomes runnable again and
+                    // returns from here with zero.
+                    true => Outcome::Blocked,
+                    // One thread, and it wants to wait for itself.
+                    false => Outcome::Fault(Fault::detailed(
+                        number::FUTEX,
+                        arguments,
+                        "a wait with no other thread that could wake it",
+                    )),
                 }
             }
             _ => Outcome::Fault(Fault::detailed(
                 number::FUTEX,
                 arguments,
-                "an operation that would wait — there is one thread, so \
-                 nothing could wake it; the wait queues are M7's",
+                "a futex operation this kernel does not implement",
             )),
         }
     }
@@ -1470,7 +1711,7 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
                 // Read out before the address space is borrowed; the
                 // write's argument cannot borrow the kernel the write is
                 // reached through.
-                let blocked = self.blocked_signals.to_le_bytes();
+                let blocked = self.machine.owned().blocked_signals.to_le_bytes();
                 self.memory_mut()
                     .write(old, &blocked)
             } {
@@ -1487,15 +1728,15 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             Ok(bytes) => u64::from_le_bytes(bytes.try_into().expect("eight bytes")),
             Err(errno) => return Outcome::Done(errno.as_result()),
         };
-        self.blocked_signals = match how {
-            SIG_BLOCK => self.blocked_signals | mask,
-            SIG_UNBLOCK => self.blocked_signals & !mask,
+        self.machine.owned().blocked_signals = match how {
+            SIG_BLOCK => self.machine.owned().blocked_signals | mask,
+            SIG_UNBLOCK => self.machine.owned().blocked_signals & !mask,
             SIG_SETMASK => mask,
             _ => return Outcome::Done(Errno::Invalid.as_result()),
         };
         // `SIGKILL` and `SIGSTOP` cannot be blocked, and Linux drops them
         // from the mask silently rather than refusing the call.
-        self.blocked_signals &= !(signal_bit(SIGKILL) | signal_bit(SIGSTOP));
+        self.machine.owned().blocked_signals &= !(signal_bit(SIGKILL) | signal_bit(SIGSTOP));
         Outcome::Done(0)
     }
 
@@ -1528,7 +1769,7 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
         if !(1..=64).contains(&signal) {
             return Outcome::Done(Errno::Invalid.as_result());
         }
-        if self.blocked_signals & signal_bit(signal) != 0 {
+        if self.machine.owned().blocked_signals & signal_bit(signal) != 0 {
             // Pending, and nothing will ever deliver it.
             return Outcome::Done(0);
         }
