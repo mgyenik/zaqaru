@@ -119,13 +119,47 @@ pub fn settle(object: &mut ObjectFile) -> Result<()> {
         // and the lifter says where the code actually stopped — evidence
         // discovery could not have had, arriving a pass later, exactly like
         // a recovered arm.
+        //
+        // And where a truncated body has no terminator at all, the candidate
+        // was never a function. Every real one contains something that ends
+        // its execution — a `ret`, a jump out, a call that does not return —
+        // because control has to get out; a body with none is bytes
+        // execution could enter and never leave. `libcrypto.so.3` supplies
+        // the case: AES's Te0 table sits in `.text` and two `lea`s take its
+        // address, so the operand harvest minted a function whose whole body
+        // truncates to `xor %rax,%rax`.
+        //
+        // Truncating that to a stub rather than removing it is not free.
+        // The design's licence for weak witnesses is that a wrong one is
+        // dead code costing bytes — but a stub is *in the exec map*, so an
+        // indirect transfer to a data address would call three bytes of
+        // nonsense instead of missing by name, which is the one failure this
+        // whole design exists to avoid.
+        //
+        // Only for a witness that may not bound. A *strong* one said a
+        // function is here; a body of its that decodes to nothing that
+        // returns is worth keeping and looking at, not deleting quietly.
         let mut shortened = 0;
+        let mut discarded: std::collections::HashSet<usize> = std::collections::HashSet::new();
         for body in &lifted {
-            let function = &mut object.functions[body.function];
-            if body.size < function.size {
-                function.size = body.size;
-                shortened += 1;
+            let function = &object.functions[body.function];
+            if body.size >= function.size {
+                continue;
             }
+            if !function.witness.is_strong() && !body.has_terminator() {
+                discarded.insert(body.function);
+            } else {
+                object.functions[body.function].size = body.size;
+            }
+            shortened += 1;
+        }
+        if !discarded.is_empty() {
+            let mut index = 0;
+            object.functions.retain(|_| {
+                let keep = !discarded.contains(&index);
+                index += 1;
+                keep
+            });
         }
 
         let arms = stranded_arms(object, &lifted);

@@ -14,42 +14,60 @@ mod support;
 use support::WorkingDirectory;
 use zaqaru::reader::ObjectFile;
 
-/// A table nothing but a `lea` points at is not a function, and stops being
-/// treated as one after three bytes.
+/// A table nothing but a `lea` points at is not a function, and does not
+/// become one.
+///
+/// The operand harvest mints a candidate there — an instruction really does
+/// take the address, because it is a lookup table — and the decode then says
+/// what the bytes are: three bytes with nothing in them that ends execution.
+/// Every real function has something that does, because control has to get
+/// out.
+///
+/// Truncating it to a stub instead would not be free. A stub is *in the exec
+/// map*, so an indirect transfer to a data address would call three bytes of
+/// nonsense instead of missing by name — which is the one failure the whole
+/// discovery design exists to avoid, arrived at from the other direction.
 #[test]
-fn a_guessed_extent_ends_where_its_code_stops_decoding() {
+fn a_table_something_takes_the_address_of_is_not_a_function() {
     let workspace = WorkingDirectory::new("data-in-text-guessed");
     let elf = support::link_corpus_executable(&workspace, "data_in_text.s", "_start", "-O1");
     let bytes = std::fs::read(&elf).expect("read");
     let object = ObjectFile::parse(&bytes).expect("parse");
 
-    // The fixture has to be the shape it claims to be: something took the
-    // table's address, so discovery minted a function there.
-    let table = object
-        .functions
-        .iter()
-        .find(|function| function.witness == zaqaru::discover::Witness::AddressTaken)
-        .expect("the table was not address-taken, so this proves nothing");
-    assert_eq!(
-        table.extent,
-        zaqaru::discover::Extent::Guessed,
-        "the table's extent is stated, so it is not the case this describes"
-    );
-
-    // Three bytes: `xor %rax,%rax`, and then the byte that is not an
-    // instruction. Not "less than the table", which a bounding change could
-    // satisfy by accident — the exact place the decode stops.
-    assert_eq!(
-        table.size, 3,
-        "the extent was not cut back to where the code stops"
-    );
-
-    // And nothing else was lost: the function before it keeps its own size.
+    // The fixture has to be the shape it claims to be: `lookup` really does
+    // take the table's address, so something had to decide about it.
     let lookup = object
         .functions
         .iter()
         .find(|function| function.name == "lookup")
         .expect("the fixture defines `lookup`");
+    let text = &object.sections[lookup.section];
+    let table = lookup.offset + lookup.size;
+
+    assert!(
+        !object
+            .functions
+            .iter()
+            .any(|function| function.section == lookup.section && function.offset >= table
+                && function.offset < table + 0x1c),
+        "a function was left inside the table at {:#x}: {:?}",
+        text.address + table,
+        object
+            .functions
+            .iter()
+            .map(|function| (&function.name, function.offset))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        !object
+            .functions
+            .iter()
+            .any(|function| function.witness == zaqaru::discover::Witness::AddressTaken),
+        "an address-taken candidate survived, and the only one here is data"
+    );
+
+    // And nothing else was lost: the function that takes the address keeps
+    // its own size.
     assert_eq!(lookup.size, 11, "a neighbour was truncated too");
 }
 

@@ -361,6 +361,21 @@ ends where the decode says, and the extent is cut back to there. What is
 kept is every instruction that decoded; what is dropped never decoded and so
 could never have executed.
 
+**And where a truncated body has no terminator, the candidate was never a
+function at all.** Every real one contains something that ends its
+execution — a `ret`, a jump out, a call that does not return — because
+control has to get out; a body with none is bytes execution could enter and
+never leave. Te0 truncates to `xor %rax,%rax` and nothing else, so it is
+discarded rather than kept as a stub.
+
+That distinction is not tidiness. A stub is *in the exec map*, so an indirect
+transfer to a data address would call three bytes of nonsense instead of
+missing by name — the silent answer this design exists to avoid, arrived at
+from the other direction. Only a weak witness's candidate is discarded this
+way: a strong one said a function is here, and a body of its that decodes to
+nothing that returns is worth keeping and looking at rather than deleting
+quietly.
+
 **Why this does not weaken the invariant.** A stated extent's authority is
 over where a function *starts* and that nothing else begins inside it. It
 was never a claim that every byte is an instruction — `RC4_options` is the

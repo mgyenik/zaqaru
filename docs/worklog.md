@@ -2853,3 +2853,24 @@ assembly, and hand-written assembly arrives here inside linked libraries.
 The exclusion list now carries two categories instead of one, with that
 distinction written into it rather than the design's out-of-scope clause,
 which is real but was not what was happening.
+
+## 2026-08-30 — a truncated body with no way out was never a function
+
+The extent fix above left something it should not have, and reporting it as
+complete was wrong. Truncating Te0's minted function to three bytes stopped
+the bake failing, but kept a stub — and a stub is *in the exec map*, so an
+indirect transfer to a data address would have called three bytes of
+nonsense instead of missing by name. That is the silent answer this design
+exists to prevent, reached from the other side.
+
+The test is threshold-free: every real function contains something that ends
+its execution — a `ret`, a jump out, a call that does not return — because
+control has to get out. A truncated body with none of those is bytes
+execution could enter and never leave. Te0 truncates to `xor %rax,%rax` and
+nothing else.
+
+Applied only to a witness that may not bound. A strong one said a function is
+here; a body of its that decodes to nothing that returns is worth keeping and
+looking at rather than deleting quietly. `RC4_options` is the check that the
+line is in the right place: it truncates too, and its kept body still holds
+its own `ret`, so it stays whole either way.

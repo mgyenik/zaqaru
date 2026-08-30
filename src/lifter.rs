@@ -78,6 +78,20 @@ impl LiftedFunction {
     pub fn contains(&self, offset: u64) -> bool {
         offset >= self.offset && offset < self.offset + self.size
     }
+
+    /// Whether anything in this body ends its execution: a `ret`, a jump
+    /// that leaves, or a call that never returns.
+    ///
+    /// Every real function has one somewhere — control has to get out. A
+    /// body with none is one execution could only enter and never leave,
+    /// which is a statement about the bytes rather than about the program:
+    /// they are not code. See `crate::frontend::settle`, which is what acts
+    /// on that, and only for a body a truncation has already cut back.
+    pub fn has_terminator(&self) -> bool {
+        self.instructions
+            .iter()
+            .any(|lifted| !continues_past(&lifted.instruction))
+    }
 }
 
 /// Decodes one function, resolving every relocated operand to a symbol.
