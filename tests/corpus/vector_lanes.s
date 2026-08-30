@@ -250,6 +250,110 @@ lane_pmovmskb_after_compare:
 	lane_case	lane_punpcklwd, punpcklwd %xmm1, %xmm0
 	lane_case	lane_punpckhwd, punpckhwd %xmm1, %xmm0
 
+/* ---- word shuffles and word insertion ------------------------------------ */
+
+/* `pshuflw` and `pshufhw` permute the four words of *one* half and copy the
+   other through, which the doubleword shuffle cannot express. Every selector
+   below is a different permutation, and each names a different half, so a
+   translation that shuffled the wrong half or reused the wrong two selector
+   bits fails one of them rather than all of them. `0xe4` is the identity —
+   the case a translation that ignored the immediate would pass. */
+	lane_case	lane_pshuflw_reverse, pshuflw $0x1b, %xmm1, %xmm0
+	lane_case	lane_pshuflw_broadcast, pshuflw $0x00, %xmm1, %xmm0
+	lane_case	lane_pshuflw_identity, pshuflw $0xe4, %xmm1, %xmm0
+	lane_case	lane_pshuflw_mixed, pshuflw $0x93, %xmm1, %xmm0
+	lane_case	lane_pshuflw_memory, pshuflw $0x1b, SWAPPED(%rsp), %xmm0
+	lane_case	lane_pshufhw_reverse, pshufhw $0x1b, %xmm1, %xmm0
+	lane_case	lane_pshufhw_broadcast, pshufhw $0x00, %xmm1, %xmm0
+	lane_case	lane_pshufhw_identity, pshufhw $0xe4, %xmm1, %xmm0
+	lane_case	lane_pshufhw_mixed, pshufhw $0x93, %xmm1, %xmm0
+	lane_case	lane_pshufhw_memory, pshufhw $0x1b, SWAPPED(%rsp), %xmm0
+
+/* `pinsrw` replaces one word of eight and keeps the other seven, so a case
+   per half is the least that can tell a wrong half from a right one — and
+   the words either side of the one written are what say the mask was built
+   the right way round.
+
+   The source register is *complemented* first, and that is the difference
+   between a case and a case that works. `pinsrw` uses only the low sixteen
+   bits of a register source and the architecture drops the rest; a
+   translation that carried them would OR them into the neighbouring word.
+   Written as `movq %rdi, %rdx`, the bits it would carry are bits 16..31 of
+   `%rdi` — which are *already* the destination's next word, so the wrong
+   answer and the right one are the same bits and the mutation passes.
+   Complementing makes them differ by construction. Found by making the
+   mutation and watching it survive. */
+/* A macro of its own rather than `lane_case` with a multi-instruction body,
+   and that is not a style choice. GAS ends a macro invocation at the first
+   `;`, so `lane_case name, movq …; notq …; pinsrw …` expands to the macro
+   with *only the `movq`* and leaves the rest as statements after it — a case
+   containing no `pinsrw` at all, which passes every mutation of a
+   translation it never reaches. Found by mutating and watching five
+   mutations survive. `lane_broadcast_byte` below is written out longhand for
+   the same reason. */
+	.macro	insert_case name, selector
+	.globl	\name
+	.type	\name, @function
+\name:
+	lane_prologue
+	movq	%rdi, %rdx
+	notq	%rdx
+	pinsrw	$\selector, %edx, %xmm0
+	movdqu	%xmm0, RESULT(%rsp)
+	movq	RESULT(%rsp), %rax
+	imulq	$31, %rax, %rax
+	addq	RESULT+8(%rsp), %rax
+	ret
+	.size	\name, .-\name
+	.endm
+
+	insert_case	lane_pinsrw_low, 0
+	insert_case	lane_pinsrw_low_middle, 2
+	insert_case	lane_pinsrw_high, 4
+	insert_case	lane_pinsrw_top, 7
+/* A memory source is *sixteen bits*, so this is also the case that says the
+   read is two bytes rather than four — reading a doubleword here would touch
+   a byte the instruction does not name. */
+	lane_case	lane_pinsrw_memory, pinsrw $5, SWAPPED(%rsp), %xmm0
+
+/* And the other direction. `pextrw` writes a *32-bit* register, so the upper
+   half of the 64-bit one is zeroed — x86-64's rule for every doubleword
+   write, and the one thing this instruction depends on it for.
+
+   `%rax` is filled with ones first, and that is what makes the case a case:
+   left as it arrives it is already zero, so a translation that wrote sixteen
+   bits and kept the rest would produce the same answer and the mutation
+   would survive. Found by making it and watching it. */
+	.macro	extract_case name, selector
+	.globl	\name
+	.type	\name, @function
+\name:
+	lane_prologue
+	movq	$-1, %rax
+	pextrw	$\selector, %xmm0, %eax
+	ret
+	.size	\name, .-\name
+	.endm
+
+	extract_case	lane_pextrw_0, 0
+	extract_case	lane_pextrw_3, 3
+	extract_case	lane_pextrw_4, 4
+	extract_case	lane_pextrw_7, 7
+
+/* The SSE4.1 form, whose destination is *sixteen bits of memory*. The slot is
+   filled with ones first so that a store of four bytes — two the instruction
+   does not name — shows up in the two bytes above it. */
+	.globl	lane_pextrw_memory
+	.type	lane_pextrw_memory, @function
+lane_pextrw_memory:
+	lane_prologue
+	movq	$-1, %rax
+	movq	%rax, RESULT(%rsp)
+	pextrw	$6, %xmm0, RESULT(%rsp)
+	movq	RESULT(%rsp), %rax
+	ret
+	.size	lane_pextrw_memory, .-lane_pextrw_memory
+
 /* Interleaving a register with itself, which is how an SSE2 `memset`
    broadcasts one byte across a whole vector — the shape that actually
    appears in a libc. */

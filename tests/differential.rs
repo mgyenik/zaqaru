@@ -2052,6 +2052,33 @@ fn packed_lanes_match_native() {
         "lane_punpcklwd",
         "lane_punpckhwd",
         "lane_broadcast_byte",
+        // The word shuffles, which move pieces the doubleword shuffle
+        // cannot. Every selector is a different permutation and each names
+        // a different half, so a translation that shuffled the wrong one
+        // fails a case rather than all of them; the identity selector is
+        // what a translation ignoring the immediate would pass.
+        "lane_pshuflw_reverse",
+        "lane_pshuflw_broadcast",
+        "lane_pshuflw_identity",
+        "lane_pshuflw_mixed",
+        "lane_pshuflw_memory",
+        "lane_pshufhw_reverse",
+        "lane_pshufhw_broadcast",
+        "lane_pshufhw_identity",
+        "lane_pshufhw_mixed",
+        "lane_pshufhw_memory",
+        // And word insertion, one case per half plus the two ends, because
+        // the seven words it must *not* touch are the answer.
+        "lane_pinsrw_low",
+        "lane_pinsrw_low_middle",
+        "lane_pinsrw_high",
+        "lane_pinsrw_top",
+        "lane_pinsrw_memory",
+        "lane_pextrw_0",
+        "lane_pextrw_3",
+        "lane_pextrw_4",
+        "lane_pextrw_7",
+        "lane_pextrw_memory",
     ]
     .into_iter()
     .map(str::to_string)

@@ -2874,3 +2874,56 @@ here; a body of its that decodes to nothing that returns is worth keeping and
 looking at rather than deleting quietly. `RC4_options` is the check that the
 line is in the right place: it truncates too, and its kept body still holds
 its own `ret`, so it stays whole either way.
+
+## 2026-08-30 — the word shuffles, and five mutations that survived a test with nothing in it
+
+`zlib` reached `pshuflw` and `pinsrw`, so both families went in:
+`pshuflw`/`pshufhw` — four words of one half permuted by an immediate, the
+other copied through — and `pinsrw`/`pextrw`, the one member of the family
+that reads across the two register files. All four are pair arithmetic
+rather than SIMD, because a word permutation *within* an `i64` is exactly the
+pair's own grain, which is the same argument the byte shifts and `pmuludq`
+already make.
+
+    import zlib     identical to native
+    import gzip     identical
+    import pickle, csv, decimal, fractions   identical
+
+### The fixture had nothing in it, and five mutations said so
+
+Written as `lane_case name, movq %rdi, %rdx; notq %rdx; pinsrw $0, %edx,
+%xmm0` — and **GAS ends a macro invocation at the first `;`**, so the case
+expanded to the prologue, the `movq`, and the fold. No `notq`, no `pinsrw`.
+Four of the five `pinsrw` cases contained not one instance of the
+instruction they were named for, and every mutation of the translation
+passed because nothing reached it.
+
+Found by mutating, not by reading: five in a row surviving is not a
+translation that is right. `lane_broadcast_byte` in the same file is written
+out longhand and now says why; the insert cases have a macro of their own.
+
+### And then three more mutations, each teaching something different
+
+- **`pinsrw` keeping its source's high bits** survived even after the cases
+  were real, because the value inserted was `%rdi` — whose bits 16..31 are
+  *already* the destination's next word, so the wrong answer and the right
+  one are the same bits. The source is complemented now, which makes them
+  differ by construction.
+- **`pextrw` writing a word instead of a doubleword** survived, and that one
+  was not a missing test: `write_operand` takes the width from the
+  *register's own slice* for a register destination and never consults the
+  argument. The mutation changed nothing. Which is the promotion plan's
+  lesson — a mutation that survives may be testing the wrong claim — and it
+  exposed a real gap beside it: SSE4.1's `pextrw` can write **m16**, where
+  the width is the whole answer, and four bytes would have gone where two
+  were named. Fixed, with a case whose destination slot is pre-filled so a
+  wide store shows.
+- **`pinsrw` reading four bytes from a memory source** survives and is
+  documented rather than tested. The extra two bytes are masked off, so the
+  value is identical; what differs is only which bytes were touched, and
+  that is observable exactly once — a source in the last two bytes of linear
+  memory, where the wider read traps — which no fixture can place.
+
+Everything else was caught: both halves of both shuffles, the selector
+stride, the insert's half and its destination mask, the extract's half and
+its word.

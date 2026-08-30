@@ -468,6 +468,13 @@ impl FunctionTranslator<'_> {
             // shuffle below cannot express. `punpcklbw` against a register
             // holding one byte is how an SSE2 `memset` broadcasts its fill
             // value across a whole vector.
+            // Word-grain shuffles of one half, the other copied through.
+            // The doubleword shuffle cannot express these either, and unlike
+            // the interleaves they take one operand rather than two.
+            Mnemonic::Pshuflw => self.translate_word_shuffle(body, lifted, VectorHalf::Low)?,
+            Mnemonic::Pshufhw => self.translate_word_shuffle(body, lifted, VectorHalf::High)?,
+            Mnemonic::Pinsrw => self.translate_insert_word(body, lifted)?,
+            Mnemonic::Pextrw => self.translate_extract_word(body, lifted)?,
             Mnemonic::Punpcklbw => {
                 self.translate_interleave(body, lifted, LaneWidth::Byte, false)?
             }
@@ -1495,6 +1502,158 @@ impl FunctionTranslator<'_> {
             self.state.write_vector(body, destination, output);
         }
         Ok(())
+    }
+
+    /// `pshuflw` and `pshufhw`: four words of one half permuted by an
+    /// immediate, the other half copied through.
+    ///
+    /// Pair arithmetic rather than SIMD, because this lands exactly on the
+    /// pair's own grain — one half is a permutation *within* an `i64` and
+    /// the other is that `i64` unchanged. The copied half comes from the
+    /// *source*, not from the destination: these read one operand and write
+    /// another, so a destination that is a different register keeps nothing
+    /// of its own.
+    fn translate_word_shuffle(
+        &mut self,
+        body: &mut FunctionBodyBuilder,
+        lifted: &LiftedInstruction,
+        shuffled: VectorHalf,
+    ) -> Result<()> {
+        let destination = self.expect_vector_operand(&lifted.instruction, 0)?;
+        let selector = usize::from(lifted.instruction.immediate8());
+        let source = self.park_operand_halves(body, lifted, 1)?;
+
+        for (slot, half) in [VectorHalf::Low, VectorHalf::High].into_iter().enumerate() {
+            if half != shuffled {
+                body.local_get(source[slot]);
+            } else {
+                for word in 0..4 {
+                    // Two selector bits per output word, naming one of the
+                    // four words of the same half.
+                    let from = (selector >> (2 * word)) & 3;
+                    body.local_get(source[slot]);
+                    if from > 0 {
+                        body.i64_const(16 * from as i64);
+                        body.i64_shr_unsigned();
+                    }
+                    body.i64_const(0xffff);
+                    body.i64_and();
+                    if word > 0 {
+                        body.i64_const(16 * word as i64);
+                        body.i64_shl();
+                        body.i64_or();
+                    }
+                }
+            }
+            self.state.write_vector(body, destination, half);
+        }
+        Ok(())
+    }
+
+    /// `pinsrw`: one 16-bit word of the destination replaced, the rest kept.
+    ///
+    /// The source is a general-purpose register or a 16-bit memory operand,
+    /// so this is the one member of the family that reads across the two
+    /// register files. Only the low sixteen bits of a register source are
+    /// used, whatever the register's width — the encoding names a `r32` and
+    /// the architecture reads a word out of it.
+    fn translate_insert_word(
+        &mut self,
+        body: &mut FunctionBodyBuilder,
+        lifted: &LiftedInstruction,
+    ) -> Result<()> {
+        let instruction = &lifted.instruction;
+        let destination = self.expect_vector_operand(instruction, 0)?;
+        // Three bits, so eight words — the selector reaches either half, and
+        // which half it names is the top bit of the three.
+        let selector = usize::from(instruction.immediate8()) & 7;
+        let half = match selector < 4 {
+            true => VectorHalf::Low,
+            false => VectorHalf::High,
+        };
+        let word = selector & 3;
+
+        // A register source is read at its own width and narrowed here; a
+        // memory source is a word and is read as one, because reading four
+        // bytes where the instruction names two would touch a byte the guest
+        // did not.
+        //
+        // The corpus cannot see the difference and that is a property of the
+        // difference rather than a gap: the extra two bytes are masked off,
+        // so the *value* is the same either way, and what changes is only
+        // which bytes were touched. That is observable exactly once — a
+        // sixteen-bit source in the last two bytes of linear memory, where
+        // the wider read traps — which no corpus fixture can place. The
+        // narrow read is still what the instruction says, and the note is
+        // here so the next reader does not go looking for the test.
+        let width = match instruction.op_kind(1) {
+            iced_x86::OpKind::Register => OperandWidth::DoubleWord,
+            _ => OperandWidth::Word,
+        };
+        self.read_operand(body, lifted, 1, width)?;
+        body.i64_extend_i32_unsigned();
+        body.i64_const(0xffff);
+        body.i64_and();
+        if word > 0 {
+            body.i64_const(16 * word as i64);
+            body.i64_shl();
+        }
+        let inserted = self.temporaries.take(body, ValueType::I64);
+        body.local_set(inserted);
+
+        // The destination's own half with that word cleared, then the new
+        // one dropped in. The other half is not touched at all.
+        self.state.read_vector(body, destination, half);
+        body.i64_const(!(0xffffi64 << (16 * word as i64)));
+        body.i64_and();
+        body.local_get(inserted);
+        body.i64_or();
+        self.state.write_vector(body, destination, half);
+        Ok(())
+    }
+
+    /// `pextrw`: one 16-bit word of the source, zero-extended into a
+    /// general-purpose register.
+    ///
+    /// The other direction of the same move, and it earns its place here
+    /// rather than waiting for a binary to ask: a family whose members are
+    /// implemented one at a time is a family whose untouched members are
+    /// untested, which is the gap `vector_lanes.s` exists to close.
+    fn translate_extract_word(
+        &mut self,
+        body: &mut FunctionBodyBuilder,
+        lifted: &LiftedInstruction,
+    ) -> Result<()> {
+        let instruction = &lifted.instruction;
+        let selector = usize::from(instruction.immediate8()) & 7;
+        let half = match selector < 4 {
+            true => VectorHalf::Low,
+            false => VectorHalf::High,
+        };
+        let source = self.expect_vector_operand(instruction, 1)?;
+
+        self.state.read_vector(body, source, half);
+        let word = selector & 3;
+        if word > 0 {
+            body.i64_const(16 * word as i64);
+            body.i64_shr_unsigned();
+        }
+        body.i64_const(0xffff);
+        body.i64_and();
+        body.i32_wrap_i64();
+        let value = self.temporaries.take(body, ValueType::I32);
+        body.local_set(value);
+        // A register destination is a `r32` and the write zero-extends into
+        // the whole of it, which the register slice already decides — the
+        // width below is not consulted for one. A *memory* destination is
+        // the SSE4.1 form, `r/m16`, and there the width is the whole answer:
+        // storing four bytes would overwrite two the instruction does not
+        // name.
+        let width = match instruction.op_kind(0) {
+            iced_x86::OpKind::Register => OperandWidth::DoubleWord,
+            _ => OperandWidth::Word,
+        };
+        self.write_operand(body, lifted, 0, width, value)
     }
 
     /// Rebuilds all 128 bits of the destination out of doubleword lanes taken

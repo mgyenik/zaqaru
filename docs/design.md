@@ -973,10 +973,11 @@ whereas `rol` is what gcc reaches for to swap adjacent words at `-O2`, and
 only the particular shapes the corpus settled on keep it out.
 
 **SSE.** The long tail the float plan bounded by demand rather than by
-enumeration: packed `min`/`max`, `pmovmskb`, `palignr`,
-`pshuflw`/`pshufhw`, the packed conversions (`cvttpd2dq`, `cvtpd2ps`,
-`cvtps2pd`), SSE4's integer minima and maxima, horizontal adds, blends,
-`pabsd`, `ptest`. Packed `min`/`max` deserve a warning of their own: they
+enumeration: `palignr`, the packed conversions (`cvttpd2dq`, `cvtpd2ps`,
+`cvtps2pd`), horizontal adds, blends, `pabsd`, `ptest`. (`pshuflw`,
+`pshufhw`, `pinsrw` and `pextrw` have left this list — zlib's `deflate`
+asked for the first and the third, and the families they belong to went in
+together.) Packed `min`/`max` deserve a warning of their own: they
 carry the same second-operand-on-ties-and-NaN rule as their scalar forms, so
 they are not a matter of reaching for `f64x2.min` — that is precisely the
 mapping the scalar design rejects. Register-count packed shifts are a loud
