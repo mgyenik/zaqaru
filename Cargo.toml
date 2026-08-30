@@ -1,5 +1,9 @@
 [workspace]
 members = ["baker", "kisal", "runner", "x87"]
+# The interpreter-throughput spike (docs/vm.md, gate G1) is a standalone
+# instrument, not a member: it must not add its dependencies or build time
+# to the workspace.
+exclude = ["tools/interp-spike"]
 
 [package]
 name = "zaqaru"

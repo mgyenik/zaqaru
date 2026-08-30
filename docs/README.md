@@ -28,6 +28,15 @@ Current documents:
   saturated tier that makes an arbitrary binary run when the witnesses
   miss, the front-end fixpoint that lets recovered jump-table arms cut
   (D1–D7), and the survey of the field it rests on.
+- [vm.md](vm.md) — **proposed**: the userspace-VM alternative path — an
+  x86-64 interpreter compiled to wasm as the correctness floor (tier 0),
+  runtime hot-block translation as the accelerator (tier 1), and the AOT
+  transpiler demoted to an optional precompiler (tier 2), all under an
+  unchanged kisal. Carries the measured throughput spike, the
+  SMC/page-permission design that repeals the AOT deal, the collapsed
+  thread/signal machinery, the subsystem-by-subsystem reuse inventory,
+  and gates G1–G3 with milestones V1–V5; the adoption decision sits at
+  V2.
 - [x87-plan.md](x87-plan.md) — the plan that finishes the x87: symbol
   plumbing and the translator lowering (X1–X2), linking the staticlib
   into every build (X3), corpus differentials (X4), the refusal-tail

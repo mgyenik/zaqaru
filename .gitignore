@@ -6,3 +6,4 @@
 # pointing at a file that is not in the clone.
 .claude/settings.local.json
 .claude/hooks/
+/tools/interp-spike/target
