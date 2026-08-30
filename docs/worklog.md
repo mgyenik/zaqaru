@@ -2986,3 +2986,99 @@ address* — a resume ID is a small integer or larger than any address a guest
 can hold, never in between, which is the discrimination the design's miss
 path turns on. It also now says, if the sentinel ever comes back, that the
 container was built without resume rather than that `longjmp` changed.
+
+## 2026-08-30 — the process table, and four defects that shared one shape
+
+`docs/vm.md` §7a is the design; the build is `kisal/src/system.rs`,
+`kisal/src/pipe.rs` and `kisal/src/poll.rs`. What belongs here is the four
+defects, because they were the *same* defect wearing four coats, and the
+coat is worth recognising on sight.
+
+**The rule they all broke: a guest address means a process's own bytes only
+while that process is the one at the guest's addresses.** There is one such
+process at a time — that is the whole reason a dormant process's memory
+lives somewhere else — and every operation that touches guest memory has to
+happen on that process's own turn. Written down like that it sounds
+unmissable. It was missed four times in one afternoon.
+
+1. **`wake_waiters` wrote a child's exit status into the parent's pages
+   while the child was current.** Natively the parent's memory is
+   `PROT_NONE`, so it segfaulted the test binary immediately — the good
+   case. Fixed by completing a parked `wait4` *after* the switch back to
+   the waiter, which is also where a real `wait4` returns.
+2. **A parked `poll` re-read the caller's `pollfd` array to decide whether
+   to wake it** — while the forked child's memory was mapped. This one does
+   *not* fault, because a forked child has a stack at the same address. It
+   answered with somebody else's bytes and the wait never woke, and the
+   container reported a deadlock with everything apparently fine. Fixed by
+   copying the set into kernel state at park time, which turns a `poll`
+   into an `epoll` set with a one-call lifetime and makes readiness
+   answerable without touching any process's memory.
+3. **A process that exited kept its descriptors.** So a pipe still had a
+   writer, and the parent's `poll` on the other end waited forever for an
+   end-of-file that had already happened. Not the same rule, but the same
+   *class*: state that outlived the thing it described.
+4. **Inside the module, every process was given a fresh address-space
+   region off the top of linear memory** — half a gigabyte of the module's
+   four per `execve`, so the eighth program got `ENOEXEC` from a load with
+   nowhere to go. Sharing one range fixes it, and sharing exposed the next
+   layer: `kisal::space::Space` states that above a fresh space's
+   high-water mark memory "is freshly grown and therefore zero", which
+   inside the module is only true if whoever left made it true.
+
+### What actually found them
+
+Not review. **A one-line stall report.** A container that stops with
+"deadlocked" and nothing else sends whoever reads it to a debugger, so
+`System::stall` now names every process, every thread, what each is parked
+on, and what descriptors each still holds. Defect 3 was a `subprocess.run`
+that hung after twelve seconds of CPython; the report said
+
+```
+  process 2 (parent 1) exited 0, unreaped
+    thread 1 runnable
+    open 0:console:Input 1:pipe0:Write 2:pipe1:Write
+```
+
+and that is the whole diagnosis. It cost twenty lines to write and it has
+already paid for itself twice.
+
+Defect 2 was found by printing the scheduler's own readiness decisions —
+which is the same idea one rung lower, and which suggests the report should
+grow a mode that prints it continuously rather than only at the end.
+
+### The one that only exists in one of the two builds
+
+Defects 4 and its sequel are **module-only**: natively a process's bytes
+live in a `memfd` of its own, so a fresh address space is genuinely fresh
+and reuse never happens. Every native test passed throughout. The
+regression test therefore had to be a module test — `tests/
+interpreted_container.rs`, nine programs in a row each checking its `.bss`
+and a fresh mapping are zero — and both negative controls were *run*, not
+reasoned about: put `guest_base` back and it fails "generation 1 could not
+reserve"; take the zeroing out and it fails "generation 8 found bytes in a
+fresh mapping".
+
+Worth stating plainly because the native suite is where nearly all the
+evidence in this project lives, and this is a class of defect it cannot
+see. The native build and the module build differ in exactly one thing —
+where a dormant process's bytes go — and that one thing has its own bugs.
+
+### A cost stated rather than discovered
+
+A process switch is free natively (one `MAP_FIXED` of a file) and is a copy
+inside the module. So a process holds the processor for a slice of sixteen
+thread quanta before another is considered — the same number in both
+builds, so a native run and a module run of one container still schedule
+identically and the native tests stay evidence about the module. The shapes
+that matter never reach it: a process that blocks yields at once, so
+fork-and-wait and fork-and-exec cost two switches each.
+
+### Also corrected, and not a defect in the code
+
+`vm.md`'s status header claimed nothing past V1 existed and that G2 was
+unanswered, while its own §12 recorded V2 and V3 built and G2 answered at
+29 MIPS. §7's V3 text still said `fork` was "refused by name", which §7a
+had already replaced with a design and a build. A document that disagrees
+with itself is worse than one that is merely out of date, because the
+reader cannot tell which half to trust.
