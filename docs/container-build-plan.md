@@ -1,7 +1,10 @@
 # Building the container runtime: kisal, the baker, and the seams
 
 Status: **in progress — M0 through M5 built and green (2026-08-28); M6's
-front end and the dynamic tier built (2026-08-29).**
+front end and the dynamic tier built (2026-08-29); M6's acceptance ladder
+climbed both rungs (2026-08-30) — busybox `echo`/`cat`/`ls -l`, then
+`python3 -c 'print("hello")'` from the distribution's own interpreter and
+its whole standard library.**
 [container-plan.md](container-plan.md) is the design authority this
 plan implements; where the two disagree, the design doc wins and this
 plan gets corrected. M0's verdicts get written into its section as the
@@ -1753,7 +1756,34 @@ appendix's dlopen item, which carries the measurement and the spike.
 **Not measured:** breadth. Three dynamic files read closely and fifteen
 more through a parse spike is not a population.
 
-## Appendix — M6's second checkpoint: what Python still needs (appended 2026-08-29)
+## Appendix — M6's second checkpoint: reached (appended 2026-08-29, closed 2026-08-30)
+
+**The rung is green.** `python3 -c 'print("hello")'` runs in a container
+built from the distribution's own `/usr/bin/python3.12` and its whole
+standard library, output byte-identical to the same binary run natively with
+the same environment, exit 0, 494 syscalls. What follows is the appendix as
+it was written before the work, with each item's outcome folded in, so that
+what was predicted and what was found stay separately readable.
+
+| | |
+| --- | --- |
+| image tree | 58 MB (54 MB of `/usr/lib/python3.12`) |
+| bake | 4.0 s |
+| container | 153 MB, 81,714 functions, 371 refusals, none reached |
+| boot, including the engine compiling the module | 5.9 s wall, 1 m 40 s CPU |
+
+The two quantities this appendix called unmeasured are the last two rows.
+Neither is a problem, and neither was guessable: the bake is fifteen times
+faster than the run, and the run is dominated by wasmtime's own compilation.
+
+Where it stops now is `import json`, which dlopens
+`lib-dynload/_json.cpython-312-x86_64-linux-gnu.so` and gets the named AOT
+fault — item 3 below, exactly where it says.
+
+---
+
+### The appendix as written before the work
+
 
 M6's acceptance ladder is "musl BusyBox `echo`/`cat`/`ls` first, then
 `python -c 'print("hello")'`". The first rung is green — on the
@@ -1784,7 +1814,25 @@ So the loader, the multi-library closure, the prelink round-trip, the
 cross-module exec map, and the whole of the dynamic tier are not the
 problem. What remains is inside CPython.
 
-### 1. A `switch` whose arms are in sibling pieces — *blocking*
+### 1. A `switch` whose arms are in sibling pieces — *blocking* — **built**
+
+**Outcome: route (a), sharpened into `code-discovery.md`'s D7 and built.**
+The front end is a fixpoint over discover → lift → recover;
+`src/frontend.rs` owns it. Python settles in three rounds and 1,082 arm-cut
+pieces across the image.
+
+Two things this section did not foresee, both found by running it:
+
+- Its safety argument — that the eval loop is protected by never having been
+  split — is false about this binary. `_PyEval_EvalFrameDefault` is **779
+  pieces**, all cut by direct branches, before any of this runs. What
+  protects it is the invariant about *establishment*, not about splitting.
+- Getting past `_Py_HashBytes` only reached the next defect. The eval loop's
+  own computed goto was not recovered at all, because the dispatch-table
+  discriminator asked about the *first two* entries and gcc's hot/cold split
+  puts entry zero of `opcode_targets[]` in the eval loop's cold twin. That
+  rule took three corrections, each from a binary; see the worklog.
+
 
 `_Py_HashBytes` is siphash, and its tail is `switch (len & 7)`. The table is
 recovered correctly — eight arms, eight-byte entries — but two of the arms
@@ -1842,7 +1890,23 @@ loud build-time error instead of a silent runtime miss. Route (b) is
 recorded there as the answer to a *different* problem — interior
 addresses computed at run time — and stays in the drawer.
 
-### 2. The standard library — untested
+### 2. The standard library — **baked, and it works**
+
+**Outcome:** measured above. `/proc/self/exe` was *not* needed — CPython
+finds its `stdlib dir` from the compiled-in prefix — but the environment
+was, and not for the reason this section gives. With no `HOME`, CPython does
+not fail; it takes a different path, through `expanduser` into
+`pwd.getpwuid`, into glibc's NSS, into an nscd probe over `AF_UNIX`.
+Measured natively: `HOME` set, zero socket calls; empty environment, two and
+a read of `/etc/passwd`. A container with no environment has a *larger*
+syscall surface than the run it will be diffed against.
+
+So the image index grew an environment region beside its command line
+(version 4) and `zaqaru-bake --env NAME=value` records it. `DF_1_NOW` at
+bake is still the outstanding half — `LD_BIND_NOW=1` is still injected, and
+now goes first so a recorded one wins.
+
+### 2 (as written). The standard library — untested
 
 `python -c 'print(1)'` imports `encodings` before it runs anything, so the
 image needs `/usr/lib/python3.12`: 54 MB of it, against the 91 MB container
