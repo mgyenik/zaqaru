@@ -56,7 +56,20 @@ fn main() -> Result<()> {
             "-h" | "--help" => {
                 println!(
                     "usage: zaqaru-bake <program> [-o <container.wasm>] \
-                     [--root <directory>] [--env NAME=value]... [-- <argv>...]"
+                     [--root <directory>] [--env NAME=value]... [-- <argv>...]\n\
+                     \n\
+                     The program is the host path of a linked x86-64 ELF. It \
+                     goes before the options; everything after `--` is the \
+                     guest's own command line, so a program named only there \
+                     is `argv[0]` and not the thing to bake.\n\
+                     \n\
+                     `--root` is the filesystem the container will have *and* \
+                     the tree its libraries are resolved against — a dynamic \
+                     program's interpreter and every `DT_NEEDED` must be \
+                     inside it, because the bake does not look at the host's \
+                     `/` once a root is given. Without `--root` the host's `/` \
+                     is searched and the container gets a few empty \
+                     directories."
                 );
                 return Ok(());
             }
@@ -64,10 +77,24 @@ fn main() -> Result<()> {
             other => program = Some(PathBuf::from(other)),
         }
     }
-    let program = program.context(
-        "usage: zaqaru-bake <program> [-o <container.wasm>] [--root <directory>] \
-         [--env NAME=value]...",
-    )?;
+    let program = match (program, argv.first()) {
+        (Some(program), _) => program,
+        // The mistake this catches is the one that gets made: the program
+        // named after `--`, where the *guest's* command line starts. Saying
+        // "usage" about a command line that plainly contains a program is
+        // baffling, so say which one was read as what.
+        (None, Some(first)) => bail!(
+            "no program was given. `{}` came after `--`, which begins the \
+             guest's own command line — the program to bake goes before the \
+             options, and is usually repeated after `--` as `argv[0]`:\n  \
+             zaqaru-bake {0} -o out.wasm -- {0} …",
+            String::from_utf8_lossy(first)
+        ),
+        (None, None) => bail!(
+            "usage: zaqaru-bake <program> [-o <container.wasm>] \
+             [--root <directory>] [--env NAME=value]... [-- <argv>...]"
+        ),
+    };
     let output = output.unwrap_or_else(|| program.with_extension("wasm"));
 
     // The filesystem the container will have, before the translated files
