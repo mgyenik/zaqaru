@@ -2278,3 +2278,54 @@ inside *guessed* extents as well as residue. Written down, not built.
 
 Seven targets in 20 seconds, having gained two. It was 105 for five this
 morning; the entry above records why.
+
+### `ls -l`, and a witness collected then dropped
+
+`busybox ls -l` works. Against native the only differences are three the
+image explains: `total` counts blocks an image does not allocate, uid 1000
+stays a number with no `/etc/passwd` to resolve it, and the time is UTC with
+no `/etc/localtime`.
+
+The gap was not a missing witness. `0x598bd0` is named by a `lea rdx` at
+`0x5a4f87` — a callback passed as an argument — and that instruction sits
+*inside a discovered function*, so D4 had harvested it correctly. It was
+then dropped, because `placements` skips an address something already
+covers, and this one is covered by a piece whose extent a transfer target
+guessed.
+
+So the refinement the applet table forced had been applied too narrowly:
+only table entries could revise a guessed extent, when the argument is about
+weak evidence and says nothing about which kind. An address an instruction
+takes disputes a guessed bound exactly as much as a table entry does. The
+document now states three tiers instead of two.
+
+Finding it took the runtime backtrace, the translator's own dump, and a byte
+scan of `.text` for an instruction naming the address — because **`objdump`
+had desynced** at a bad instruction boundary and showed the calling piece
+ending in `ret` with no indirect transfer in it at all. The translator's
+dump showed the `call r14` that was really there. Worth remembering: a
+disassembler starting at the wrong offset is confidently wrong, and the
+piece boundaries this project computes are exactly the offsets it starts at.
+
+The dump was also stale by 677 functions until rebuilt, which is the second
+time in a day a tool answered about an older binary than the one under test.
+
+### Two performance defects of one shape
+
+The cut loop resolved every target's section per round of a sixteen-round
+fixpoint, through a lookup linear in the ninety sections of a merged dynamic
+program. Hoisting it helped a little. The real one was the same mistake I
+had just written a comment about while introducing it: **the data-array scan
+asked which section holds an address once per eight-byte word of every data
+section** — hundreds of thousands of words against ninety sections.
+
+    dynamic bake, before D5   0.87s
+    with D5 as first written  2.03s
+    with the ranges hoisted   0.70s
+
+Faster than before the witness existed. The lesson is not "hoist loop
+invariants", which everyone knows; it is that a linear scan over sections is
+*fine* everywhere this project had used it before, because the section count
+was fifteen — and merging three modules into one translation unit multiplied
+it by six without any of those call sites changing. A merge changes the cost
+of every question asked per section.

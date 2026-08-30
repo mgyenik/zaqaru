@@ -124,6 +124,22 @@ inside a stated one is skipped exactly as before — which is what keeps a
 computed goto's 256 labels from shredding `_PyEval_EvalFrameDefault`, whose
 size its symbol states.
 
+**Every** weak witness, not merely the data-array one. The first version of
+this rule was written for the applet table and applied only to it, and
+`busybox ls -l` then failed on an address a `lea` had taken and D4 had duly
+harvested — dropped, because something already covered it. An address an
+instruction takes is exactly as much evidence that a guess ran too long as a
+table entry is; the argument is about the standing of the *extent*, and says
+nothing about which kind of weak evidence disputes it.
+
+So there are three tiers rather than two:
+
+| evidence | may cut a stated extent | may cut a guessed one |
+|---|---|---|
+| a direct branch or call | yes | yes |
+| an address a table or an instruction names | no | yes |
+| nothing else | no | no |
+
 **Weak witnesses may only introduce a function into a region no strong
 witness covers.** A weak witness must never split, shorten, or bound a
 function that strong evidence established. Weak evidence is an
