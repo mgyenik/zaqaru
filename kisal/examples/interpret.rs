@@ -62,6 +62,18 @@ impl Store for Terminal {
             into.extend_from_slice(&[0x5a; 32]);
             return StoreOutcome::Present;
         }
+        // Ctrl-C, through the same flag the runner's `/iso/shutdown` store
+        // reads — shared rather than reimplemented, so what this driver does
+        // with a signal and what `zaqaru-run` does with one cannot drift.
+        if path == kisal::paths::SHUTDOWN_REQUESTED {
+            return match runner::store::Shutdown::asked() {
+                true => {
+                    into.push(b'1');
+                    StoreOutcome::Present
+                }
+                false => StoreOutcome::Absent,
+            };
+        }
         // The edge, if this container was given one.
         if path.first().map(|held| *held) == Some(&b"iso"[..])
             && path.get(1).map(|held| *held) == Some(&b"net"[..])
@@ -156,6 +168,8 @@ fn main() {
             }
         }
     }
+    // Ctrl-C becomes the container's own `SIGTERM`, at its first process.
+    let _shutdown = runner::store::Shutdown::listening();
     let mut arguments = rest.into_iter();
     let root = PathBuf::from(arguments.next().unwrap_or_else(|| {
         eprintln!("usage: interpret <root> [argv...]");

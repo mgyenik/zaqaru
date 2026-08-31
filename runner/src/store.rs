@@ -27,6 +27,26 @@ pub trait Store: Send {
 #[derive(Default)]
 pub struct Sink {
     entries: Vec<(Vec<Vec<u8>>, Vec<u8>)>,
+    /// Where to echo writes as they arrive, if anywhere.
+    ///
+    /// Keeping every write and handing it back at the end is right for a
+    /// program that ends. A *server* does not: its logs are how you find out
+    /// what it is doing while it does it, and reading them back after exit
+    /// is reading them back never. So the console can be teed, and what it
+    /// is teed to is the embedder's decision rather than this store's.
+    tee: Option<Tee>,
+}
+
+/// Which of the runner's own streams a sink echoes to.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Tee {
+    /// By the last segment of the path: `stdout` to stdout and everything
+    /// else to stderr, which keeps a container's own output separable from
+    /// its diagnostics by the same rule the guest used.
+    ByStream,
+    /// Everything to standard error, for a log that must not be confused
+    /// with the container's output.
+    Diagnostics,
 }
 
 impl Sink {
@@ -54,6 +74,34 @@ impl Sink {
     }
 }
 
+impl Sink {
+    /// Echoes every write as it arrives, as well as keeping it.
+    pub fn teed(mut self, tee: Tee) -> Self {
+        self.tee = Some(tee);
+        self
+    }
+
+    fn echo(&self, path: &[Vec<u8>], data: &[u8]) {
+        use std::io::Write;
+        let Some(tee) = self.tee else {
+            return;
+        };
+        let text = String::from_utf8_lossy(data);
+        let to_stdout = tee == Tee::ByStream
+            && path.last().map(Vec::as_slice) == Some(b"stdout");
+        match to_stdout {
+            true => {
+                print!("{text}");
+                let _ = std::io::stdout().flush();
+            }
+            false => {
+                eprint!("{text}");
+                let _ = std::io::stderr().flush();
+            }
+        }
+    }
+}
+
 impl Store for Sink {
     fn read(&mut self, path: &[Vec<u8>]) -> Result<Option<Vec<u8>>, String> {
         Ok(self
@@ -64,8 +112,79 @@ impl Store for Sink {
     }
 
     fn write(&mut self, path: &[Vec<u8>], data: &[u8]) -> Result<Vec<Vec<u8>>, String> {
+        self.echo(path, data);
         self.slot(path).extend_from_slice(data);
         Ok(path.to_vec())
+    }
+}
+
+/// `/iso/shutdown`: the container asking how it ended, and the host asking
+/// it to.
+///
+/// Two directions through one mount, which is the boundary's whole shape:
+/// `complete` is a write the guest makes on its way out, and `requested` is
+/// a read it makes to find out whether anybody wants it to stop.
+///
+/// **Polled, not pushed.** A signal handler runs on whatever thread the
+/// operating system chose and may do almost nothing safely; it certainly
+/// may not reach into a `wasmtime::Store` another thread is executing in.
+/// So it sets a flag, and the guest reads it at the points it is already
+/// asking the host things — which also makes the moment a shutdown is
+/// noticed a function of the guest's own execution rather than of when a
+/// signal happened to land.
+#[derive(Default)]
+pub struct Shutdown {
+    recorded: Sink,
+}
+
+/// Set by the handler, read by the store. `static` because a signal handler
+/// has no argument to carry anything in.
+static REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+extern "C" fn requested(_signal: i32) {
+    REQUESTED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+impl Shutdown {
+    /// Asks to be told about `SIGINT` and `SIGTERM`.
+    ///
+    /// Both, because a demo ends with Ctrl-C and a supervisor ends with
+    /// `docker stop`, and the container should not be able to tell which
+    /// happened to it.
+    pub fn listening() -> Self {
+        // SAFETY: installing a handler that does nothing but set an atomic,
+        // which is the one thing a handler is allowed to do.
+        unsafe {
+            let handler = requested as *const () as libc::sighandler_t;
+            libc::signal(libc::SIGINT, handler);
+            libc::signal(libc::SIGTERM, handler);
+        }
+        Self::default()
+    }
+
+    /// Whether a stop has been asked for, for a host that wants to know
+    /// without going through the guest.
+    pub fn asked() -> bool {
+        REQUESTED.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl Store for Shutdown {
+    fn read(&mut self, path: &[Vec<u8>]) -> Result<Option<Vec<u8>>, String> {
+        if path.last().map(Vec::as_slice) == Some(b"requested") {
+            return Ok(match Self::asked() {
+                true => Some(b"1".to_vec()),
+                // Absent rather than "0", because the guest asks this at
+                // every slice boundary and an absent path is the cheaper
+                // answer as well as the truer one: nothing has asked.
+                false => None,
+            });
+        }
+        self.recorded.read(path)
+    }
+
+    fn write(&mut self, path: &[Vec<u8>], data: &[u8]) -> Result<Vec<Vec<u8>>, String> {
+        self.recorded.write(path, data)
     }
 }
 

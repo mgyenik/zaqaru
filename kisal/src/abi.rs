@@ -205,6 +205,15 @@ impl<S> Shared<S> {
     pub fn borrow(&self) -> std::cell::Ref<'_, S> {
         self.0.borrow()
     }
+
+    /// The same, to change what the host will answer next.
+    ///
+    /// A host's answers are not fixed at boot — a clock moves, a network
+    /// delivers, and a shutdown is asked for while the container is
+    /// running. This is how an embedder that holds a store changes one.
+    pub fn borrow_mut(&self) -> std::cell::RefMut<'_, S> {
+        self.0.borrow_mut()
+    }
 }
 
 impl<S: Store> Store for Shared<S> {

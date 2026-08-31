@@ -6,3 +6,7 @@ description = "The wasmtime host: the two ll-store imports, the mount table, and
 
 [dependencies]
 wasmtime = "48.0.1"
+# For `SIGINT`. The runner has to notice Ctrl-C to turn it into the
+# container's own `SIGTERM`, and a signal handler is the only way a process
+# is told about one.
+libc = "0.2"

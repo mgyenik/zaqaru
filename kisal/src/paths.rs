@@ -81,3 +81,17 @@ pub const CONFIG_TRACE: &[&[u8]] = &[b"iso", b"config", b"trace"];
 /// is the last thing the kernel does, and the run loop returns to the host
 /// immediately after.
 pub const SHUTDOWN_COMPLETE: &[&[u8]] = &[b"iso", b"shutdown", b"complete"];
+
+/// The host asking the container to stop.
+///
+/// Polled rather than pushed, because the boundary has no way to push: the
+/// host answers questions and the guest asks them. It is read at the points
+/// the container is already asking the host things — a process finishing its
+/// slice, and nothing being runnable — so the moment a shutdown is noticed
+/// is a function of execution like every other decision here.
+///
+/// What it becomes is a `SIGTERM` at the first process, which is what
+/// `docker stop` sends and what an init script is written to handle. Nothing
+/// is forced: a container that ignores it keeps running, exactly as one
+/// under `docker` does until the timeout runs out.
+pub const SHUTDOWN_REQUESTED: &[&[u8]] = &[b"iso", b"shutdown", b"requested"];

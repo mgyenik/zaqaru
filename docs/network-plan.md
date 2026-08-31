@@ -685,6 +685,64 @@ control: no `-p` — the guest binds and serves loopback happily, the
 host connection is refused; no `/iso/net` mount — `bind` still
 succeeds, loopback-only, and nothing reaches the store.
 
+**N4 — the wait. BUILT, 2026-08-30, and measured.** The blocking read is
+`/iso/net/wait/{ms}` and `System::idle` is where it is called: nothing
+runnable, earliest deadline known. **The demo idles at 0% of one core**
+between requests — three successive ten-second windows, after roughly
+twenty seconds of post-request work that is Django still importing rather
+than the kernel spinning. `Exit::Deadlocked` gained the third verdict:
+nothing runnable with a listener outstanding is a server at rest.
+
+**Ctrl-C ends the tree, and the tree ends itself.** `SIGINT` at the runner
+sets a flag; `/iso/shutdown/requested` is a path the guest *reads* at the
+points it already asks the host things, because the boundary has no way to
+push; and what it becomes is a `SIGTERM` at the first process, which is
+what `docker stop` sends. The log is the whole story:
+
+```
+[notice] 1#1: signal 15 (SIGTERM) received, exiting
+[notice] 3#1: exiting
+[notice] 3#1: exit
+[notice] 1#1: signal 17 (SIGCHLD) received
+[notice] 1#1: worker process 3 exited with code 0
+[notice] 1#1: exit
+```
+
+nginx's master told its worker over their channel socketpair, the worker
+exited, the master reaped it and left. Exit status 0.
+
+**Three defects on the way, each of which only a server finds.**
+
+*The mask a suspend puts aside goes back on `sigreturn`, not on wake.*
+`rt_sigsuspend` replaces the blocked set for the length of the wait, and
+restoring it when the wait ends re-blocks the very signal the program
+suspended in order to receive — between the moment it arrived and the
+moment a handler was chosen for it. nginx does exactly this, and the
+container sat there ignoring its own shutdown with the signal pending and
+unblocked in the trace. It goes into the frame the handler returns
+through, which is where Linux puts it.
+
+*`recvmsg` with a control buffer is not ancillary data.* The refusal was
+on the buffer's presence rather than on anything being sent, and nginx
+passes one on every channel message because it *might* be sent a
+descriptor. Only a `sendmsg` carrying ancillary data is refused now; a
+receiver is told `msg_controllen` is zero, which is how it learns nothing
+arrived.
+
+*An out parameter that is only sometimes written is one the caller cannot
+use.* `msg_flags` was never cleared, so nginx read whatever was in that
+stack slot, found `MSG_CTRUNC`, and logged "recvmsg() truncated data" on
+every message.
+
+**And `setitimer` with it**, which N0 said was on the shutdown path:
+nginx's master arms a fifty-millisecond `ITIMER_REAL` to poll for its
+worker's exit, so `SIGALRM` had to be real. It is a per-process deadline
+that raises a signal through the disposition table like any other, and it
+joins the earliest-deadline computation — a container asleep past an alarm
+would deliver it late.
+
+The original text follows.
+
 **N4 — the wait.** `/iso/net/wait/{ms}`, the earliest-deadline
 computation, the `Deadlocked`-versus-listening verdict, Ctrl-C to
 SIGTERM. Acceptance: the N3 server idles at (measured) ~0 % host CPU

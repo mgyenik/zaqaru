@@ -42,6 +42,14 @@ impl Drop for Tree {
 #[derive(Default)]
 struct Console {
     written: Vec<(Vec<Vec<u8>>, Vec<u8>)>,
+    /// Whether this container has been asked to stop.
+    ///
+    /// The host's half of a shutdown, which is a *read* the guest makes
+    /// rather than anything pushed at it — the boundary has no way to push.
+    /// A test sets it and the container notices at the next point it asks
+    /// the host anything, which is the same moment `zaqaru-run` would have
+    /// it notice a Ctrl-C.
+    stopping: bool,
 }
 
 impl Console {
@@ -56,7 +64,11 @@ impl Console {
 }
 
 impl Store for Console {
-    fn read(&mut self, _path: &[&[u8]], _into: &mut Vec<u8>) -> StoreOutcome {
+    fn read(&mut self, path: &[&[u8]], into: &mut Vec<u8>) -> StoreOutcome {
+        if self.stopping && path == kisal::paths::SHUTDOWN_REQUESTED {
+            into.push(b'1');
+            return StoreOutcome::Present;
+        }
         StoreOutcome::Absent
     }
 
@@ -2338,4 +2350,66 @@ int main(void) {
 "#,
         Linkage::Dynamic,
     );
+}
+
+/// **A shutdown request becomes the container's own `SIGTERM`**, at its
+/// first process.
+///
+/// How a server ends. The host has no way to push anything at a container —
+/// the boundary answers questions — so a stop is a path the guest reads at
+/// the points it is already asking the host things, and what it becomes is
+/// a signal at pid 1. That is what makes an init script's `trap` run and
+/// its children get told, rather than the runner reaching past the
+/// container to kill processes it did not start.
+///
+/// Checked directly rather than against a native run: nothing sends this
+/// program a signal when it runs on the host, so the host is not the oracle.
+#[test]
+fn a_shutdown_request_becomes_a_signal_at_the_first_process() {
+    let (_tree, baked) = image_of(
+        "shutdown",
+        r#"
+#include <signal.h>
+#include <stdio.h>
+#include <unistd.h>
+
+static volatile sig_atomic_t asked = 0;
+
+static void stopping(int signal) {
+    asked = signal;
+}
+
+int main(void) {
+    struct sigaction action = {0};
+    action.sa_handler = stopping;
+    sigaction(SIGTERM, &action, 0);
+    printf("running\n");
+    fflush(stdout);
+    /* Waits for a signal and nothing else, which is what an init that has
+       started its children does. */
+    while (!asked) {
+        pause();
+    }
+    printf("asked to stop by %d\n", asked);
+    return 0;
+}
+"#,
+        Linkage::Dynamic,
+    );
+    let image = Image::parse(&baked.index, &baked.blob).expect("parse the image");
+    let mut system = boot("shutdown", image);
+    system.current().kernel.store.borrow_mut().stopping = true;
+    let exit = system.run();
+    report("shutdown", &exit, &mut system);
+    assert_eq!(exit, Exit::Status(0), "the container did not exit cleanly");
+    let out = String::from_utf8(
+        system
+            .current()
+            .kernel
+            .store
+            .borrow()
+            .contents(kisal::paths::CONSOLE_STDOUT),
+    )
+    .expect("utf-8");
+    assert_eq!(out, "running\nasked to stop by 15\n");
 }

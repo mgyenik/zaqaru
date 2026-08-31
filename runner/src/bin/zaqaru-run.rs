@@ -107,11 +107,10 @@ fn main() -> ExitCode {
 
     let status = container.boot();
 
-    // The console first, whichever way the boot went: a container that
-    // failed part way through has usually said why, and throwing that away
-    // to report the failure would be the wrong half.
-    print!("{}", console(&mut container, b"stdout"));
-    eprint!("{}", console(&mut container, b"stderr"));
+    // Already echoed as it arrived, so nothing is printed again here — a
+    // container's output must not appear twice because the runner kept a
+    // copy of it.
+    let _ = &mut container;
 
     if let Some(where_to) = &trace {
         let lines = read(&mut container, &[b"iso", b"log", b"debug"]);
@@ -127,11 +126,9 @@ fn main() -> ExitCode {
     match status {
         Ok(status) => ExitCode::from(status.clamp(0, 255) as u8),
         Err(error) => {
-            let log = read(&mut container, &[b"iso", b"log", b"error"]);
+            // The kernel log was teed too, so this is the failure itself
+            // rather than a replay of what led to it.
             eprintln!("zaqaru-run: the container did not finish: {error:?}");
-            if !log.is_empty() {
-                eprintln!("zaqaru-run: kernel log: {log}");
-            }
             ExitCode::from(1)
         }
     }
@@ -146,10 +143,24 @@ fn main() -> ExitCode {
 /// on the user's behalf; one that would rather not, does not mount it.
 fn mounts() -> runner::store::MountTable {
     let mut mounts = runner::store::MountTable::new();
-    mounts.mount(&[b"iso", b"console"], Box::new(runner::store::Sink::new()));
-    mounts.mount(&[b"iso", b"log"], Box::new(runner::store::Sink::new()));
+    // Teed, so a server's output arrives while it is running rather than
+    // when it stops — and a server does not stop.
+    mounts.mount(
+        &[b"iso", b"console"],
+        Box::new(runner::store::Sink::new().teed(runner::store::Tee::ByStream)),
+    );
+    mounts.mount(
+        &[b"iso", b"log"],
+        Box::new(runner::store::Sink::new().teed(runner::store::Tee::Diagnostics)),
+    );
     mounts.mount(&[b"iso", b"random"], Box::new(runner::store::Sink::new()));
-    mounts.mount(&[b"iso", b"shutdown"], Box::new(runner::store::Sink::new()));
+    // Listening, so Ctrl-C becomes the container's own `SIGTERM` at its
+    // first process — which is how a demo ends the way `docker stop` ends,
+    // with the tree shutting itself down rather than being torn out.
+    mounts.mount(
+        &[b"iso", b"shutdown"],
+        Box::new(runner::store::Shutdown::listening()),
+    );
     mounts.mount(&[b"iso", b"time"], Box::new(runner::store::Clock::new()));
 
     // Exactly as many bytes as the seed holds. `/dev/urandom` is a

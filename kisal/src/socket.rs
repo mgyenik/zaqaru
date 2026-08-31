@@ -1463,12 +1463,23 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
         let word = |offset: usize| {
             u64::from_le_bytes(header[offset..offset + 8].try_into().expect("eight bytes"))
         };
+        // A *sender* with ancillary data is refused by name: the only thing
+        // that arrives in it here is `SCM_RIGHTS` — descriptor passing,
+        // designed in `docs/network-plan.md` §9 and not built — and a worker
+        // that thinks it was handed a listener and was not is worse than one
+        // told it could not be.
+        //
+        // A *receiver* offering a buffer is not the same thing at all, and
+        // refusing it was wrong: nginx passes a control buffer on every
+        // `recvmsg` on its worker channel, because it might be sent a
+        // descriptor, and is perfectly happy to be told it was not. What
+        // says so is a `msg_controllen` of zero on the way back.
         let control_length = word(40);
-        if word(32) != 0 && control_length != 0 {
+        if sending && word(32) != 0 && control_length != 0 {
             return Outcome::Fault(crate::syscall::Fault::detailed(
                 number,
                 arguments,
-                "ancillary data on a socket message, which here means \
+                "ancillary data on a sent message, which here means \
                  `SCM_RIGHTS` — descriptor passing, designed in \
                  `docs/network-plan.md` §9 and not built, and worse to \
                  accept and drop than to refuse",
@@ -1478,6 +1489,24 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
         let count = word(24);
         if count > 1024 {
             return Outcome::Done(Errno::Invalid.as_result());
+        }
+        // No ancillary data arrived, and nothing was truncated — both of
+        // which the caller reads back from the *header* rather than from the
+        // return value.
+        //
+        // `msg_flags` is an out parameter and its contents on the way in are
+        // the caller's business, so leaving it alone leaves whatever was in
+        // that stack slot: nginx checks it for `MSG_CTRUNC` and logs
+        // "recvmsg() truncated data" on every channel message when it is not
+        // cleared. An out parameter that is only sometimes written is one
+        // the caller cannot use.
+        if !sending {
+            if control_length != 0 && self.pages.write(at + 40, &0u64.to_le_bytes()).is_err() {
+                return Outcome::Done(Errno::Fault.as_result());
+            }
+            if self.pages.write(at + 48, &0u32.to_le_bytes()).is_err() {
+                return Outcome::Done(Errno::Fault.as_result());
+            }
         }
         // The address a `sendmsg` names is ignored on a connected stream —
         // there is one peer and it was already chosen — and `recvmsg` fills

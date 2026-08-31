@@ -34,6 +34,20 @@ use crate::syscall::Request;
 /// The first process's identifier.
 pub const FIRST: i32 = 1;
 
+/// The longest the container will sleep before looking at the host again.
+///
+/// **Invisible to the guest**, which is what makes it a free knob: waking
+/// early does not return anything to a parked thread, it only re-checks
+/// readiness and goes back to sleep. What it bounds is how long the *host*
+/// waits to be noticed — a shutdown request arrives on a path nothing is
+/// waiting on, so without a cap a container asleep until nginx's
+/// sixty-second `epoll_wait` takes sixty seconds to answer a Ctrl-C.
+///
+/// A quarter of a second: four wakeups a second while idle, which measured
+/// at 0% of a core on the demo stack, against a shutdown that feels
+/// immediate.
+pub const PATIENCE: u64 = 250;
+
 /// How many thread quanta a process gets before another one is considered.
 ///
 /// A *process* switch is not the free thing a thread switch is. Natively it
@@ -80,6 +94,8 @@ pub struct System<'a, S: Store> {
     /// How many thread quanta the running process has used since it was
     /// given the processor. See [`SLICE`].
     slice: u64,
+    /// Whether the host's shutdown request has already been delivered.
+    stopping: bool,
     /// What processes that are gone retired and decoded before they went.
     ///
     /// Kept here because ending destroys the only other place those numbers
@@ -104,6 +120,7 @@ impl<'a, S: Store + Clone> System<'a, S> {
             current: 0,
             next: FIRST + 1,
             slice: 0,
+            stopping: false,
             departed: 0,
             departed_blocks: 0,
         }
@@ -359,6 +376,7 @@ impl<'a, S: Store + Clone> System<'a, S> {
             // breaking the rule the process table is built on.
             if why == Yield::Quantum && self.slice == 0 {
                 self.current().kernel.pump(None);
+                self.take_shutdown();
             }
             if !self.schedule(why) {
                 // Nothing runnable anywhere, which is three different things
@@ -499,6 +517,13 @@ impl<'a, S: Store + Clone> System<'a, S> {
     /// long" is the one call that turns this spin into a sleep. Until then
     /// it spins, which costs a core and is correct.
     fn idle(&mut self) -> bool {
+        // First, because a pending shutdown is exactly what makes a
+        // container that looks stuck not stuck: every process parked on a
+        // signal that has not come is a deadlock until somebody sends one.
+        self.take_shutdown();
+        if self.stopping && self.anything_runnable() {
+            return true;
+        }
         let deadline = self
             .containers
             .iter()
@@ -517,8 +542,8 @@ impl<'a, S: Store + Clone> System<'a, S> {
                 // Wait for the host rather than spin, which is the whole of
                 // N4: nothing here is runnable and there is no deadline, so
                 // "wait for an event or a good long while" *is* a sleep.
-                const PATIENT: u64 = 60_000;
-                self.current().kernel.pump(Some(PATIENT));
+                self.current().kernel.pump(Some(PATIENCE));
+                self.take_shutdown();
                 return true;
             }
             // Nothing is waiting for time and nothing is listening, so
@@ -543,8 +568,13 @@ impl<'a, S: Store + Clone> System<'a, S> {
             // Nothing has expired yet and the host may still have something.
             // Waiting until the earliest deadline turns the spin into a
             // sleep without ever waiting past a timeout the guest set.
-            let patience = deadline.saturating_sub(now) / 1_000_000;
-            woken |= self.current().kernel.pump(Some(patience.max(1).min(60_000)));
+            // Never longer than [`PATIENCE`], and never past the guest's own
+            // deadline — whichever comes first.
+            let until = deadline.saturating_sub(now) / 1_000_000;
+            woken |= self
+                .current()
+                .kernel
+                .pump(Some(until.clamp(1, PATIENCE)));
         }
         // Nothing expired *yet*. The deadline is still ahead, so the
         // container is idle rather than stuck, and going round again is
@@ -581,22 +611,36 @@ impl<'a, S: Store + Clone> System<'a, S> {
     /// is where it lives — a signal's meaning is a property of the process
     /// receiving it, which is why this could not be answered by the caller.
     fn signal_process(&mut self, pid: i32, signal: i32) {
+        let answer = match self.deliver(pid, signal) {
+            true => 0,
+            false => crate::errno::Errno::NoProcess.as_result(),
+        };
+        self.current().answer(answer);
+    }
+
+    /// Sends a signal to a process, and says whether there was one.
+    ///
+    /// Separate from the row above because **not every signal has a
+    /// caller**. A shutdown request from the host becomes a `SIGTERM` at the
+    /// first process with no syscall in flight, and writing an answer into
+    /// `%rax` there would overwrite a register the running thread was in the
+    /// middle of using.
+    fn deliver(&mut self, pid: i32, signal: i32) -> bool {
         let Some(index) = self.containers.iter().position(|held| held.pid == pid) else {
-            return self.current().answer(crate::errno::Errno::NoProcess.as_result());
+            return false;
         };
         // A zombie is still a process id until it is reaped, and a signal
         // sent to one succeeds and does nothing — which is what Linux does
         // and what keeps a `kill` racing a child's exit from becoming an
         // error the caller has to distinguish.
         if self.containers[index].status.is_some() {
-            return self.current().answer(0);
+            return true;
         }
         // Signal zero asks whether the process exists and sends nothing.
         if signal == 0 {
-            return self.current().answer(0);
+            return true;
         }
         let fatal = self.containers[index].process.kernel.signal_process(signal);
-        self.current().answer(0);
         if fatal {
             // Nothing caught it and its default action ends the process.
             // What a shell reports for a process killed by a signal is 128
@@ -608,6 +652,44 @@ impl<'a, S: Store + Clone> System<'a, S> {
                 access: None,
             });
         }
+        true
+    }
+
+    /// Whether anything anywhere could run now.
+    fn anything_runnable(&self) -> bool {
+        (0..self.containers.len()).any(|index| self.ready(index))
+    }
+
+    /// Turns a host shutdown request into a `SIGTERM` at the first process.
+    ///
+    /// Once: a request that fired twice would send a second `SIGTERM` to a
+    /// tree already shutting down, which is what `docker stop` escalating to
+    /// `SIGKILL` means and is not what one Ctrl-C asked for.
+    ///
+    /// It goes to the *first* process because that is what a container's
+    /// init is, and delivering it there is what makes an init script's
+    /// `trap` run and its children get told — rather than the runner
+    /// reaching past the container to signal processes it did not start.
+    /// Nothing is forced: a container that ignores it keeps running, exactly
+    /// as one under `docker` does until the timeout runs out.
+    fn take_shutdown(&mut self) {
+        if self.stopping {
+            return;
+        }
+        let mut answer = Vec::new();
+        let asked = self
+            .current()
+            .kernel
+            .store
+            .read(crate::paths::SHUTDOWN_REQUESTED, &mut answer);
+        if asked != crate::abi::StoreOutcome::Present
+            || answer.first().is_none_or(|byte| *byte == b'0')
+        {
+            return;
+        }
+        self.stopping = true;
+        const SIGTERM: i32 = 15;
+        self.deliver(FIRST, SIGTERM);
     }
 
     /// `execve`: the running process, with a different program in it.

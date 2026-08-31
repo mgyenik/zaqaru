@@ -519,13 +519,13 @@ impl<'a, S: Store> Process<'a, S> {
             if thread.state == crate::thread::State::Paused && thread.deliverable().is_some() {
                 thread.state = crate::thread::State::Runnable;
                 thread.tcb.registers[0] = crate::errno::Errno::Interrupted.as_result() as u64;
-                // A suspend put a mask aside for the length of the wait, and
-                // it goes back *before* the handler runs — which is what
-                // `rt_sigsuspend` promises and what makes it different from
-                // `pause`.
-                if let Some(previous) = thread.owned.suspended_mask.take() {
-                    thread.owned.blocked_signals = previous;
-                }
+                // The mask a suspend put aside is *not* restored here. It
+                // goes into the frame the handler returns through, so
+                // `sigreturn` puts it back — which is where Linux puts it
+                // and why: restoring it now would re-block the very signal
+                // the program suspended in order to receive, between the
+                // moment it arrived and the moment a handler was chosen for
+                // it. See `Kernel::deliver`.
             }
             // A sleep is cut short by a signal too, and Linux reports the
             // time remaining — which nothing here asks for, so the answer is
@@ -557,6 +557,10 @@ impl<'a, S: Store> Process<'a, S> {
                 crate::thread::State::Watching(watching) => watching.deadline,
                 _ => None,
             })
+            // And the process's own interval timer, which is a deadline
+            // nothing is parked on: `SIGALRM` arrives whatever the threads
+            // are doing, so a container asleep past it would deliver late.
+            .chain(self.kernel.alarm.map(|alarm| alarm.deadline))
             .min()
     }
 
@@ -569,6 +573,25 @@ impl<'a, S: Store> Process<'a, S> {
     /// scheduler's inner loop.
     pub fn expire(&mut self, now: u64) -> bool {
         let mut woken = false;
+        // The interval timer first, because what it does is *raise a
+        // signal*, and a thread woken by that signal has to see it pending
+        // rather than be woken again a pass later.
+        if let Some(alarm) = self.kernel.alarm
+            && now >= alarm.deadline
+        {
+            const SIGALRM: i32 = 14;
+            self.kernel.alarm = match alarm.interval {
+                0 => None,
+                interval => Some(crate::syscall::Alarm {
+                    deadline: now.saturating_add(interval),
+                    interval,
+                }),
+            };
+            // Through the disposition table, like every other signal: a
+            // program that ignores `SIGALRM` is not woken by one.
+            self.kernel.signal_process(SIGALRM);
+            woken = true;
+        }
         let mut watches: Vec<(usize, crate::thread::Watching)> = Vec::new();
         for (slot, thread) in self.kernel.machine.threads.all_mut().iter_mut().enumerate() {
             match thread.state {

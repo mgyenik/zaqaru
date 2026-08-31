@@ -100,6 +100,8 @@ pub mod number {
     pub const CLOCK_GETRES: i64 = 229;
     pub const RT_SIGSUSPEND: i64 = 130;
     pub const SETITIMER: i64 = 38;
+    pub const GETITIMER: i64 = 36;
+    pub const ALARM: i64 = 37;
     pub const NANOSLEEP: i64 = 35;
     pub const CLOCK_NANOSLEEP: i64 = 230;
     pub const EVENTFD2: i64 = 290;
@@ -241,6 +243,8 @@ pub mod number {
             CLOCK_GETRES => "clock_getres",
             RT_SIGSUSPEND => "rt_sigsuspend",
             SETITIMER => "setitimer",
+            GETITIMER => "getitimer",
+            ALARM => "alarm",
             NANOSLEEP => "nanosleep",
             CLOCK_NANOSLEEP => "clock_nanosleep",
             EVENTFD2 => "eventfd2",
@@ -622,6 +626,11 @@ pub struct Kernel<'a, S: Store, M: Machine> {
     /// Recorded and answered, and nothing reads it: the signal it exists to
     /// direct is one this kernel does not send. See the `F_SETOWN` row.
     pub owners: std::collections::BTreeMap<i32, i32>,
+    /// The interval timer `setitimer(ITIMER_REAL)` armed, if any.
+    ///
+    /// Per process rather than per thread, which is what `ITIMER_REAL`
+    /// means: it counts wall time and its `SIGALRM` goes to the process.
+    pub alarm: Option<Alarm>,
     /// `PR_SET_DUMPABLE`, recorded and answered; see the row.
     pub dumpable: i32,
     /// `PR_SET_PDEATHSIG`, likewise.
@@ -730,6 +739,20 @@ pub enum Delivery {
 enum Direction {
     In,
     Out,
+}
+
+/// An armed `ITIMER_REAL`.
+///
+/// nginx's master arms one for fifty milliseconds during shutdown, to poll
+/// for its worker's exit — so `SIGALRM` is on the shutdown path and this is
+/// not an exotic row.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Alarm {
+    /// When it fires, in nanoseconds on the monotonic clock.
+    pub deadline: u64,
+    /// What to re-arm it to afterwards. Zero for a timer that fires once,
+    /// which is the common case and the one nginx uses.
+    pub interval: u64,
 }
 
 /// Who a process is running as.
@@ -895,6 +918,7 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             parent: 0,
             files: crate::fd::FdTable::with_standard_streams(),
             owners: std::collections::BTreeMap::new(),
+            alarm: None,
             dumpable: 1,
             parent_death_signal: 0,
             rings: crate::ring::Shared::default(),
@@ -1255,6 +1279,10 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             identity: self.identity,
             files: self.files.clone(),
             owners: self.owners.clone(),
+            // Linux clears a child's interval timers at `fork`, and it has
+            // to: an alarm is a promise about *this* process, and a copy of
+            // one would fire in a process that never asked.
+            alarm: None,
             dumpable: self.dumpable,
             // Linux clears this in the child, and nginx sets it back after
             // dropping privileges — which is why the row exists at all.
@@ -1376,6 +1404,9 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             identity: self.identity,
             files,
             owners: self.owners.clone(),
+            // And clears them at `execve` too, for the same reason: the
+            // program that asked is gone.
+            alarm: None,
             dumpable: self.dumpable,
             parent_death_signal: self.parent_death_signal,
             // Kept, which is the entire reason `dup2` before an `execve` is
@@ -1512,6 +1543,112 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             ));
         }
         Outcome::Blocked
+    }
+
+    /// `setitimer(2)` and `getitimer(2)`, and `alarm(2)`, which is
+    /// `setitimer` with a coarser unit.
+    ///
+    /// Only `ITIMER_REAL` — the one that counts wall time and sends
+    /// `SIGALRM`. `ITIMER_VIRTUAL` and `ITIMER_PROF` count *CPU* time, which
+    /// this kernel does not account for, and inventing a number for them
+    /// would be worse than saying so: a profiler that believed it would
+    /// report the wrong thing rather than nothing.
+    fn interval_timer(&mut self, number: i64, arguments: Arguments) -> Outcome {
+        const REAL: i64 = 0;
+        if number != number::ALARM && arguments.get(0) != REAL {
+            return Outcome::Fault(Fault::detailed(
+                number,
+                arguments,
+                "an interval timer counting processor time, which this \
+                 kernel does not account for",
+            ));
+        }
+        let Some(now) = self.monotonic() else {
+            return Outcome::Fault(Fault::detailed(
+                number,
+                arguments,
+                "an interval timer with no clock for it to count against",
+            ));
+        };
+        // What is left of the one already armed, which both calls report.
+        let remaining = self
+            .alarm
+            .map(|alarm| alarm.deadline.saturating_sub(now))
+            .unwrap_or(0);
+        let interval = self.alarm.map(|alarm| alarm.interval).unwrap_or(0);
+
+        if number == number::ALARM {
+            let seconds = arguments.get(0).max(0) as u64;
+            self.alarm = match seconds {
+                0 => None,
+                seconds => Some(Alarm {
+                    deadline: now.saturating_add(seconds.saturating_mul(1_000_000_000)),
+                    interval: 0,
+                }),
+            };
+            // Seconds remaining, rounded up — which is what Linux answers
+            // and what a program re-arming a watchdog reads.
+            return Outcome::Done((remaining.div_ceil(1_000_000_000)) as i64);
+        }
+
+        if number == number::GETITIMER {
+            return Outcome::Done(match self.write_itimer(arguments.get(1), interval, remaining) {
+                Ok(()) => 0,
+                Err(errno) => errno.as_result(),
+            });
+        }
+
+        // `setitimer`: the old value first, because a caller that asked for
+        // it and then hit a bad new value should still have been told.
+        if arguments.get(2) != 0
+            && let Err(errno) = self.write_itimer(arguments.get(2), interval, remaining)
+        {
+            return Outcome::Done(errno.as_result());
+        }
+        let at = arguments.get(1) as u64;
+        if at == 0 {
+            self.alarm = None;
+            return Outcome::Done(0);
+        }
+        let mut bytes = [0u8; 32];
+        if self.pages.read(at, &mut bytes).is_err() {
+            return Outcome::Done(Errno::Fault.as_result());
+        }
+        let field = |at: usize| -> u64 {
+            let seconds = u64::from_le_bytes(bytes[at..at + 8].try_into().expect("eight bytes"));
+            let micros = u64::from_le_bytes(bytes[at + 8..at + 16].try_into().expect("eight"));
+            seconds
+                .saturating_mul(1_000_000_000)
+                .saturating_add(micros.saturating_mul(1000))
+        };
+        let interval = field(0);
+        let value = field(16);
+        // A zero `it_value` disarms, whatever the interval says — which is
+        // how every program cancels a timer.
+        self.alarm = match value {
+            0 => None,
+            value => Some(Alarm {
+                deadline: now.saturating_add(value),
+                interval,
+            }),
+        };
+        Outcome::Done(0)
+    }
+
+    /// Writes a `struct itimerval`: two `timeval`s, seconds and
+    /// *micro*seconds.
+    fn write_itimer(&mut self, at: i64, interval: u64, value: u64) -> Result<(), Errno> {
+        if at == 0 {
+            return Ok(());
+        }
+        let mut bytes = [0u8; 32];
+        for (offset, nanoseconds) in [(0, interval), (16, value)] {
+            bytes[offset..offset + 8]
+                .copy_from_slice(&(nanoseconds / 1_000_000_000).to_le_bytes());
+            bytes[offset + 8..offset + 16]
+                .copy_from_slice(&(nanoseconds % 1_000_000_000 / 1000).to_le_bytes());
+        }
+        self.pages.write(at as u64, &bytes).map_err(|_| Errno::Fault)
     }
 
     /// `rt_sigsuspend(2)`: `pause` with a mask.
@@ -1748,7 +1885,25 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             return Delivery::NoRestorer;
         }
 
-        let before = self.machine.owned().blocked_signals;
+        // The mask the frame carries, and therefore the one `sigreturn`
+        // restores.
+        //
+        // For an ordinary delivery that is the mask in effect now. For one
+        // that interrupted an `rt_sigsuspend` it is the mask that was in
+        // effect *before* the suspend — which is what the call promises to
+        // put back, and it goes back when the handler returns rather than
+        // when the wait ends. Restoring it any earlier is not a subtlety: a
+        // program that suspends with an empty mask precisely so a signal it
+        // normally blocks can reach it would have that signal blocked again
+        // a moment before the handler was chosen, and the handler would
+        // never run. nginx does exactly this, and the container would sit
+        // there ignoring its own shutdown.
+        let before = self
+            .machine
+            .owned()
+            .suspended_mask
+            .take()
+            .unwrap_or(self.machine.owned().blocked_signals);
         let altstack = self.machine.owned().altstack;
         let on_altstack = self.machine.owned().on_altstack;
         let Some(thread) = self.machine.tcb() else {
@@ -2284,6 +2439,9 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
                 }
             }
             number::RT_SIGSUSPEND => self.suspend(arguments),
+            number::SETITIMER | number::GETITIMER | number::ALARM => {
+                self.interval_timer(number, arguments)
+            }
             number::NANOSLEEP | number::CLOCK_NANOSLEEP => self.sleep(number, arguments),
             number::STATFS | number::FSTATFS => self.statfs(number, arguments),
             number::EPOLL_WAIT | number::EPOLL_PWAIT => self.epoll_wait(arguments),
