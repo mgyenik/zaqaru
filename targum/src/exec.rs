@@ -472,6 +472,12 @@ impl<'a> Cpu<'a> {
         }
     }
 
+    /// Deliberately *not* `#[inline(always)]`, unlike its fast-path
+    /// counterpart. Inlined into `step` — which is a match over the whole
+    /// of `Mnemonic` — it takes `alu` from 2.59x to 1.49x: the function
+    /// becomes one enormous wasm body and Cranelift, which cannot split it
+    /// back up, allocates registers for the whole thing at once. Small hot
+    /// helpers want forcing inline; this one wants the opposite.
     fn read(&mut self, instruction: &Instruction, operand: u32, width: Width) -> Result<u64, Trap> {
         match instruction.op_kind(operand) {
             OpKind::Register => Ok(self
@@ -503,6 +509,7 @@ impl<'a> Cpu<'a> {
     /// majority of instruction arms end by writing their destination, and
     /// giving the write the retirement means those arms are one expression
     /// with no trailing `Ok(Step::Retired)` to forget.
+    /// Not force-inlined, for the reason [`Self::read`] gives.
     fn write(
         &mut self,
         instruction: &Instruction,

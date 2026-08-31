@@ -239,6 +239,10 @@ impl Tcb {
     }
 
     /// Reads a register slice, zero-extended into a `u64`.
+    // Two or three instructions once the width is known, and called
+    // for every operand of every instruction. As its own function it
+    // was a wasm call per register access.
+    #[inline(always)]
     pub fn read_register(&self, slice: Slice) -> u64 {
         let whole = self.registers[slice.number as usize];
         let shifted = if slice.high_byte { whole >> 8 } else { whole };
@@ -253,6 +257,10 @@ impl Tcb {
     /// compiler zeroes `%rax`, and it only works because the 32-bit write
     /// clears the top; `mov %al, ...` next to it must not. One function
     /// states the rule so no instruction arm can get it wrong privately.
+    // Two or three instructions once the width is known, and called
+    // for every operand of every instruction. As its own function it
+    // was a wasm call per register access.
+    #[inline(always)]
     pub fn write_register(&mut self, slice: Slice, value: u64) {
         let slot = &mut self.registers[slice.number as usize];
         match (slice.width, slice.high_byte) {
