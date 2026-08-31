@@ -331,14 +331,14 @@ impl<'a> Cpu<'a> {
             }
             Op::Push => {
                 let value = self.quick_load(quick, quick.source, width)?;
-                return self.push(width, value);
+                return self.push_inline(width, value);
             }
             // The value first, then the destination — so that `pop` into a
             // memory operand computes its address after the stack pointer
             // has moved, which is the order the general path uses and the
             // order the architecture specifies.
             Op::Pop => {
-                let value = self.pop(width)?;
+                let value = self.pop_inline(width)?;
                 return self.quick_store(quick, quick.destination, width, value);
             }
             Op::Nop => return Ok(Step::Retired),
@@ -365,12 +365,12 @@ impl<'a> Cpu<'a> {
                 let target = self.quick_load(quick, quick.source, Width::Qword)?;
                 // Which `run` put there, and is exactly the return address.
                 let ret = self.tcb.rip;
-                self.push(Width::Qword, ret)?;
+                self.push_inline(Width::Qword, ret)?;
                 self.tcb.rip = target;
                 return Ok(Step::Retired);
             }
             Op::Ret => {
-                let target = self.pop(Width::Qword)?;
+                let target = self.pop_inline(Width::Qword)?;
                 if let Source::Immediate(extra) = quick.source
                     && extra != 0
                 {
@@ -537,12 +537,20 @@ impl<'a> Cpu<'a> {
 
     // ---- the stack -------------------------------------------------------
 
-    // Showed as its own frame at 4% of the Django import, and forcing it
-    // inline made things *worse* — `calls` 3.41x to 3.26x. It is called
-    // from the general path as well as the fast one, so inlining it puts a
-    // copy inside `step`, and `step` is the function that must stay small.
-    // The same trap as `read` and `write`.
-    fn push(&mut self, width: Width, value: u64) -> Result<Step, Trap> {
+    /// The stack push, in the form the fast path wants: inlined.
+    ///
+    /// Split from [`Self::push`] because the two callers want opposite
+    /// things. Forcing the *shared* function inline put a copy inside
+    /// `step` — a match over the whole of `Mnemonic` — and took `calls`
+    /// from 3.41x to 3.26x, because Cranelift cannot colour a body that
+    /// size. Leaving it alone left it as a wasm call at 4.4% of a Django
+    /// import, which is a call per prologue, epilogue, `call` and `ret`.
+    ///
+    /// So the body is inlined into the fast path and reached through a
+    /// plain call from the general one, and neither caller pays for the
+    /// other's needs.
+    #[inline(always)]
+    fn push_inline(&mut self, width: Width, value: u64) -> Result<Step, Trap> {
         let at = self
             .tcb
             .stack_pointer()
@@ -552,13 +560,24 @@ impl<'a> Cpu<'a> {
         Ok(Step::Retired)
     }
 
-    /// Not force-inlined, for the reason [`Self::push`] gives.
-    fn pop(&mut self, width: Width) -> Result<u64, Trap> {
+    /// The same, for the general path, which must not grow.
+    fn push(&mut self, width: Width, value: u64) -> Result<Step, Trap> {
+        self.push_inline(width, value)
+    }
+
+    /// The stack pop the fast path uses; see [`Self::push_inline`].
+    #[inline(always)]
+    fn pop_inline(&mut self, width: Width) -> Result<u64, Trap> {
         let at = self.tcb.stack_pointer();
         let value = self.space.load(at, width)?;
         self.tcb
             .set_stack_pointer(at.wrapping_add(u64::from(width.bytes())));
         Ok(value)
+    }
+
+    /// The same, for the general path.
+    fn pop(&mut self, width: Width) -> Result<u64, Trap> {
+        self.pop_inline(width)
     }
 
     // ---- one instruction -------------------------------------------------
