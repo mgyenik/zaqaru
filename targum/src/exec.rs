@@ -1531,29 +1531,13 @@ impl<'a> Cpu<'a> {
         }
     }
 
-    /// What `rdtsc` answers.
-    ///
-    /// A function of the retired-instruction counter, which makes it
-    /// deterministic and replayable — two runs of the same container see the
-    /// same timestamps — and monotone, because the counter is. It is
-    /// emphatically **not a clock**: it has no relationship to elapsed time,
-    /// to `/iso/time`, or to anything a guest can observe another way, and
-    /// nothing may calibrate against it. Time reaches the guest as a
-    /// resource, through syscalls; `rdtsc` is an instruction and bypasses
-    /// that whether or not we would like it to, so it answers from state.
-    ///
-    /// The multiplier is large so that a guest spinning on a deadline —
-    /// "wait until the counter passes now plus n" — crosses it in a few
-    /// reads instead of burning millions of iterations, and odd so that the
-    /// low bits cycle: glibc's adaptive mutex takes exactly those bits as
-    /// jitter for its backoff, and an even step would hand it the same
-    /// value every time.
+    /// What `rdtsc` answers; see [`crate::state::Tcb::timestamp`].
     fn timestamp(&self) -> u64 {
-        self.tcb.retired.wrapping_mul(TIMESTAMP_STEP)
+        self.tcb.timestamp()
     }
 }
 
-/// See [`Cpu::timestamp`].
+/// See [`crate::state::Tcb::timestamp`].
 pub const TIMESTAMP_STEP: u64 = 1_000_000_007;
 
 /// Which string operation an instruction is. The mnemonics are shared with

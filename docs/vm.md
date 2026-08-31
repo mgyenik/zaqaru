@@ -585,6 +585,21 @@ terminal with the Django page.** Five processes in one module, two
 readiness disciplines (nginx's epoll, gunicorn's poll) running at once, and
 nginx's own access log naming the client that connected.
 
+**And the clock is read without a syscall.** `kisal/src/vdso.rs` maps a
+real ELF shared object into every process and advertises it as
+`AT_SYSINFO_EHDR`, exactly as Linux does — so glibc resolves
+`__vdso_clock_gettime` out of it and calls it directly. It works here
+because `rdtsc` already answers from the retired-instruction counter: the
+kernel samples the host clock at the points it already crosses the
+boundary and publishes a timebase against that counter, and the guest
+interpolates. Which gives something a real vDSO cannot — between kernel
+samples the time a guest reads is a pure function of how far it has
+executed — while the nondeterminism still enters only through the store,
+so a recorded run still replays.
+
+That closed the last structural divergence between a native trace of the
+demo stack and an interpreted one: 6,455 of 6,621 extra calls, gone.
+
 The `vfork`/`posix_spawn` fast path is unchanged and is still the case
 that matters: no snapshot at all, the child instantiated fresh from the
 image with fd dispositions applied. The AOT design's note that this is

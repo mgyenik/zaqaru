@@ -390,9 +390,10 @@ pub mod auxv {
     /// Sixteen bytes libc uses to seed stack canaries and hash tables.
     pub const RANDOM: u64 = 25;
     pub const SECURE: u64 = 23;
-    /// The vDSO's base, which is *deliberately never supplied*. Without it
-    /// libc has no user-space clock to call and issues `clock_gettime` as a
-    /// real syscall — which is the only form kisal can answer.
+    /// The vDSO's base. Supplied, since `kisal::vdso`: without it libc has
+    /// no user-space clock to call and issues `clock_gettime` as a real
+    /// syscall on every read — which was the single structural divergence
+    /// between a native trace of the demo stack and an interpreted one.
     pub const SYSINFO_EHDR: u64 = 33;
 }
 
@@ -428,6 +429,7 @@ pub fn build_stack(
     program: &Program,
     interpreter: Option<u64>,
     random: &[u8; RANDOM_BYTES],
+    vdso: Option<u64>,
 ) -> Result<Stack, Error> {
     let (low, high) = region;
     let size = high - low;
@@ -494,6 +496,14 @@ pub fn build_stack(
         (auxv::RANDOM, random_at),
         (auxv::NULL, 0),
     ];
+    // Before the terminator, and only when there is one: an `AT_SYSINFO_EHDR`
+    // of zero is not "no vDSO", it is a vDSO at address zero, and glibc
+    // would try to parse an ELF header out of the null page.
+    let mut vector = vector;
+    if let Some(at) = vdso {
+        let terminator = vector.len() - 1;
+        vector.insert(terminator, (auxv::SYSINFO_EHDR, at));
+    }
 
     let words = 1 + arguments.len() + 1 + environment.len() + 1 + vector.len() * 2;
     let fixed = words as u64 * 8;
@@ -710,7 +720,8 @@ mod tests {
         let argv: [&[u8]; 3] = [b"python3", b"-c", b"print(1)"];
         let envp: [&[u8]; 2] = [b"PATH=/usr/bin", b"HOME=/root"];
         let random = [0x5au8; RANDOM_BYTES];
-        let stack = build_stack(region, &argv, &envp, &program, None, &random).expect("build");
+        let stack =
+            build_stack(region, &argv, &envp, &program, None, &random, None).expect("build");
 
         assert_eq!(
             stack.stack_pointer % 16,
@@ -828,7 +839,15 @@ mod tests {
         let huge = std::vec![b'x'; 4096];
         let argv: [&[u8]; 1] = [&huge];
         assert!(matches!(
-            build_stack((0x1000, 0x1800), &argv, &[], &program, None, &[0; RANDOM_BYTES]),
+            build_stack(
+                (0x1000, 0x1800),
+                &argv,
+                &[],
+                &program,
+                None,
+                &[0; RANDOM_BYTES],
+                None
+            ),
             Err(Error::StackTooSmall { .. })
         ));
     }
@@ -1069,6 +1088,12 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
             self.place(file, program)?;
         }
 
+        // Mapped before the stack, because the stack carries the auxiliary
+        // vector and `AT_SYSINFO_EHDR` is how anything finds this. A failure
+        // is not fatal: a container without a vDSO is the container this
+        // project had until now, and every clock call falls back to the
+        // syscall that has always answered them.
+        let vdso = self.map_vdso().ok().map(|placed| placed.image);
         let stack = self.reserve_stack()?;
         let random = self.random_bytes();
         let built = build_stack(
@@ -1078,6 +1103,7 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
             &program,
             interpreter.as_ref().map(|(_, loader, _)| loader.base()),
             &random,
+            vdso,
         )?;
         // SAFETY: the region came from the address space, which grew memory
         // to cover it, and the block ends exactly at the region's top.

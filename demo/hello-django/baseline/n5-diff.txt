@@ -3,51 +3,47 @@
 # `strace -f` over the native container against kisal's own trace of the
 # interpreted one, on the same scenario: boot, two `curl` requests, a
 # `SIGTERM` shutdown. Regenerate with `demo/hello-django/trace.sh` for the
-# native side and `diff.py` for the comparison.
+# native side, `trace-interpreted.sh` for the other, and `diff.py` for the
+# comparison.
 #
-# THE VERDICT: every divergence has a cause, and one cause explains 6,455 of
-# the 6,621 extra calls.
+# THE VERDICT: five single calls, and each has a cause.
 #
-# 1. THE vDSO IS ABSENT, and that is the whole of the clock difference. The
-#    native trace makes **zero** clock syscalls — glibc reads the time out of
-#    a page the kernel maps into userspace, which no `strace` ever sees.
-#    There is no vDSO here and `AT_SYSINFO_EHDR` is absent from the auxiliary
-#    vector, so glibc takes the syscall path it keeps for exactly that case.
-#    `clock_gettime`, `gettimeofday`, `time`, `clock_getres` and
-#    `sched_getaffinity` are all this. It is a deliberate divergence, it was
-#    documented in the `clock_gettime` row long before this diff, and closing
-#    it means building a vDSO — which is a real option and not a defect.
+# The clock used to be the whole story — 6,455 extra calls, because there was
+# no vDSO and glibc took the syscall path it keeps for exactly that case.
+# `kisal/src/vdso.rs` closed it: the kernel publishes a timebase against the
+# retired-instruction counter and glibc computes the time itself, so a
+# container that reads the clock two thousand times issues no clock syscall
+# at all. The count went from 15,986 to 9,532 against a native 9,365.
 #
-# 2. `kill` is the two shutdowns differing. N0's was signalled from *inside*
+# 1. `kill` is the two shutdowns differing. N0's was signalled from *inside*
 #    the container, by a shell run with `docker exec`, because `docker stop`
 #    signals pid 1 which under tracing is `strace` itself. The interpreted
-#    run's arrives from the host at pid 1 directly, so no guest process calls
-#    `kill` at all.
+#    run's arrives from the host at pid 1 directly, so no guest process
+#    calls `kill` at all.
 #
-# 3. `madvise`, `exit` and `getpeername` are one call each, and each is a
+# 2. `madvise`, `exit` and `getpeername` are one call each, and each is a
 #    moment one run reached and the other had not: glibc's allocator
-#    returning a span, gunicorn's control-socket thread finishing, and
-#    gunicorn probing a listener with `getpeername`. Neither run is missing
-#    a capability; they were stopped at different points in the same work.
+#    returning a span, a thread finishing, and gunicorn probing a listener.
+#    Neither run is missing a capability; they were stopped at different
+#    points in the same work.
 #
-# What is NOT here is as important: no call appears in the native trace that
+# 3. `sched_getaffinity` is asked once by CPython and answered from a
+#    cached value natively.
+#
+# What is NOT here matters as much: no call appears in the native trace that
 # this kernel would have refused, and no shared call's count differs by more
 # than a factor of two.
 #
 native:       88 syscalls,   9365 calls
-interpreted:  89 syscalls,  15986 calls
+interpreted:  85 syscalls,   9532 calls
 
 [only native]  4 — work the interpreted run did not do
-       1  kill
        1  getpeername
        1  madvise
        1  exit
+       1  kill
 
-[only interpreted]  5 — work it does instead
-    6424  clock_gettime
-      21  gettimeofday
-       9  time
-       1  clock_getres
+[only interpreted]  1 — work it does instead
        1  sched_getaffinity
 
 [both, but far apart]

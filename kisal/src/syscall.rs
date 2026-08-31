@@ -626,6 +626,15 @@ pub struct Kernel<'a, S: Store, M: Machine> {
     /// Recorded and answered, and nothing reads it: the signal it exists to
     /// direct is one this kernel does not send. See the `F_SETOWN` row.
     pub owners: std::collections::BTreeMap<i32, i32>,
+    /// Where the vDSO and its timebase page were mapped, once a program has
+    /// been loaded. `None` before that, and for a machine that has no
+    /// address space to map them into.
+    pub vdso: Option<crate::vdso::Placement>,
+    /// The timebase most recently published, kept so the next sample can
+    /// measure a rate against it and so the kernel's own `clock_gettime`
+    /// answers from the same arithmetic the vDSO does — a guest that calls
+    /// one and a guest that calls the other must not see two clocks.
+    pub timebase: crate::vdso::Timebase,
     /// The interval timer `setitimer(ITIMER_REAL)` armed, if any.
     ///
     /// Per process rather than per thread, which is what `ITIMER_REAL`
@@ -918,6 +927,8 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             parent: 0,
             files: crate::fd::FdTable::with_standard_streams(),
             owners: std::collections::BTreeMap::new(),
+            vdso: None,
+            timebase: crate::vdso::Timebase::default(),
             alarm: None,
             dumpable: 1,
             parent_death_signal: 0,
@@ -1279,6 +1290,12 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             identity: self.identity,
             files: self.files.clone(),
             owners: self.owners.clone(),
+            // The child's address space is a copy, so the vDSO is at the
+            // same address and the timebase page carries the same bytes —
+            // and a refresh writes both, because a fork copies the mapping
+            // and not the kernel's idea of what is in it.
+            vdso: self.vdso,
+            timebase: self.timebase,
             // Linux clears a child's interval timers at `fork`, and it has
             // to: an alarm is a promise about *this* process, and a copy of
             // one would fire in a process that never asked.
@@ -1404,6 +1421,9 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             identity: self.identity,
             files,
             owners: self.owners.clone(),
+            // A new address space has no vDSO in it yet; `exec` maps one.
+            vdso: None,
+            timebase: crate::vdso::Timebase::default(),
             // And clears them at `execve` too, for the same reason: the
             // program that asked is gone.
             alarm: None,
@@ -3252,15 +3272,37 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             return Outcome::Done(errno.as_result());
         }
 
-        let mut bytes = Vec::new();
-        if self.store.read(path, &mut bytes) != crate::abi::StoreOutcome::Present {
-            // No clock mounted. Refused by name rather than answered with
-            // zero, which would be a time — the epoch — and would be
-            // believed.
-            return Outcome::Done(Errno::Invalid.as_result());
-        }
-        let Some(nanoseconds) = parse_nanoseconds(&bytes) else {
-            return Outcome::Done(Errno::Invalid.as_result());
+        // From the published timebase when there is one, which is the same
+        // arithmetic the vDSO does — a guest that calls the vDSO and a guest
+        // that calls the syscall must not see two different clocks, and the
+        // way to guarantee that is one calculation rather than two.
+        //
+        // It is also *cheaper*: this answers without crossing the boundary,
+        // which is the whole point of the timebase and applies to the
+        // syscall as much as to the vDSO.
+        let monotonic = path == crate::paths::TIME_MONOTONIC;
+        let nanoseconds = match self.timebase.usable != 0 {
+            true => {
+                let tsc = self
+                    .machine
+                    .tcb()
+                    .map(|thread| thread.timestamp())
+                    .unwrap_or(0);
+                self.timebase.at(tsc, monotonic) as i64
+            }
+            false => {
+                let mut bytes = Vec::new();
+                if self.store.read(path, &mut bytes) != crate::abi::StoreOutcome::Present {
+                    // No clock mounted. Refused by name rather than answered
+                    // with zero, which would be a time — the epoch — and
+                    // would be believed.
+                    return Outcome::Done(Errno::Invalid.as_result());
+                }
+                match parse_nanoseconds(&bytes) {
+                    Some(nanoseconds) => nanoseconds,
+                    None => return Outcome::Done(Errno::Invalid.as_result()),
+                }
+            }
         };
 
         // `timespec` is a whole-seconds field and a remainder that is always

@@ -42,6 +42,9 @@ impl Drop for Tree {
 #[derive(Default)]
 struct Console {
     written: Vec<(Vec<Vec<u8>>, Vec<u8>)>,
+    /// Whether the container should trace its syscalls, which is how a test
+    /// counts them.
+    tracing: bool,
     /// Whether this container has been asked to stop.
     ///
     /// The host's half of a shutdown, which is a *read* the guest makes
@@ -67,6 +70,24 @@ impl Store for Console {
     fn read(&mut self, path: &[&[u8]], into: &mut Vec<u8>) -> StoreOutcome {
         if self.stopping && path == kisal::paths::SHUTDOWN_REQUESTED {
             into.push(b'1');
+            return StoreOutcome::Present;
+        }
+        if self.tracing && path == kisal::paths::CONFIG_TRACE {
+            into.push(b'1');
+            return StoreOutcome::Present;
+        }
+        // A *fixed* clock, which is a clock: the container gets a usable
+        // timebase — so the vDSO is exercised rather than skipped — and two
+        // runs of one container still agree, which
+        // `a_racing_container_runs_the_same_way_twice` is about. Time still
+        // advances between samples, because the vDSO derives it from the
+        // retired-instruction counter and only the *base* comes from here.
+        if path == kisal::paths::TIME_REALTIME {
+            into.extend_from_slice(b"1700000000000000000");
+            return StoreOutcome::Present;
+        }
+        if path == kisal::paths::TIME_MONOTONIC {
+            into.extend_from_slice(b"1000000000");
             return StoreOutcome::Present;
         }
         StoreOutcome::Absent
@@ -2412,4 +2433,84 @@ int main(void) {
     )
     .expect("utf-8");
     assert_eq!(out, "running\nasked to stop by 15\n");
+}
+
+/// **The vDSO, and the only way to tell it is working.**
+///
+/// A vDSO glibc rejects is a vDSO glibc *silently* ignores — it falls back
+/// to the syscall, which answers correctly, and everything passes. So the
+/// assertion cannot be that the clock works. It has to be that **no clock
+/// syscall was issued at all**, which is what a native `strace` of the same
+/// program shows and what `demo/hello-django/baseline/n5-diff.txt` named as
+/// the one structural divergence left between the two.
+///
+/// Two thousand reads, so a single stray syscall is visible against zero,
+/// and a spread over the three calls glibc routes through it.
+#[test]
+fn the_clock_is_read_without_a_syscall() {
+    let (_tree, baked) = image_of(
+        "vdso",
+        r#"
+#include <stdio.h>
+#include <sys/time.h>
+#include <time.h>
+
+int main(void) {
+    struct timespec first, last;
+    clock_gettime(CLOCK_MONOTONIC, &first);
+    for (int index = 0; index < 2000; index++) {
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &last);
+    struct timeval wall;
+    gettimeofday(&wall, 0);
+
+    long long elapsed = (last.tv_sec - first.tv_sec) * 1000000000LL
+        + (last.tv_nsec - first.tv_nsec);
+    /* Monotonic, and it *moved*: a clock frozen between kernel samples
+       would read the same value twice and report zero, which is the failure
+       the interpolation exists to avoid. */
+    printf("forward %d\n", elapsed > 0);
+    printf("wall is a real time %d\n", wall.tv_sec > 1600000000);
+    struct timespec grain;
+    printf("resolution %d\n", clock_getres(CLOCK_MONOTONIC, &grain) == 0);
+    return 0;
+}
+"#,
+        Linkage::Dynamic,
+    );
+    let image = Image::parse(&baked.index, &baked.blob).expect("parse the image");
+    let mut system = boot("vdso", image);
+    system.current().kernel.store.borrow_mut().tracing = true;
+    let exit = system.run();
+    report("vdso", &exit, &mut system);
+    assert_eq!(exit, Exit::Status(0), "the container did not exit cleanly");
+
+    let store = system.current().kernel.store.borrow();
+    let out = String::from_utf8(store.contents(kisal::paths::CONSOLE_STDOUT)).expect("utf-8");
+    assert_eq!(out, "forward 1\nwall is a real time 1\nresolution 1\n");
+
+    let trace = String::from_utf8_lossy(&store.contents(kisal::paths::LOG_DEBUG)).into_owned();
+    let clock_calls: Vec<&str> = trace
+        .lines()
+        .filter(|line| {
+            ["clock_gettime(", "gettimeofday(", "time(", "clock_getres("]
+                .iter()
+                .any(|name| line.contains(name))
+        })
+        .collect();
+    assert!(
+        !trace.is_empty(),
+        "nothing was traced, so this proves nothing"
+    );
+    assert_eq!(
+        clock_calls.len(),
+        0,
+        "the clock was read by syscall {} times, so glibc rejected the vDSO \
+         and fell back — which answers correctly and is why this test counts \
+         syscalls rather than checking the time:\n{}",
+        clock_calls.len(),
+        clock_calls.join("\n")
+    );
 }

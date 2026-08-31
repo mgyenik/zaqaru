@@ -96,6 +96,18 @@ pub struct System<'a, S: Store> {
     slice: u64,
     /// Whether the host's shutdown request has already been delivered.
     stopping: bool,
+    /// How the *first* process ended, in full.
+    ///
+    /// [`Ending`] keeps only what `wait4` can report — a code or a signal
+    /// number — because that is all a parent may see. The container's own
+    /// report is not a `wait4`: when a run stops because something
+    /// segmentation-faulted, the address and the program counter are the
+    /// entire diagnosis, and rebuilding an `Exit` from an `Ending` throws
+    /// them away. Measured: a fault at `0x60012d0` in glibc's
+    /// `_dl_non_dynamic_init` was reported as `address: 0, rip: 0`, and
+    /// finding it again took a debugging session that the numbers would
+    /// have ended in a line.
+    ending: Option<Exit>,
     /// What processes that are gone retired and decoded before they went.
     ///
     /// Kept here because ending destroys the only other place those numbers
@@ -121,6 +133,7 @@ impl<'a, S: Store + Clone> System<'a, S> {
             next: FIRST + 1,
             slice: 0,
             stopping: false,
+            ending: None,
             departed: 0,
             departed_blocks: 0,
         }
@@ -376,6 +389,7 @@ impl<'a, S: Store + Clone> System<'a, S> {
             // breaking the rule the process table is built on.
             if why == Yield::Quantum && self.slice == 0 {
                 self.current().kernel.pump(None);
+                self.current().kernel.refresh_timebase();
                 self.take_shutdown();
             }
             if !self.schedule(why) {
@@ -384,8 +398,8 @@ impl<'a, S: Store + Clone> System<'a, S> {
                 if self.idle() {
                     continue;
                 }
-                return match self.containers.first().and_then(|first| first.status) {
-                    Some(status) => status.as_exit(),
+                return match self.ending.clone() {
+                    Some(ending) => ending,
                     None => Exit::Deadlocked,
                 };
             }
@@ -517,6 +531,10 @@ impl<'a, S: Store + Clone> System<'a, S> {
     /// long" is the one call that turns this spin into a sleep. Until then
     /// it spins, which costs a core and is correct.
     fn idle(&mut self) -> bool {
+        // Nothing can run, so this is the other moment the container is
+        // already crossing the boundary — and the clock a sleeping container
+        // wakes to must be the time it woke, not the time it went to sleep.
+        self.current().kernel.refresh_timebase();
         // First, because a pending shutdown is exactly what makes a
         // container that looks stuck not stuck: every process parked on a
         // signal that has not come is a deadlock until somebody sends one.
@@ -854,7 +872,7 @@ impl<'a, S: Store + Clone> System<'a, S> {
             let _ = self.containers[at].process.kernel.signal_process(SIGCHLD);
         }
         match pid == FIRST {
-            true => Some(status.as_exit()),
+            true => Some(exit),
             false => None,
         }
     }

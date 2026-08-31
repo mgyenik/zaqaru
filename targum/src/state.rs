@@ -191,6 +191,29 @@ impl Default for Tcb {
 }
 
 impl Tcb {
+    /// What `rdtsc` answers.
+    ///
+    /// A function of the retired-instruction counter, which makes it
+    /// deterministic and replayable — two runs of the same container see the
+    /// same timestamps — and monotone, because the counter is.
+    ///
+    /// It is not a clock, and the guest must not treat it as one: it has no
+    /// relationship to elapsed time that the guest can know. The *kernel*
+    /// may relate the two, and does — it holds both this counter and the
+    /// host's clock, samples them together, and publishes the ratio for the
+    /// vDSO to interpolate with. That is calibration done by the one party
+    /// entitled to do it, and it is the whole of `kisal::vdso`.
+    ///
+    /// The multiplier is large so that a guest spinning on a deadline —
+    /// "wait until the counter passes now plus n" — crosses it in a few
+    /// reads instead of burning millions of iterations, and odd so that the
+    /// low bits cycle: glibc's adaptive mutex takes exactly those bits as
+    /// jitter for its backoff, and an even step would hand it the same
+    /// value every time.
+    pub fn timestamp(&self) -> u64 {
+        self.retired.wrapping_mul(crate::exec::TIMESTAMP_STEP)
+    }
+
     /// The state Linux hands `_start`: every register zero, and a stack
     /// pointer boot is expected to write before anything runs.
     pub fn new() -> Self {
