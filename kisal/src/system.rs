@@ -377,6 +377,22 @@ impl<'a, S: Store + Clone> System<'a, S> {
                     Yield::Kept
                 }
                 Progress::Finished(exit) => {
+                    // The edge, one last time. A process that writes a
+                    // reply and exits has put those bytes in a ring and
+                    // nowhere else, and the two scheduled pump points are
+                    // both about a container that keeps running: a whole
+                    // slice used, or nothing left to run. Neither happens
+                    // again after the last process goes, so without this
+                    // the final write of a run is dropped on the floor.
+                    //
+                    // Before `finish`, because that is what tears the
+                    // process down — and closing its descriptors is what
+                    // releases the ring the bytes are still sitting in.
+                    //
+                    // A long-lived server never showed this: nginx is
+                    // always still there to be pumped on somebody else's
+                    // turn. It took a program that answers once and exits.
+                    self.current().kernel.pump(None);
                     if let Some(ending) = self.finish(exit) {
                         return ending;
                     }

@@ -464,3 +464,128 @@ int main(void) {
          it proves nothing"
     );
 }
+
+/// **The edge, end to end**: a guest binds a port, the host reaches it, and
+/// bytes cross in both directions.
+///
+/// Everything else about sockets here happens inside one module — two
+/// processes in a shared arena, where a connection is two rings and nothing
+/// leaves. This is the other network, the one the plan calls host-terminated:
+/// a real `TcpListener` on the host, a real client connecting to it, and the
+/// guest's `accept` waking because something outside the module arrived.
+///
+/// It is the piece the demo proves and nothing checked. `-p HOST:GUEST` is
+/// also the capability model's firewall — a guest port with no mapping is
+/// loopback-only and cannot be reached — so a test that never crosses the
+/// boundary cannot tell a working edge from a mapping that silently did
+/// nothing, which is what an unopened host listener looks like from inside.
+///
+/// The host port is taken from the kernel rather than picked: binding zero
+/// and reading back what was assigned is what keeps this from failing on a
+/// machine where somebody happens to be using the number a test guessed.
+#[test]
+fn the_host_reaches_a_port_the_guest_published() {
+    use std::io::{Read, Write};
+
+    const GUEST_PORT: u16 = 8080;
+    // Bound and dropped, purely to be told a free number.
+    let host_port = std::net::TcpListener::bind(("127.0.0.1", 0))
+        .expect("ask for a free port")
+        .local_addr()
+        .expect("its address")
+        .port();
+
+    let (workspace, module) = module_for(
+        "edge",
+        r#"
+#include <netinet/in.h>
+#include <poll.h>
+#include <stdio.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+int main(void) {
+    int server = socket(AF_INET, SOCK_STREAM, 0);
+    int one = 1;
+    setsockopt(server, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    struct sockaddr_in mine = {0};
+    mine.sin_family = AF_INET;
+    mine.sin_addr.s_addr = htonl(INADDR_ANY);
+    mine.sin_port = htons(8080);
+    if (bind(server, (struct sockaddr *)&mine, sizeof mine) != 0) {
+        perror("bind"); return 1;
+    }
+    if (listen(server, 8) != 0) { perror("listen"); return 1; }
+    /* Bounded, so that an edge which never opens is a failing test with a
+       diagnosis rather than a run that hangs: the guest is the only thing
+       that can end the container, so it has to be the thing that gives up. */
+    struct pollfd waiting = { .fd = server, .events = POLLIN };
+    if (poll(&waiting, 1, 30000) <= 0) { printf("nobody came\n"); return 0; }
+    int client = accept(server, 0, 0);
+    if (client < 0) { perror("accept"); return 1; }
+    char asked[64] = {0};
+    ssize_t got = read(client, asked, sizeof asked - 1);
+    printf("read %zd: %s", got, asked);
+    write(client, "pong\n", 5);
+    close(client);
+    close(server);
+    return 0;
+}
+"#,
+        &["-static", "-no-pie"],
+    );
+
+    // The client runs while the container does, because the container does
+    // not return until the guest has served it — which is the whole shape
+    // of the thing being tested.
+    let client = std::thread::spawn(move || -> Result<String, String> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            if std::time::Instant::now() > deadline {
+                return Err("the guest never answered on the host port".into());
+            }
+            // Refused until the guest has listened and the store has opened
+            // the host listener behind it, which is not instant: the module
+            // is interpreting a dynamic loader and a libc start-up first.
+            let Ok(mut stream) = std::net::TcpStream::connect(("127.0.0.1", host_port)) else {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                continue;
+            };
+            // Bounded, for the same reason the guest's `poll` is: the host
+            // listener is opened by the store the moment the guest
+            // registers its port, so a connection can be accepted *here*
+            // and never reach the guest at all — and a read waiting for an
+            // end of file that is not coming is a hung test with nothing
+            // to say.
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(30)))
+                .map_err(|e| e.to_string())?;
+            stream.write_all(b"ping\n").map_err(|e| e.to_string())?;
+            let mut back = String::new();
+            stream.read_to_string(&mut back).map_err(|e| e.to_string())?;
+            return Ok(back);
+        }
+    });
+
+    let mut mounts = support::mounts_seeded(&[0x33; 32]);
+    // A clock, because the guest's `poll` has a timeout and a deadline with
+    // nothing to measure it against is refused rather than ignored.
+    mounts.mount(&[b"iso", b"time"], Box::new(runner::store::Clock::new()));
+    mounts.mount(
+        &[b"iso", b"net"],
+        Box::new(runner::net::NetStore::new(vec![(host_port, GUEST_PORT)])),
+    );
+    let (status, printed) = boot(&module, mounts);
+    let heard = client.join().expect("the client thread");
+
+    // The guest's own account first. It is the side that can say whether
+    // the connection ever crossed, so a client error reported ahead of it
+    // describes a symptom where the guest has the diagnosis.
+    assert_eq!(status, 0, "the guest failed: {printed}");
+    assert_eq!(
+        printed, "read 5: ping\n",
+        "the guest did not read the request; the host end said {heard:?}"
+    );
+    assert_eq!(heard.as_deref(), Ok("pong\n"), "the host did not read the reply");
+    drop(workspace);
+}

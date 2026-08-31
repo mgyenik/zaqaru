@@ -308,6 +308,18 @@ impl Store for NetStore {
                                 }
                             }
                             _ => {
+                                // The reader thread holds a clone of this
+                                // socket, so letting go of ours closes
+                                // nothing: `shutdown` is what actually
+                                // sends the end of file the peer is
+                                // waiting for, and it is what ends the
+                                // reader rather than leaving it parked on
+                                // a connection nobody is on the other end
+                                // of. A guest that closes a connection has
+                                // closed it.
+                                if let Some(stream) = connection.outgoing.as_ref() {
+                                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                                }
                                 connection.outgoing = None;
                                 net.connections[id as usize] = None;
                             }

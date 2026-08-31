@@ -2247,6 +2247,37 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
     /// writer is still there. So it is a difference of two censuses instead.
     pub(crate) fn reconcile_shared(&mut self, before: &Census) {
         let after = self.shared_census();
+        // Sockets before rings, and the order is load-bearing: a socket's
+        // ring ends are counted among the pipes, so releasing those first
+        // would free the ring out from under an edge connection whose
+        // pending reply has not been sent yet. Both censuses were taken
+        // before any of this, so the counts do not care which runs first.
+        let mut retired: Vec<(u32, u32)> = Vec::new();
+        {
+            let mut arena = self.sockets.borrow_mut();
+            for held in distinct(&before.sockets, &after.sockets) {
+                let was = count(&before.sockets, &held);
+                let now = count(&after.sockets, &held);
+                for _ in was..now {
+                    arena.acquire(held);
+                }
+                for _ in now..was {
+                    // Asked before the release, because a retired socket is
+                    // gone and the host still has to be told.
+                    let edge = arena.edge_of(held);
+                    if let (Some(endpoint), Some(conn)) = (arena.release(held), edge) {
+                        retired.push((conn, endpoint.transmit));
+                    }
+                }
+            }
+        }
+        // The last descriptor naming an edge connection has gone, so the
+        // connection is over — and the host is the only one that can close
+        // it. Without this the far side waits for an end of file that
+        // nobody is going to send.
+        for (conn, ring) in retired {
+            self.end_edge(conn, ring, b"close");
+        }
         {
             let mut rings = self.rings.borrow_mut();
             for held in distinct(&before.pipes, &after.pipes) {
@@ -2257,19 +2288,6 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
                 }
                 for _ in now..was {
                     rings.release(held.0, held.1);
-                }
-            }
-        }
-        {
-            let mut arena = self.sockets.borrow_mut();
-            for held in distinct(&before.sockets, &after.sockets) {
-                let was = count(&before.sockets, &held);
-                let now = count(&after.sockets, &held);
-                for _ in was..now {
-                    arena.acquire(held);
-                }
-                for _ in now..was {
-                    arena.release(held);
                 }
             }
         }

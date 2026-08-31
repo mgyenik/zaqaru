@@ -305,6 +305,13 @@ impl Sockets {
         }
     }
 
+    /// The host-side connection number an edge socket stands for, if it is
+    /// one. Asked before a release, because a retired socket is gone and
+    /// the host still has to be told about it.
+    pub fn edge_of(&self, id: u32) -> Option<u32> {
+        self.get(id)?.edge
+    }
+
     /// One fewer descriptor. Answers the rings to let go of when the last
     /// one goes, because the arena does not own the rings.
     pub fn release(&mut self, id: u32) -> Option<Endpoint> {
@@ -734,6 +741,18 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
         }
         Outcome::Done(0)
     }
+}
+
+/// `/iso/net/conn/{j}/{leaf}`, built once so that the pump and the close
+/// path cannot disagree about where a connection lives.
+fn edge_path(conn: u32, leaf: &[u8]) -> Vec<Vec<u8>> {
+    vec![
+        b"iso".to_vec(),
+        b"net".to_vec(),
+        b"conn".to_vec(),
+        conn.to_string().into_bytes(),
+        leaf.to_vec(),
+    ]
 }
 
 /// What a descriptor reaches when a transfer asks for its socket's ring.
@@ -1656,13 +1675,7 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
             }
             let mut bytes = vec![0u8; queued];
             self.rings.borrow_mut().take(ring, &mut bytes);
-            let path: Vec<Vec<u8>> = vec![
-                b"iso".to_vec(),
-                b"net".to_vec(),
-                b"conn".to_vec(),
-                conn.to_string().into_bytes(),
-                b"tx".to_vec(),
-            ];
+            let path = edge_path(conn, b"tx");
             let borrowed: Vec<&[u8]> = path.iter().map(|held| held.as_slice()).collect();
             self.store.write(&borrowed, &bytes);
             moved = true;
@@ -1693,6 +1706,31 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
             }
         }
         moved
+    }
+
+    /// Tells the host an edge connection is over, having first sent
+    /// whatever the guest wrote and had not sent yet.
+    ///
+    /// The flush is the point. A program that writes a reply and closes has
+    /// put those bytes in a ring, and closing is what releases the ring —
+    /// so a `close` that did not drain first would discard exactly the
+    /// answer the connection existed to deliver. Linux sends the queued
+    /// data and then the FIN, and this is that, over the store.
+    ///
+    /// `how` is `close` for both directions or `shutdown` for the write
+    /// half, which the host turns into the same two things a kernel does.
+    pub(crate) fn end_edge(&mut self, conn: u32, ring: u32, how: &[u8]) {
+        let queued = self.rings.borrow().queued(ring);
+        if queued > 0 {
+            let mut bytes = vec![0u8; queued];
+            self.rings.borrow_mut().take(ring, &mut bytes);
+            let path = edge_path(conn, b"tx");
+            let borrowed: Vec<&[u8]> = path.iter().map(|held| held.as_slice()).collect();
+            self.store.write(&borrowed, &bytes);
+        }
+        let path = edge_path(conn, b"ctl");
+        let borrowed: Vec<&[u8]> = path.iter().map(|held| held.as_slice()).collect();
+        self.store.write(&borrowed, how);
     }
 
     /// One line of the host's event stream.
