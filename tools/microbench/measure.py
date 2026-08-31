@@ -125,9 +125,24 @@ def run_once(leg: str, name: str, scale: int) -> dict:
 def best(leg: str, name: str, scale: int) -> dict:
     """Minimum of `REPEATS`, which is the sample least interfered with."""
     rows = [run_once(leg, name, scale) for _ in range(REPEATS)]
+    # NOTE: callers must interleave the two scales -- see `measure`.
     fastest = min(rows, key=lambda row: row["total"])
     fastest["spread"] = max(r["total"] for r in rows) / min(r["total"] for r in rows)
     return fastest
+
+
+def interleaved(leg: str, name: str, scale: int) -> tuple[dict, dict]:
+    """Alternates the two scales so clock drift hits both equally."""
+    low: list[dict] = []
+    high: list[dict] = []
+    for _ in range(REPEATS):
+        low.append(run_once(leg, name, scale))
+        high.append(run_once(leg, name, scale * 2))
+    fastest = lambda rows: min(rows, key=lambda row: row["total"])
+    pick_low, pick_high = fastest(low), fastest(high)
+    for picked, rows in ((pick_low, low), (pick_high, high)):
+        picked["spread"] = max(r["total"] for r in rows) / min(r["total"] for r in rows)
+    return pick_low, pick_high
 
 
 def calibrate(name: str, scale: int) -> int:
@@ -155,7 +170,14 @@ def main() -> None:
         row: dict[str, dict] = {}
         for leg in ("native", "wasm"):
             at = calibrate(name, scale) if leg == "native" else scale
-            low, high = best(leg, name, at), best(leg, name, at * 2)
+            # Interleaved, not one scale then the other. A long kernel
+            # holds the core for tens of seconds and the clock decays
+            # across the measurement, so taking every low sample before
+            # every high one subtracts a later slower run from an earlier
+            # faster one. That measured `calls` at 25.5, 96.8 and 47.1 MIPS
+            # on three runs of identical code; alternating brought the
+            # spread to 2.5%.
+            low, high = interleaved(leg, name, at)
             seconds = high["total"] - low["total"]
             row[leg] = {
                 "scale": at,
