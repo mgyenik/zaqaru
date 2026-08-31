@@ -66,6 +66,11 @@ pub struct Block {
     pub instructions: Vec<Instruction>,
     /// Whether every instruction but the last falls straight through.
     ///
+    /// Kept for the diagnostics that ask; the run loop uses the
+    /// per-instruction [`crate::quick::Quick::checks_rip`] instead, because
+    /// an extended block has conditional branches in its middle and one
+    /// flag for the whole block cannot say which instructions they are.
+    ///
     /// Blocks end at the first control transfer, so by construction only
     /// the last instruction can branch — and the only other way `rip` moves
     /// unexpectedly is a `rep`-prefixed string operation, which stays put
@@ -323,7 +328,7 @@ fn decode(address: u64, space: &Space) -> Result<Block, FetchError> {
                 DecoderError::NoMoreBytes if !instructions.is_empty() => Ok(Block {
                     entry: address,
                     end,
-                    quick: instructions.iter().map(crate::quick::Quick::lower).collect(),
+                    quick: lower_all(&instructions),
                     simple: straight_through(&instructions),
                     instructions,
                 }),
@@ -346,10 +351,30 @@ fn decode(address: u64, space: &Space) -> Result<Block, FetchError> {
     Ok(Block {
         entry: address,
         end,
-        quick: instructions.iter().map(crate::quick::Quick::lower).collect(),
+        quick: lower_all(&instructions),
         simple: straight_through(&instructions),
         instructions,
     })
+}
+
+/// Lowers a block's instructions and records, for each, whether the run
+/// loop has to consult `rip` afterwards.
+///
+/// That is a property of the instruction rather than of the lowering: an
+/// instruction iced calls `Next` with no repeat prefix goes to the next one
+/// whether or not [`crate::quick`] understood it.
+fn lower_all(instructions: &[Instruction]) -> Vec<crate::quick::Quick> {
+    instructions
+        .iter()
+        .map(|instruction| {
+            let mut lowered = crate::quick::Quick::lower(instruction);
+            lowered.checks_rip = instruction.flow_control() != FlowControl::Next
+                || instruction.has_rep_prefix()
+                || instruction.has_repe_prefix()
+                || instruction.has_repne_prefix();
+            lowered
+        })
+        .collect()
 }
 
 /// Whether every instruction but the last simply falls through.
@@ -391,6 +416,24 @@ pub fn terminator(instruction: &Instruction) -> Option<Terminator> {
     }
     match instruction.flow_control() {
         FlowControl::Next => None,
+        // A conditional branch does *not* end a block, and that is the
+        // whole of the extended-basic-block idea. Its fall-through is the
+        // next instruction, so decoding can carry straight on; when it is
+        // taken the run loop notices `rip` disagreeing and leaves.
+        //
+        // Blocks were averaging five instructions because control transfers
+        // are a fifth of what a real program retires, and a profile of the
+        // Django import put the run loop and the block lookup at 22% of the
+        // engine between them — all of it paid per block. Following the
+        // fall-through is what makes a block long enough for that to be
+        // amortised.
+        //
+        // Calls and returns still end one. A `call` comes back to the
+        // instruction after it, which would be the middle of this block,
+        // and a block is only ever entered at its start — so continuing
+        // past one builds bytes that can never be reached through this
+        // entry.
+        FlowControl::ConditionalBranch => None,
         _ => Some(Terminator::Transfer),
     }
 }

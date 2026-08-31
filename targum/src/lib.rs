@@ -120,7 +120,6 @@ impl Engine {
             let block = cache.block(index);
             let mut cpu = Cpu::new(tcb, space);
             let mut position = 0usize;
-            let last = block.instructions.len().saturating_sub(1);
             while position < block.instructions.len() {
                 let instruction = &block.instructions[position];
                 if budget == 0 {
@@ -132,10 +131,11 @@ impl Engine {
                     break;
                 }
                 budget -= 1;
-                // Everything but a block's last instruction, in a block
-                // whose prefix cannot branch or stay put. The loop knows
-                // where these go without asking.
-                if block.simple && position < last {
+                // Anything that goes to the next instruction, which is
+                // most of them. An extended block has conditional branches
+                // in its middle, so this is decided per instruction rather
+                // than once for the block.
+                if !block.quick[position].checks_rip {
                     match cpu.advance(&block.quick[position], instruction) {
                         Ok(()) => {}
                         Err(trap) => {
@@ -155,6 +155,11 @@ impl Engine {
                         break;
                     }
                     position += 1;
+                    // A block that ends on a straight instruction falls out
+                    // of its last one, and `advance` left `rip` behind.
+                    if position == block.instructions.len() {
+                        cpu.tcb.rip = instruction.next_ip();
+                    }
                     continue;
                 }
                 match cpu.run(&block.quick[position], instruction) {

@@ -129,6 +129,11 @@ pub struct Quick {
     /// What [`Op::Widen`] and [`Op::WidenSigned`] read at, where `width` is
     /// what they write at. Equal to `width` everywhere else.
     pub source_width: Width,
+    /// Whether the run loop must read `rip` back after this instruction to
+    /// find out where execution went. False for the overwhelming majority —
+    /// they go to the next instruction — and set by
+    /// [`crate::block`], which knows the instruction, rather than here.
+    pub checks_rip: bool,
     /// `%fs`-relative. `%gs` is never lowered — the general path refuses it,
     /// loudly, and should go on being the only place that knows that.
     pub segmented: bool,
@@ -146,6 +151,10 @@ impl Quick {
         address: Address::Fixed(0),
         condition: Condition::Equal,
         source_width: Width::Qword,
+        // Conservative, and overwritten for every instruction that is
+        // actually part of a block: a lowering that forgot to say costs
+        // speed and not correctness.
+        checks_rip: true,
         segmented: false,
     };
 
@@ -222,7 +231,7 @@ impl Quick {
             segmented = fs;
         }
         Quick { op, width, destination, source, address,
-                condition: Condition::Equal, source_width: width, segmented }
+                condition: Condition::Equal, source_width: width, checks_rip: true, segmented }
     }
 
     /// Whether the flags this op leaves behind are a logical rule's.
@@ -347,7 +356,7 @@ fn lower_widen(instruction: &Instruction, op: Op) -> Quick {
         false => (Address::Fixed(0), false),
     };
     Quick { op, width, source_width, destination, source, address, segmented,
-            condition: Condition::Equal }
+            condition: Condition::Equal, checks_rip: true }
 }
 
 /// `push`, whose one operand is a source and whose immediate form is
@@ -374,7 +383,7 @@ fn lower_push(instruction: &Instruction) -> Quick {
         false => (Address::Fixed(0), false),
     };
     Quick { op: Op::Push, width, destination: Source::Register(PLACEHOLDER), source, address,
-            condition: Condition::Equal, source_width: width, segmented }
+            condition: Condition::Equal, source_width: width, checks_rip: true, segmented }
 }
 
 /// `pop`, whose one operand is a destination.
@@ -396,7 +405,7 @@ fn lower_pop(instruction: &Instruction) -> Quick {
         false => (Address::Fixed(0), false),
     };
     Quick { op: Op::Pop, width, destination, source: Source::Register(PLACEHOLDER), address,
-            condition: Condition::Equal, source_width: width, segmented }
+            condition: Condition::Equal, source_width: width, checks_rip: true, segmented }
 }
 
 /// Operand zero's width, which is the instruction's — the same rule
