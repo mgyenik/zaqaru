@@ -537,6 +537,11 @@ impl<'a> Cpu<'a> {
 
     // ---- the stack -------------------------------------------------------
 
+    // Showed as its own frame at 4% of the Django import, and forcing it
+    // inline made things *worse* — `calls` 3.41x to 3.26x. It is called
+    // from the general path as well as the fast one, so inlining it puts a
+    // copy inside `step`, and `step` is the function that must stay small.
+    // The same trap as `read` and `write`.
     fn push(&mut self, width: Width, value: u64) -> Result<Step, Trap> {
         let at = self
             .tcb
@@ -547,6 +552,7 @@ impl<'a> Cpu<'a> {
         Ok(Step::Retired)
     }
 
+    /// Not force-inlined, for the reason [`Self::push`] gives.
     fn pop(&mut self, width: Width) -> Result<u64, Trap> {
         let at = self.tcb.stack_pointer();
         let value = self.space.load(at, width)?;
