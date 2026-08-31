@@ -87,7 +87,12 @@ Current documents:
   `demo/hello-django/baseline/n5-diff.txt`. And a served HTTP session
   **records and replays byte for byte with no network at all**, which is
   the determinism claim demonstrated rather than asserted.
-  `demo/hello-django/` holds the image and the scripts.
+  `demo/hello-django/` holds the image and the scripts. Both of those
+  claims are now checked by tests rather than by running the demo — the
+  tape against a world deliberately changed underneath it, and the edge
+  by a guest that publishes a port the test's own client connects to,
+  which is what found three defects in the close path that a long-lived
+  nginx cannot show you.
 - [worklog.md](worklog.md) — the working layer under the build plan:
   decisions taken mid-build and why, roadblocks and how they were cleared,
   and the mistakes worth not repeating. Where the build plan records a
