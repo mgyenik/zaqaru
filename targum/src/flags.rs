@@ -125,6 +125,11 @@ impl Flags {
     /// `left`, `right` and `result` are truncated here rather than at the
     /// hundred call sites, so an instruction arm can hand over whatever
     /// width-agnostic `u64`s its arithmetic produced.
+    // Five field stores, on every arithmetic instruction, and showing
+    // as its own frame at 4.2% of the Django import. Small enough that
+    // a copy inside `step` costs nothing — unlike `read`, `write`,
+    // `push` and `pop`, which were tried and reverted.
+    #[inline(always)]
     pub fn record(&mut self, rule: Rule, width: Width, left: u64, right: u64, result: u64) {
         debug_assert!(rule != Rule::Materialized, "use `set_all` for that");
         // `inc` and `dec` preserve the carry, and preserving it means
@@ -363,6 +368,7 @@ pub enum Condition {
 }
 
 impl Condition {
+    #[inline(always)]
     pub fn holds(self, flags: &Flags) -> bool {
         match self {
             Condition::Overflow => flags.overflow(),
