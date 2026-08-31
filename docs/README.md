@@ -42,10 +42,13 @@ Current documents:
   retired-instruction quantum, signal delivery with faults delivered as
   signals a handler can catch, and the process table of section 7a —
   `fork`, `execve`, `wait4`, `SIGCHLD`, pipes as structural fd hoisting,
-  and `poll`/`epoll`. G2 is answered at 29 MIPS in wasm. The deliverable:
+  and `poll`/`epoll`. G2 is answered — at 29 MIPS in wasm when it was
+  measured, and at 67.7 MIPS since the engine work of 2026-08-31; see
+  [performance.md](performance.md). The deliverable:
   the official `python:3.12-slim` OCI image as a 119.8 MB `.wasm`, running
-  CPython that forks subprocesses and shell pipelines. G3, tier 1, sockets
-  and V4's JIT trophy are not built, and the document says which is which.
+  CPython that forks subprocesses and shell pipelines. Sockets have since
+  been built — see [network-plan.md](network-plan.md). G3, tier 1 and
+  V4's JIT trophy are not, and the document says which is which.
 - [x87-plan.md](x87-plan.md) — the plan that finishes the x87: symbol
   plumbing and the translator lowering (X1–X2), linking the staticlib
   into every build (X3), corpus differentials (X4), the refusal-tail
@@ -93,6 +96,17 @@ Current documents:
   by a guest that publishes a port the test's own client connects to,
   which is what found three defects in the close path that a long-lived
   nginx cannot show you.
+- [performance.md](performance.md) — **reference**: what a container
+  costs, where the time goes, and what has been tried. The Django demo
+  native against wasm and the nine workload shapes with their ratios; the
+  three instruments — a mnemonic histogram, a guest-address profile, and
+  `perf` against wasmtime's JIT map — with the command for each; the
+  measurement discipline, which is not preamble, because two of the
+  numbers this file used to carry were artefacts of the harness; the
+  table of six changes that were argued from the code and measured at
+  nothing or worse; and the inlining rule that every real win since
+  turned out to be. Carries what is open, including a concurrency
+  collapse nobody has explained.
 - [fidelity.md](fidelity.md) — **reference**: the index of where kisal
   differs from Linux, read out of the code rather than the plans. The
   three answers a guest can get for something not fully built — a loud

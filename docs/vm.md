@@ -815,6 +815,15 @@ full dispatch breadth, lazy flags and page bitmaps on. The verdict line
 asked for ≥ 25 MIPS and the reroute is not needed; tier 1 stays at V5.
 The original text follows.
 
+**And 67.7 MIPS since 2026-08-31**, on the nginx/gunicorn/Django stack,
+after the engine work in [performance.md](performance.md): instructions
+pre-decoded once per block rather than re-derived per execution, blocks
+extended past conditional branches, and a set of inlining decisions the
+compiler had made and recorded nowhere — the largest of which was 26% of
+a run sitting in two operand accessors that were real function calls.
+None of that changes G2's verdict, which was already answered; what it
+changes is section 11's arithmetic, which was written against 29.
+
 **G2 — breadth does not collapse dispatch.** Extend the spike's engine to
 the real corpus: the integer/branch/flags surface the differential corpus
 already exercises (~a hundred-plus mnemonics), lazy flags, the page

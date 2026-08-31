@@ -1,7 +1,19 @@
 # The network: sockets in the arena, and the edge at `/iso/net`
 
-Status: **draft** — a design and implementation plan, written 2026-08-30,
-before any socket code exists. `container-plan.md`'s "Sockets and epoll"
+Status: **built** — written 2026-08-30 as a design and implementation
+plan, before any socket code existed; N0 through N5 were built the same
+day and the demo answers. What is *not* built is named in section 12 and
+in the pothole list: egress above all — a guest connecting anywhere off
+`127.0.0.0/8` gets `ENETUNREACH`, which is the truthful answer for a
+namespace holding only `lo` and not a working outbound path — along with
+`SCM_RIGHTS`, `MAP_SHARED` across `fork`, and DNS. A concurrency defect
+found afterwards is recorded in [performance.md](performance.md): four
+clients at once measure *worse* throughput than one, which no arrangement
+of the pump explains.
+
+The text below is the plan as written.
+
+`container-plan.md`'s "Sockets and epoll"
 section remains the design authority for socket *semantics* (the readiness
 model, the epoll rules, the half-close matrix, the no-packets decision);
 this document is the plan for building them under the interpreter, where
