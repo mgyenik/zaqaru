@@ -413,7 +413,7 @@ impl<'a> Cpu<'a> {
     /// constant half already folded and the register lookups already
     /// resolved to slices — and the thirty-two bit wrap applied to the sum
     /// rather than to each term, which is where it happens.
-    #[inline]
+    #[inline(always)]
     fn quick_address(&self, quick: &Quick) -> Result<u64, Trap> {
         let address = match quick.address {
             Address::Fixed(at) => at,
@@ -437,7 +437,7 @@ impl<'a> Cpu<'a> {
         })
     }
 
-    #[inline]
+    #[inline(always)]
     fn quick_load(&mut self, quick: &Quick, from: Source, width: Width) -> Result<u64, Trap> {
         match from {
             Source::Register(slice) => Ok(self.tcb.read_register(slice)),
@@ -449,7 +449,7 @@ impl<'a> Cpu<'a> {
         }
     }
 
-    #[inline]
+    #[inline(always)]
     fn quick_store(
         &mut self,
         quick: &Quick,

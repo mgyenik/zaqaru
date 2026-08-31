@@ -59,7 +59,16 @@ pub struct Container {
 impl Container {
     /// Instantiates a linked container module against a mount table.
     pub fn instantiate(module_bytes: &[u8], mounts: MountTable) -> Result<Self> {
-        let engine = wasmtime::Engine::default();
+        // JIT frames are anonymous machine code, so a host profiler shows
+        // the engine as a single unresolved address unless wasmtime writes
+        // the map that names them. Off by default: it writes a file per
+        // process into /tmp and exists only to be profiled.
+        let mut configuration = wasmtime::Config::new();
+        if std::env::var_os("ZAQARU_PERFMAP").is_some() {
+            configuration.profiler(wasmtime::ProfilingStrategy::PerfMap);
+        }
+        let engine = wasmtime::Engine::new(&configuration)
+            .context("configuring the wasm engine")?;
         let module = wasmtime::Module::new(&engine, module_bytes)
             .context("wasmtime rejected the container module")?;
         let mut store = wasmtime::Store::new(&engine, mounts);
