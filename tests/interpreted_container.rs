@@ -89,6 +89,20 @@ fn run(label: &str, source: &str) -> (i32, String) {
 }
 
 fn run_linked(label: &str, source: &str, linkage: &[&str]) -> (i32, String) {
+    let (workspace, module) = module_for(label, source, linkage);
+    let outcome = boot(&module, support::mounts_seeded(&[0x33; 32]));
+    drop(workspace);
+    outcome
+}
+
+/// Builds a program into a container module, and hands back both it and the
+/// workspace holding it — which the caller has to keep alive, because the
+/// module is a file in it.
+fn module_for(
+    label: &str,
+    source: &str,
+    linkage: &[&str],
+) -> (WorkingDirectory, std::path::PathBuf) {
     let workspace = WorkingDirectory::new(label);
     let root = workspace.path().join("root");
     std::fs::create_dir_all(&root).expect("mkdir");
@@ -120,10 +134,14 @@ fn run_linked(label: &str, source: &str, linkage: &[&str]) -> (i32, String) {
     let baked = baker::bake_directory(&root).expect("bake");
     let object = baker::object::emit(&baked).expect("emit the image object");
     let module = link_engine(&workspace, &object, label);
+    (workspace, module)
+}
 
+/// Boots a module against a given world and answers what it did.
+fn boot(module: &Path, mounts: runner::store::MountTable) -> (i32, String) {
     let mut container = runner::Container::instantiate(
-        &std::fs::read(&module).expect("read the container"),
-        support::mounts_seeded(&[0x33; 32]),
+        &std::fs::read(module).expect("read the container"),
+        mounts,
     )
     .expect("instantiate the container");
 
@@ -148,6 +166,10 @@ fn run_linked(label: &str, source: &str, linkage: &[&str]) -> (i32, String) {
         .ok()
         .flatten()
         .unwrap_or_default();
+    // Written out if this world was recording; `None` if it was not.
+    if let Some(kept) = container.mounts().keep_tape() {
+        kept.expect("write the tape");
+    }
     (status, String::from_utf8(written).expect("utf-8"))
 }
 
@@ -365,5 +387,80 @@ int main(void) {
     assert_eq!(
         out,
         "child said the child's, parent still has the parent's, exited 7\n"
+    );
+}
+
+/// **A run records, and replays byte for byte against a different world.**
+///
+/// This is the determinism claim, which the demo demonstrates with a served
+/// HTTP session and which nothing until now checked. Everything a container
+/// does is a function of its own execution and the answers the host gave it,
+/// so keeping the answers keeps the run: replayed, the same module reaches
+/// the same bytes with no clock and no entropy behind it.
+///
+/// The world is deliberately *changed* under the replay — a different seed
+/// and a fresh clock — because a replay that agrees with the world it was
+/// recorded against has not been shown to be reading the tape. The third
+/// run is the control: the same change, without a tape, has to disagree.
+/// Without it this test would pass on any program whose output never
+/// varied, which is most of them.
+///
+/// The clock is the sharper half. A guest here reads it through the vDSO,
+/// where glibc interpolates from a timebase page rather than asking, so
+/// what has to be deterministic is the timebase's own refresh and the
+/// retired-instruction counter it extrapolates against — a path with no
+/// syscall in it at all.
+#[test]
+fn a_run_records_and_replays_against_a_changed_world() {
+    let source = r#"
+#include <stdio.h>
+#include <sys/random.h>
+#include <time.h>
+
+int main(void) {
+    unsigned char bytes[8] = {0};
+    if (getrandom(bytes, sizeof bytes, 0) != sizeof bytes) {
+        printf("no entropy\n");
+        return 1;
+    }
+    for (unsigned i = 0; i < sizeof bytes; i++) printf("%02x", bytes[i]);
+    printf("\n");
+    struct timespec now;
+    clock_gettime(CLOCK_REALTIME, &now);
+    printf("%lld.%09ld\n", (long long)now.tv_sec, now.tv_nsec);
+    return 0;
+}
+"#;
+    let (workspace, module) = module_for("tape", source, &["-static", "-no-pie"]);
+    let tape = workspace.path().join("answers.tape");
+
+    let mut recording = support::mounts_seeded(&[0x33; 32]);
+    recording.mount(&[b"iso", b"time"], Box::new(runner::store::Clock::new()));
+    recording.record(tape.clone());
+    let (status, first) = boot(&module, recording);
+    assert_eq!(status, 0, "the recorded run failed: {first}");
+    assert!(tape.is_file(), "nothing was recorded");
+
+    // A different world: another seed, and a clock that has moved on.
+    let changed = || {
+        let mut mounts = support::mounts_seeded(&[0x77; 32]);
+        mounts.mount(&[b"iso", b"time"], Box::new(runner::store::Clock::new()));
+        mounts
+    };
+
+    let mut replaying = changed();
+    replaying.replay(&tape).expect("read the tape");
+    let (status, replayed) = boot(&module, replaying);
+    assert_eq!(status, 0, "the replayed run failed: {replayed}");
+    assert_eq!(replayed, first, "the replay diverged from the recording");
+
+    // The control: the same changed world with no tape has to disagree,
+    // or the two agreements above were about nothing.
+    let (status, without) = boot(&module, changed());
+    assert_eq!(status, 0, "the control run failed: {without}");
+    assert_ne!(
+        without, first,
+        "the program's output does not depend on the world, so replaying \
+         it proves nothing"
     );
 }
