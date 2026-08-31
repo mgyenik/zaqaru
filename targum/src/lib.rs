@@ -37,6 +37,7 @@
 pub mod block;
 pub mod exec;
 pub mod flags;
+pub mod quick;
 pub mod space;
 pub mod state;
 
@@ -123,7 +124,7 @@ impl Engine {
                     break;
                 }
                 budget -= 1;
-                match cpu.step(instruction) {
+                match cpu.run(&block.quick[position], instruction) {
                     Ok(Step::Retired) => {}
                     Ok(Step::Syscall) => return Outcome::Syscall,
                     Err(trap) => {

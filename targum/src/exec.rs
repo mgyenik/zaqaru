@@ -29,6 +29,7 @@ pub mod x87;
 use iced_x86::{Code, Instruction, Mnemonic, OpKind, Register};
 
 use crate::flags::{Condition, Rule, bit};
+use crate::quick::{Address, Op, Quick, Source};
 use crate::space::{Fault, Space};
 use crate::state::{Slice, Tcb, Width};
 
@@ -250,6 +251,144 @@ impl<'a> Cpu<'a> {
                 instruction,
                 Some("a `%gs`-prefixed memory operand"),
             ))),
+        }
+    }
+
+    /// Runs a pre-decoded instruction, or falls back to the general path.
+    ///
+    /// The fallback is not a fast-path failure mode — it is the design.
+    /// [`crate::quick`] lowers what it fully understands and declines
+    /// everything else, so this arm carries the instructions nobody has got
+    /// to yet at exactly the speed they ran before.
+    pub fn run(&mut self, quick: &Quick, instruction: &Instruction) -> Result<Step, Trap> {
+        if quick.op == Op::General {
+            return self.step(instruction);
+        }
+        // The same two lines `step` opens with, and they are not
+        // bookkeeping: the run loop reads `rip` afterwards to decide whether
+        // the instruction fell through, branched, or stayed put, so a fast
+        // path that left it alone would re-run the same instruction until
+        // the quantum expired. Nothing lowered here transfers control, so
+        // the answer is always the next instruction.
+        self.tcb.retired += 1;
+        self.tcb.rip = instruction.next_ip();
+        self.quick(quick)
+    }
+
+    /// The whole fast path: a handful of arms over a `u8`, with every
+    /// operand already resolved.
+    fn quick(&mut self, quick: &Quick) -> Result<Step, Trap> {
+        let width = quick.width;
+        // The two ops here that do not read their destination, and they
+        // have to be taken before the read rather than after it. A `mov`
+        // whose destination is a bad address must fault as a *write* — a
+        // read fault names the wrong access, and a handler that resolves
+        // faults by mapping the page would map it readable. The load would
+        // also be real work nobody asked for.
+        match quick.op {
+            // `lea` never touches memory at all: its source *is* the
+            // address, which is why it is not a load.
+            Op::Lea => {
+                let at = self.quick_address(quick)?;
+                return self.quick_store(quick, quick.destination, width, at);
+            }
+            Op::Mov => {
+                let value = self.quick_load(quick, quick.source, width)?;
+                return self.quick_store(quick, quick.destination, width, value);
+            }
+            Op::Push => {
+                let value = self.quick_load(quick, quick.source, width)?;
+                return self.push(width, value);
+            }
+            // The value first, then the destination — so that `pop` into a
+            // memory operand computes its address after the stack pointer
+            // has moved, which is the order the general path uses and the
+            // order the architecture specifies.
+            Op::Pop => {
+                let value = self.pop(width)?;
+                return self.quick_store(quick, quick.destination, width, value);
+            }
+            _ => {}
+        }
+        let left = self.quick_load(quick, quick.destination, width)?;
+        let right = self.quick_load(quick, quick.source, width)?;
+        let result = width.truncate(match quick.op {
+            Op::Add => left.wrapping_add(right),
+            Op::Sub | Op::Cmp => left.wrapping_sub(right),
+            Op::Or => left | right,
+            Op::Xor => left ^ right,
+            // `and` and `test`, which differ only in the write-back.
+            _ => left & right,
+        });
+        self.tcb.flags.record(quick.rule(), width, left, right, result);
+        match quick.writes_back() {
+            true => self.quick_store(quick, quick.destination, width, result),
+            false => Ok(Step::Retired),
+        }
+    }
+
+    /// The address a lowered memory operand computes, segment base included.
+    ///
+    /// The same arithmetic [`Self::unsegmented_address`] does, with the
+    /// constant half already folded and the register lookups already
+    /// resolved to slices — and the thirty-two bit wrap applied to the sum
+    /// rather than to each term, which is where it happens.
+    #[inline]
+    fn quick_address(&self, quick: &Quick) -> Result<u64, Trap> {
+        let address = match quick.address {
+            Address::Fixed(at) => at,
+            Address::Computed { displacement, base, index, scale, narrow } => {
+                let mut at = displacement;
+                if let Some(base) = base {
+                    at = at.wrapping_add(self.tcb.read_register(base));
+                }
+                if let Some(index) = index {
+                    at = at.wrapping_add(self.tcb.read_register(index).wrapping_mul(scale));
+                }
+                match narrow {
+                    true => at & 0xffff_ffff,
+                    false => at,
+                }
+            }
+        };
+        Ok(match quick.segmented {
+            true => address.wrapping_add(self.tcb.fs_base),
+            false => address,
+        })
+    }
+
+    #[inline]
+    fn quick_load(&mut self, quick: &Quick, from: Source, width: Width) -> Result<u64, Trap> {
+        match from {
+            Source::Register(slice) => Ok(self.tcb.read_register(slice)),
+            Source::Immediate(value) => Ok(value),
+            Source::Memory => {
+                let at = self.quick_address(quick)?;
+                Ok(self.space.load(at, width)?)
+            }
+        }
+    }
+
+    #[inline]
+    fn quick_store(
+        &mut self,
+        quick: &Quick,
+        into: Source,
+        width: Width,
+        value: u64,
+    ) -> Result<Step, Trap> {
+        match into {
+            Source::Register(slice) => {
+                self.tcb.write_register(slice, value);
+                Ok(Step::Retired)
+            }
+            Source::Memory => {
+                let at = self.quick_address(quick)?;
+                self.space.store(at, width, value)?;
+                Ok(Step::Retired)
+            }
+            // An immediate destination is not a shape the lowering makes.
+            Source::Immediate(_) => unreachable!("an immediate is never a destination"),
         }
     }
 

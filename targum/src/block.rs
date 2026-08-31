@@ -59,6 +59,11 @@ pub struct Block {
     /// control transfer falls through to here.
     pub end: u64,
     pub instructions: Vec<Instruction>,
+    /// The same instructions, pre-decoded — see [`crate::quick`]. Parallel
+    /// to `instructions` rather than folded into it, because the general
+    /// path still wants the original and a lowered op that had to carry one
+    /// would save nothing.
+    pub quick: Vec<crate::quick::Quick>,
 }
 
 impl Block {
@@ -256,6 +261,7 @@ fn decode(address: u64, space: &Space) -> Result<Block, FetchError> {
                 DecoderError::NoMoreBytes if !instructions.is_empty() => Ok(Block {
                     entry: address,
                     end,
+                    quick: instructions.iter().map(crate::quick::Quick::lower).collect(),
                     instructions,
                 }),
                 DecoderError::NoMoreBytes => Err(FetchError::Fault(Fault {
@@ -277,6 +283,7 @@ fn decode(address: u64, space: &Space) -> Result<Block, FetchError> {
     Ok(Block {
         entry: address,
         end,
+        quick: instructions.iter().map(crate::quick::Quick::lower).collect(),
         instructions,
     })
 }
