@@ -8,6 +8,7 @@
 //! stays small on purpose: two imports, a mount table, and a way to start the
 //! guest.
 
+pub mod net;
 pub mod store;
 
 use store::MountTable;
@@ -35,6 +36,17 @@ const TABLE_EXPORT: &str = "__indirect_function_table";
 /// arrives through the store at `/iso/shutdown/complete` — here so that a
 /// host that mounts nothing can still tell how the run ended.
 pub const BOOT_EXPORT: &str = "kisal_boot";
+
+/// The same, for a container that carries an interpreter instead of a
+/// translation.
+///
+/// Two names rather than one because they are two entry points into two
+/// different things — `kisal_boot` enters a program the bake turned into
+/// wasm functions, `targum_boot` enters a loop over a program the bake
+/// never read — and one runner serves both because everything *around* the
+/// entry is identical: the same image, the same kernel, the same two
+/// imports, the same mount table.
+pub const INTERPRETED_BOOT_EXPORT: &str = "targum_boot";
 
 /// The canonical ABI's alignment for a `list`'s `(pointer, length)` pair.
 const LIST_ALIGNMENT: u32 = 4;
@@ -140,7 +152,18 @@ impl Container {
     /// One call, because a container is one program: the kernel loads it,
     /// enters it, and catches the throw its `exit_group` becomes.
     pub fn boot(&mut self) -> Result<i32> {
-        self.call::<(), i32>(BOOT_EXPORT, ())
+        // Whichever the module has. A container built either way is a
+        // container, and a runner that only knew one name would make the
+        // choice of execution path visible in the command line.
+        let entry = match self
+            .instance
+            .get_func(&mut self.store, INTERPRETED_BOOT_EXPORT)
+            .is_some()
+        {
+            true => INTERPRETED_BOOT_EXPORT,
+            false => BOOT_EXPORT,
+        };
+        self.call::<(), i32>(entry, ())
     }
 
     /// The mount table. A host that cannot see what the guest wrote cannot

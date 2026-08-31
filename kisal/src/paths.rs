@@ -48,6 +48,12 @@ pub const RANDOM_SEED: &[&[u8]] = &[b"iso", b"random", b"bytes", b"32"];
 pub const TIME_REALTIME: &[&[u8]] = &[b"iso", b"time", b"realtime_ns"];
 pub const TIME_MONOTONIC: &[&[u8]] = &[b"iso", b"time", b"monotonic_ns"];
 
+/// The network edge. A container with nothing mounted here has `lo` and
+/// nothing else, which is exactly a Linux network namespace with no
+/// interfaces attached — see `docs/network-plan.md` §11, amendment 1.
+pub const NET_LISTEN: &[&[u8]] = &[b"iso", b"net", b"listen"];
+pub const NET_EVENTS: &[&[u8]] = &[b"iso", b"net", b"events"];
+
 /// Kernel diagnostics. Distinct from guest stderr on purpose: a container's
 /// own output and the kernel's complaints about it must never be interleaved
 /// into one stream that nobody can separate afterwards.

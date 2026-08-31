@@ -2086,6 +2086,16 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
         }
     }
 
+    /// Whether anything in this container is reachable from outside.
+    ///
+    /// The difference between a container at rest and a deadlocked one: a
+    /// process parked on an `accept` for a mapped port is waiting for
+    /// somebody who has not arrived yet, which is what a server does for a
+    /// living, and reporting it as a deadlock would end every idle server.
+    pub fn has_edge(&self) -> bool {
+        !self.sockets.borrow().listeners().is_empty() || !self.sockets.borrow().edges().is_empty()
+    }
+
     /// Whether this container is tracing its syscalls, decided once.
     ///
     /// `None` until something asks, because the store is not reachable

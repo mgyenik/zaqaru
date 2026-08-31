@@ -26,4 +26,10 @@ targum = { path = "../targum" }
 # A cycle Cargo allows, and the honest one: the kernel's tests drive real
 # baked images rather than a hand-written stand-in for one.
 baker = { path = "../baker" }
+# The `interpret` example serves a container to the host, which means real
+# sockets — and the one place they live is the runner's `/iso/net` broker.
+# Sharing it rather than writing a second is the point: the edge the native
+# driver serves and the edge the module serves have to be the same protocol,
+# or the native runs stop being evidence about the module.
+runner = { path = "../runner" }
 libc = "0.2"

@@ -628,6 +628,53 @@ CPython with no host network. Negative control: an epoll-registered
 descriptor closed while a dup survives still fires (the description
 rule, now with a socket behind it).
 
+**N3 — the edge, and the first curl. BUILT, 2026-08-30.**
+`runner/src/net.rs` is the `/iso/net` broker: real `TcpListener`s on host
+threads, one event queue the store answers from, and the protocol section 5
+specifies — `write /iso/net/listen`, `read /iso/net/events`,
+`read /iso/net/conn/{j}/rx/{room}`, `write /iso/net/conn/{j}/tx`. The room
+is in the *path*, so the host never delivers more than the guest's ring can
+hold and real backpressure reaches all the way back to curl.
+`zaqaru-run` takes `-p HOST:GUEST`, repeatable. `Kernel::pump` is the
+kisal half, and it touches kernel state only — rings, the socket arena, the
+store, never any process's memory — which is what lets it run on any turn
+without breaking the rule the process table is built on.
+
+**And the demo answers.** `zaqaru-run hello-django.wasm -p 8081:80`, then
+from another terminal:
+
+```
+$ curl http://localhost:8081/
+<h1>Hello, world!</h1>
+```
+
+Five processes inside one 170 MB `.wasm` — an init script, nginx's master
+and worker, gunicorn's arbiter and worker — with nginx's own access log
+recording `127.0.0.1 - - "GET / HTTP/1.1" 200 34 "-" "curl/8.5.0"`. The
+`docker save` archive is the input and the image's own entrypoint runs it.
+
+Three things the milestone did not anticipate. **A listener's registration
+answers nothing**, and does not need to: an unmapped port simply never
+produces an event, so a loopback-only listener is one with nothing arriving
+on it, and a guest that could tell the difference would be a guest that can
+see its own port mapping — which `docker` does not give it either. **One
+runner serves both paths**: `Container::boot` picks `targum_boot` or
+`kisal_boot` by which the module has, because everything around the entry
+is identical and a runner that knew one name would put the choice of
+execution path in the command line. And **the peer address is not
+optional** — nginx writes it into its access log, so dropping it gives a
+container whose log says `unix:` for every request.
+
+**N4 arrived with it**, because the demo could not work without it. The
+`/iso/net/wait/{ms}` read is built and `System::idle` is where it is
+called: nothing runnable, earliest deadline known, so "wait for an event or
+that long" is the one call that turns a spin into a sleep. `Exit::Deadlocked`
+gained the third verdict this section foresaw — nothing runnable with a
+listener outstanding is a server at rest, not a deadlock. What has *not*
+been done is measuring the idle CPU, which is N4's own acceptance line.
+
+The original text follows.
+
 **N3 — the edge, and the first curl.** The `/iso/net` protocol,
 the pump at its two deterministic points, `NetStore` with `-p`, the
 console tee. Acceptance: `zaqaru-run module.wasm -p 8080:80` around

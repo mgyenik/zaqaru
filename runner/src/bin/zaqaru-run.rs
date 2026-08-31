@@ -15,11 +15,14 @@ use std::process::ExitCode;
 fn main() -> ExitCode {
     let mut path = None;
     let mut trace = None;
+    let mut ports: Vec<(u16, u16)> = Vec::new();
     let mut arguments = std::env::args().skip(1);
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
             "-h" | "--help" => {
-                println!("usage: zaqaru-run <container.wasm> [--trace <file>]");
+                println!(
+                    "usage: zaqaru-run <container.wasm> [-p HOST:GUEST] [--trace <file>]"
+                );
                 return ExitCode::SUCCESS;
             }
             // A syscall trace, in the shape `strace` prints. The guest is
@@ -33,6 +36,27 @@ fn main() -> ExitCode {
                     return ExitCode::from(2);
                 }
             },
+            // `-p HOST:GUEST`, repeatable, the docker convention — and the
+            // capability model's firewall, living host-side as
+            // configuration. A guest port with no mapping is loopback-only,
+            // which is not an error and which the guest cannot tell.
+            "-p" | "--publish" => {
+                let Some(mapping) = arguments.next() else {
+                    eprintln!("zaqaru-run: `-p` needs HOST:GUEST");
+                    return ExitCode::from(2);
+                };
+                let Some((host, guest)) = mapping.split_once(':') else {
+                    eprintln!("zaqaru-run: `-p {mapping}` is not HOST:GUEST");
+                    return ExitCode::from(2);
+                };
+                match (host.parse::<u16>(), guest.parse::<u16>()) {
+                    (Ok(host), Ok(guest)) => ports.push((host, guest)),
+                    _ => {
+                        eprintln!("zaqaru-run: `-p {mapping}` is not two port numbers");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
             other if other.starts_with('-') => {
                 eprintln!("zaqaru-run: unknown option `{other}`");
                 return ExitCode::from(2);
@@ -41,7 +65,7 @@ fn main() -> ExitCode {
         }
     }
     let Some(path) = path else {
-        eprintln!("usage: zaqaru-run <container.wasm> [--trace <file>]");
+        eprintln!("usage: zaqaru-run <container.wasm> [-p HOST:GUEST] [--trace <file>]");
         return ExitCode::from(2);
     };
 
@@ -54,6 +78,15 @@ fn main() -> ExitCode {
     };
 
     let mut table = mounts();
+    // No mount, no edge. A container started without `-p` still binds and
+    // listens happily; nothing outside can reach it, which is exactly a
+    // network namespace with only `lo` in it.
+    if !ports.is_empty() {
+        for (host, guest) in &ports {
+            eprintln!("listening on host port {host} for guest port {guest}");
+        }
+        table.mount(&[b"iso", b"net"], Box::new(runner::net::NetStore::new(ports)));
+    }
     if trace.is_some() {
         let mut config = runner::store::Sink::new();
         // The whole path: a mount table hands its store the path the guest

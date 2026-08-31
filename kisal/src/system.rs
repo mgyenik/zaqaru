@@ -353,6 +353,13 @@ impl<'a, S: Store + Clone> System<'a, S> {
                     Yield::Given
                 }
             };
+            // The edge, at a point that is a pure function of execution: a
+            // process has used a whole slice. Kernel state only — rings, the
+            // socket arena, the store — so it may run on any turn without
+            // breaking the rule the process table is built on.
+            if why == Yield::Quantum && self.slice == 0 {
+                self.current().kernel.pump(None);
+            }
             if !self.schedule(why) {
                 // Nothing runnable anywhere, which is three different things
                 // and only one of them is a deadlock.
@@ -498,11 +505,26 @@ impl<'a, S: Store + Clone> System<'a, S> {
             .filter(|container| container.status.is_none())
             .filter_map(|container| container.process.earliest_deadline())
             .min();
+        // Something outside may still change things. A container with a
+        // listener the host answers for is *at rest*, not deadlocked, and
+        // this is where `docs/network-plan.md` §6 says the difference is
+        // decided.
+        let listening = self.containers.iter().any(|container| {
+            container.status.is_none() && container.process.kernel.has_edge()
+        });
         let Some(deadline) = deadline else {
-            // Nothing is waiting for time, so nothing will change on its
-            // own. Whatever the processes are parked on, no process will
-            // ever post it — which is the honest deadlock the stall report
-            // is written for.
+            if listening {
+                // Wait for the host rather than spin, which is the whole of
+                // N4: nothing here is runnable and there is no deadline, so
+                // "wait for an event or a good long while" *is* a sleep.
+                const PATIENT: u64 = 60_000;
+                self.current().kernel.pump(Some(PATIENT));
+                return true;
+            }
+            // Nothing is waiting for time and nothing is listening, so
+            // nothing will change on its own. Whatever the processes are
+            // parked on, no process will ever post it — which is the honest
+            // deadlock the stall report is written for.
             return false;
         };
         let Some(now) = self.current().kernel.monotonic() else {
@@ -516,6 +538,13 @@ impl<'a, S: Store + Clone> System<'a, S> {
                 continue;
             }
             woken |= self.containers[index].process.expire(now);
+        }
+        if !woken && listening {
+            // Nothing has expired yet and the host may still have something.
+            // Waiting until the earliest deadline turns the spin into a
+            // sleep without ever waiting past a timeout the guest set.
+            let patience = deadline.saturating_sub(now) / 1_000_000;
+            woken |= self.current().kernel.pump(Some(patience.max(1).min(60_000)));
         }
         // Nothing expired *yet*. The deadline is still ahead, so the
         // container is idle rather than stuck, and going round again is

@@ -245,6 +245,14 @@ impl Default for Options {
 pub struct Socket {
     pub family: i32,
     pub kind: i32,
+    /// The host's number for this connection or listener, when it is one the
+    /// host terminates.
+    ///
+    /// `None` for everything that stays inside the container, which is most
+    /// of it: a loopback connection has both ends in the guest and never
+    /// reaches the store. This is what tells the pump which sockets have a
+    /// far side it has to move bytes to.
+    pub edge: Option<u32>,
     /// How many descriptors name it, across every process.
     pub references: u32,
     pub state: State,
@@ -264,6 +272,7 @@ impl Sockets {
         let socket = Socket {
             family,
             kind,
+            edge: None,
             references: 1,
             state: State::Idle,
             options: Options::default(),
@@ -340,6 +349,30 @@ impl Sockets {
             State::Bound(address) | State::Listening { address, .. } => address == wanted,
             _ => false,
         })
+    }
+
+    /// Every listening socket, by identifier.
+    pub fn listeners(&self) -> Vec<u32> {
+        self.entries
+            .iter()
+            .enumerate()
+            .filter_map(|(id, held)| {
+                matches!(held.as_ref()?.state, State::Listening { .. }).then_some(id as u32)
+            })
+            .collect()
+    }
+
+    /// Every connected socket the host terminates, with its host number.
+    pub fn edges(&self) -> Vec<(u32, u32)> {
+        self.entries
+            .iter()
+            .enumerate()
+            .filter_map(|(id, held)| {
+                let socket = held.as_ref()?;
+                let edge = socket.edge?;
+                matches!(socket.state, State::Connected(_)).then_some((id as u32, edge))
+            })
+            .collect()
     }
 
     /// A port nothing is using, for a `connect` from an unbound socket.
@@ -928,11 +961,18 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
         let Some(socket) = sockets.get_mut(id) else {
             return Outcome::Done(Errno::BadFile.as_result());
         };
+        let port = address.port();
         socket.state = State::Listening {
             address,
             backlog,
             queue: std::collections::VecDeque::new(),
         };
+        drop(sockets);
+        // The host is told, so that a mapped port can start accepting. An
+        // `AF_UNIX` listener has no port and never crosses.
+        if let Some(port) = port {
+            self.register_listener(port);
+        }
         Outcome::Done(0)
     }
 
@@ -1520,4 +1560,256 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
     fn write_address_into(&mut self, at: u64, length_at: u64, address: &Address) -> Result<(), Errno> {
         self.write_address(at, length_at, address)
     }
+}
+
+impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_, S, M> {
+    /// Tells the host a listener exists, and records whether it answered.
+    ///
+    /// A mapped port opens a real host socket and the guest becomes
+    /// reachable from outside; an unmapped one is loopback-only. **Neither
+    /// is an error and the guest cannot tell**, which is exactly what
+    /// `docker` without `-p` does — and a container with no `/iso/net` mount
+    /// at all simply has no edge, which is the whole of the capability
+    /// model.
+    /// Nothing is read back, and that is not a shortcut. Whether the port
+    /// was mapped changes nothing this kernel does: an unmapped one simply
+    /// never produces an event, so the listener is loopback-only by having
+    /// nothing arrive on it. A guest that could tell the difference would be
+    /// a guest that can see its own port mapping, which `docker` does not
+    /// give it either.
+    fn register_listener(&mut self, port: u16) {
+        let _ = self
+            .store
+            .write(crate::paths::NET_LISTEN, port.to_string().as_bytes());
+    }
+
+    /// Moves bytes across the edge, in both directions, and turns the host's
+    /// events into arena state.
+    ///
+    /// **Kernel state only.** Rings, the socket arena, the store — never any
+    /// process's memory — which is what lets this run on any turn without
+    /// breaking the rule the whole process table is built on. It runs at two
+    /// points that are a pure function of execution: when a process has used
+    /// a whole slice, and when nothing in the container can run.
+    pub fn pump(&mut self, waiting: Option<u64>) -> bool {
+        let mut moved = false;
+        // Out first, so a response written just before the container went
+        // idle is on its way before anything waits.
+        for (id, conn) in self.sockets.borrow().edges() {
+            let Some(ring) = self
+                .sockets
+                .borrow()
+                .endpoint(id)
+                .map(|endpoint| endpoint.transmit)
+            else {
+                continue;
+            };
+            let queued = self.rings.borrow().queued(ring);
+            if queued == 0 {
+                continue;
+            }
+            let mut bytes = vec![0u8; queued];
+            self.rings.borrow_mut().take(ring, &mut bytes);
+            let path: Vec<Vec<u8>> = vec![
+                b"iso".to_vec(),
+                b"net".to_vec(),
+                b"conn".to_vec(),
+                conn.to_string().into_bytes(),
+                b"tx".to_vec(),
+            ];
+            let borrowed: Vec<&[u8]> = path.iter().map(|held| held.as_slice()).collect();
+            self.store.write(&borrowed, &bytes);
+            moved = true;
+        }
+        // Then in. A wait is the same read with a deadline on it, which is
+        // the one store read allowed to take time — see
+        // `docs/network-plan.md` §6.
+        let mut batch = Vec::new();
+        let present = match waiting {
+            Some(milliseconds) => {
+                let path: Vec<Vec<u8>> = vec![
+                    b"iso".to_vec(),
+                    b"net".to_vec(),
+                    b"wait".to_vec(),
+                    milliseconds.to_string().into_bytes(),
+                ];
+                let borrowed: Vec<&[u8]> = path.iter().map(|held| held.as_slice()).collect();
+                self.store.read(&borrowed, &mut batch)
+            }
+            None => self.store.read(crate::paths::NET_EVENTS, &mut batch),
+        };
+        if present != crate::abi::StoreOutcome::Present {
+            return moved;
+        }
+        for line in batch.split(|byte| *byte == b'\n') {
+            if self.handle_event(line) {
+                moved = true;
+            }
+        }
+        moved
+    }
+
+    /// One line of the host's event stream.
+    fn handle_event(&mut self, line: &[u8]) -> bool {
+        let mut words = line.split(|byte| *byte == b' ');
+        let kind = words.next().unwrap_or(b"");
+        let number = |held: Option<&[u8]>| -> Option<u32> {
+            core::str::from_utf8(held?).ok()?.trim().parse().ok()
+        };
+        match kind {
+            b"open" => {
+                let (Some(conn), Some(port)) = (number(words.next()), number(words.next())) else {
+                    return false;
+                };
+                // Who connected, which `accept4` and `getpeername` answer
+                // with — and which nginx writes into its access log, so a
+                // container whose log says `unix:` for every request is one
+                // that dropped this on the floor.
+                let peer = words.next().and_then(peer_address).unwrap_or_default();
+                self.accept_edge(conn, port as u16, peer)
+            }
+            b"data" => {
+                let Some(conn) = number(words.next()) else {
+                    return false;
+                };
+                self.drain_edge(conn)
+            }
+            b"eof" => {
+                let Some(conn) = number(words.next()) else {
+                    return false;
+                };
+                // Take what is left, then let go of the writing end — which
+                // makes the guest's next read drain and then return zero,
+                // exactly as a pipe whose last writer closed does.
+                self.drain_edge(conn);
+                let Some(id) = self.socket_for_edge(conn) else {
+                    return false;
+                };
+                let receive = self
+                    .sockets
+                    .borrow()
+                    .endpoint(id)
+                    .map(|endpoint| endpoint.receive);
+                if let Some(receive) = receive {
+                    self.rings.borrow_mut().release(receive, End::Write);
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// A connection the host accepted, materialized as one the guest can.
+    ///
+    /// From here it is indistinguishable from a loopback connection, which
+    /// is the seam the whole design turns on: **everything above the rings
+    /// is one code path**.
+    fn accept_edge(&mut self, conn: u32, port: u16, peer: Address) -> bool {
+        let wanted = Address::Inet {
+            address: INADDR_LOOPBACK,
+            port,
+        };
+        let Some(listener) = self.sockets.borrow().listener_for(&wanted) else {
+            return false;
+        };
+        let up = self.rings.borrow_mut().create();
+        let down = self.rings.borrow_mut().create();
+        let mut sockets = self.sockets.borrow_mut();
+        let (family, kind) = match sockets.get(listener) {
+            Some(socket) => (socket.family, socket.kind),
+            None => return false,
+        };
+        let accepted = sockets.create(family, kind);
+        if let Some(socket) = sockets.get_mut(accepted) {
+            socket.edge = Some(conn);
+            socket.state = State::Connected(Endpoint {
+                // The guest reads what the host wrote, and writes what the
+                // host will read.
+                receive: down,
+                transmit: up,
+                local: wanted,
+                peer,
+                read_shut: false,
+                write_shut: false,
+            });
+        }
+        sockets.enqueue(listener, accepted).is_ok()
+    }
+
+    /// Takes what the host has for a connection, up to the ring's room.
+    ///
+    /// The room is *in the path*, so the host never delivers more than
+    /// there is space for — which is how the guest's backpressure reaches
+    /// all the way back to whoever is talking to us.
+    fn drain_edge(&mut self, conn: u32) -> bool {
+        let Some(id) = self.socket_for_edge(conn) else {
+            return false;
+        };
+        let Some(receive) = self
+            .sockets
+            .borrow()
+            .endpoint(id)
+            .map(|endpoint| endpoint.receive)
+        else {
+            return false;
+        };
+        let room = self.rings.borrow().room(receive);
+        if room == 0 {
+            return false;
+        }
+        let path: Vec<Vec<u8>> = vec![
+            b"iso".to_vec(),
+            b"net".to_vec(),
+            b"conn".to_vec(),
+            conn.to_string().into_bytes(),
+            b"rx".to_vec(),
+            room.to_string().into_bytes(),
+        ];
+        let borrowed: Vec<&[u8]> = path.iter().map(|held| held.as_slice()).collect();
+        let mut bytes = Vec::new();
+        if self.store.read(&borrowed, &mut bytes) != crate::abi::StoreOutcome::Present
+            || bytes.is_empty()
+        {
+            return false;
+        }
+        self.rings.borrow_mut().give(receive, &bytes);
+        true
+    }
+
+    fn socket_for_edge(&self, conn: u32) -> Option<u32> {
+        self.sockets
+            .borrow()
+            .edges()
+            .into_iter()
+            .find(|(_, edge)| *edge == conn)
+            .map(|(id, _)| id)
+    }
+}
+
+/// Parses the `address:port` the host reports a peer as.
+///
+/// Faithful live *and under replay*, because it arrived on the tape: the
+/// address is a store answer like any other, so a recorded run reproduces
+/// the same one.
+fn peer_address(text: &[u8]) -> Option<Address> {
+    let text = core::str::from_utf8(text).ok()?.trim();
+    let (address, port) = text.rsplit_once(':')?;
+    // IPv6 arrives bracketed and this kernel has no `AF_INET6`; reporting an
+    // unnamed peer is better than reporting half an address as a whole one.
+    if address.contains(':') {
+        return None;
+    }
+    let mut packed = 0u32;
+    let mut parts = 0;
+    for part in address.split('.') {
+        packed = (packed << 8) | u32::from(part.parse::<u8>().ok()?);
+        parts += 1;
+    }
+    if parts != 4 {
+        return None;
+    }
+    Some(Address::Inet {
+        address: packed,
+        port: port.parse().ok()?,
+    })
 }

@@ -30,6 +30,12 @@ use kisal::syscall::{Enforcement, Kernel};
 #[derive(Clone)]
 struct Terminal {
     trace: bool,
+    /// The `/iso/net` broker, when the caller asked for one with `-p`.
+    ///
+    /// Shared rather than cloned: a fork copies the store, and two processes
+    /// with separate copies of the network would each accept a different
+    /// half of the connections.
+    net: Option<std::rc::Rc<std::cell::RefCell<runner::net::NetStore>>>,
     /// Where this container's monotonic clock starts. A container sees one
     /// that begins near zero at boot, which is all `CLOCK_MONOTONIC`
     /// promises: an origin that does not move during a run, never a
@@ -55,6 +61,23 @@ impl Store for Terminal {
         if path == kisal::paths::RANDOM_SEED {
             into.extend_from_slice(&[0x5a; 32]);
             return StoreOutcome::Present;
+        }
+        // The edge, if this container was given one.
+        if path.first().map(|held| *held) == Some(&b"iso"[..])
+            && path.get(1).map(|held| *held) == Some(&b"net"[..])
+        {
+            let Some(net) = self.net.as_ref() else {
+                return StoreOutcome::Absent;
+            };
+            let owned: Vec<Vec<u8>> = path.iter().map(|held| held.to_vec()).collect();
+            return match runner::store::Store::read(&mut *net.borrow_mut(), &owned) {
+                Ok(Some(bytes)) => {
+                    into.extend_from_slice(&bytes);
+                    StoreOutcome::Present
+                }
+                Ok(None) => StoreOutcome::Absent,
+                Err(_) => StoreOutcome::Failed,
+            };
         }
         // The two clocks, in the format `runner::store::Clock` answers with:
         // nanoseconds as decimal text. Without them `clock_gettime` refuses
@@ -86,6 +109,18 @@ impl Store for Terminal {
 
     fn write(&mut self, path: &[&[u8]], bytes: &[u8]) -> StoreOutcome {
         use std::io::Write;
+        if path.first().map(|held| *held) == Some(&b"iso"[..])
+            && path.get(1).map(|held| *held) == Some(&b"net"[..])
+        {
+            let Some(net) = self.net.as_ref() else {
+                return StoreOutcome::Absent;
+            };
+            let owned: Vec<Vec<u8>> = path.iter().map(|held| held.to_vec()).collect();
+            return match runner::store::Store::write(&mut *net.borrow_mut(), &owned, bytes) {
+                Ok(_) => StoreOutcome::Present,
+                Err(_) => StoreOutcome::Failed,
+            };
+        }
         let text = String::from_utf8_lossy(bytes);
         if path == kisal::paths::CONSOLE_STDOUT {
             print!("{text}");
@@ -98,7 +133,30 @@ impl Store for Terminal {
 }
 
 fn main() {
-    let mut arguments = std::env::args().skip(1);
+    let mut ports: Vec<(u16, u16)> = Vec::new();
+    let raw: Vec<String> = std::env::args().skip(1).collect();
+    let mut rest: Vec<String> = Vec::new();
+    let mut index = 0;
+    while index < raw.len() {
+        match raw[index].as_str() {
+            // The same `-p HOST:GUEST` `zaqaru-run` takes, so a stack can be
+            // served from the native driver while it is being built and from
+            // the module once it is.
+            "-p" | "--publish" if index + 1 < raw.len() => {
+                if let Some((host, guest)) = raw[index + 1].split_once(':')
+                    && let (Ok(host), Ok(guest)) = (host.parse(), guest.parse())
+                {
+                    ports.push((host, guest));
+                }
+                index += 2;
+            }
+            _ => {
+                rest.push(raw[index].clone());
+                index += 1;
+            }
+        }
+    }
+    let mut arguments = rest.into_iter();
     let root = PathBuf::from(arguments.next().unwrap_or_else(|| {
         eprintln!("usage: interpret <root> [argv...]");
         std::process::exit(2);
@@ -156,6 +214,17 @@ fn main() {
         Terminal {
             trace: std::env::var_os("KISAL_TRACE").is_some(),
             started: std::time::Instant::now(),
+            net: match ports.is_empty() {
+                true => None,
+                false => {
+                    for (host, guest) in &ports {
+                        eprintln!("listening on host port {host} for guest port {guest}");
+                    }
+                    Some(std::rc::Rc::new(std::cell::RefCell::new(
+                        runner::net::NetStore::new(ports),
+                    )))
+                }
+            },
         },
         Interpreted::new(),
         image,
