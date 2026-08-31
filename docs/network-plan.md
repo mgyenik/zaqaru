@@ -784,9 +784,25 @@ What is *not* in the diff matters as much: no call appears in the native
 trace that this kernel would have refused, and no shared call's count
 differs by more than a factor of two.
 
-**What is left of N5** is the recorded tape replaying to a bit-identical
-run — section 5's record/replay claim, demonstrated rather than asserted.
-Nothing records a tape yet.
+**And the tape replays**, which was the last of it. `zaqaru-run --record`
+keeps every answer the host gave and `--replay` answers from that instead
+of from the world; `demo/hello-django/replay.sh` records a served HTTP
+session and replays it **with no network at all** — no `-p`, nothing
+mounted at `/iso/net` — and the container's output is identical byte for
+byte, down to nginx's access-log timestamp and the clean `SIGTERM`
+shutdown after it.
+
+Reads only, and that is not a limitation: a write *leaves* the container,
+and replaying one would mean sending the same bytes to a real socket a
+second time, which is repeating an effect rather than reproducing a run.
+
+One thing it had to be taught, and it is the kind of thing only running it
+finds: **a tape holds every answer, including a refusal.** A read of a
+path nothing is mounted at fails, and that failure is an answer the guest
+acts on — an unmounted `/iso/config/trace` is how a container learns it is
+not being traced. Recording only the successful ones shifted every later
+entry by one, and the replay handed the guest its entropy seed where it
+had asked for a configuration flag.
 
 The original text follows.
 

@@ -16,12 +16,15 @@ fn main() -> ExitCode {
     let mut path = None;
     let mut trace = None;
     let mut ports: Vec<(u16, u16)> = Vec::new();
+    let mut record = None;
+    let mut replay = None;
     let mut arguments = std::env::args().skip(1);
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
             "-h" | "--help" => {
                 println!(
-                    "usage: zaqaru-run <container.wasm> [-p HOST:GUEST] [--trace <file>]"
+                    "usage: zaqaru-run <container.wasm> [-p HOST:GUEST] \
+                     [--trace <file>] [--record <tape> | --replay <tape>]"
                 );
                 return ExitCode::SUCCESS;
             }
@@ -57,6 +60,24 @@ fn main() -> ExitCode {
                     }
                 }
             }
+            // Every answer the host gives, kept — which is the whole of a
+            // run's nondeterminism, because everything else is a function
+            // of the guest's own execution.
+            "--record" => match arguments.next() {
+                Some(where_to) => record = Some(std::path::PathBuf::from(where_to)),
+                None => {
+                    eprintln!("zaqaru-run: `--record` needs a file to write to");
+                    return ExitCode::from(2);
+                }
+            },
+            // And the same run again, from the tape rather than the world.
+            "--replay" => match arguments.next() {
+                Some(from) => replay = Some(std::path::PathBuf::from(from)),
+                None => {
+                    eprintln!("zaqaru-run: `--replay` needs a tape to read");
+                    return ExitCode::from(2);
+                }
+            },
             other if other.starts_with('-') => {
                 eprintln!("zaqaru-run: unknown option `{other}`");
                 return ExitCode::from(2);
@@ -97,6 +118,19 @@ fn main() -> ExitCode {
         );
         table.mount(&[b"iso", b"config"], Box::new(config));
     }
+    if record.is_some() && replay.is_some() {
+        eprintln!("zaqaru-run: `--record` and `--replay` are opposite ends of the same tape");
+        return ExitCode::from(2);
+    }
+    if let Some(to) = &record {
+        table.record(to.clone());
+    }
+    if let Some(from) = &replay {
+        if let Err(error) = table.replay(from) {
+            eprintln!("zaqaru-run: {error}");
+            return ExitCode::from(2);
+        }
+    }
     let mut container = match runner::Container::instantiate(&bytes, table) {
         Ok(container) => container,
         Err(error) => {
@@ -111,6 +145,12 @@ fn main() -> ExitCode {
     // container's output must not appear twice because the runner kept a
     // copy of it.
     let _ = &mut container;
+
+    match container.mounts().keep_tape() {
+        Some(Ok(answers)) => eprintln!("zaqaru-run: recorded {answers} host answers"),
+        Some(Err(error)) => eprintln!("zaqaru-run: {error}"),
+        None => {}
+    }
 
     if let Some(where_to) = &trace {
         let lines = read(&mut container, &[b"iso", b"log", b"debug"]);

@@ -188,6 +188,96 @@ impl Store for Shutdown {
     }
 }
 
+/// One thing the host was asked and what it said.
+pub type Answer = (Vec<Vec<u8>>, Result<Option<Vec<u8>>, String>);
+
+/// A tape, as bytes: a count, then each entry as its path segments and its
+/// answer, every piece length-prefixed.
+///
+/// Deliberately dull. A tape is read by exactly one program and its value is
+/// that it is exact, so the format optimises for having no way to be
+/// ambiguous about a byte — not for being readable, which is what the
+/// trace is for.
+fn encode(entries: &[Answer]) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    let mut piece = |held: &[u8], into: &mut Vec<u8>| {
+        into.extend_from_slice(&(held.len() as u32).to_le_bytes());
+        into.extend_from_slice(held);
+    };
+    bytes.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    for (path, answer) in entries {
+        bytes.extend_from_slice(&(path.len() as u32).to_le_bytes());
+        for segment in path {
+            piece(segment, &mut bytes);
+        }
+        match answer {
+            // Three kinds, and they are three different things a guest
+            // branches on: bytes, nothing at that path, and a store that
+            // could not answer at all.
+            Ok(Some(held)) => {
+                bytes.push(1);
+                piece(held, &mut bytes);
+            }
+            Ok(None) => bytes.push(0),
+            Err(why) => {
+                bytes.push(2);
+                piece(why.as_bytes(), &mut bytes);
+            }
+        }
+    }
+    bytes
+}
+
+type Entries = std::collections::VecDeque<Answer>;
+
+fn decode(bytes: &[u8]) -> Result<Entries, String> {
+    let mut at = 0;
+    let mut word = |at: &mut usize| -> Result<usize, String> {
+        if *at + 4 > bytes.len() {
+            return Err(String::from("a tape that ends inside a length"));
+        }
+        let held = u32::from_le_bytes(bytes[*at..*at + 4].try_into().expect("four bytes"));
+        *at += 4;
+        Ok(held as usize)
+    };
+    let count = word(&mut at)?;
+    let mut entries = Entries::new();
+    for _ in 0..count {
+        let segments = word(&mut at)?;
+        let mut path = Vec::new();
+        for _ in 0..segments {
+            let length = word(&mut at)?;
+            if at + length > bytes.len() {
+                return Err(String::from("a tape that ends inside a path"));
+            }
+            path.push(bytes[at..at + length].to_vec());
+            at += length;
+        }
+        if at >= bytes.len() {
+            return Err(String::from("a tape that ends where an answer should be"));
+        }
+        let kind = bytes[at];
+        at += 1;
+        let mut held = |at: &mut usize| -> Result<Vec<u8>, String> {
+            let length = word(at)?;
+            if *at + length > bytes.len() {
+                return Err(String::from("a tape that ends inside an answer"));
+            }
+            let taken = bytes[*at..*at + length].to_vec();
+            *at += length;
+            Ok(taken)
+        };
+        let answer = match kind {
+            0 => Ok(None),
+            1 => Ok(Some(held(&mut at)?)),
+            2 => Err(String::from_utf8_lossy(&held(&mut at)?).into_owned()),
+            other => return Err(format!("a tape entry of kind {other}")),
+        };
+        entries.push_back((path, answer));
+    }
+    Ok(entries)
+}
+
 /// What is mounted where, resolved by longest prefix.
 ///
 /// Longest-prefix rather than exact match because a mount is a *subtree*:
@@ -197,6 +287,44 @@ impl Store for Shutdown {
 #[derive(Default)]
 pub struct MountTable {
     mounts: Vec<(Vec<Vec<u8>>, Box<dyn Store>)>,
+    tape: Option<Tape>,
+}
+
+/// A record of every answer the host gave, or a replay of one.
+///
+/// **The design's determinism claim, made checkable.** Nothing inside the
+/// container is nondeterministic: the schedule is a function of retired
+/// instructions, the guest's instructions are a function of its own bytes,
+/// and every input from outside — the clock, the entropy seed, the network,
+/// a shutdown request — arrives as a store *read*. So the sequence of read
+/// answers is the entire nondeterminism of a run, and recording it is
+/// recording the run.
+///
+/// Reads only. A write leaves the container; replaying one would mean
+/// sending the same bytes to a real socket a second time, which is not
+/// reproducing a run, it is repeating an effect.
+///
+/// **Every answer, including a refusal.** A read of a path nothing is
+/// mounted at fails, and that failure is an answer the guest acts on — an
+/// unmounted `/iso/config/trace` is how a container learns it is not being
+/// traced. Recording only the successful ones shifts every later entry by
+/// one, and the replay then hands the guest its entropy seed where it asked
+/// for a configuration flag. Which is precisely what happened the first time
+/// this was written.
+///
+/// The path is recorded beside the answer and checked on replay. It is not
+/// redundant: if a replayed run asks a *different* question than the
+/// recorded one did, the determinism claim is false and this is where that
+/// is found — loudly, at the first divergence, rather than as a run that
+/// quietly goes somewhere else.
+pub enum Tape {
+    Recording {
+        entries: Vec<Answer>,
+        to: std::path::PathBuf,
+    },
+    Replaying {
+        entries: std::collections::VecDeque<Answer>,
+    },
 }
 
 impl MountTable {
@@ -228,10 +356,64 @@ impl MountTable {
     }
 
     pub fn read(&mut self, path: &[Vec<u8>]) -> Result<Option<Vec<u8>>, String> {
-        match self.resolve(path) {
+        // A replay never reaches a store at all: the tape *is* the host.
+        if let Some(Tape::Replaying { entries }) = &mut self.tape {
+            let Some((asked, answer)) = entries.pop_front() else {
+                return Err(format!(
+                    "the tape ran out at {} — the replayed run asked more of \
+                     the host than the recorded one did",
+                    render(path)
+                ));
+            };
+            if asked != path {
+                return Err(format!(
+                    "the tape says {} and the run asked {} — the replay \
+                     diverged, which means something in the container is not \
+                     a function of its inputs",
+                    render(&asked),
+                    render(path)
+                ));
+            }
+            return answer;
+        }
+        let answer = match self.resolve(path) {
             Some(store) => store.read(path),
             None => Err(format!("nothing is mounted at {}", render(path))),
+        };
+        if let Some(Tape::Recording { entries, .. }) = &mut self.tape {
+            entries.push((path.to_vec(), answer.clone()));
         }
+        answer
+    }
+
+    /// Starts recording every answer, to be written when the run ends.
+    pub fn record(&mut self, to: std::path::PathBuf) {
+        self.tape = Some(Tape::Recording {
+            entries: Vec::new(),
+            to,
+        });
+    }
+
+    /// Answers from a tape instead of from the stores.
+    pub fn replay(&mut self, from: &std::path::Path) -> Result<(), String> {
+        let bytes = std::fs::read(from).map_err(|error| format!("reading {from:?}: {error}"))?;
+        Ok(self.tape = Some(Tape::Replaying {
+            entries: decode(&bytes)?,
+        }))
+    }
+
+    /// Writes a recording out, if one was being made. Answers how many
+    /// answers it holds.
+    pub fn keep_tape(&mut self) -> Option<Result<usize, String>> {
+        let Some(Tape::Recording { entries, to }) = self.tape.take() else {
+            return None;
+        };
+        let held = entries.len();
+        Some(
+            std::fs::write(&to, encode(&entries))
+                .map(|()| held)
+                .map_err(|error| format!("writing {to:?}: {error}")),
+        )
     }
 
     pub fn write(&mut self, path: &[Vec<u8>], data: &[u8]) -> Result<Vec<Vec<u8>>, String> {
