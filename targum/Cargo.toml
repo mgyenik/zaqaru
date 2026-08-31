@@ -17,6 +17,10 @@ crate-type = ["staticlib", "rlib"]
 # one place this engine cannot afford anything.
 [features]
 histogram = []
+# The same bargain for addresses: which guest code a run spends itself in,
+# counted exactly, at the cost of running several times slower while it is
+# being counted.
+profile = []
 
 [dependencies]
 # Decoding and the RFLAGS-effect tables, and nothing else: no encoder, no

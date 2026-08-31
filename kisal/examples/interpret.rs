@@ -19,6 +19,92 @@ use kisal::run::{Exit, Process};
 use kisal::system::System;
 use kisal::syscall::{Enforcement, Kernel};
 
+/// Turns counted addresses into "which file, and how much of the run".
+///
+/// Two tables. The first is by mapped file, which answers the question a
+/// container is actually slow for — a Python interpreter loop being itself
+/// is one answer and half a run inside `memcpy` is a different one. The
+/// second is the hottest individual addresses with their offset inside that
+/// file, which is what `nm` needs to turn them into names.
+fn attribute(hot: &[(u64, u64)], total: u64, maps: &str) -> String {
+    use std::fmt::Write;
+
+    // `start-end ... name`, which is what `render_maps` writes.
+    let regions: Vec<(u64, u64, u64, String)> = maps
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let (from, to) = fields.next()?.split_once('-')?;
+            let start = u64::from_str_radix(from, 16).ok()?;
+            let end = u64::from_str_radix(to, 16).ok()?;
+            let offset = fields.nth(1).and_then(|held| u64::from_str_radix(held, 16).ok())?;
+            let name = fields.last().unwrap_or("").to_string();
+            Some((start, end, offset, name))
+        })
+        .collect();
+    let find = |address: u64| {
+        regions
+            .iter()
+            .find(|(start, end, _, _)| address >= *start && address < *end)
+    };
+
+    let mut by_file: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    for (address, count) in hot {
+        let name = match find(*address) {
+            Some((_, _, _, name)) if !name.is_empty() => name.clone(),
+            _ => String::from("(anonymous)"),
+        };
+        *by_file.entry(name).or_insert(0) += count;
+    }
+    let mut files: Vec<(String, u64)> = by_file.into_iter().collect();
+    files.sort_by(|left, right| right.1.cmp(&left.1));
+
+    let mut out = format!("\n{total} instructions retired, by mapped file:\n\n");
+    for (name, count) in files.iter().take(15) {
+        let _ = writeln!(
+            out,
+            "  {:>6.2}%  {:>14}  {name}",
+            *count as f64 / total as f64 * 100.0,
+            count
+        );
+    }
+    // The whole profile, machine-readable, when somebody asks for it: an
+    // engine cannot name a function and `nm` cannot count instructions, so
+    // the join happens outside.
+    if let Ok(path) = std::env::var("TARGUM_PROFILE_OUT") {
+        let mut dump = String::new();
+        for (address, count) in hot {
+            match find(*address) {
+                Some((start, _, offset, name)) if !name.is_empty() => {
+                    let _ = writeln!(dump, "{name}\t{}\t{count}", address - start + offset);
+                }
+                _ => {
+                    let _ = writeln!(dump, "(anonymous)\t{address}\t{count}");
+                }
+            }
+        }
+        let _ = std::fs::write(&path, dump);
+        let _ = writeln!(out, "\nfull profile written to {path}");
+    }
+    let _ = writeln!(out, "\nhottest addresses, with the offset `nm` wants:\n");
+    let _ = writeln!(out, "  {:>6} {:>14}  {:<18} {}", "share", "retired", "file+offset", "address");
+    for (address, count) in hot.iter().take(30) {
+        let (where_, offset) = match find(*address) {
+            Some((start, _, offset, name)) if !name.is_empty() => {
+                (name.clone(), address - start + offset)
+            }
+            _ => (String::from("(anonymous)"), *address),
+        };
+        let _ = writeln!(
+            out,
+            "  {:>5.2}% {count:>14}  {:#018x} {where_}",
+            *count as f64 / total as f64 * 100.0,
+            offset
+        );
+    }
+    out
+}
+
 /// A store that puts the guest's console on this process's.
 ///
 /// `Clone` because a fork clones the store, and what that means is the
@@ -279,6 +365,14 @@ fn main() {
     // faster place to take the measurement.
     if let Some(table) = targum::histogram::report() {
         eprint!("{table}");
+    }
+    // Likewise `--features targum/profile`. Addresses are attributed
+    // against *this* process's address space, so the report is honest for a
+    // container running one process and misleading for a tree of them —
+    // which is why the thing to profile is a single `python -c` rather than
+    // the whole server.
+    if let Some((hot, total)) = targum::profile::hot() {
+        eprint!("{}", attribute(&hot, total, &process.kernel.render_maps()));
     }
     match exit {
         Exit::Status(status) => std::process::exit(status),

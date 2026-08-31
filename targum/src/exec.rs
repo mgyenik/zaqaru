@@ -279,6 +279,7 @@ impl<'a> Cpu<'a> {
     /// engine.
     pub fn advance(&mut self, quick: &Quick, instruction: &Instruction) -> Result<(), Trap> {
         crate::histogram::record(instruction, quick.op != Op::General);
+        crate::profile::record(instruction.ip());
         if quick.op == Op::General {
             // The general path counts and sets `rip` itself. Nothing in a
             // straight-through prefix reads it, so letting it write one is
@@ -292,6 +293,7 @@ impl<'a> Cpu<'a> {
 
     pub fn run(&mut self, quick: &Quick, instruction: &Instruction) -> Result<Step, Trap> {
         crate::histogram::record(instruction, quick.op != Op::General);
+        crate::profile::record(instruction.ip());
         if quick.op == Op::General {
             return self.step(instruction);
         }

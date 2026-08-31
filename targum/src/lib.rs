@@ -38,6 +38,7 @@ pub mod block;
 pub mod exec;
 pub mod flags;
 pub mod histogram;
+pub mod profile;
 pub mod quick;
 pub mod space;
 pub mod state;

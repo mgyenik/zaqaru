@@ -382,7 +382,10 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
     /// The format is fixed by what that parser accepts —
     /// `start-end perms offset dev:dev inode path`, one line per mapping, in
     /// address order.
-    pub(crate) fn render_maps(&self) -> String {
+    /// Public because a profile is addresses and a reader needs names: the
+    /// engine counts where a guest spent itself and only the kernel knows
+    /// what is mapped there.
+    pub fn render_maps(&self) -> String {
         let mut rendered = String::new();
         for vma in self.space.vmas() {
             hex(&mut rendered, vma.start);
