@@ -46,6 +46,13 @@ pub enum Errno {
     AddressUnavailable = 99,
     /// `ECONNREFUSED`: nothing is listening there, or its backlog is full.
     ConnectionRefused = 111,
+    /// `ENETUNREACH`: there is no route to that address. This container is a
+    /// network namespace holding only `lo` — it is told of no interface at
+    /// all — so every address outside `127.0.0.0/8` is unreachable, and
+    /// saying so is a different fact from `ECONNREFUSED`. A program that
+    /// hears "refused" concludes the service is down and retries; one that
+    /// hears "unreachable" concludes there is no network, which is true.
+    NetworkUnreachable = 101,
     /// `ENOTCONN`: the socket is not connected, which `getpeername` on a
     /// listener answers — gunicorn asks, in the traced baseline.
     NotConnected = 107,
@@ -153,6 +160,7 @@ impl Errno {
             Self::AddressInUse => "EADDRINUSE",
             Self::AddressUnavailable => "EADDRNOTAVAIL",
             Self::ConnectionRefused => "ECONNREFUSED",
+            Self::NetworkUnreachable => "ENETUNREACH",
             Self::NotConnected => "ENOTCONN",
             Self::AlreadyConnected => "EISCONN",
             Self::ProtocolUnsupported => "EPROTONOSUPPORT",

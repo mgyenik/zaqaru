@@ -592,10 +592,15 @@ distinction glibc's `nscd` probe turns on; and the options with
 run rather than reasoned about: delete the socket half of the reference
 census and the socketpair test deadlocks.
 
-**What is left of N1**: `recvmsg`/`sendmsg`, which N0 found on the
-*shutdown* path — nginx's master tells its worker to stop over their
-channel socketpair — and `eventfd2`. Neither is on the request path, and
-both are small; they land with N2.
+**What was left of N1**, and is not any more: `recvmsg`/`sendmsg`, which
+N0 found on the *shutdown* path — nginx's master tells its worker to
+stop over their channel socketpair — and `eventfd2`. All three landed
+with N2. `recvmsg` cost one thing this text did not predict: nginx
+passes a control buffer on every channel message, so refusing a
+non-null `msg_control` refuses the shutdown path. Only *sending*
+ancillary data is refused now; on receive, `msg_controllen` and
+`msg_flags` are both cleared, and leaving `msg_flags` alone is what
+made nginx report "recvmsg() truncated data".
 
 **Two corrections to this section's own text**, both from building it.
 `SO_RCVTIMEO`/`SNDTIMEO` are refused by name rather than recorded,
@@ -872,6 +877,19 @@ Seeded from the design work; grown as they are earned.
    pass every in-guest test and break on the first outbound edge
    connection. The demo needs no egress, which is exactly why the
    asymmetry must be stated where the next feature will trip it.
+
+   **As built, there is no egress at all**, and what was found in
+   review is that this has to be *said* rather than left to fall out.
+   The guest is told of no interface, so `127.0.0.0/8` is the whole of
+   the world it can route to; a `connect` anywhere else now answers
+   `ENETUNREACH`. It used to answer `ECONNREFUSED`, which is a
+   different claim and the wrong one — a client that hears "refused"
+   concludes the service is down and retries forever, where one that
+   hears "unreachable" concludes there is no network, which is true.
+   `-p` does not soften this: it publishes a guest port *inward*, a
+   listener the host reaches, never a route the guest can take out.
+   When egress is built it takes the `EINPROGRESS`/`SO_ERROR` shape
+   this pitfall describes, and `ENETUNREACH` is what it replaces.
 5. **Do not let the wait read carry a zero timeout as "forever".**
    `{ms}` of zero means poll-and-return; forever is a large explicit
    cap. An accidental infinite host block with no guest deadline is a

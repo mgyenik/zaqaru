@@ -2170,6 +2170,72 @@ int main(void) {
     );
 }
 
+/// **Connecting off `lo` says there is no network**, not that something
+/// refused.
+///
+/// This container is a namespace with only loopback in it — the guest is
+/// told of no interface at all — so `127.0.0.0/8` is the whole of the world
+/// it can route to and everything else is `ENETUNREACH`. The distinction is
+/// the one a client acts on: "refused" means the service is down, so retry;
+/// "unreachable" means there is no network, so stop. Answering
+/// `ECONNREFUSED` for an address with no route tells a program to keep
+/// trying something that cannot ever work.
+///
+/// And `-p` does not change this. It publishes a guest port *inward* — a
+/// listener the host can reach — which is not a route the guest can take
+/// out. Egress is not built; this is what not having it should look like
+/// from inside, rather than a hang or a lie.
+///
+/// Checked directly rather than against a native run, for the same reason
+/// the orphan test is: the machine running these tests has a route to the
+/// internet and this container does not, so the host is not the oracle. A
+/// native run of this program would sit in a TEST-NET connect until it
+/// timed out.
+#[test]
+fn there_is_no_route_off_loopback() {
+    let (_tree, baked) = image_of(
+        "unreachable",
+        r#"
+#include <errno.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <stdio.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+static int reach(const char *dotted, int port) {
+    int client = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in where = {0};
+    where.sin_family = AF_INET;
+    where.sin_addr.s_addr = inet_addr(dotted);
+    where.sin_port = htons(port);
+    errno = 0;
+    int outcome = connect(client, (struct sockaddr *)&where, sizeof where);
+    int kept = errno;
+    close(client);
+    return outcome == 0 ? 0 : kept;
+}
+
+int main(void) {
+    /* TEST-NET-3, and a private address a container would really have. */
+    printf("far %d\n", reach("203.0.113.1", 80) == ENETUNREACH);
+    printf("private %d\n", reach("172.17.0.2", 80) == ENETUNREACH);
+    /* Loopback still has a route, and nothing is listening on it: the
+       answer there is refused, which is the fact this must not flatten. */
+    printf("loopback %d\n", reach("127.0.0.1", 9) == ECONNREFUSED);
+    /* All of 127/8 is loopback, not just the one address. */
+    printf("wider %d\n", reach("127.0.0.53", 53) == ECONNREFUSED);
+    return 0;
+}
+"#,
+        Linkage::Dynamic,
+    );
+    assert_eq!(
+        interpreted_output("unreachable", baked),
+        "far 1\nprivate 1\nloopback 1\nwider 1\n"
+    );
+}
+
 /// **`send`, `recv` and the options**, which is the rest of what the traced
 /// stack asks a socket for.
 ///

@@ -152,6 +152,12 @@ impl Address {
     }
 }
 
+/// Whether an address is one of this container's own — `127.0.0.0/8`, the
+/// whole of the network a namespace with only `lo` in it has.
+pub fn loopback(address: u32) -> bool {
+    address >> 24 == 127
+}
+
 /// `INADDR_ANY`, the wildcard bind.
 pub const INADDR_ANY: u32 = 0;
 /// `INADDR_LOOPBACK`, which is where every connection that stays inside the
@@ -1006,15 +1012,26 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
             _ => {}
         }
         let wanted = match requested {
-            Requested::Inet { address, port } => Address::Inet {
+            Requested::Inet { address, port } => {
                 // A connection to any local address is a connection to this
                 // container; there is nowhere else for it to go.
-                address: match address {
+                let address = match address {
                     INADDR_ANY => INADDR_LOOPBACK,
                     address => address,
-                },
-                port,
-            },
+                };
+                // And there is nowhere else at all. This container is a
+                // namespace holding only `lo`: it is told of no interface,
+                // so nothing outside `127.0.0.0/8` has a route, and the
+                // answer is that there is no network rather than that the
+                // far side refused. The distinction is what a client acts
+                // on — "refused" means retry, "unreachable" means stop —
+                // and `-p` publishes a port *inward*, which is a listener
+                // the host reaches, never a route the guest can take out.
+                if !loopback(address) {
+                    return Outcome::Done(Errno::NetworkUnreachable.as_result());
+                }
+                Address::Inet { address, port }
+            }
             Requested::Unix { path } => {
                 // Resolved rather than created: a path that is not there is
                 // `ENOENT`, which is exactly what glibc's `nscd` probe
