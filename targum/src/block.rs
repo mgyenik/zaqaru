@@ -51,6 +51,11 @@ const MAX_INSTRUCTION_BYTES: u64 = 15;
 /// says a real workload thrashes it.
 pub const CAPACITY: usize = 64 * 1024;
 
+/// Slots in the direct-mapped lookup. A power of two, so the index is a
+/// mask, and large enough that a working set of a few thousand blocks —
+/// which is what a Python import graph turns out to be — mostly fits.
+const RECENT: usize = 4096;
+
 /// A decoded run of instructions, entered at one address.
 pub struct Block {
     /// The guest address the block is entered at, and the key it is found by.
@@ -105,13 +110,31 @@ impl From<Fault> for FetchError {
 
 /// Decoded blocks, keyed by entry address, and the page registry that
 /// invalidation hangs on.
-#[derive(Default)]
 pub struct BlockCache {
     /// A slab: invalidated blocks leave a hole for the next one, so a block
     /// index is stable for as long as the block lives.
     blocks: Vec<Option<Block>>,
     free: Vec<usize>,
     entries: HashMap<u64, usize>,
+    /// A direct-mapped cache in front of `entries`.
+    ///
+    /// Blocks end at the first control transfer, and control transfers turn
+    /// out to be a fifth of everything a real program retires — so a block
+    /// averages about five instructions and this lookup is paid every fifth
+    /// one, not once in a while. `HashMap`'s hasher is SipHash, which is
+    /// chosen to resist an adversary picking keys; the keys here are a
+    /// guest's own instruction addresses, and the worst a bad distribution
+    /// costs is a miss into the map that was going to be consulted anyway.
+    ///
+    /// **It validates rather than invalidates.** A hit is only believed
+    /// after the block it names is confirmed to still be entered at the
+    /// address asked for — so a block that was freed, or whose slab index
+    /// was reused by another block, simply misses. Nothing has to remember
+    /// to clear this, which is the property the alternative did not have:
+    /// a stale entry here would hand back a block decoded from bytes the
+    /// guest has since overwritten, and that is the one bug this whole file
+    /// exists to make impossible.
+    recent: Vec<(u64, usize)>,
     /// Which blocks took bytes from each page. The list is short —
     /// a page holds a few dozen blocks — so removal is a scan.
     registry: HashMap<u64, Vec<usize>>,
@@ -119,6 +142,22 @@ pub struct BlockCache {
     /// for the diagnostics that ask how much decoding a workload does.
     pub decoded: u64,
     pub flushes: u64,
+}
+
+impl Default for BlockCache {
+    fn default() -> Self {
+        Self {
+            blocks: Vec::new(),
+            free: Vec::new(),
+            entries: HashMap::new(),
+            // Allocated once, here, rather than checked for on a path that
+            // runs every fifth instruction.
+            recent: vec![(u64::MAX, 0); RECENT],
+            registry: HashMap::new(),
+            decoded: 0,
+            flushes: 0,
+        }
+    }
 }
 
 impl BlockCache {
@@ -141,11 +180,25 @@ impl BlockCache {
     /// which nothing can do while the caller is executing it: the store path
     /// only *queues* pages, and the loop drains the queue between blocks.
     pub fn entry(&mut self, address: u64, space: &mut Space) -> Result<usize, FetchError> {
+        // Shifted by four before masking: instruction addresses are dense
+        // and their low bits are the ones that differ, but so are the bits
+        // just above, and a block entry is never one byte from another.
+        let slot = ((address >> 4) as usize) & (RECENT - 1);
+        let (cached, index) = self.recent[slot];
+        if cached == address
+            && let Some(block) = &self.blocks[index]
+            && block.entry == address
+        {
+            return Ok(index);
+        }
         if let Some(index) = self.entries.get(&address) {
+            self.recent[slot] = (address, *index);
             return Ok(*index);
         }
         let block = decode(address, space)?;
-        Ok(self.install(block, space))
+        let index = self.install(block, space);
+        self.recent[slot] = (address, index);
+        Ok(index)
     }
 
     pub fn block(&self, index: usize) -> &Block {
