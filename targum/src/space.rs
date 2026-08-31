@@ -373,7 +373,11 @@ impl Space {
     }
 
     /// An integer load of one, two, four or eight bytes, zero-extended.
-    #[inline]
+    // Forced, not suggested. A guest load or store is what an
+    // interpreter does, and `store` was showing as its own frame in a
+    // profile of a real workload at 5.9% — which is a wasm call per
+    // guest memory write.
+    #[inline(always)]
     pub fn load(&self, address: u64, width: Width) -> Result<u64, Fault> {
         self.permitted(address, u64::from(width.bytes()), Access::Read)?;
         // SAFETY: checked immediately above.
@@ -390,7 +394,11 @@ impl Space {
 
     /// An integer store. Every store in the engine reaches memory through
     /// here, which is what makes the code-page test unavoidable.
-    #[inline]
+    // Forced, not suggested. A guest load or store is what an
+    // interpreter does, and `store` was showing as its own frame in a
+    // profile of a real workload at 5.9% — which is a wasm call per
+    // guest memory write.
+    #[inline(always)]
     pub fn store(&mut self, address: u64, width: Width, value: u64) -> Result<(), Fault> {
         self.permitted(address, u64::from(width.bytes()), Access::Write)?;
         self.note_code_write(address, u64::from(width.bytes()));
