@@ -64,6 +64,15 @@ pub struct Block {
     /// control transfer falls through to here.
     pub end: u64,
     pub instructions: Vec<Instruction>,
+    /// Whether every instruction but the last falls straight through.
+    ///
+    /// Blocks end at the first control transfer, so by construction only
+    /// the last instruction can branch — and the only other way `rip` moves
+    /// unexpectedly is a `rep`-prefixed string operation, which stays put
+    /// while it has iterations left. When neither is present in the prefix,
+    /// the run loop already knows where each of those instructions goes and
+    /// does not have to ask `rip` afterwards to find out.
+    pub simple: bool,
     /// The same instructions, pre-decoded — see [`crate::quick`]. Parallel
     /// to `instructions` rather than folded into it, because the general
     /// path still wants the original and a lowered op that had to carry one
@@ -315,6 +324,7 @@ fn decode(address: u64, space: &Space) -> Result<Block, FetchError> {
                     entry: address,
                     end,
                     quick: instructions.iter().map(crate::quick::Quick::lower).collect(),
+                    simple: straight_through(&instructions),
                     instructions,
                 }),
                 DecoderError::NoMoreBytes => Err(FetchError::Fault(Fault {
@@ -337,7 +347,28 @@ fn decode(address: u64, space: &Space) -> Result<Block, FetchError> {
         entry: address,
         end,
         quick: instructions.iter().map(crate::quick::Quick::lower).collect(),
+        simple: straight_through(&instructions),
         instructions,
+    })
+}
+
+/// Whether every instruction but the last simply falls through.
+///
+/// Conservative on both counts: anything iced does not call `Next`, and
+/// anything carrying a repeat prefix, makes the block ordinary. Being wrong
+/// in the other direction would mean the loop stopped consulting `rip` for
+/// an instruction that changes it, which is a silent jump to the wrong
+/// place — so the test is over what the *prefix* contains rather than over
+/// what the terminator is.
+fn straight_through(instructions: &[Instruction]) -> bool {
+    let Some((_, prefix)) = instructions.split_last() else {
+        return true;
+    };
+    prefix.iter().all(|instruction| {
+        instruction.flow_control() == FlowControl::Next
+            && !instruction.has_rep_prefix()
+            && !instruction.has_repe_prefix()
+            && !instruction.has_repne_prefix()
     })
 }
 

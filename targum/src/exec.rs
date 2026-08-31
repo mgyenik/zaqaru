@@ -260,6 +260,36 @@ impl<'a> Cpu<'a> {
     /// [`crate::quick`] lowers what it fully understands and declines
     /// everything else, so this arm carries the instructions nobody has got
     /// to yet at exactly the speed they ran before.
+    /// Retires one instruction that is known to fall through, without
+    /// touching `rip`.
+    ///
+    /// The run loop used to write `rip` after every instruction and read it
+    /// back twice — against the instruction's own address and against the
+    /// next one — to work out whether it fell through, branched, or stayed
+    /// put. For every instruction but a block's last, that was settled when
+    /// the block was decoded: blocks end at control transfers, so nothing
+    /// in the middle can branch, and [`crate::block::Block::simple`] says
+    /// whether anything in the middle carries a repeat prefix either.
+    ///
+    /// So this leaves `rip` stale on purpose and the loop makes it good on
+    /// the way out — at a trap, at the end of a quantum, or when a store
+    /// lands on cached code. All three are cold. What it saves is a store
+    /// and two reads of the forty-byte decode per instruction, on the path
+    /// that runs a thousand million times, and it was worth 8% of the
+    /// engine.
+    pub fn advance(&mut self, quick: &Quick, instruction: &Instruction) -> Result<(), Trap> {
+        crate::histogram::record(instruction, quick.op != Op::General);
+        if quick.op == Op::General {
+            // The general path counts and sets `rip` itself. Nothing in a
+            // straight-through prefix reads it, so letting it write one is
+            // cheaper than keeping a second copy of that function.
+            self.step(instruction)?;
+            return Ok(());
+        }
+        self.tcb.retired += 1;
+        self.quick(quick).map(|_| ())
+    }
+
     pub fn run(&mut self, quick: &Quick, instruction: &Instruction) -> Result<Step, Trap> {
         crate::histogram::record(instruction, quick.op != Op::General);
         if quick.op == Op::General {

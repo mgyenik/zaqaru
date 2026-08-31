@@ -119,12 +119,43 @@ impl Engine {
             let block = cache.block(index);
             let mut cpu = Cpu::new(tcb, space);
             let mut position = 0usize;
+            let last = block.instructions.len().saturating_sub(1);
             while position < block.instructions.len() {
                 let instruction = &block.instructions[position];
                 if budget == 0 {
+                    // Which `advance` may have left stale, and which is
+                    // always this instruction's own address: whatever ran
+                    // before it either fell through to here or branched
+                    // here.
+                    cpu.tcb.rip = instruction.ip();
                     break;
                 }
                 budget -= 1;
+                // Everything but a block's last instruction, in a block
+                // whose prefix cannot branch or stay put. The loop knows
+                // where these go without asking.
+                if block.simple && position < last {
+                    match cpu.advance(&block.quick[position], instruction) {
+                        Ok(()) => {}
+                        Err(trap) => {
+                            cpu.tcb.rip = match trap {
+                                Trap::Breakpoint { .. } => instruction.next_ip(),
+                                _ => {
+                                    cpu.tcb.retired -= 1;
+                                    instruction.ip()
+                                }
+                            };
+                            return Outcome::Trap(trap);
+                        }
+                    }
+                    if cpu.space.has_dirty_code() {
+                        // Fell through, so this is where execution is.
+                        cpu.tcb.rip = instruction.next_ip();
+                        break;
+                    }
+                    position += 1;
+                    continue;
+                }
                 match cpu.run(&block.quick[position], instruction) {
                     Ok(Step::Retired) => {}
                     Ok(Step::Syscall) => return Outcome::Syscall,
