@@ -131,6 +131,12 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     }
+    // Compiling is not running, and a container's cost is both. wasmtime
+    // turns the whole module into machine code before the guest's first
+    // instruction — a fixed price paid per process, on a module whose size
+    // is the engine plus the image — and a report that folded it into the
+    // run would make a container look slower the bigger its filesystem is.
+    let compiling = std::time::Instant::now();
     let mut container = match runner::Container::instantiate(&bytes, table) {
         Ok(container) => container,
         Err(error) => {
@@ -138,13 +144,25 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    eprintln!(
+        "zaqaru-run: compiled {:.1} MB of module in {:.2}s",
+        bytes.len() as f64 / (1 << 20) as f64,
+        compiling.elapsed().as_secs_f64()
+    );
 
+    let started = std::time::Instant::now();
     let status = container.boot();
+    let elapsed = started.elapsed().as_secs_f64();
 
     // Already echoed as it arrived, so nothing is printed again here — a
     // container's output must not appear twice because the runner kept a
     // copy of it.
     let _ = &mut container;
+
+    // What the run cost. The module counts the work and cannot time itself;
+    // this is the only side holding a clock, so the rate is computed here or
+    // nowhere.
+    report_cost(&mut container, elapsed);
 
     match container.mounts().keep_tape() {
         Some(Ok(answers)) => eprintln!("zaqaru-run: recorded {answers} host answers"),
@@ -193,6 +211,14 @@ fn mounts() -> runner::store::MountTable {
         &[b"iso", b"log"],
         Box::new(runner::store::Sink::new().teed(runner::store::Tee::Diagnostics)),
     );
+    // Not teed: the kernel log is echoed as it arrives because a server's
+    // diagnostics are worth nothing after it stops, but the cost summary is
+    // written once on the way out and is reported in a line of this
+    // program's own.
+    mounts.mount(
+        &[b"iso", b"log", b"statistics"],
+        Box::new(runner::store::Sink::new()),
+    );
     mounts.mount(&[b"iso", b"random"], Box::new(runner::store::Sink::new()));
     // Listening, so Ctrl-C becomes the container's own `SIGTERM` at its
     // first process — which is how a demo ends the way `docker stop` ends,
@@ -229,6 +255,31 @@ fn mounts() -> runner::store::MountTable {
         )
         .expect("seed the container");
     mounts
+}
+
+/// Prints how much work the container did, and how fast.
+///
+/// Both numbers, not one. Instructions retired says what the guest asked
+/// for; seconds says what it cost; and the rate between them is the engine's
+/// speed, which is the only one of the three that can be compared across
+/// runs of different programs. Blocks decoded is the fourth and says how
+/// much of the run was *new* code rather than a loop — a program whose block
+/// count keeps climbing is one the decoder never gets ahead of.
+fn report_cost(container: &mut runner::Container, elapsed: f64) {
+    let text = read(container, &[b"iso", b"log", b"statistics"]);
+    let field = |name: &str| -> Option<u64> {
+        text.lines()
+            .find_map(|line| line.strip_prefix(name)?.trim().parse().ok())
+    };
+    let (Some(retired), Some(decoded)) = (field("retired"), field("decoded")) else {
+        // A container that stopped before it could say. Silence rather than
+        // zeros, which would read as a run that did nothing.
+        return;
+    };
+    eprintln!(
+        "zaqaru-run: {retired} instructions in {elapsed:.2}s = {:.1} MIPS, {decoded} blocks decoded",
+        retired as f64 / elapsed / 1e6
+    );
 }
 
 fn console(container: &mut runner::Container, stream: &[u8]) -> String {

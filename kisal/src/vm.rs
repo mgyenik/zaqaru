@@ -62,7 +62,13 @@ pub unsafe extern "C" fn targum_boot() -> i32 {
     // second address space rather than an error. One process is the common
     // case and costs a vector of one.
     let mut system = System::new(process);
-    match system.run() {
+    let outcome = system.run();
+    // What the run cost, before anything is said about how it ended. A
+    // module has no clock of its own worth trusting and no way to time
+    // itself, so the host measures the seconds and this supplies the
+    // numerator: how much work was done to fill them.
+    report_statistics(&mut system);
+    match outcome {
         Exit::Status(status) => status,
         // Loud, and named. A container that stopped because the engine does
         // not implement an instruction, or the kernel a syscall, must not
@@ -74,6 +80,27 @@ pub unsafe extern "C" fn targum_boot() -> i32 {
             UNIMPLEMENTED
         }
     }
+}
+
+/// Writes what the run cost to `/iso/log/statistics`.
+///
+/// Two numbers and no rate: instructions retired and blocks decoded, across
+/// every process the container had, living or gone — a container that forks
+/// does most of its work in children and a count that lost them would
+/// understate the engine by however far the guest fanned out. Dividing by a
+/// wall time is the host's job, because the host is the only one holding
+/// one.
+fn report_statistics(system: &mut System<'_, HostStore>) {
+    let mut message = String::from("retired ");
+    crate::push_decimal(&mut message, system.retired() as i64);
+    message.push_str("\ndecoded ");
+    crate::push_decimal(&mut message, system.decoded() as i64);
+    message.push('\n');
+    let _ = crate::abi::Store::write(
+        &mut system.current().kernel.store,
+        crate::paths::LOG_STATISTICS,
+        message.as_bytes(),
+    );
 }
 
 /// Sends a panic's message to `/iso/log/error` before the module aborts.

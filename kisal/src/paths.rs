@@ -66,6 +66,19 @@ pub const LOG_ERROR: &[&[u8]] = &[b"iso", b"log", b"error"];
 /// that succeeds writes nothing to the first and everything to the second.
 pub const LOG_DEBUG: &[&[u8]] = &[b"iso", b"log", b"debug"];
 
+/// What the run cost, written once as the container exits.
+///
+/// Retired instructions and decoded blocks — the two numbers that say how
+/// much work a container actually did, as against how long it took, which
+/// is the host's to measure. Separate from the error log because a run that
+/// went perfectly still has an answer here, and separate from the trace
+/// because it is a summary rather than a record.
+///
+/// A host that mounts nothing here learns nothing and the container pays
+/// one failed write, which is the same bargain every other `/iso` path
+/// makes.
+pub const LOG_STATISTICS: &[&[u8]] = &[b"iso", b"log", b"statistics"];
+
 /// Whether to trace. Read once, at the first syscall.
 ///
 /// A mount rather than a flag, because the kernel has no other channel: the
