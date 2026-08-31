@@ -1671,29 +1671,10 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
     /// points that are a pure function of execution: when a process has used
     /// a whole slice, and when nothing in the container can run.
     pub fn pump(&mut self, waiting: Option<u64>) -> bool {
-        let mut moved = false;
         // Out first, so a response written just before the container went
-        // idle is on its way before anything waits.
-        for (id, conn) in self.sockets.borrow().edges() {
-            let Some(ring) = self
-                .sockets
-                .borrow()
-                .endpoint(id)
-                .map(|endpoint| endpoint.transmit)
-            else {
-                continue;
-            };
-            let queued = self.rings.borrow().queued(ring);
-            if queued == 0 {
-                continue;
-            }
-            let mut bytes = vec![0u8; queued];
-            self.rings.borrow_mut().take(ring, &mut bytes);
-            let path = edge_path(conn, b"tx");
-            let borrowed: Vec<&[u8]> = path.iter().map(|held| held.as_slice()).collect();
-            self.store.write(&borrowed, &bytes);
-            moved = true;
-        }
+        // idle is on its way before anything waits — and on its own, every
+        // quantum, from the run loop.
+        let mut moved = self.flush_edges();
         // Then in. A wait is the same read with a deadline on it, which is
         // the one store read allowed to take time — see
         // `docs/network-plan.md` §6.
@@ -1718,6 +1699,48 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
             if self.handle_event(line) {
                 moved = true;
             }
+        }
+        moved
+    }
+
+    /// Sends whatever the guest has written and the host has not yet been
+    /// given, and answers whether anything moved.
+    ///
+    /// Split out of [`Self::pump`] because the two halves want completely
+    /// different frequencies. Sending is what a *response* waits on, so it
+    /// wants to happen often; the inbound read is a host call with a
+    /// deadline on it, and doing that sixteen times as often cost more
+    /// throughput than the promptness was worth — four concurrent clients
+    /// measured slower, because this work scales with the number of open
+    /// connections and the frequency multiplied it.
+    ///
+    /// The early return matters for the same reason: most containers have
+    /// no edge at all, and this now runs every quantum in every one of them.
+    pub fn flush_edges(&mut self) -> bool {
+        let edges = self.sockets.borrow().edges();
+        if edges.is_empty() {
+            return false;
+        }
+        let mut moved = false;
+        for (id, conn) in edges {
+            let Some(ring) = self
+                .sockets
+                .borrow()
+                .endpoint(id)
+                .map(|endpoint| endpoint.transmit)
+            else {
+                continue;
+            };
+            let queued = self.rings.borrow().queued(ring);
+            if queued == 0 {
+                continue;
+            }
+            let mut bytes = vec![0u8; queued];
+            self.rings.borrow_mut().take(ring, &mut bytes);
+            let path = edge_path(conn, b"tx");
+            let borrowed: Vec<&[u8]> = path.iter().map(|held| held.as_slice()).collect();
+            self.store.write(&borrowed, &bytes);
+            moved = true;
         }
         moved
     }

@@ -403,6 +403,37 @@ impl<'a, S: Store + Clone> System<'a, S> {
             // process has used a whole slice. Kernel state only — rings, the
             // socket arena, the store — so it may run on any turn without
             // breaking the rule the process table is built on.
+            // Every quantum, not every slice. The slice is about *fairness*
+            // — how long a process holds the processor before another gets a
+            // turn — and tying the edge to it made a response the guest had
+            // already written wait up to 1.6 million instructions, some
+            // fifty milliseconds of interpretation, before it reached the
+            // host.
+            //
+            // Sequentially that never showed: a container with nothing left
+            // to run goes idle, and the idle path pumps at once. Under
+            // concurrency nothing is idle — nginx and gunicorn always have
+            // work — so everything waited for the slice boundary, and four
+            // clients at once measured *worse* throughput than one at a
+            // time. Honest queueing behind a single worker would have held
+            // it flat.
+            //
+            // Still denominated in retired instructions, which is the
+            // property that matters: scheduling stays a pure function of
+            // execution, so a recorded run still replays. What it costs is
+            // sixteen times as many `/iso/net/events` reads — a few hundred
+            // a second, against a syscall budget in the millions.
+            if why == Yield::Quantum {
+                // Sending, every quantum. This is what a response waits on,
+                // and tying it to the slice made one sit in a ring for 1.6
+                // million instructions — some fifty milliseconds of
+                // interpretation — before it reached the host.
+                self.current().kernel.flush_edges();
+            }
+            // Receiving, and the clock, and the shutdown switch: once a
+            // slice. The inbound read is a host call, and doing it sixteen
+            // times as often cost more throughput than the promptness was
+            // worth, because it scales with the number of open connections.
             if why == Yield::Quantum && self.slice == 0 {
                 self.current().kernel.pump(None);
                 self.current().kernel.refresh_timebase();
