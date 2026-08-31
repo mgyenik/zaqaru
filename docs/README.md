@@ -93,6 +93,15 @@ Current documents:
   by a guest that publishes a port the test's own client connects to,
   which is what found three defects in the close path that a long-lived
   nginx cannot show you.
+- [fidelity.md](fidelity.md) — **reference**: the index of where kisal
+  differs from Linux, read out of the code rather than the plans. The
+  three answers a guest can get for something not fully built — a loud
+  refusal, a recorded no-op, an honest errno — and then the lists: the
+  31 named refusals with the program shape each one needs, the no-ops
+  that succeed and change nothing with the evidence that allowed each
+  and what would notice, and what is simply not built (egress, DNS,
+  `SCM_RIGHTS`, `MAP_SHARED` across fork). Carries the one-line grep
+  that checks its own refusal count.
 - [worklog.md](worklog.md) — the working layer under the build plan:
   decisions taken mid-build and why, roadblocks and how they were cleared,
   and the mistakes worth not repeating. Where the build plan records a

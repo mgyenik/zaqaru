@@ -1554,7 +1554,8 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
             return Outcome::Fault(Fault::detailed(
                 number::READLINK,
                 Arguments::new([dirfd, path, buffer, capacity, 0, 0]),
-                "the path of the running executable, which nothing has set —                  M6's `execve` is what knows it",
+                "the path of the running executable, which nothing has set — \
+                 M6's `execve` is what knows it",
             ));
         }
         // Truncated rather than refused, and no terminator: `readlink` is the
