@@ -44,7 +44,17 @@ fn container(workspace: &WorkingDirectory) -> runner::Container {
     std::fs::create_dir_all(&root).expect("create the image tree");
     let mut placed = bytes.clone();
     baker::program::apply(&mut placed, &translation.patches).expect("apply the patches");
-    std::fs::write(root.join(PROGRAM), &placed).expect("place the program in the image");
+    let program = root.join(PROGRAM);
+    std::fs::write(&program, &placed).expect("place the program in the image");
+    // Executable, because the kernel asks: `execve` on a file with no execute
+    // bit is `EACCES`, here as on Linux. A baked image carries the mode from
+    // the tree it was baked from; a test that writes the patched bytes itself
+    // has to say so on its own behalf.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
+            .expect("make the program executable");
+    }
     let image = baker::object::emit(&baker::bake_directory(&root).expect("bake"))
         .expect("emit the image object");
     let module = support::link_container_for_program(
@@ -308,7 +318,17 @@ fn calling_an_untranslated_function_names_it() {
     std::fs::create_dir_all(&root).expect("create the image tree");
     let mut placed = bytes.clone();
     baker::program::apply(&mut placed, &translation.patches).expect("apply the patches");
-    std::fs::write(root.join(PROGRAM), &placed).expect("place the program");
+    let program = root.join(PROGRAM);
+    std::fs::write(&program, &placed).expect("place the program");
+    // Executable, because the kernel asks: `execve` on a file with no execute
+    // bit is `EACCES`, here as on Linux. A baked image carries the mode from
+    // the tree it was baked from; a test that writes the patched bytes itself
+    // has to say so on its own behalf.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
+            .expect("make the program executable");
+    }
     let image = baker::object::emit(&baker::bake_directory(&root).expect("bake"))
         .expect("emit the image object");
 

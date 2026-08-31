@@ -245,7 +245,17 @@ fn run_static_glibc_with(name: &str, program: &str, stripped: bool) -> String {
     std::fs::create_dir_all(&root).expect("create the image tree");
     let mut placed = bytes.clone();
     baker::program::apply(&mut placed, &translation.patches).expect("apply the patches");
-    std::fs::write(root.join("init"), &placed).expect("place the program");
+    let program = root.join("init");
+    std::fs::write(&program, &placed).expect("place the program");
+    // Executable, because the kernel asks: `execve` on a file with no execute
+    // bit is `EACCES`, here as on Linux. A baked image carries the mode from
+    // the tree it was baked from, where the compiler set it; a test that
+    // writes the patched bytes itself has to say so on its own behalf.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
+            .expect("make the program executable");
+    }
     let image = baker::object::emit(&baker::bake_directory(&root).expect("bake"))
         .expect("emit the image object");
 

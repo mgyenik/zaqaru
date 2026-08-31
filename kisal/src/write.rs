@@ -130,8 +130,18 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
     fn new_inode(&mut self, kind: u32, mode: u32) -> Inode {
         Inode {
             // The umask clears what the caller asked for, which is the one
-            // thing `umask(2)` does and the reason it is recorded at all.
-            mode: kind | (mode & 0o7777 & !self.identity.umask),
+            // thing `umask(2)` does and the reason it is recorded at all —
+            // but it clears what a caller *chose*, and nobody chooses a
+            // symlink's mode. A symlink is `0o777` on Linux always, because
+            // permission on the link is never consulted: the walk resolves
+            // it and checks the target. Masking it makes `lstat` disagree
+            // with the real kernel by exactly the umask, which is how this
+            // was found — a differential, at `0o120755` against `0o120777`.
+            mode: kind
+                | match kind == file_type::SYMLINK {
+                    true => 0o777,
+                    false => mode & 0o7777 & !self.identity.umask,
+                },
             // Whoever this process has become. Constant zero until nginx's
             // worker dropped to `nobody` and then created its own files.
             uid: self.identity.effective_uid,

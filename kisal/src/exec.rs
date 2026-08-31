@@ -1093,7 +1093,19 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
         // is not fatal: a container without a vDSO is the container this
         // project had until now, and every clock call falls back to the
         // syscall that has always answered them.
-        let vdso = self.map_vdso().ok().map(|placed| placed.image);
+        //
+        // Only where the guest's code is *executed* rather than translated.
+        // The vDSO is guest text that arrives at runtime, like an unplaced
+        // shared object above: under `Flat` the bake decided what code
+        // exists, no translated function covers these bytes, and a program
+        // that took `AT_SYSINFO_EHDR` at its word would call into an address
+        // that is not the address of any function. So that world is told
+        // there is no vDSO, and glibc reads the clock by syscall — which is
+        // what it did here until now.
+        let vdso = match self.enforcement {
+            crate::syscall::Enforcement::Mapped => self.map_vdso().ok().map(|placed| placed.image),
+            crate::syscall::Enforcement::Flat => None,
+        };
         let stack = self.reserve_stack()?;
         let random = self.random_bytes();
         let built = build_stack(
