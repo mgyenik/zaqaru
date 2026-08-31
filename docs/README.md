@@ -73,6 +73,21 @@ Current documents:
   (`SCM_RIGHTS`, `MAP_SHARED`-across-fork, netlink), the amendments to
   fold back into `container-plan.md`, and gates N0–N5 from a native
   strace baseline through "curl gets the Django page".
+  **N0–N5 are built (2026-08-30) and the demo answers.** An ordinary
+  Dockerfile — `python:3.12-slim` plus nginx, gunicorn and Django — baked
+  to one 170 MB `.wasm`, served by `zaqaru-run -p 8080:80`, and
+  `curl http://localhost:8080/` returns the Django page: five processes
+  inside the module, nginx's own access log naming the client. It idles at
+  **0% of one core** between requests, and Ctrl-C ends the tree the way
+  `docker stop` does — the worker told over the channel socketpair, the
+  master reaping it by `SIGCHLD`, exit status 0. The same stack traced both
+  ways diffs to **one structural divergence** (there is no vDSO, so glibc
+  reads the clock by syscall where a native run reads it from a mapped
+  page) plus four single calls, recorded in
+  `demo/hello-django/baseline/n5-diff.txt`. And a served HTTP session
+  **records and replays byte for byte with no network at all**, which is
+  the determinism claim demonstrated rather than asserted.
+  `demo/hello-django/` holds the image and the scripts.
 - [worklog.md](worklog.md) — the working layer under the build plan:
   decisions taken mid-build and why, roadblocks and how they were cleared,
   and the mistakes worth not repeating. Where the build plan records a
