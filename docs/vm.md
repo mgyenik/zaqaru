@@ -568,9 +568,22 @@ deadlocks) said in one line.
 a 124 MB `.wasm` — a second CPython forked, `execve`d, captured through a
 pipe, waited for, and reaped.
 
-What is left is sockets, which are the next thing whose state two
-processes share, and which hoist the way a pipe does because the arena is
-already that shape.
+**And sockets are built (2026-08-30), which finishes the picture.**
+`docs/network-plan.md` is the plan and its gates N0–N4 are done. A
+connected socket is two rings crossed, so the whole of `kisal/src/ring.rs`
+serves both it and a pipe, and the half-close matrix falls out of the
+reference counts rather than being a matrix. Loopback never leaves the
+kernel — `connect` is a queue push into an arena the process tree shares —
+and the edge is a stream the host terminates, reached through the same two
+imports as everything else.
+
+The demo that follows is the one this document's whole argument was for:
+**an ordinary Dockerfile carrying nginx, gunicorn and Django, baked to one
+`.wasm` in four seconds with nothing having read the programs inside it,
+served by `zaqaru-run -p 8080:80`, and answered by `curl` from another
+terminal with the Django page.** Five processes in one module, two
+readiness disciplines (nginx's epoll, gunicorn's poll) running at once, and
+nginx's own access log naming the client that connected.
 
 The `vfork`/`posix_spawn` fast path is unchanged and is still the case
 that matters: no snapshot at all, the child instantiated fresh from the
