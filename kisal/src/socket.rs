@@ -718,8 +718,14 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
             return Outcome::Done(Errno::Invalid.as_result());
         }
         let mut released: Vec<(u32, End)> = Vec::new();
+        // The write half of an edge connection, if this call gives it up.
+        // A half-close has to reach the host for the same reason a full one
+        // does: the peer is waiting for an end of file, and nothing inside
+        // the module can send it one.
+        let mut half_closed: Option<(u32, u32)> = None;
         {
             let mut sockets = self.sockets.borrow_mut();
+            let edge = sockets.edge_of(id);
             let Some(endpoint) = sockets.endpoint_mut(id) else {
                 // `shutdown` on a socket that was never connected is
                 // `ENOTCONN`, which is how a program learns the difference
@@ -733,7 +739,15 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
             if direction != how::READ && !endpoint.write_shut {
                 endpoint.write_shut = true;
                 released.push((endpoint.transmit, End::Write));
+                if let Some(conn) = edge {
+                    half_closed = Some((conn, endpoint.transmit));
+                }
             }
+        }
+        // Before the ring goes, because the flush inside reads it — the
+        // same ordering the close path needs, and for the same reason.
+        if let Some((conn, ring)) = half_closed {
+            self.end_edge(conn, ring, b"shutdown");
         }
         let mut rings = self.rings.borrow_mut();
         for (ring, end) in released {

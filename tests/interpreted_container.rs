@@ -589,3 +589,116 @@ int main(void) {
     assert_eq!(heard.as_deref(), Ok("pong\n"), "the host did not read the reply");
     drop(workspace);
 }
+
+/// **A half-close reaches the host too.**
+///
+/// `shutdown(SHUT_WR)` is how a server says "that is the whole response"
+/// while still reading — the peer sees end of file on its side and the
+/// connection stays open on the other. Inside the module that is one ring
+/// reference going away, which the arena has always handled. Across the
+/// edge it is a FIN that only the host can send, and the guest has to ask.
+///
+/// Separate from the full close rather than folded into it, because a
+/// half-close that quietly did nothing looks exactly like one that worked
+/// right up until the guest closes for other reasons and the peer is
+/// finally released — which is to say, it looks fine in any test whose
+/// guest exits.
+#[test]
+fn a_half_close_reaches_the_host() {
+    use std::io::{Read, Write};
+
+    let host_port = std::net::TcpListener::bind(("127.0.0.1", 0))
+        .expect("ask for a free port")
+        .local_addr()
+        .expect("its address")
+        .port();
+
+    let (workspace, module) = module_for(
+        "halfclose",
+        r#"
+#include <netinet/in.h>
+#include <poll.h>
+#include <stdio.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+int main(void) {
+    int server = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in mine = {0};
+    mine.sin_family = AF_INET;
+    mine.sin_addr.s_addr = htonl(INADDR_ANY);
+    mine.sin_port = htons(8080);
+    if (bind(server, (struct sockaddr *)&mine, sizeof mine) != 0) {
+        perror("bind"); return 1;
+    }
+    if (listen(server, 8) != 0) { perror("listen"); return 1; }
+    struct pollfd waiting = { .fd = server, .events = POLLIN };
+    if (poll(&waiting, 1, 30000) <= 0) { printf("nobody came\n"); return 0; }
+    int client = accept(server, 0, 0);
+    if (client < 0) { perror("accept"); return 1; }
+    write(client, "half\n", 5);
+    /* The whole of the response, said without closing: the peer reads end
+       of file and this end can still read. */
+    if (shutdown(client, SHUT_WR) != 0) { perror("shutdown"); return 1; }
+    /* And it can: the client sends this only after it has seen the end of
+       file, so a reply here proves the connection outlived the FIN. */
+    char last[16] = {0};
+    /* Bounded like the accept, so a half-close that stopped reaching the
+       host fails this test with a diagnosis instead of parking here while
+       the client waits for an end of file that is not coming. */
+    struct pollfd reply = { .fd = client, .events = POLLIN };
+    if (poll(&reply, 1, 30000) <= 0) { printf("no reply\n"); return 0; }
+    ssize_t got = read(client, last, sizeof last - 1);
+    printf("after %zd: %s", got, last);
+    close(client);
+    close(server);
+    return 0;
+}
+"#,
+        &["-static", "-no-pie"],
+    );
+
+    let client = std::thread::spawn(move || -> Result<String, String> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            if std::time::Instant::now() > deadline {
+                return Err("the guest never answered on the host port".into());
+            }
+            let Ok(mut stream) = std::net::TcpStream::connect(("127.0.0.1", host_port)) else {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                continue;
+            };
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(30)))
+                .map_err(|e| e.to_string())?;
+            // Reads to end of file. If the half-close never reached the
+            // host this blocks until the timeout, because the guest is
+            // still sitting in its own read and will not close.
+            let mut back = String::new();
+            stream.read_to_string(&mut back).map_err(|e| e.to_string())?;
+            stream.write_all(b"bye\n").map_err(|e| e.to_string())?;
+            return Ok(back);
+        }
+    });
+
+    let mut mounts = support::mounts_seeded(&[0x33; 32]);
+    mounts.mount(&[b"iso", b"time"], Box::new(runner::store::Clock::new()));
+    mounts.mount(
+        &[b"iso", b"net"],
+        Box::new(runner::net::NetStore::new(vec![(host_port, 8080)])),
+    );
+    let (status, printed) = boot(&module, mounts);
+    let heard = client.join().expect("the client thread");
+
+    assert_eq!(status, 0, "the guest failed: {printed}");
+    assert_eq!(
+        heard.as_deref(),
+        Ok("half\n"),
+        "the host did not see the response end"
+    );
+    assert_eq!(
+        printed, "after 4: bye\n",
+        "the guest could not read after half-closing"
+    );
+    drop(workspace);
+}
