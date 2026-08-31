@@ -11,6 +11,13 @@ edition = "2024"
 [lib]
 crate-type = ["staticlib", "rlib"]
 
+# Counting what a real program retires, so that the next instruction to
+# lower is chosen by measurement rather than by reading code and guessing.
+# Off by default because it runs once per retired instruction, which is the
+# one place this engine cannot afford anything.
+[features]
+histogram = []
+
 [dependencies]
 # Decoding and the RFLAGS-effect tables, and nothing else: no encoder, no
 # formatters. The engine names an instruction it cannot execute by its

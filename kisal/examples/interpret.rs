@@ -273,6 +273,13 @@ fn main() {
         retired as f64 / elapsed / 1e6
     );
     eprintln!("blocks decoded: {decoded}");
+    // Present only in a build asked for it: `--features targum/histogram`.
+    // What each mnemonic *costs* differs between the native and the wasm
+    // build; how often the guest executes one does not, so this is the
+    // faster place to take the measurement.
+    if let Some(table) = targum::histogram::report() {
+        eprint!("{table}");
+    }
     match exit {
         Exit::Status(status) => std::process::exit(status),
         other => {

@@ -261,6 +261,7 @@ impl<'a> Cpu<'a> {
     /// everything else, so this arm carries the instructions nobody has got
     /// to yet at exactly the speed they ran before.
     pub fn run(&mut self, quick: &Quick, instruction: &Instruction) -> Result<Step, Trap> {
+        crate::histogram::record(instruction, quick.op != Op::General);
         if quick.op == Op::General {
             return self.step(instruction);
         }
