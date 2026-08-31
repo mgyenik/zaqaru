@@ -107,7 +107,15 @@ impl Width {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Slice {
     /// Index into the register file, in x86 encoding order.
-    pub number: usize,
+    ///
+    /// A byte, for a number that is zero to fifteen. It used to be a
+    /// `usize`, which cost nothing where a `Slice` is a local and a great
+    /// deal once [`crate::quick`] started storing two of them per
+    /// instruction for the life of a block: `Quick` was ninety-six bytes
+    /// against `Instruction`'s forty, and workloads made mostly of
+    /// instructions the lowering *declines* paid that for no benefit at all.
+    /// `float` measured slower than before the fast path existed.
+    pub number: u8,
     pub width: Width,
     /// True for `%ah`, `%ch`, `%dh` and `%bh`, which name bits 8..16.
     pub high_byte: bool,
@@ -127,7 +135,7 @@ impl Slice {
             Register::AH | Register::CH | Register::DH | Register::BH
         );
         Some(Self {
-            number: register.full_register().number(),
+            number: register.full_register().number() as u8,
             width: Width::from_bytes(register.size())?,
             high_byte,
         })
@@ -136,7 +144,7 @@ impl Slice {
     /// The whole of a register named by its index, for the interpreter's own
     /// bookkeeping accesses — the stack pointer, the string-instruction
     /// pointers, the implicit accumulator — which always work full width.
-    pub const fn quad(number: usize) -> Self {
+    pub const fn quad(number: u8) -> Self {
         Self {
             number,
             width: Width::Qword,
@@ -232,7 +240,7 @@ impl Tcb {
 
     /// Reads a register slice, zero-extended into a `u64`.
     pub fn read_register(&self, slice: Slice) -> u64 {
-        let whole = self.registers[slice.number];
+        let whole = self.registers[slice.number as usize];
         let shifted = if slice.high_byte { whole >> 8 } else { whole };
         shifted & slice.width.mask()
     }
@@ -246,7 +254,7 @@ impl Tcb {
     /// clears the top; `mov %al, ...` next to it must not. One function
     /// states the rule so no instruction arm can get it wrong privately.
     pub fn write_register(&mut self, slice: Slice, value: u64) {
-        let slot = &mut self.registers[slice.number];
+        let slot = &mut self.registers[slice.number as usize];
         match (slice.width, slice.high_byte) {
             (Width::Qword, _) => *slot = value,
             (Width::Dword, _) => *slot = value & 0xffff_ffff,
@@ -325,7 +333,7 @@ mod tests {
     #[test]
     fn spl_and_ah_are_different_bytes_of_different_registers() {
         let spl = Slice::of(Register::SPL).expect("spl is a general-purpose register");
-        assert_eq!(spl.number, STACK_POINTER);
+        assert_eq!(usize::from(spl.number), STACK_POINTER);
         assert!(!spl.high_byte);
         let ah = Slice::of(Register::AH).expect("ah is a general-purpose register");
         assert_eq!(ah.number, 0);
@@ -354,7 +362,7 @@ mod tests {
         ];
         for (expected, register) in ORDER.iter().enumerate() {
             let slice = Slice::of(*register).expect("a general-purpose register");
-            assert_eq!(slice.number, expected, "{register:?}");
+            assert_eq!(usize::from(slice.number), expected, "{register:?}");
             assert_eq!(slice.width, Width::Qword);
         }
     }

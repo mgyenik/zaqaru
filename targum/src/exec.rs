@@ -309,6 +309,53 @@ impl<'a> Cpu<'a> {
                 let value = self.pop(width)?;
                 return self.quick_store(quick, quick.destination, width, value);
             }
+            Op::Nop => return Ok(Step::Retired),
+            // `rip` already names the next instruction — `run` set it — so
+            // a branch not taken has nothing left to do, and a branch taken
+            // only has to disagree.
+            Op::Jcc => {
+                if quick.condition.holds(&self.tcb.flags) {
+                    self.tcb.rip = match quick.source {
+                        Source::Immediate(target) => target,
+                        _ => unreachable!("a conditional branch target is always an immediate"),
+                    };
+                }
+                return Ok(Step::Retired);
+            }
+            Op::Jmp => {
+                self.tcb.rip = self.quick_load(quick, quick.source, Width::Qword)?;
+                return Ok(Step::Retired);
+            }
+            // The target before the push, because an indirect call through
+            // memory can name a location the push would move — `call
+            // *(%rsp)` reads the stack the return address is about to go on.
+            Op::Call => {
+                let target = self.quick_load(quick, quick.source, Width::Qword)?;
+                // Which `run` put there, and is exactly the return address.
+                let ret = self.tcb.rip;
+                self.push(Width::Qword, ret)?;
+                self.tcb.rip = target;
+                return Ok(Step::Retired);
+            }
+            Op::Ret => {
+                let target = self.pop(Width::Qword)?;
+                if let Source::Immediate(extra) = quick.source
+                    && extra != 0
+                {
+                    self.tcb
+                        .set_stack_pointer(self.tcb.stack_pointer().wrapping_add(extra));
+                }
+                self.tcb.rip = target;
+                return Ok(Step::Retired);
+            }
+            Op::Widen | Op::WidenSigned => {
+                let value = self.quick_load(quick, quick.source, quick.source_width)?;
+                let widened = match quick.op {
+                    Op::Widen => value,
+                    _ => quick.source_width.sign_extend(value),
+                };
+                return self.quick_store(quick, quick.destination, width, widened);
+            }
             _ => {}
         }
         let left = self.quick_load(quick, quick.destination, width)?;
@@ -344,7 +391,7 @@ impl<'a> Cpu<'a> {
                     at = at.wrapping_add(self.tcb.read_register(base));
                 }
                 if let Some(index) = index {
-                    at = at.wrapping_add(self.tcb.read_register(index).wrapping_mul(scale));
+                    at = at.wrapping_add(self.tcb.read_register(index).wrapping_mul(u64::from(scale)));
                 }
                 match narrow {
                     true => at & 0xffff_ffff,
@@ -543,13 +590,13 @@ impl<'a> Cpu<'a> {
                     _ => (Width::Dword, Width::Qword),
                 };
                 let value = self.tcb.read_register(Slice {
-                    number: number::RAX,
+                    number: number::RAX as u8,
                     width: from,
                     high_byte: false,
                 });
                 self.tcb.write_register(
                     Slice {
-                        number: number::RAX,
+                        number: number::RAX as u8,
                         width: to,
                         high_byte: false,
                     },
@@ -564,7 +611,7 @@ impl<'a> Cpu<'a> {
                     _ => Width::Qword,
                 };
                 let value = self.tcb.read_register(Slice {
-                    number: number::RAX,
+                    number: number::RAX as u8,
                     width,
                     high_byte: false,
                 });
@@ -574,7 +621,7 @@ impl<'a> Cpu<'a> {
                 };
                 self.tcb.write_register(
                     Slice {
-                        number: number::RDX,
+                        number: number::RDX as u8,
                         width,
                         high_byte: false,
                     },
@@ -747,7 +794,7 @@ impl<'a> Cpu<'a> {
                     _ => Width::Dword,
                 };
                 if self.tcb.read_register(Slice {
-                    number: number::RCX,
+                    number: number::RCX as u8,
                     width,
                     high_byte: false,
                 }) == 0
@@ -827,7 +874,7 @@ impl<'a> Cpu<'a> {
                 let low = self.tcb.flags.materialized() & 0xff;
                 self.tcb.write_register(
                     Slice {
-                        number: number::RAX,
+                        number: number::RAX as u8,
                         width: Width::Byte,
                         high_byte: true,
                     },
@@ -837,7 +884,7 @@ impl<'a> Cpu<'a> {
             }
             Mnemonic::Sahf => {
                 let ah = self.tcb.read_register(Slice {
-                    number: number::RAX,
+                    number: number::RAX as u8,
                     width: Width::Byte,
                     high_byte: true,
                 });
@@ -852,7 +899,7 @@ impl<'a> Cpu<'a> {
                 let destination = self.read(instruction, 0, width)?;
                 let source = self.read(instruction, 1, width)?;
                 let accumulator = self.tcb.read_register(Slice {
-                    number: number::RAX,
+                    number: number::RAX as u8,
                     width,
                     high_byte: false,
                 });
@@ -865,7 +912,7 @@ impl<'a> Cpu<'a> {
                     false => {
                         self.tcb.write_register(
                             Slice {
-                                number: number::RAX,
+                                number: number::RAX as u8,
                                 width,
                                 high_byte: false,
                             },
@@ -1067,7 +1114,7 @@ impl<'a> Cpu<'a> {
         let (left, right) = match instruction.op_count() {
             1 => (
                 self.tcb.read_register(Slice {
-                    number: number::RAX,
+                    number: number::RAX as u8,
                     width,
                     high_byte: false,
                 }),
@@ -1106,7 +1153,7 @@ impl<'a> Cpu<'a> {
         self.tcb.flags.set_all(status);
         if wide {
             let accumulator = Slice {
-                number: number::RAX,
+                number: number::RAX as u8,
                 width,
                 high_byte: false,
             };
@@ -1115,7 +1162,7 @@ impl<'a> Cpu<'a> {
                 // product lands in `%ax` rather than being split.
                 Width::Byte => self.tcb.write_register(
                     Slice {
-                        number: number::RAX,
+                        number: number::RAX as u8,
                         width: Width::Word,
                         high_byte: false,
                     },
@@ -1125,7 +1172,7 @@ impl<'a> Cpu<'a> {
                     self.tcb.write_register(accumulator, low);
                     self.tcb.write_register(
                         Slice {
-                            number: number::RDX,
+                            number: number::RDX as u8,
                             width,
                             high_byte: false,
                         },
@@ -1156,31 +1203,31 @@ impl<'a> Cpu<'a> {
         let (dividend, remainder_slice) = match width {
             Width::Byte => (
                 u128::from(self.tcb.read_register(Slice {
-                    number: number::RAX,
+                    number: number::RAX as u8,
                     width: Width::Word,
                     high_byte: false,
                 })),
                 Slice {
-                    number: number::RAX,
+                    number: number::RAX as u8,
                     width: Width::Byte,
                     high_byte: true,
                 },
             ),
             _ => {
                 let low = self.tcb.read_register(Slice {
-                    number: number::RAX,
+                    number: number::RAX as u8,
                     width,
                     high_byte: false,
                 });
                 let high = self.tcb.read_register(Slice {
-                    number: number::RDX,
+                    number: number::RDX as u8,
                     width,
                     high_byte: false,
                 });
                 (
                     (u128::from(high) << width.bits()) | u128::from(low),
                     Slice {
-                        number: number::RDX,
+                        number: number::RDX as u8,
                         width,
                         high_byte: false,
                     },
@@ -1221,12 +1268,12 @@ impl<'a> Cpu<'a> {
         }
         let quotient_slice = match width {
             Width::Byte => Slice {
-                number: number::RAX,
+                number: number::RAX as u8,
                 width: Width::Byte,
                 high_byte: false,
             },
             _ => Slice {
-                number: number::RAX,
+                number: number::RAX as u8,
                 width,
                 high_byte: false,
             },
@@ -1578,7 +1625,7 @@ impl<'a> Cpu<'a> {
             }
             StringOperation::Store => {
                 let value = self.tcb.read_register(Slice {
-                    number: number::RAX,
+                    number: number::RAX as u8,
                     width,
                     high_byte: false,
                 });
@@ -1589,7 +1636,7 @@ impl<'a> Cpu<'a> {
                 let value = self.space.load(source, width)?;
                 self.tcb.write_register(
                     Slice {
-                        number: number::RAX,
+                        number: number::RAX as u8,
                         width,
                         high_byte: false,
                     },
@@ -1600,7 +1647,7 @@ impl<'a> Cpu<'a> {
             StringOperation::Scan => {
                 let value = self.space.load(destination, width)?;
                 let accumulator = self.tcb.read_register(Slice {
-                    number: number::RAX,
+                    number: number::RAX as u8,
                     width,
                     high_byte: false,
                 });
@@ -1659,7 +1706,7 @@ impl<'a> Cpu<'a> {
             // An unknown leaf answers zeros, which is what a processor does
             // for a leaf above the highest it supports.
             .unwrap_or([0; 4]);
-        for (number, value) in [0usize, 3, 1, 2].into_iter().zip(answer) {
+        for (number, value) in [0u8, 3, 1, 2].into_iter().zip(answer) {
             self.tcb.write_register(
                 Slice {
                     number,

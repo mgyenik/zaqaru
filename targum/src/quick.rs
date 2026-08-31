@@ -30,7 +30,7 @@
 
 use iced_x86::{Instruction, Mnemonic, OpKind, Register};
 
-use crate::flags::Rule;
+use crate::flags::{Condition, Rule};
 use crate::state::{Slice, Width};
 
 /// What a lowered instruction does. Dense and small on purpose.
@@ -55,6 +55,28 @@ pub enum Op {
     /// operand shape.
     Push,
     Pop,
+    /// Nothing at all. Worth an arm because `endbr64` is 0.8% of a Django
+    /// import — every indirect-call landing pad in a libc built for
+    /// control-flow enforcement — and doing nothing quickly beats doing
+    /// nothing after a seventeen-hundred-way dispatch.
+    Nop,
+    /// A conditional near branch, whose target is a constant and whose
+    /// condition is in [`Quick::condition`]. The measured reason this
+    /// module grew control flow at all: branches are a sixth of a real
+    /// run, which is what a five-instruction average block implies and
+    /// what reading the code did not suggest.
+    Jcc,
+    /// Unconditional, to whatever `source` names — an immediate for a near
+    /// branch, a register or memory for an indirect one. CPython's
+    /// interpreter dispatch is the indirect kind.
+    Jmp,
+    Call,
+    Ret,
+    /// `movzx`, `movsx` and `movsxd`: a load at one width and a store at
+    /// another, which is why they need [`Quick::source_width`].
+    Widen,
+    /// The same, sign-extending.
+    WidenSigned,
 }
 
 /// Where a lowered operand's value comes from.
@@ -81,7 +103,7 @@ pub enum Address {
         displacement: u64,
         base: Option<Slice>,
         index: Option<Slice>,
-        scale: u64,
+        scale: u8,
         /// A thirty-two bit address-size prefix: the *sum* wraps, which is
         /// why this is a property of the address and not of each term.
         narrow: bool,
@@ -101,6 +123,12 @@ pub struct Quick {
     pub destination: Source,
     pub source: Source,
     pub address: Address,
+    /// Which condition [`Op::Jcc`] tests. Meaningless for every other op,
+    /// and never read by one.
+    pub condition: Condition,
+    /// What [`Op::Widen`] and [`Op::WidenSigned`] read at, where `width` is
+    /// what they write at. Equal to `width` everywhere else.
+    pub source_width: Width,
     /// `%fs`-relative. `%gs` is never lowered — the general path refuses it,
     /// loudly, and should go on being the only place that knows that.
     pub segmented: bool,
@@ -116,6 +144,8 @@ impl Quick {
         destination: Source::Register(PLACEHOLDER),
         source: Source::Register(PLACEHOLDER),
         address: Address::Fixed(0),
+        condition: Condition::Equal,
+        source_width: Width::Qword,
         segmented: false,
     };
 
@@ -133,7 +163,26 @@ impl Quick {
             Mnemonic::Test => Op::Test,
             Mnemonic::Push => return lower_push(instruction),
             Mnemonic::Pop => return lower_pop(instruction),
-            _ => return Quick::GENERAL,
+            // Genuinely nothing on an in-order interpreter with one thread
+            // and no cache hierarchy. The general path says so at length;
+            // this agrees with exactly that list and no more of it, because
+            // a fence that mattered would matter here too.
+            Mnemonic::Nop | Mnemonic::Endbr64 | Mnemonic::Endbr32 | Mnemonic::Pause => {
+                return Quick { op: Op::Nop, ..Quick::GENERAL };
+            }
+            Mnemonic::Jmp => return lower_branch(instruction, Op::Jmp),
+            Mnemonic::Call => return lower_branch(instruction, Op::Call),
+            Mnemonic::Ret => return lower_return(instruction),
+            Mnemonic::Movzx => return lower_widen(instruction, Op::Widen),
+            Mnemonic::Movsx | Mnemonic::Movsxd => {
+                return lower_widen(instruction, Op::WidenSigned);
+            }
+            _ => {
+                if let Some(condition) = condition_of(instruction.mnemonic()) {
+                    return lower_conditional(instruction, condition);
+                }
+                return Quick::GENERAL;
+            }
         };
         // Exactly two operands, because every op above has two and a
         // lowering that guessed at a third would be lowering something else.
@@ -172,7 +221,8 @@ impl Quick {
             address = form;
             segmented = fs;
         }
-        Quick { op, width, destination, source, address, segmented }
+        Quick { op, width, destination, source, address,
+                condition: Condition::Equal, source_width: width, segmented }
     }
 
     /// Whether the flags this op leaves behind are a logical rule's.
@@ -188,6 +238,116 @@ impl Quick {
     pub fn writes_back(&self) -> bool {
         !matches!(self.op, Op::Cmp | Op::Test)
     }
+}
+
+/// The sixteen conditional near branches, by mnemonic.
+///
+/// Only the jumps: `setcc` and `cmovcc` share these conditions and are not
+/// lowered, because they write an operand and the jumps do not.
+fn condition_of(mnemonic: Mnemonic) -> Option<Condition> {
+    Some(match mnemonic {
+        Mnemonic::Jo => Condition::Overflow,
+        Mnemonic::Jno => Condition::NoOverflow,
+        Mnemonic::Jb => Condition::Below,
+        Mnemonic::Jae => Condition::AboveOrEqual,
+        Mnemonic::Je => Condition::Equal,
+        Mnemonic::Jne => Condition::NotEqual,
+        Mnemonic::Jbe => Condition::BelowOrEqual,
+        Mnemonic::Ja => Condition::Above,
+        Mnemonic::Js => Condition::Sign,
+        Mnemonic::Jns => Condition::NoSign,
+        Mnemonic::Jp => Condition::Parity,
+        Mnemonic::Jnp => Condition::NoParity,
+        Mnemonic::Jl => Condition::Less,
+        Mnemonic::Jge => Condition::GreaterOrEqual,
+        Mnemonic::Jle => Condition::LessOrEqual,
+        Mnemonic::Jg => Condition::Greater,
+        _ => return None,
+    })
+}
+
+/// A conditional branch: the target is a constant the decoder already
+/// resolved, so all that is left at run time is reading a lazy flag.
+fn lower_conditional(instruction: &Instruction, condition: Condition) -> Quick {
+    if instruction.op0_kind() != OpKind::NearBranch64 {
+        return Quick::GENERAL;
+    }
+    Quick {
+        op: Op::Jcc,
+        source: Source::Immediate(instruction.near_branch64()),
+        condition,
+        ..Quick::GENERAL
+    }
+}
+
+/// `jmp` and `call`, near or indirect.
+fn lower_branch(instruction: &Instruction, op: Op) -> Quick {
+    if instruction.op_count() != 1 || instruction.has_lock_prefix() {
+        return Quick::GENERAL;
+    }
+    let (source, address, segmented) = match instruction.op0_kind() {
+        OpKind::NearBranch64 => (
+            Source::Immediate(instruction.near_branch64()),
+            Address::Fixed(0),
+            false,
+        ),
+        // An indirect branch reads a full-width pointer, whatever the
+        // operand's own size would say.
+        OpKind::Register => match Slice::of(instruction.op_register(0)) {
+            Some(slice) if slice.width == Width::Qword => {
+                (Source::Register(slice), Address::Fixed(0), false)
+            }
+            _ => return Quick::GENERAL,
+        },
+        OpKind::Memory => match address_of(instruction) {
+            Some((address, segmented)) => (Source::Memory, address, segmented),
+            None => return Quick::GENERAL,
+        },
+        _ => return Quick::GENERAL,
+    };
+    Quick { op, width: Width::Qword, source, address, segmented, ..Quick::GENERAL }
+}
+
+/// `ret`, whose optional immediate pops extra bytes off the stack.
+fn lower_return(instruction: &Instruction) -> Quick {
+    let extra = match instruction.op_count() {
+        0 => 0,
+        1 => instruction.immediate(0),
+        _ => return Quick::GENERAL,
+    };
+    Quick {
+        op: Op::Ret,
+        width: Width::Qword,
+        source: Source::Immediate(extra),
+        ..Quick::GENERAL
+    }
+}
+
+/// `movzx`, `movsx` and `movsxd`: read at one width, write at another.
+fn lower_widen(instruction: &Instruction, op: Op) -> Quick {
+    if instruction.op_count() != 2 || instruction.has_lock_prefix() {
+        return Quick::GENERAL;
+    }
+    let (Some(width), Some(source_width)) =
+        (width_at(instruction, 0), width_at(instruction, 1))
+    else {
+        return Quick::GENERAL;
+    };
+    let Some(destination) = source_of(instruction, 0, width) else {
+        return Quick::GENERAL;
+    };
+    let Some(source) = source_of(instruction, 1, source_width) else {
+        return Quick::GENERAL;
+    };
+    let (address, segmented) = match destination == Source::Memory || source == Source::Memory {
+        true => match address_of(instruction) {
+            Some(found) => found,
+            None => return Quick::GENERAL,
+        },
+        false => (Address::Fixed(0), false),
+    };
+    Quick { op, width, source_width, destination, source, address, segmented,
+            condition: Condition::Equal }
 }
 
 /// `push`, whose one operand is a source and whose immediate form is
@@ -213,7 +373,8 @@ fn lower_push(instruction: &Instruction) -> Quick {
         },
         false => (Address::Fixed(0), false),
     };
-    Quick { op: Op::Push, width, destination: Source::Register(PLACEHOLDER), source, address, segmented }
+    Quick { op: Op::Push, width, destination: Source::Register(PLACEHOLDER), source, address,
+            condition: Condition::Equal, source_width: width, segmented }
 }
 
 /// `pop`, whose one operand is a destination.
@@ -234,14 +395,21 @@ fn lower_pop(instruction: &Instruction) -> Quick {
         },
         false => (Address::Fixed(0), false),
     };
-    Quick { op: Op::Pop, width, destination, source: Source::Register(PLACEHOLDER), address, segmented }
+    Quick { op: Op::Pop, width, destination, source: Source::Register(PLACEHOLDER), address,
+            condition: Condition::Equal, source_width: width, segmented }
 }
 
 /// Operand zero's width, which is the instruction's — the same rule
 /// `Cpu::width` follows, including an immediate taking operand zero's.
 fn width_of(instruction: &Instruction) -> Option<Width> {
-    let bytes = match instruction.op_kind(0) {
-        OpKind::Register => instruction.op_register(0).size(),
+    width_at(instruction, 0)
+}
+
+/// The width a named operand is accessed at, which for the widening moves
+/// differs between the two.
+fn width_at(instruction: &Instruction, operand: u32) -> Option<Width> {
+    let bytes = match instruction.op_kind(operand) {
+        OpKind::Register => instruction.op_register(operand).size(),
         OpKind::Memory => instruction.memory_size().size(),
         _ => return None,
     };
@@ -299,7 +467,7 @@ fn address_of(instruction: &Instruction) -> Option<(Address, bool)> {
             displacement: instruction.memory_displacement64(),
             base: lowered(base)?,
             index: lowered(index)?,
-            scale: u64::from(instruction.memory_index_scale()),
+            scale: instruction.memory_index_scale() as u8,
             narrow,
         },
         segmented,

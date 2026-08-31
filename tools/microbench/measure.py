@@ -59,7 +59,13 @@ CORE = "2"
 SCALES = {
     "alu": 7_000_000,
     "memory_sequential": 2,
-    "memory_random": 500_000,
+    # Eight million, because the chase has to dominate the shuffle that
+    # sets it up. At five hundred thousand the differential signal was a
+    # couple of million instructions against a sixty-million-instruction
+    # permutation, and the measurement swung between 1.1x and 2.1x on
+    # reruns of identical code -- a fixed cost cancels in the subtraction,
+    # but its variance does not.
+    "memory_random": 8_000_000,
     "calls": 150,
     "branches": 1_500_000,
     "string": 2_500,
