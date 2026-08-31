@@ -53,15 +53,15 @@
        6  wait4                row
        5  prlimit64            row
        5  getppid              row
-       5  chown                MISSING
+       5  chown                row
        5  setsockopt           row
        5  sendto               row
        4  rseq                 row
        4  getegid              row
        4  listen               row
        4  unlink               row
-       4  clock_nanosleep      MISSING
-       4  pselect6             MISSING
+       4  clock_nanosleep      row
+       4  pselect6             row
        4  writev               row
        4  exit_group           row
        3  access               row
@@ -75,44 +75,32 @@
        2  getuid               row
        2  getgid               row
        2  epoll_create         row
-       2  rt_sigsuspend        MISSING
+       2  rt_sigsuspend        row
        2  epoll_create1        row
        2  chdir                row
-       2  umask                MISSING
+       2  umask                row
        2  getsockopt           row
        2  shutdown             row
        2  readv                row
        2  poll                 row
-       2  recvmsg              MISSING
+       2  recvmsg              row
        1  readlinkat           row
        1  pwrite64             row
        1  dup2                 row
-       1  setgid               MISSING
-       1  setgroups            MISSING
-       1  setuid               MISSING
+       1  setgid               row
+       1  setgroups            row
+       1  setuid               row
        1  prctl                row
-       1  eventfd2             MISSING
+       1  eventfd2             row
        1  pipe2                row
        1  clone3               row
        1  chmod                row
-       1  sendmsg              MISSING
-       1  setitimer            MISSING
+       1  sendmsg              row
+       1  setitimer            row
        1  madvise              row
        1  exit                 row
        1  kill                 row
        1  getpeername          row
 
-[missing]  12 rows the stack calls and kisal has none for
+[missing]  0 rows the stack calls and kisal has none for
 
-       5  chown
-       4  clock_nanosleep
-       4  pselect6
-       2  recvmsg
-       2  rt_sigsuspend
-       2  umask
-       1  eventfd2
-       1  sendmsg
-       1  setgid
-       1  setgroups
-       1  setitimer
-       1  setuid

@@ -66,7 +66,7 @@ pub trait Machine {
     }
 
     /// Parks this thread on a futex word, and reports whether it could be.
-    fn park(&mut self, _word: u64, _bitset: u32) -> bool {
+    fn park(&mut self, _word: u64, _bitset: u32, _deadline: Option<u64>) -> bool {
         false
     }
 
@@ -97,6 +97,16 @@ pub trait Machine {
 
     /// Parks this thread in `accept`, waiting for a connection.
     fn park_on_accept(&mut self, _waiting: crate::thread::Accepting) -> bool {
+        false
+    }
+
+    /// Parks this thread until a deadline, which is `nanosleep`.
+    fn park_on_deadline(&mut self, _deadline: u64) -> bool {
+        false
+    }
+
+    /// Parks this thread on an `eventfd` counter.
+    fn park_on_event(&mut self, _waiting: crate::thread::Eventing) -> bool {
         false
     }
 
@@ -587,8 +597,12 @@ impl Machine for Interpreted {
         Some(tid)
     }
 
-    fn park(&mut self, word: u64, bitset: u32) -> bool {
-        self.threads.current_mut().state = crate::thread::State::Waiting { word, bitset };
+    fn park(&mut self, word: u64, bitset: u32, deadline: Option<u64>) -> bool {
+        self.threads.current_mut().state = crate::thread::State::Waiting {
+            word,
+            bitset,
+            deadline,
+        };
         true
     }
 
@@ -609,6 +623,16 @@ impl Machine for Interpreted {
 
     fn park_on_accept(&mut self, waiting: crate::thread::Accepting) -> bool {
         self.threads.current_mut().state = crate::thread::State::Accepting(waiting);
+        true
+    }
+
+    fn park_on_deadline(&mut self, deadline: u64) -> bool {
+        self.threads.current_mut().state = crate::thread::State::Sleeping { deadline };
+        true
+    }
+
+    fn park_on_event(&mut self, waiting: crate::thread::Eventing) -> bool {
+        self.threads.current_mut().state = crate::thread::State::Eventing(waiting);
         true
     }
 

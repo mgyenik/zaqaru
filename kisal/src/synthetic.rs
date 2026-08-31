@@ -56,19 +56,51 @@ struct Entry {
     rdev: u64,
 }
 
+/// The console, as three devices.
+///
+/// A base image ships `/dev/stdout` and friends as symlinks into
+/// `/proc/self/fd`, which this kernel does not have — so an image that
+/// writes there gets a dangling link and a program that logs there does not
+/// start. nginx does exactly that, and `open("/dev/stderr") failed (30:
+/// Read-only file system)` is how it says so.
+///
+/// Character devices instead of symlinks, and the difference is worth
+/// stating: a symlink would make `/dev/stdout` mean *this process's*
+/// descriptor 1, which is what `/proc/self/fd` means and what a shell
+/// redirection changes. These mean the container's console, always. For a
+/// container whose stdout is the console that is the same thing, and it is
+/// what every image that logs to `/dev/stdout` is asking for.
+pub const CONSOLE_INPUT_DEVICE: (u32, u32) = (5, 100);
+pub const CONSOLE_OUTPUT_DEVICE: (u32, u32) = (5, 101);
+pub const CONSOLE_ERROR_DEVICE: (u32, u32) = (5, 102);
+
 /// `/dev`, with the character devices a libc actually opens.
 ///
 /// Not the whole of a real `/dev`: no `tty`, because v0 decides stdio is not
-/// a terminal and a `/dev/tty` that answered would contradict that; no
-/// `stdin`/`stdout`/`stderr` symlinks, because they point into `/proc/self/fd`
-/// which does not exist until M6 has one to point at. What is here is what a
-/// process opens before it does anything else.
+/// a terminal and a `/dev/tty` that answered would contradict that. What is
+/// here is what a process opens before it does anything else, plus the three
+/// console devices above.
 pub fn dev() -> Vec<u8> {
     build(&[
         Entry {
             name: b"null",
             mode: file_type::CHARACTER | 0o666,
             rdev: make_device(NULL_DEVICE.0, NULL_DEVICE.1),
+        },
+        Entry {
+            name: b"stdin",
+            mode: file_type::CHARACTER | 0o666,
+            rdev: make_device(CONSOLE_INPUT_DEVICE.0, CONSOLE_INPUT_DEVICE.1),
+        },
+        Entry {
+            name: b"stdout",
+            mode: file_type::CHARACTER | 0o666,
+            rdev: make_device(CONSOLE_OUTPUT_DEVICE.0, CONSOLE_OUTPUT_DEVICE.1),
+        },
+        Entry {
+            name: b"stderr",
+            mode: file_type::CHARACTER | 0o666,
+            rdev: make_device(CONSOLE_ERROR_DEVICE.0, CONSOLE_ERROR_DEVICE.1),
         },
         Entry {
             name: b"zero",
@@ -328,7 +360,7 @@ mod tests {
         let image = parse(&index).expect("the built index parses");
         let root = image.inode(image.root()).expect("root");
         assert!(root.is_directory());
-        assert_eq!(image.entry_count(&root).expect("count"), 5);
+        assert_eq!(image.entry_count(&root).expect("count"), 8);
 
         for (name, (major, minor)) in [
             (&b"null"[..], NULL_DEVICE),
@@ -336,6 +368,12 @@ mod tests {
             (b"full", FULL_DEVICE),
             (b"random", RANDOM_DEVICE),
             (b"urandom", URANDOM_DEVICE),
+            // The console, which a base image ships as symlinks into
+            // `/proc/self/fd` and this kernel provides as devices — see the
+            // constants' own comment.
+            (b"stdin", CONSOLE_INPUT_DEVICE),
+            (b"stdout", CONSOLE_OUTPUT_DEVICE),
+            (b"stderr", CONSOLE_ERROR_DEVICE),
         ] {
             let entry = image
                 .lookup(&root, name)

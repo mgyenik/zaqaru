@@ -129,12 +129,13 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
     /// A fresh inode with the mode and ownership a new file gets.
     fn new_inode(&mut self, kind: u32, mode: u32) -> Inode {
         Inode {
-            mode: kind | (mode & 0o7777),
-            // One user. `setuid` and the rest of the identity story arrive
-            // with M6; until then everything the container creates belongs
-            // to whoever the image says is running it.
-            uid: 0,
-            gid: 0,
+            // The umask clears what the caller asked for, which is the one
+            // thing `umask(2)` does and the reason it is recorded at all.
+            mode: kind | (mode & 0o7777 & !self.identity.umask),
+            // Whoever this process has become. Constant zero until nginx's
+            // worker dropped to `nobody` and then created its own files.
+            uid: self.identity.effective_uid,
+            gid: self.identity.effective_gid,
             nlink: 1,
             size: 0,
             mtime_sec: self.now(),
@@ -187,6 +188,72 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
         let overlay = self.overlay_of(directory)?;
         let created = overlay.create(directory.inode, &name, inode, Some(Vec::new()))?;
         Ok(Vnode::new(directory.mount, created))
+    }
+
+    /// `chown`, `lchown`, `fchown` and `fchownat`.
+    ///
+    /// Recorded on the inode, and like the identity it records nothing
+    /// enforces it — see [`crate::syscall::Identity`]. It is not a no-op
+    /// either: nginx's master `chown`s its scratch directories to the user
+    /// its worker will become, and `ls -l` on them afterwards has to agree,
+    /// which is the whole of what a program can observe here.
+    pub(crate) fn chown(&mut self, number: i64, arguments: Arguments) -> Outcome {
+        let (dirfd, path, uid, gid, flags) = match number {
+            number::FCHOWN => {
+                let fd = arguments.get(0) as i32;
+                let Ok(vnode) = self.image_inode(fd, Errno::NotSupported) else {
+                    // A console or a socket has no inode to own.
+                    return Outcome::Done(match self.files.is_open(fd) {
+                        true => 0,
+                        false => Errno::BadFile.as_result(),
+                    });
+                };
+                return Outcome::Done(
+                    match self.change_owner(vnode, arguments.get(1), arguments.get(2)) {
+                        Ok(()) => 0,
+                        Err(errno) => errno.as_result(),
+                    },
+                );
+            }
+            number::FCHOWNAT => (
+                arguments.get(0),
+                arguments.get(1),
+                arguments.get(2),
+                arguments.get(3),
+                arguments.get(4) as i32,
+            ),
+            // `lchown` is `chown` that does not follow a final symlink.
+            number::LCHOWN => (
+                at::FDCWD,
+                arguments.get(0),
+                arguments.get(1),
+                arguments.get(2),
+                at::SYMLINK_NOFOLLOW,
+            ),
+            _ => (at::FDCWD, arguments.get(0), arguments.get(1), arguments.get(2), 0),
+        };
+        let lookup = Lookup {
+            follow_final: flags & at::SYMLINK_NOFOLLOW == 0,
+            require_directory: false,
+        };
+        let vnode = match self.resolve_at(dirfd, path, lookup) {
+            Ok(vnode) => vnode,
+            Err(errno) => return Outcome::Done(errno.as_result()),
+        };
+        Outcome::Done(match self.change_owner(vnode, uid, gid) {
+            Ok(()) => 0,
+            Err(errno) => errno.as_result(),
+        })
+    }
+
+    /// Writes an owner onto an inode, copying it up first.
+    ///
+    /// `-1` means "leave this one", which is how `chown(path, uid, -1)`
+    /// changes the user and not the group — and which nginx uses.
+    fn change_owner(&mut self, vnode: Vnode, uid: i64, gid: i64) -> Result<(), Errno> {
+        let vnode = self.copy_up(vnode)?;
+        let overlay = self.overlay_of(vnode)?;
+        overlay.set_owner(vnode.inode, uid, gid)
     }
 
     pub(crate) fn mkdir(&mut self, arguments: Arguments) -> Outcome {
@@ -543,11 +610,18 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             // so. `pwrite` does arrive, and a pipe has no position.
             crate::fd::Backing::Pipe { .. } => return Err(Errno::NotSeekable),
             crate::fd::Backing::Epoll(_) => return Err(Errno::Invalid),
-            crate::fd::Backing::Socket(_) => return Err(Errno::NotSeekable),
+            crate::fd::Backing::Socket(_) | crate::fd::Backing::Event(_) => {
+                return Err(Errno::NotSeekable);
+            }
             crate::fd::Backing::Image(vnode) => {
                 let inode = self.vfs.inode(vnode)?;
                 return match inode.file_type() {
                     crate::image::file_type::CHARACTER => {
+                        if let Some(answer) =
+                            self.write_console_device(inode.payload, bytes)
+                        {
+                            return answer;
+                        }
                         self.device_write_bytes(inode.payload, bytes.len() as u64)
                     }
                     crate::image::file_type::REGULAR => {
@@ -650,6 +724,11 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
         self.memory().check(buffer as u64, count as u64)?;
         let inode = self.vfs.inode(vnode)?;
         if inode.file_type() == file_type::CHARACTER {
+            if let Some(answer) =
+                self.write_console_device_from(inode.payload, buffer, count as u64)
+            {
+                return answer;
+            }
             return self.device_write_bytes(inode.payload, count as u64);
         }
         if !inode.is_regular() {
@@ -765,7 +844,8 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
                 crate::fd::Backing::Console(_)
                 | crate::fd::Backing::Pipe { .. }
                 | crate::fd::Backing::Epoll(_)
-                | crate::fd::Backing::Socket(_) => return Ok(()),
+                | crate::fd::Backing::Socket(_)
+                | crate::fd::Backing::Event(_) => return Ok(()),
             }
         } else {
             let text = self.path_at(path)?;
@@ -885,7 +965,8 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             crate::fd::Backing::Console(_)
             | crate::fd::Backing::Pipe { .. }
             | crate::fd::Backing::Epoll(_)
-            | crate::fd::Backing::Socket(_) => return Outcome::Done(0),
+            | crate::fd::Backing::Socket(_)
+            | crate::fd::Backing::Event(_) => return Outcome::Done(0),
         };
         let outcome = self.change_mode_at(at::FDCWD, 0, vnode, mode);
         self.finish_change(arguments, outcome)

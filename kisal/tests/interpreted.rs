@@ -2203,3 +2203,139 @@ int main(void) {
         Linkage::Dynamic,
     );
 }
+
+/// **`select` waking on a connection**, which is how gunicorn's worker
+/// learns it has one.
+///
+/// The traced stack waits in `pselect6` on its listener, so a `select` that
+/// only ever returns when its *timeout* expires is a server that answers
+/// every request fifteen seconds late — which looks like slowness and is
+/// actually a readiness path that never fires.
+#[test]
+fn select_wakes_on_a_connection() {
+    agrees_with_native(
+        "select",
+        r#"
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/select.h>
+#include <sys/socket.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+int main(void) {
+    int listener = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in bound = {0};
+    bound.sin_family = AF_INET;
+    bound.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    bind(listener, (struct sockaddr *)&bound, sizeof bound);
+    listen(listener, 8);
+    socklen_t length = sizeof bound;
+    getsockname(listener, (struct sockaddr *)&bound, &length);
+
+    fflush(stdout);
+    if (fork() == 0) {
+        int client = socket(AF_INET, SOCK_STREAM, 0);
+        connect(client, (struct sockaddr *)&bound, sizeof bound);
+        write(client, "hello", 5);
+        close(client);
+        _exit(0);
+    }
+
+    /* A generous timeout that must NOT be what ends the wait: if the
+       connection is what wakes it, this returns almost at once, and the
+       test would still pass on a slow machine — what it cannot survive is
+       readiness never firing, because then `ready` is zero. */
+    fd_set readable;
+    FD_ZERO(&readable);
+    FD_SET(listener, &readable);
+    struct timeval patience = { .tv_sec = 30, .tv_usec = 0 };
+    int ready = select(listener + 1, &readable, 0, 0, &patience);
+    printf("select said %d, listener in set %d\n", ready, FD_ISSET(listener, &readable) != 0);
+
+    int served = accept(listener, 0, 0);
+    char buffer[16] = {0};
+    printf("read %zd: %s\n", read(served, buffer, sizeof buffer - 1), buffer);
+    close(served);
+    close(listener);
+    wait(0);
+    return 0;
+}
+"#,
+        Linkage::Dynamic,
+    );
+}
+
+/// **`epoll` on a connected socket**, which is how nginx reads a response
+/// from an upstream it proxied to.
+///
+/// The listener case is the one every socket test reaches for, and it is not
+/// the one a proxy spends its life in: nginx connects to its upstream,
+/// registers *that* descriptor, and waits for the response to arrive. If a
+/// connected socket's readiness never reaches `epoll`, the proxy waits for
+/// its `proxy_read_timeout` and answers 504 — which is what the demo stack
+/// did, sixty seconds at a time, while the upstream had already replied.
+#[test]
+fn epoll_wakes_on_a_reply_from_an_upstream() {
+    agrees_with_native(
+        "epoll-upstream",
+        r#"
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/epoll.h>
+#include <sys/socket.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+int main(void) {
+    int listener = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in bound = {0};
+    bound.sin_family = AF_INET;
+    bound.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    bind(listener, (struct sockaddr *)&bound, sizeof bound);
+    listen(listener, 8);
+    socklen_t length = sizeof bound;
+    getsockname(listener, (struct sockaddr *)&bound, &length);
+
+    fflush(stdout);
+    if (fork() == 0) {
+        /* The upstream: accept, read the request, answer it. */
+        int served = accept(listener, 0, 0);
+        char request[64] = {0};
+        read(served, request, sizeof request - 1);
+        write(served, "HTTP/1.0 200 OK", 15);
+        close(served);
+        close(listener);
+        _exit(0);
+    }
+    close(listener);
+
+    int upstream = socket(AF_INET, SOCK_STREAM, 0);
+    connect(upstream, (struct sockaddr *)&bound, sizeof bound);
+    write(upstream, "GET / HTTP/1.0", 14);
+
+    int set = epoll_create1(0);
+    struct epoll_event watch = { .events = EPOLLIN, .data = { .fd = upstream } };
+    epoll_ctl(set, EPOLL_CTL_ADD, upstream, &watch);
+    struct epoll_event fired[4];
+    /* Generous, and it must not be what ends the wait. */
+    int ready = epoll_wait(set, fired, 4, 30000);
+    printf("epoll said %d, on the upstream %d\n", ready, ready > 0 && fired[0].data.fd == upstream);
+
+    char reply[64] = {0};
+    printf("read %zd: %s\n", read(upstream, reply, sizeof reply - 1), reply);
+    close(upstream);
+    close(set);
+    wait(0);
+    return 0;
+}
+"#,
+        Linkage::Dynamic,
+    );
+}

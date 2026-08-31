@@ -96,6 +96,26 @@ pub mod number {
     pub const CLOSE_RANGE: i64 = 436;
     pub const FADVISE64: i64 = 221;
     pub const PAUSE: i64 = 34;
+    pub const GETTIMEOFDAY: i64 = 96;
+    pub const CLOCK_GETRES: i64 = 229;
+    pub const RT_SIGSUSPEND: i64 = 130;
+    pub const SETITIMER: i64 = 38;
+    pub const NANOSLEEP: i64 = 35;
+    pub const CLOCK_NANOSLEEP: i64 = 230;
+    pub const EVENTFD2: i64 = 290;
+    pub const PSELECT6: i64 = 270;
+    pub const SELECT: i64 = 23;
+    pub const UMASK: i64 = 95;
+    pub const CHOWN: i64 = 92;
+    pub const FCHOWN: i64 = 93;
+    pub const LCHOWN: i64 = 94;
+    pub const FCHOWNAT: i64 = 260;
+    pub const SETUID: i64 = 105;
+    pub const SETGID: i64 = 106;
+    pub const SETGROUPS: i64 = 116;
+    pub const GETGROUPS: i64 = 115;
+    pub const SETRESUID: i64 = 117;
+    pub const SETRESGID: i64 = 119;
     pub const CONNECT: i64 = 42;
     pub const ACCEPT: i64 = 43;
     pub const SENDTO: i64 = 44;
@@ -109,6 +129,8 @@ pub mod number {
     pub const SETSOCKOPT: i64 = 54;
     pub const GETSOCKOPT: i64 = 55;
     pub const ACCEPT4: i64 = 288;
+    pub const SENDMSG: i64 = 46;
+    pub const RECVMSG: i64 = 47;
     pub const STATFS: i64 = 137;
     pub const FSTATFS: i64 = 138;
     pub const GETRANDOM: i64 = 318;
@@ -215,6 +237,26 @@ pub mod number {
             CLOSE_RANGE => "close_range",
             FADVISE64 => "fadvise64",
             PAUSE => "pause",
+            GETTIMEOFDAY => "gettimeofday",
+            CLOCK_GETRES => "clock_getres",
+            RT_SIGSUSPEND => "rt_sigsuspend",
+            SETITIMER => "setitimer",
+            NANOSLEEP => "nanosleep",
+            CLOCK_NANOSLEEP => "clock_nanosleep",
+            EVENTFD2 => "eventfd2",
+            PSELECT6 => "pselect6",
+            SELECT => "select",
+            UMASK => "umask",
+            CHOWN => "chown",
+            FCHOWN => "fchown",
+            LCHOWN => "lchown",
+            FCHOWNAT => "fchownat",
+            SETUID => "setuid",
+            SETGID => "setgid",
+            SETGROUPS => "setgroups",
+            GETGROUPS => "getgroups",
+            SETRESUID => "setresuid",
+            SETRESGID => "setresgid",
             CONNECT => "connect",
             ACCEPT => "accept",
             ACCEPT4 => "accept4",
@@ -228,6 +270,8 @@ pub mod number {
             SOCKETPAIR => "socketpair",
             SETSOCKOPT => "setsockopt",
             GETSOCKOPT => "getsockopt",
+            SENDMSG => "sendmsg",
+            RECVMSG => "recvmsg",
             STATFS => "statfs",
             FSTATFS => "fstatfs",
             PIPE => "pipe",
@@ -563,8 +607,25 @@ pub struct Kernel<'a, S: Store, M: Machine> {
     /// the parent that just created it.
     pub pid: i32,
     pub parent: i32,
+    /// Who this process is running as, and what mask it creates files with.
+    ///
+    /// A constant zero until the traced nginx dropped privileges — see
+    /// `demo/hello-django/baseline/n0-surface.txt`. `container-plan.md`
+    /// answers `getuid` with zero on the grounds that "a container has one
+    /// user and it is the one that started it", which was true until a
+    /// program *in* the container changed users.
+    pub identity: Identity,
     /// The descriptor table, and the open file descriptions under it.
     pub files: crate::fd::FdTable,
+    /// Who `F_SETOWN` named for each descriptor.
+    ///
+    /// Recorded and answered, and nothing reads it: the signal it exists to
+    /// direct is one this kernel does not send. See the `F_SETOWN` row.
+    pub owners: std::collections::BTreeMap<i32, i32>,
+    /// `PR_SET_DUMPABLE`, recorded and answered; see the row.
+    pub dumpable: i32,
+    /// `PR_SET_PDEATHSIG`, likewise.
+    pub parent_death_signal: i32,
     /// Every pipe in the container, **shared** with every other process in
     /// it rather than copied into each.
     ///
@@ -580,6 +641,9 @@ pub struct Kernel<'a, S: Store, M: Machine> {
     /// because a port table is network-namespace state and a namespace
     /// spans processes. See [`crate::socket`].
     pub sockets: crate::socket::Shared,
+    /// Every `eventfd`, shared for the same reason: a copy of a
+    /// notification notifies nobody.
+    pub events: crate::eventfd::Shared,
     /// Every `epoll` instance in *this* process. See [`crate::poll::Epolls`]
     /// for why this one is not shared where the pipes are.
     pub epolls: crate::poll::Held,
@@ -666,6 +730,47 @@ pub enum Delivery {
 enum Direction {
     In,
     Out,
+}
+
+/// Who a process is running as.
+///
+/// **Recorded and answered; not enforced.** Every `open` in this kernel
+/// succeeds or fails on whether the path resolves, not on whether the
+/// caller's identity may reach it, and adding a check to *one* of the
+/// places that would need one is worse than adding it to none: nginx's
+/// worker drops to `nobody` and then opens the log its master created, and
+/// a half-enforced model is how that fails in a way nobody can predict.
+///
+/// What the recording buys is that a program which asks who it is gets an
+/// answer that changes when it changes itself. nginx compares `geteuid()`
+/// against zero to decide whether to drop privileges at all, and would drop
+/// them again on every reload if the answer never moved.
+#[derive(Clone, Copy, Debug)]
+pub struct Identity {
+    pub uid: u32,
+    pub gid: u32,
+    pub effective_uid: u32,
+    pub effective_gid: u32,
+    /// How many supplementary groups `setgroups` was given. The list itself
+    /// is not kept, because nothing reads it back that this kernel could
+    /// answer differently — `getgroups` reports the count and the primary.
+    pub groups: u32,
+    /// The bits `umask(2)` clears from a created file's mode.
+    pub umask: u32,
+}
+
+impl Default for Identity {
+    fn default() -> Self {
+        Self {
+            uid: 0,
+            gid: 0,
+            effective_uid: 0,
+            effective_gid: 0,
+            groups: 0,
+            // What a shell and every container runtime start with.
+            umask: 0o022,
+        }
+    }
 }
 
 /// The container's only process, which is the first in its own namespace.
@@ -783,13 +888,18 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             executable: String::new(),
             vfs: crate::vfs::Vfs::new(image),
             pid: PROCESS_ID as i32,
+            identity: Identity::default(),
             // The entry process of a container has no parent inside it, and
             // Linux answers zero for a process whose parent is outside its
             // namespace — which is exactly this case.
             parent: 0,
             files: crate::fd::FdTable::with_standard_streams(),
+            owners: std::collections::BTreeMap::new(),
+            dumpable: 1,
+            parent_death_signal: 0,
             rings: crate::ring::Shared::default(),
             sockets: crate::socket::Shared::default(),
+            events: crate::eventfd::Shared::default(),
             epolls: crate::poll::Held::default(),
             clock: 1,
             status: None,
@@ -1140,11 +1250,20 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             // than by a zero nothing notices.
             pid: self.pid,
             parent: self.pid,
+            // Inherited across a fork, which is what makes an nginx worker
+            // run as the user its master became.
+            identity: self.identity,
             files: self.files.clone(),
+            owners: self.owners.clone(),
+            dumpable: self.dumpable,
+            // Linux clears this in the child, and nginx sets it back after
+            // dropping privileges — which is why the row exists at all.
+            parent_death_signal: 0,
             // Shared, not copied — see the field. The counts were raised
             // above, once per descriptor the copied table holds.
             rings: crate::ring::Shared::clone(&self.rings),
             sockets: crate::socket::Shared::clone(&self.sockets),
+            events: crate::eventfd::Shared::clone(&self.events),
             // Copied, and marked: a registration names a description, and
             // a description is an index into a table the child has its own
             // copy of. See [`crate::poll::Epolls`].
@@ -1251,12 +1370,20 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             // `exec` transparent to whoever is waiting.
             pid: self.pid,
             parent: self.parent,
+            // Kept across an exec. A set-user-id binary would change it
+            // here, and this image has none — every file in a baked image
+            // has the mode the bake recorded, and nothing sets that bit.
+            identity: self.identity,
             files,
+            owners: self.owners.clone(),
+            dumpable: self.dumpable,
+            parent_death_signal: self.parent_death_signal,
             // Kept, which is the entire reason `dup2` before an `execve` is
             // how every shell wires a pipeline: the descriptors survive and
             // so must what is behind them.
             rings: crate::ring::Shared::clone(&self.rings),
             sockets: crate::socket::Shared::clone(&self.sockets),
+            events: crate::eventfd::Shared::clone(&self.events),
             // The same process, so not inherited: `execve` keeps the
             // descriptor table it did not close, and the indices with it.
             epolls: crate::poll::Held::new(self.epolls.borrow().clone()),
@@ -1382,6 +1509,95 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
                 Arguments::new([0; 6]),
                 "waiting for a signal on a machine with no scheduler, where \
                  nothing could ever arrive to end the wait",
+            ));
+        }
+        Outcome::Blocked
+    }
+
+    /// `rt_sigsuspend(2)`: `pause` with a mask.
+    ///
+    /// Replaces the blocked set for exactly the length of the wait and puts
+    /// it back before the handler runs, which is the whole of the call and
+    /// the reason it exists at all: a program that unblocked a signal and
+    /// *then* called `pause` would miss one that arrived in between.
+    /// nginx's master lives in this call with an empty mask.
+    fn suspend(&mut self, arguments: Arguments) -> Outcome {
+        let at = arguments.get(0) as u64;
+        let length = arguments.get(1) as u64;
+        if length != 8 {
+            return Outcome::Done(Errno::Invalid.as_result());
+        }
+        let mut bytes = [0u8; 8];
+        if self.pages.read(at, &mut bytes).is_err() {
+            return Outcome::Done(Errno::Fault.as_result());
+        }
+        // `SIGKILL` and `SIGSTOP` cannot be blocked, and a mask that tried
+        // is silently corrected rather than refused — which is what Linux
+        // does.
+        let wanted = u64::from_le_bytes(bytes) & !(signal_bit(9) | signal_bit(19));
+        let owned = self.machine.owned();
+        owned.suspended_mask = Some(owned.blocked_signals);
+        owned.blocked_signals = wanted;
+        if !self.machine.park_on_signal() {
+            let owned = self.machine.owned();
+            if let Some(previous) = owned.suspended_mask.take() {
+                owned.blocked_signals = previous;
+            }
+            return Outcome::Fault(Fault::detailed(
+                number::RT_SIGSUSPEND,
+                arguments,
+                "waiting for a signal on a machine with no scheduler",
+            ));
+        }
+        Outcome::Blocked
+    }
+
+    /// `nanosleep(2)` and `clock_nanosleep(2)`.
+    ///
+    /// A deadline and nothing else — the one wait with no object at all,
+    /// where `pause` at least has a signal to wait for. gunicorn's arbiter
+    /// sleeps in `clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME)` between
+    /// turns of its loop.
+    ///
+    /// **It spins**, and so does every other deadline in this kernel, for
+    /// the reason `crate::poll`'s header gives: the host boundary is two
+    /// imports and neither of them waits. `docs/network-plan.md`'s N4 is
+    /// where that stops being true, and it retires the spin everywhere at
+    /// once rather than here.
+    fn sleep(&mut self, number: i64, arguments: Arguments) -> Outcome {
+        /// `TIMER_ABSTIME`.
+        const ABSOLUTE: i64 = 1;
+        let (absolute, at) = match number == number::CLOCK_NANOSLEEP {
+            true => (arguments.get(1) == ABSOLUTE, arguments.get(2)),
+            false => (false, arguments.get(0)),
+        };
+        let requested = match self.timespec_at(at) {
+            Ok(Some(nanoseconds)) => nanoseconds,
+            Ok(None) => return Outcome::Done(Errno::Fault.as_result()),
+            Err(errno) => return Outcome::Done(errno.as_result()),
+        };
+        let Some(now) = self.monotonic() else {
+            // No clock mounted, so a deadline cannot be told from a wait.
+            return Outcome::Fault(Fault::detailed(
+                number,
+                arguments,
+                "sleeping with no clock mounted, so nothing could ever say \
+                 the sleep was over",
+            ));
+        };
+        let deadline = match absolute {
+            true => requested,
+            false => now.saturating_add(requested),
+        };
+        if deadline <= now {
+            return Outcome::Done(0);
+        }
+        if !self.machine.park_on_deadline(deadline) {
+            return Outcome::Fault(Fault::detailed(
+                number,
+                arguments,
+                "sleeping on a machine with no scheduler, where nothing \
+                 could ever wake it",
             ));
         }
         Outcome::Blocked
@@ -1911,6 +2127,7 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             number::SETSOCKOPT => self.setsockopt(arguments),
             number::GETSOCKOPT => self.getsockopt(arguments),
             number::SENDTO | number::RECVFROM => self.send_receive(number, arguments),
+            number::SENDMSG | number::RECVMSG => self.send_receive_message(number, arguments),
             number::SCHED_GETAFFINITY => self.sched_getaffinity(arguments),
             number::MBIND | number::SET_MEMPOLICY | number::GET_MEMPOLICY => {
                 Outcome::Done(Errno::NoSys.as_result())
@@ -2004,9 +2221,60 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
                 self.epoll_create(number, arguments)
             }
             number::EPOLL_CTL => self.epoll_control(arguments),
+            number::EVENTFD2 => self.make_eventfd(arguments),
+            number::SELECT | number::PSELECT6 => self.select(number, arguments),
             number::CLOSE_RANGE => self.close_range(arguments),
             number::FADVISE64 => self.fadvise(arguments),
             number::PAUSE => self.pause(),
+            // The wall clock as a `timeval` rather than a `timespec`, which
+            // is the whole difference from `clock_gettime(CLOCK_REALTIME)`:
+            // microseconds where that one has nanoseconds. Older than the
+            // clock it duplicates and still what a shell reaches for.
+            // How fine the clock is. One nanosecond, which is what the
+            // store's paths are denominated in — `/iso/time/monotonic_ns` —
+            // and therefore the truth rather than a flattering round number.
+            // A program that reads this to decide how long to sleep between
+            // polls is entitled to the real answer.
+            number::CLOCK_GETRES => {
+                let at = arguments.get(1) as u64;
+                if at == 0 {
+                    return Outcome::Done(0);
+                }
+                let mut image = [0u8; 16];
+                image[8..].copy_from_slice(&1i64.to_le_bytes());
+                // SAFETY: bounds-checked by the write itself.
+                match unsafe { self.memory_mut().write(at, &image) } {
+                    Ok(()) => Outcome::Done(0),
+                    Err(errno) => Outcome::Done(errno.as_result()),
+                }
+            }
+            number::GETTIMEOFDAY => {
+                let at = arguments.get(0) as u64;
+                if at == 0 {
+                    return Outcome::Done(0);
+                }
+                let mut bytes = Vec::new();
+                if self.store.read(crate::paths::TIME_REALTIME, &mut bytes)
+                    != crate::abi::StoreOutcome::Present
+                {
+                    return Outcome::Done(Errno::Invalid.as_result());
+                }
+                let Some(nanoseconds) = parse_nanoseconds(&bytes) else {
+                    return Outcome::Done(Errno::Invalid.as_result());
+                };
+                let mut image = [0u8; 16];
+                image[..8].copy_from_slice(&nanoseconds.div_euclid(1_000_000_000).to_le_bytes());
+                image[8..].copy_from_slice(
+                    &(nanoseconds.rem_euclid(1_000_000_000) / 1000).to_le_bytes(),
+                );
+                // SAFETY: bounds-checked by the write itself.
+                match unsafe { self.memory_mut().write(at, &image) } {
+                    Ok(()) => Outcome::Done(0),
+                    Err(errno) => Outcome::Done(errno.as_result()),
+                }
+            }
+            number::RT_SIGSUSPEND => self.suspend(arguments),
+            number::NANOSLEEP | number::CLOCK_NANOSLEEP => self.sleep(number, arguments),
             number::STATFS | number::FSTATFS => self.statfs(number, arguments),
             number::EPOLL_WAIT | number::EPOLL_PWAIT => self.epoll_wait(arguments),
             number::DUP => self.dup(arguments),
@@ -2031,8 +2299,74 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             // three companions, and a libc that read one number there and a
             // different one here would be right to be confused. A container
             // has one user and it is the one that started it.
-            number::GETUID | number::GETGID | number::GETEUID | number::GETEGID => {
+            number::GETUID => Outcome::Done(i64::from(self.identity.uid)),
+            number::GETGID => Outcome::Done(i64::from(self.identity.gid)),
+            number::GETEUID => Outcome::Done(i64::from(self.identity.effective_uid)),
+            number::GETEGID => Outcome::Done(i64::from(self.identity.effective_gid)),
+            // Changing identity always succeeds, because there is no
+            // identity to be refused by: a container is one privilege
+            // domain. What it does is move the number the calls above
+            // answer with, which is the whole of what a program can see —
+            // and nginx does see it, because it drops privileges only when
+            // `geteuid()` says it still has them.
+            number::SETUID => {
+                self.identity.uid = arguments.get(0) as u32;
+                self.identity.effective_uid = self.identity.uid;
                 Outcome::Done(0)
+            }
+            number::SETGID => {
+                self.identity.gid = arguments.get(0) as u32;
+                self.identity.effective_gid = self.identity.gid;
+                Outcome::Done(0)
+            }
+            number::SETRESUID => {
+                let pick = |value: i64, held: u32| match value {
+                    -1 => held,
+                    value => value as u32,
+                };
+                self.identity.uid = pick(arguments.get(0), self.identity.uid);
+                self.identity.effective_uid = pick(arguments.get(1), self.identity.effective_uid);
+                Outcome::Done(0)
+            }
+            number::SETRESGID => {
+                let pick = |value: i64, held: u32| match value {
+                    -1 => held,
+                    value => value as u32,
+                };
+                self.identity.gid = pick(arguments.get(0), self.identity.gid);
+                self.identity.effective_gid = pick(arguments.get(1), self.identity.effective_gid);
+                Outcome::Done(0)
+            }
+            number::SETGROUPS => {
+                self.identity.groups = arguments.get(0).max(0) as u32;
+                Outcome::Done(0)
+            }
+            // The count when asked for nothing, and the primary group when
+            // asked for room — which is what a caller sizing a buffer does
+            // and then does again.
+            number::GETGROUPS => {
+                let room = arguments.get(0);
+                if room == 0 {
+                    return Outcome::Done(i64::from(self.identity.groups.min(1)));
+                }
+                if self.identity.groups == 0 {
+                    return Outcome::Done(0);
+                }
+                let at = arguments.get(1) as u64;
+                match self.pages.write(at, &self.identity.gid.to_le_bytes()) {
+                    Ok(()) => Outcome::Done(1),
+                    Err(_) => Outcome::Done(Errno::Fault.as_result()),
+                }
+            }
+            // Answers the mask it replaces, which is how a program reads the
+            // umask without a call for it: set it, then set it back.
+            number::CHOWN | number::LCHOWN | number::FCHOWN | number::FCHOWNAT => {
+                self.chown(number, arguments)
+            }
+            number::UMASK => {
+                let previous = self.identity.umask;
+                self.identity.umask = arguments.get(0) as u32 & 0o777;
+                Outcome::Done(i64::from(previous))
             }
             // Zero for the entry process, which has no parent inside the
             // container — Linux answers zero for a process whose parent is
@@ -2140,12 +2474,67 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
         const COMM_LEN: usize = 16;
         /// `PR_CAPBSET_READ`: is this capability in the bounding set?
         const CAPBSET_READ: i64 = 23;
+        /// Whether this process would produce a core dump.
+        const SET_DUMPABLE: i64 = 4;
+        const GET_DUMPABLE: i64 = 3;
+        /// `PR_SET_NAME`, the other half of the one row here already.
+        const SET_NAME: i64 = 15;
+        /// `PR_SET_PDEATHSIG`: a signal when the parent dies.
+        const SET_PDEATHSIG: i64 = 1;
+        const GET_PDEATHSIG: i64 = 2;
+        /// `PR_SET_NO_NEW_PRIVS`, which a hardened service sets and which is
+        /// already true here.
+        const SET_NO_NEW_PRIVS: i64 = 38;
+        const GET_NO_NEW_PRIVS: i64 = 39;
         /// `CAP_LAST_CAP`, measured on this machine's kernel — and the only
         /// part of the answer a program can check, because everything up to
         /// it is in the set and everything past it is `EINVAL`.
         const LAST_CAPABILITY: i64 = 40;
 
         match arguments.get(0) {
+            // Whether a core dump would be written, which nginx sets after
+            // dropping privileges because Linux clears it for a process that
+            // changed uid. Recorded and answered: nothing here writes a core
+            // file, so the flag has nothing to gate — and a program that
+            // reads it back gets what it set, which is all it can observe.
+            SET_DUMPABLE => {
+                self.dumpable = arguments.get(1) as i32;
+                Outcome::Done(0)
+            }
+            GET_DUMPABLE => Outcome::Done(i64::from(self.dumpable)),
+            // The name `/proc/self/comm` and `PR_GET_NAME` report. A thread
+            // that names itself is naming itself for a debugger, and this is
+            // where the debugger would read it.
+            SET_NAME => {
+                let at = arguments.get(1) as u64;
+                let mut comm = [0u8; COMM_LEN];
+                if self.pages.read(at, &mut comm).is_err() {
+                    return Outcome::Done(Errno::Fault.as_result());
+                }
+                let end = comm.iter().position(|byte| *byte == 0).unwrap_or(comm.len());
+                self.executable = String::from_utf8_lossy(&comm[..end]).into_owned();
+                Outcome::Done(0)
+            }
+            // A signal when the parent dies, which this kernel does not
+            // send. Recorded rather than refused *and stated*: the process
+            // table knows when a parent exits — it reparents the children
+            // there — so this is a row waiting to be finished rather than a
+            // capability the design lacks.
+            SET_PDEATHSIG => {
+                self.parent_death_signal = arguments.get(1) as i32;
+                Outcome::Done(0)
+            }
+            GET_PDEATHSIG => {
+                let at = arguments.get(1) as u64;
+                match self.pages.write(at, &self.parent_death_signal.to_le_bytes()) {
+                    Ok(()) => Outcome::Done(0),
+                    Err(_) => Outcome::Done(Errno::Fault.as_result()),
+                }
+            }
+            // Already true, and permanently: there is no set-user-id bit in
+            // a baked image and nothing that would honour one.
+            SET_NO_NEW_PRIVS => Outcome::Done(0),
+            GET_NO_NEW_PRIVS => Outcome::Done(1),
             // The whole bounding set is present, which is what a container
             // started as root has and what this image expects — and there is
             // no privilege boundary here for the answer to be a claim about:
@@ -2389,20 +2778,35 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
                 Outcome::Done(self.machine.wake(word, bitset, count) as i64)
             }
             WAIT | WAIT_BITSET => {
-                // A timed wait needs a clock to expire against, and time
-                // reaches this container as a resource rather than as
-                // something the kernel keeps. Named rather than silently
-                // waited forever, which is what ignoring the timeout would
-                // be: a `pthread_cond_timedwait` that never returns is a
-                // hang with no diagnosis.
-                if arguments.get(3) != 0 {
-                    return Outcome::Fault(Fault::detailed(
-                        number::FUTEX,
-                        arguments,
-                        "a wait with a timeout, which needs a clock to expire \
-                         against",
-                    ));
-                }
+                // A timed wait, which needs a clock to expire against —
+                // and gunicorn does exactly this, seven times in one boot of
+                // the traced stack, so it is not an exotic case. The
+                // timeout is *absolute* for `WAIT_BITSET` and relative for
+                // plain `WAIT`, which is a difference Linux made when it
+                // added the bitset form and which a caller passing the
+                // wrong one waits the wrong length for.
+                let deadline = match arguments.get(3) {
+                    0 => None,
+                    at => {
+                        let requested = match self.timespec_at(at) {
+                            Ok(Some(nanoseconds)) => nanoseconds,
+                            Ok(None) => return Outcome::Done(Errno::Fault.as_result()),
+                            Err(errno) => return Outcome::Done(errno.as_result()),
+                        };
+                        let Some(now) = self.monotonic() else {
+                            return Outcome::Fault(Fault::detailed(
+                                number::FUTEX,
+                                arguments,
+                                "a wait with a timeout and no clock mounted \
+                                 for it to expire against",
+                            ));
+                        };
+                        Some(match operation == WAIT_BITSET {
+                            true => requested,
+                            false => now.saturating_add(requested),
+                        })
+                    }
+                };
                 let bitset = match operation {
                     WAIT_BITSET => arguments.get(5) as u32,
                     _ => u32::MAX,
@@ -2426,7 +2830,7 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
                 if held != expected {
                     return Outcome::Done(Errno::TryAgain.as_result());
                 }
-                match self.machine.park(word, bitset) {
+                match self.machine.park(word, bitset, deadline) {
                     // Parked. The scheduler picks somebody else; when a wake
                     // names this word the thread becomes runnable again and
                     // returns from here with zero.
@@ -2984,6 +3388,9 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             }
             crate::socket::Reach::Elsewhere => {}
         }
+        if let Some((event, flags)) = self.event_of(descriptor) {
+            return self.transfer_event(event, flags, true, buffer, count as u64);
+        }
         let path = match file.backing {
             crate::fd::Backing::Console(crate::fd::Console::Output) => paths::CONSOLE_STDOUT,
             crate::fd::Backing::Console(crate::fd::Console::Error) => paths::CONSOLE_STDERR,
@@ -3004,7 +3411,7 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
                 return Outcome::Done(Errno::Invalid.as_result());
             }
             // Answered before this row is reached; see `write_socket`.
-            crate::fd::Backing::Socket(_) => {
+            crate::fd::Backing::Socket(_) | crate::fd::Backing::Event(_) => {
                 return Outcome::Done(Errno::NotSeekable.as_result());
             }
             crate::fd::Backing::Image(vnode) => {
@@ -3147,7 +3554,14 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
         }
         let inode = self.vfs.inode(vnode)?;
         match inode.file_type() {
-            crate::image::file_type::CHARACTER => self.device_write_bytes(inode.payload, count),
+            crate::image::file_type::CHARACTER => {
+                if let Some(answer) =
+                    self.write_console_device_from(inode.payload, buffer, count)
+                {
+                    return answer;
+                }
+                self.device_write_bytes(inode.payload, count)
+            }
             crate::image::file_type::REGULAR => {
                 self.write_regular(vnode, flags, offset, buffer, count)
             }
@@ -3163,7 +3577,7 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
     /// the reason goes, and it is the only place it exists. Never attempted
     /// for a failure of the log itself — a store that cannot be written is
     /// not a store to report through.
-    fn report_store_failure(&mut self, path: &[&[u8]]) {
+    pub(crate) fn report_store_failure(&mut self, path: &[&[u8]]) {
         if path.starts_with(paths::LOG_ERROR) || paths::LOG_ERROR.starts_with(path) {
             return;
         }

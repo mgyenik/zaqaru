@@ -878,6 +878,14 @@ fn untranslated(program: &Program, base: u64) -> Result<(), Error> {
     }
 }
 
+/// A slice with leading and trailing spaces and tabs removed.
+fn trimmed(bytes: &[u8]) -> &[u8] {
+    let blank = |byte: &u8| *byte == b' ' || *byte == b'\t' || *byte == b'\r';
+    let start = bytes.iter().position(|byte| !blank(byte)).unwrap_or(bytes.len());
+    let end = bytes.iter().rposition(|byte| !blank(byte)).map_or(start, |at| at + 1);
+    &bytes[start..end]
+}
+
 /// Whether a program fits in the region reserved for it.
 pub fn check_region(program: &Program, data: u64) -> Result<(), Error> {
     let top = program.top();
@@ -915,6 +923,94 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
     /// what Linux hands `_start` — zero — because a wasm global starts at
     /// zero and nothing has run yet.
     pub fn exec(&mut self, path: &[u8], argv: &[&[u8]], envp: &[&[u8]]) -> Result<u64, Error> {
+        // A script names the program that runs it, so resolving that comes
+        // first and can happen more than once — a script whose interpreter
+        // is itself a script.
+        let script = self.interpreted_script(path, argv)?;
+        let (path, held): (&[u8], Vec<Vec<u8>>) = match &script {
+            Some((program, argv)) => (program, argv.clone()),
+            None => (path, Vec::new()),
+        };
+        let rebuilt: Vec<&[u8]> = held.iter().map(|held| held.as_slice()).collect();
+        let argv: &[&[u8]] = match script.is_some() {
+            true => &rebuilt,
+            false => argv,
+        };
+        self.exec_program(path, argv, envp)
+    }
+
+    /// Follows `#!` lines until something is an ELF, and answers the program
+    /// to load and the argument vector to give it.
+    ///
+    /// The demo stack's entrypoint is a shell script — an OCI image runs one
+    /// command and a container is a process tree, so the entrypoint is what
+    /// builds it. Without this, `/app/init.sh` is "not an ELF file" and the
+    /// container does not start.
+    ///
+    /// Linux's rules, which programs depend on in detail: at most one
+    /// argument after the interpreter and it is *not* split on spaces; the
+    /// script's own path is inserted as `argv[1]` while `argv[0]` stays
+    /// whatever the caller passed; and the whole thing nests, bounded,
+    /// because a script naming itself is otherwise a loop with no bottom.
+    fn interpreted_script(
+        &mut self,
+        path: &[u8],
+        argv: &[&[u8]],
+    ) -> Result<Option<(Vec<u8>, Vec<Vec<u8>>)>, Error> {
+        /// `BINPRM_BUF_SIZE`: how much of the first line Linux reads.
+        const LINE: usize = 256;
+        /// `BINPRM_MAX_RECURSION`.
+        const NESTING: usize = 4;
+
+        let mut program = path.to_vec();
+        let mut rebuilt: Vec<Vec<u8>> = argv.iter().map(|held| held.to_vec()).collect();
+        let mut followed = 0;
+        loop {
+            let (file, _) = self.read_whole(&program)?;
+            if !file.starts_with(b"#!") {
+                return Ok(match followed {
+                    0 => None,
+                    _ => Some((program, rebuilt)),
+                });
+            }
+            followed += 1;
+            if followed > NESTING {
+                return Err(Error::NotLoadable(
+                    "a `#!` line naming a script that names a script, deeper                      than Linux will follow",
+                ));
+            }
+            let line = &file[2..file.len().min(LINE)];
+            let line = &line[..line.iter().position(|byte| *byte == b'\n').unwrap_or(line.len())];
+            let line = trimmed(line);
+            let split = line
+                .iter()
+                .position(|byte| *byte == b' ' || *byte == b'\t')
+                .unwrap_or(line.len());
+            let (interpreter, argument) = line.split_at(split);
+            if interpreter.is_empty() {
+                return Err(Error::NotLoadable("a `#!` line naming no interpreter"));
+            }
+            // One argument, and it is not split: `#!/usr/bin/env python3 -u`
+            // hands `env` the single string "python3 -u", which is why that
+            // famously does not work.
+            let argument = trimmed(argument);
+            let script = core::mem::replace(&mut program, interpreter.to_vec());
+            let mut next: Vec<Vec<u8>> = vec![match rebuilt.first() {
+                // `argv[0]` stays what the caller passed, which is what a
+                // program printing its own name reports.
+                Some(first) => first.clone(),
+                None => interpreter.to_vec(),
+            }];
+            if !argument.is_empty() {
+                next.push(argument.to_vec());
+            }
+            next.push(script);
+            next.extend(rebuilt.into_iter().skip(1));
+            rebuilt = next;
+        }
+    }
+
+    fn exec_program(&mut self, path: &[u8], argv: &[&[u8]], envp: &[&[u8]]) -> Result<u64, Error> {
         // A transient copy, because the segments are then written into
         // guest memory while the image is still borrowed. It is only safe
         // to allocate this much at all because the bake put the allocator

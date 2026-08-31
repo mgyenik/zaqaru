@@ -27,9 +27,14 @@ use kisal::syscall::{Enforcement, Kernel};
 /// exactly what copying it produces. A store that *held* the output — the
 /// test harness's does — wraps itself in [`kisal::abi::Shared`] instead, and
 /// then cloning shares rather than copies.
-#[derive(Default, Clone)]
+#[derive(Clone)]
 struct Terminal {
     trace: bool,
+    /// Where this container's monotonic clock starts. A container sees one
+    /// that begins near zero at boot, which is all `CLOCK_MONOTONIC`
+    /// promises: an origin that does not move during a run, never a
+    /// particular origin.
+    started: std::time::Instant,
 }
 
 impl Store for Terminal {
@@ -49,6 +54,31 @@ impl Store for Terminal {
         // which is the same capability decision as the clock.
         if path == kisal::paths::RANDOM_SEED {
             into.extend_from_slice(&[0x5a; 32]);
+            return StoreOutcome::Present;
+        }
+        // The two clocks, in the format `runner::store::Clock` answers with:
+        // nanoseconds as decimal text. Without them `clock_gettime` refuses
+        // by name — which is correct, a clock is a capability the host
+        // grants — and a container that cannot read one does not merely lose
+        // timestamps. CPython's `time.time()` raises `OSError` before
+        // `logging` has finished importing, so gunicorn does not start; and
+        // nginx keeps its last cached time, which is uninitialised, and
+        // stamps its log 1973.
+        //
+        // A real clock rather than a fixed one, and the reproducibility this
+        // tool is written for survives it: scheduling here is a function of
+        // *retired instructions*, so two runs interleave identically whatever
+        // the clock says. What varies is only what the guest is told the time
+        // is.
+        if path == kisal::paths::TIME_REALTIME || path == kisal::paths::TIME_MONOTONIC {
+            let nanoseconds = match path == kisal::paths::TIME_REALTIME {
+                true => std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|since| since.as_nanos() as i128)
+                    .unwrap_or(0),
+                false => self.started.elapsed().as_nanos() as i128,
+            };
+            into.extend_from_slice(nanoseconds.to_string().as_bytes());
             return StoreOutcome::Present;
         }
         StoreOutcome::Absent
@@ -74,14 +104,47 @@ fn main() {
         std::process::exit(2);
     }));
     let given: Vec<Vec<u8>> = arguments.map(|argument| argument.into_bytes()).collect();
-    let owned: Vec<Vec<u8>> = match given.is_empty() {
-        true => vec![b"/init".to_vec()],
-        false => given,
-    };
-    let argv: Vec<&[u8]> = owned.iter().map(|argument| argument.as_slice()).collect();
 
     let baking = std::time::Instant::now();
-    let baked = baker::bake_directory(&root).expect("bake the directory");
+    // A directory or an OCI archive, because the thing worth running is
+    // usually an image somebody built rather than a tree somebody curated —
+    // and the archive carries its own entrypoint and environment.
+    let (baked, invocation) = match root.extension().is_some_and(|kind| kind == "tar") {
+        true => {
+            let archive = std::fs::read(&root).expect("read the archive");
+            let (image, invocation) =
+                baker::bake_archive_as_configured(&archive, &given).expect("bake the archive");
+            (image, Some(invocation))
+        }
+        false => (
+            baker::bake_directory(&root).expect("bake the directory"),
+            None,
+        ),
+    };
+    // The image's own entrypoint and environment when it has them, which is
+    // the whole difference between running an archive and running a tree.
+    let (owned, environment): (Vec<Vec<u8>>, Vec<Vec<u8>>) = match invocation {
+        // An archive's own entrypoint, unless the caller named one — which
+        // is `docker run image cmd`, and is how a stack gets poked at
+        // without rebuilding the image it lives in.
+        Some(invocation) => (
+            match given.is_empty() {
+                true => invocation.argv,
+                false => given,
+            },
+            invocation.environment,
+        ),
+        None => (
+            match given.is_empty() {
+                true => vec![b"/init".to_vec()],
+                false => given,
+            },
+            Vec::new(),
+        ),
+    };
+    let argv: Vec<&[u8]> = owned.iter().map(|argument| argument.as_slice()).collect();
+    let envp: Vec<&[u8]> = environment.iter().map(|held| held.as_slice()).collect();
+
     let image = Image::parse(&baked.index, &baked.blob).expect("parse the image");
     eprintln!(
         "baked {} in {:.2}s",
@@ -92,12 +155,13 @@ fn main() {
     let kernel = Kernel::with_enforcement(
         Terminal {
             trace: std::env::var_os("KISAL_TRACE").is_some(),
+            started: std::time::Instant::now(),
         },
         Interpreted::new(),
         image,
         Enforcement::Mapped,
     );
-    let process = match Process::boot(kernel, argv[0], &argv, &[]) {
+    let process = match Process::boot(kernel, argv[0], &argv, &envp) {
         Ok(process) => process,
         Err(error) => {
             let mut message = String::new();

@@ -783,7 +783,7 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
     /// The out-length is the address's *full* size even when the buffer was
     /// smaller — Linux truncates the bytes and reports what it would have
     /// needed, which is how a caller learns to ask again.
-    fn write_address(&mut self, at: u64, length_at: u64, address: &Address) -> Result<(), Errno> {
+    pub(crate) fn write_address(&mut self, at: u64, length_at: u64, address: &Address) -> Result<(), Errno> {
         if at == 0 || length_at == 0 {
             return Ok(());
         }
@@ -1383,5 +1383,141 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
             Ok(()) => Outcome::Done(seen as i64),
             Err(errno) => Outcome::Done(errno.as_result()),
         }
+    }
+}
+
+/// `struct msghdr` on x86-64.
+const MSGHDR: u64 = 56;
+/// `struct iovec`: a pointer and a length.
+const IOVEC: u64 = 16;
+
+impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_, S, M> {
+    /// `sendmsg(2)` and `recvmsg(2)`.
+    ///
+    /// On a stream socket with no control data these are `sendto` and
+    /// `recvfrom` with the buffer described indirectly, and that is the case
+    /// the traced stack uses: nginx's master tells its worker to shut down
+    /// over their channel socketpair, one `iovec`, no ancillary data.
+    ///
+    /// Control data is refused **by name**, because the only thing that
+    /// arrives in it here is `SCM_RIGHTS` — descriptor passing, which nginx
+    /// reaches the moment `worker_processes` exceeds one, and which
+    /// `docs/network-plan.md` §9 designs and defers. Accepting the message
+    /// and dropping the descriptors would be a worker that thinks it was
+    /// handed a listener and was not.
+    pub(crate) fn send_receive_message(
+        &mut self,
+        number: i64,
+        arguments: crate::syscall::Arguments,
+    ) -> crate::syscall::Outcome {
+        use crate::syscall::Outcome;
+        let fd = arguments.get(0) as i32;
+        let at = arguments.get(1) as u64;
+        let flags = arguments.get(2) as i32;
+        let sending = number == crate::syscall::number::SENDMSG;
+
+        let mut header = [0u8; MSGHDR as usize];
+        if self.pages.read(at, &mut header).is_err() {
+            return Outcome::Done(Errno::Fault.as_result());
+        }
+        let word = |offset: usize| {
+            u64::from_le_bytes(header[offset..offset + 8].try_into().expect("eight bytes"))
+        };
+        let control_length = word(40);
+        if word(32) != 0 && control_length != 0 {
+            return Outcome::Fault(crate::syscall::Fault::detailed(
+                number,
+                arguments,
+                "ancillary data on a socket message, which here means \
+                 `SCM_RIGHTS` — descriptor passing, designed in \
+                 `docs/network-plan.md` §9 and not built, and worse to \
+                 accept and drop than to refuse",
+            ));
+        }
+        let vectors = word(16);
+        let count = word(24);
+        if count > 1024 {
+            return Outcome::Done(Errno::Invalid.as_result());
+        }
+        // The address a `sendmsg` names is ignored on a connected stream —
+        // there is one peer and it was already chosen — and `recvmsg` fills
+        // it in from the endpoint.
+        if !sending {
+            let name = word(0);
+            let name_length = u32::from_le_bytes(header[8..12].try_into().expect("four bytes"));
+            if name != 0 && name_length != 0 {
+                let peer = self
+                    .socket_of(fd)
+                    .and_then(|id| self.sockets.borrow().endpoint(id).map(|e| e.peer.clone()))
+                    .unwrap_or_default();
+                // The length is written back into the header, where the
+                // caller reads it.
+                let _ = self.write_address_into(name, at + 8, &peer);
+            }
+        }
+        // Each vector in turn, stopping at the first that cannot finish.
+        // A stream may move less than it was offered, and a caller that
+        // needs all of it loops — which is what makes this correct without
+        // a scatter/gather transfer that could park half-way through.
+        let mut moved = 0i64;
+        for index in 0..count {
+            let mut vector = [0u8; IOVEC as usize];
+            if self
+                .pages
+                .read(vectors + index * IOVEC, &mut vector)
+                .is_err()
+            {
+                return Outcome::Done(Errno::Fault.as_result());
+            }
+            let base = u64::from_le_bytes(vector[0..8].try_into().expect("eight bytes"));
+            let length = u64::from_le_bytes(vector[8..16].try_into().expect("eight bytes"));
+            if length == 0 {
+                continue;
+            }
+            // Anything already moved turns a would-block into a short
+            // transfer, which is what the caller is entitled to see.
+            let piece_flags = match moved > 0 {
+                true => flags | message::DONTWAIT,
+                false => flags,
+            };
+            let outcome = self.send_receive(
+                match sending {
+                    true => crate::syscall::number::SENDTO,
+                    false => crate::syscall::number::RECVFROM,
+                },
+                crate::syscall::Arguments::new([
+                    i64::from(fd),
+                    base as i64,
+                    length as i64,
+                    i64::from(piece_flags),
+                    0,
+                    0,
+                ]),
+            );
+            match outcome {
+                Outcome::Done(piece) if piece >= 0 => {
+                    moved += piece;
+                    // A short piece means the ring is empty or full; asking
+                    // for the next one would answer zero and look like end
+                    // of file.
+                    if (piece as u64) < length {
+                        break;
+                    }
+                }
+                Outcome::Done(errno) => {
+                    return match moved > 0 {
+                        true => Outcome::Done(moved),
+                        false => Outcome::Done(errno),
+                    };
+                }
+                other => return other,
+            }
+        }
+        Outcome::Done(moved)
+    }
+
+    /// The same as `write_address`, with the length in a `msghdr` field.
+    fn write_address_into(&mut self, at: u64, length_at: u64, address: &Address) -> Result<(), Errno> {
+        self.write_address(at, length_at, address)
     }
 }

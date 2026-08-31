@@ -33,7 +33,15 @@ pub enum State {
     /// The bitset is `FUTEX_WAIT_BITSET`'s; a plain `FUTEX_WAIT` parks with
     /// every bit set, so one code path serves both and the plain case is
     /// the all-ones case rather than a second one.
-    Waiting { word: u64, bitset: u32 },
+    Waiting {
+        word: u64,
+        bitset: u32,
+        /// When to give up and answer `ETIMEDOUT`, in nanoseconds on the
+        /// monotonic clock. `None` for a wait with no timeout, which is the
+        /// cheap case — the thread is simply not runnable until a wake
+        /// names its word.
+        deadline: Option<u64>,
+    },
     /// It is in `wait4`, and a child ending completes the call: the answer
     /// is written where the caller asked and the thread becomes runnable
     /// again, rather than the syscall being re-run.
@@ -50,6 +58,12 @@ pub enum State {
     Watching(Watching),
     /// It is in `accept`, waiting for a connection to arrive on a listener.
     Accepting(Accepting),
+    /// It is in a `read` or a `write` on an `eventfd` whose counter cannot
+    /// move yet.
+    Eventing(Eventing),
+    /// It is asleep until a deadline, from `nanosleep` or
+    /// `clock_nanosleep`. Nanoseconds on the monotonic clock.
+    Sleeping { deadline: u64 },
     /// It called `pause`, and is waiting for a signal and nothing else.
     ///
     /// The one wait with no object: every other parked thread is waiting
@@ -75,6 +89,17 @@ pub struct Watching {
     /// timeout — which is the case that costs nothing, because the thread
     /// is simply not runnable until the answer changes.
     pub deadline: Option<u64>,
+}
+
+/// A parked `eventfd` read or write.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Eventing {
+    pub event: u32,
+    pub writing: bool,
+    /// Where the eight bytes go, or came from.
+    pub buffer: u64,
+    /// What a write is adding. Zero for a read, which takes what is there.
+    pub value: u64,
 }
 
 /// A parked `accept`.
@@ -128,6 +153,13 @@ pub struct Owned {
     pub on_altstack: bool,
     /// What the frame the current handler is running on says the mask was.
     pub interrupted_mask: u64,
+    /// The mask to put back when the `rt_sigsuspend` in progress ends,
+    /// which is the whole of what makes it different from `pause`.
+    ///
+    /// `None` when no suspend is in flight — and it must be, because
+    /// restoring a mask nobody replaced would silently unblock signals the
+    /// program had blocked on purpose.
+    pub suspended_mask: Option<u64>,
     /// Whether the call in progress asked for `MSG_NOSIGNAL`.
     ///
     /// Per *call*, not per socket and not per thread — which is why it is
@@ -300,6 +332,7 @@ impl Threads {
             if let State::Waiting {
                 word: parked,
                 bitset: mask,
+                ..
             } = thread.state
                 && parked == word
                 && mask & bitset != 0

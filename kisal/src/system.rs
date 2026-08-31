@@ -354,11 +354,11 @@ impl<'a, S: Store + Clone> System<'a, S> {
                 }
             };
             if !self.schedule(why) {
-                // Nothing runnable anywhere. Either everything has ended, or
-                // every process is waiting for something no process will
-                // ever do — a futex nothing will post, a pipe nothing will
-                // write. Reporting it beats spinning, because spinning looks
-                // exactly like working.
+                // Nothing runnable anywhere, which is three different things
+                // and only one of them is a deadlock.
+                if self.idle() {
+                    continue;
+                }
                 return match self.containers.first().and_then(|first| first.status) {
                     Some(status) => status.as_exit(),
                     None => Exit::Deadlocked,
@@ -391,8 +391,15 @@ impl<'a, S: Store + Clone> System<'a, S> {
                 let _ = write!(&mut into, "    thread {} ", thread.tid);
                 match thread.state {
                     crate::thread::State::Runnable => into.push_str("runnable"),
-                    crate::thread::State::Waiting { word, bitset } => {
+                    crate::thread::State::Waiting {
+                        word,
+                        bitset,
+                        deadline,
+                    } => {
                         let _ = write!(&mut into, "parked on futex {word:#x} bitset {bitset:#x}");
+                        if let Some(deadline) = deadline {
+                            let _ = write!(&mut into, " until {deadline} ns");
+                        }
                     }
                     crate::thread::State::WaitingForChild { wanted, .. } => {
                         let _ = write!(&mut into, "waiting for child {wanted}");
@@ -426,6 +433,21 @@ impl<'a, S: Store + Clone> System<'a, S> {
                             sockets.queued(waiting.listener),
                         );
                     }
+                    crate::thread::State::Eventing(waiting) => {
+                        let _ = write!(
+                            &mut into,
+                            "on eventfd {} ({}), counter {}",
+                            waiting.event,
+                            match waiting.writing {
+                                true => "writing",
+                                false => "reading",
+                            },
+                            container.process.kernel.events.borrow().count(waiting.event),
+                        );
+                    }
+                    crate::thread::State::Sleeping { deadline } => {
+                        let _ = write!(&mut into, "asleep until {deadline} ns");
+                    }
                     crate::thread::State::Paused => {
                         into.push_str("in `pause`, waiting for a signal");
                     }
@@ -447,6 +469,59 @@ impl<'a, S: Store + Clone> System<'a, S> {
             }
         }
         into
+    }
+
+    /// Nothing can run. Answers whether anything might, later.
+    ///
+    /// **This is the only place a clock is read for scheduling**, and it is
+    /// read once for the whole container. A deadline is not readiness: a
+    /// process parked on a sixty-second `epoll_wait` is not runnable, it is
+    /// *waiting*, and treating it as runnable is how a container spends its
+    /// whole processor re-checking timeouts while the one process with work
+    /// to do gets a fifth of the turns. That is not a slowdown, it is a
+    /// hang: measured on the demo stack, nginx proxying to gunicorn timed
+    /// out at sixty seconds, repeatedly, while gunicorn's worker had the
+    /// request in hand.
+    ///
+    /// So deadlines are collected here, at the one moment they matter, and
+    /// the container's whole processor goes to whoever *can* run.
+    ///
+    /// **And this is where the wait goes.** `docs/network-plan.md`'s N4 puts
+    /// a blocking store read at exactly this point — nothing is runnable and
+    /// the earliest deadline is known, so "wait for a host event or that
+    /// long" is the one call that turns this spin into a sleep. Until then
+    /// it spins, which costs a core and is correct.
+    fn idle(&mut self) -> bool {
+        let deadline = self
+            .containers
+            .iter()
+            .filter(|container| container.status.is_none())
+            .filter_map(|container| container.process.earliest_deadline())
+            .min();
+        let Some(deadline) = deadline else {
+            // Nothing is waiting for time, so nothing will change on its
+            // own. Whatever the processes are parked on, no process will
+            // ever post it — which is the honest deadlock the stall report
+            // is written for.
+            return false;
+        };
+        let Some(now) = self.current().kernel.monotonic() else {
+            // A deadline with no clock to expire against. Reporting it as a
+            // deadlock is right and the stall report names the threads.
+            return false;
+        };
+        let mut woken = false;
+        for index in 0..self.containers.len() {
+            if self.containers[index].status.is_some() {
+                continue;
+            }
+            woken |= self.containers[index].process.expire(now);
+        }
+        // Nothing expired *yet*. The deadline is still ahead, so the
+        // container is idle rather than stuck, and going round again is
+        // what waiting looks like without something to wait on.
+        let _ = deadline;
+        woken || true
     }
 
     /// Does the thing only the system can do, and writes the answer back.

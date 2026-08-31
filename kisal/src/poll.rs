@@ -75,9 +75,12 @@ const MAX_DESCRIPTORS: i64 = 1024 * 1024;
 /// software depends on that, and so do its test suites, so it is built
 /// rather than tidied away.
 #[derive(Clone, Copy, Debug)]
-struct Watched {
+pub(crate) struct Watched {
     /// What `epoll_ctl` named. Only ever compared, never dereferenced.
     fd: i32,
+    /// What was last reported for this registration, for the edge-triggered
+    /// rule below. Zero for a level-triggered one, which never consults it.
+    reported: i16,
     /// What readiness is asked of, and what has to *go* for this
     /// registration to end.
     description: usize,
@@ -133,7 +136,7 @@ impl Epolls {
     /// one's memory is mapped. Reading the array there does not fault: the
     /// forked child has a stack at the same address, so it answers with
     /// somebody else's bytes and the wait never wakes.
-    fn hold(&mut self, watched: Vec<Watched>) -> u32 {
+    pub(crate) fn hold(&mut self, watched: Vec<Watched>) -> u32 {
         let set = EpollSet {
             watched,
             references: 1,
@@ -193,6 +196,29 @@ impl Epolls {
             .get(id as usize)
             .and_then(Option::as_ref)
             .is_some_and(|set| set.inherited)
+    }
+
+    /// Remembers what a registration reported, so an edge-triggered one
+    /// reports only what changes after it — and disarms a one-shot one.
+    pub fn record(&mut self, id: u32, index: usize, ready: i16, fired: bool) {
+        let Some(set) = self.set_mut(id) else {
+            return;
+        };
+        let Some(entry) = set.watched.get_mut(index) else {
+            return;
+        };
+        if entry.events & EDGE_TRIGGERED != 0 {
+            // The *current* state, not the union with what came before: a
+            // bit that has gone away has to be forgotten, or its return is
+            // not an edge and never fires.
+            entry.reported = ready;
+        }
+        if fired && entry.events & ONESHOT != 0 {
+            // Watching for nothing until a `MOD` says otherwise. Clearing
+            // the interest rather than removing the entry, because
+            // `EPOLL_CTL_MOD` has to find it there to re-arm it.
+            entry.events &= !0xffff;
+        }
     }
 
     pub fn forget(&mut self, description: usize) {
@@ -282,6 +308,19 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
             // `poll.rs` was built to compute readiness from kernel state:
             // sockets were the case that made the rule have to be strict.
             Backing::Socket(id) => self.socket_readiness(id),
+            // A counter: readable when it holds something, writable when it
+            // has room for one more.
+            Backing::Event(id) => {
+                let events = self.events.borrow();
+                let mut bits = 0;
+                if events.readable(id) {
+                    bits |= event::IN | event::RDNORM;
+                }
+                if events.writable(id, 1) {
+                    bits |= event::OUT | event::WRNORM;
+                }
+                bits
+            }
             Backing::Epoll(id) => match self.epoll_ready(id).is_empty() {
                 true => 0,
                 false => event::IN | event::RDNORM,
@@ -323,19 +362,62 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
         }
     }
 
-    /// Every registration in a set that has something to report.
+    /// Every registration in a set that has something to report, and what
+    /// each would report.
+    ///
+    /// # Edges
+    ///
+    /// A **level-triggered** registration reports whatever is true now, on
+    /// every call. An **edge-triggered** one reports only what has *become*
+    /// true since it last reported — which is not a refinement, it is the
+    /// difference between a server and a spin.
+    ///
+    /// nginx registers `EPOLLET` on everything. Without the rule, a socket
+    /// that is persistently writable is reported on every `epoll_wait`
+    /// forever, nginx's handler finds nothing to do, and the worker loops:
+    /// measured at fifty-nine million syscalls in one run of the demo
+    /// stack, all of them `epoll_wait` returning two events nobody acted
+    /// on, while the request it was proxying timed out.
+    ///
+    /// The edge is derived from the readiness this kernel computes rather
+    /// than from anything the host said, which is `container-plan.md`'s
+    /// discipline: an edge is a *transition of our own state*, so it cannot
+    /// report one that did not happen or miss one that did.
     fn epoll_ready(&self, id: u32) -> Vec<(u64, u32)> {
+        self.epoll_edges(id)
+            .into_iter()
+            .filter(|held| held.reportable != 0)
+            .map(|held| (held.data, held.reportable as u16 as u32))
+            .collect()
+    }
+
+    /// Every registration in a set, with what is true of it now and what of
+    /// that is *reportable*.
+    ///
+    /// Both, because they are different questions and the second is what
+    /// the first is remembered for: an edge-triggered entry reports only
+    /// what has become true since it last reported, so the current state
+    /// has to be written back afterwards — including when it dropped to
+    /// nothing, or a bit that goes away and comes back never fires again.
+    fn epoll_edges(&self, id: u32) -> Vec<Registration> {
         let watched: Vec<Watched> = self.epolls.borrow().watched(id).to_vec();
         watched
             .into_iter()
-            .filter_map(|entry| {
+            .enumerate()
+            .map(|(index, entry)| {
                 // The low bits of an `epoll` mask are the `poll` bits, which
                 // is why one readiness function serves both.
                 let asked = (entry.events & 0xffff) as i16;
                 let ready = self.readiness_of(entry.description, asked);
-                match ready {
-                    0 => None,
-                    bits => Some((entry.data, bits as u16 as u32)),
+                let reportable = match entry.events & EDGE_TRIGGERED != 0 {
+                    true => ready & !entry.reported,
+                    false => ready,
+                };
+                Registration {
+                    index,
+                    data: entry.data,
+                    ready,
+                    reportable,
                 }
             })
             .collect()
@@ -367,6 +449,118 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
             },
         };
         self.begin_wait(Watch::Poll { set: 0, at, count: count as u64 }, timeout)
+    }
+
+    /// `select(2)` and `pselect6(2)`.
+    ///
+    /// A `poll` in older clothes: three bitmaps of descriptors instead of an
+    /// array of records, and the same question. So it is translated into a
+    /// `poll` set and answered by the same scan — three frontends over one
+    /// scan, which is what `container-build-plan.md`'s M8 asks for, because
+    /// a divergence between them would mean the scan lied to somebody.
+    ///
+    /// It is `pselect6` that the traced stack calls, not `select`: gunicorn's
+    /// arbiter waits in it with a fifteen-second timeout.
+    pub(crate) fn select(&mut self, number: i64, arguments: Arguments) -> Outcome {
+        /// `fd_set` is a bitmap of `FD_SETSIZE` bits.
+        const SETSIZE: i64 = 1024;
+        let highest = arguments.get(0);
+        if !(0..=SETSIZE).contains(&highest) {
+            return Outcome::Done(Errno::Invalid.as_result());
+        }
+        let sets = [
+            (arguments.get(1) as u64, event::IN),
+            (arguments.get(2) as u64, event::OUT),
+            (arguments.get(3) as u64, event::ERR),
+        ];
+        // Fold the three bitmaps into one interest per descriptor, so that a
+        // descriptor named in two of them is polled once.
+        let words = (highest as usize).div_ceil(64);
+        let mut interest = vec![0i16; highest as usize];
+        for (at, bit) in sets {
+            if at == 0 {
+                continue;
+            }
+            for word in 0..words {
+                let mut bytes = [0u8; 8];
+                if self.pages.read(at + word as u64 * 8, &mut bytes).is_err() {
+                    return Outcome::Done(Errno::Fault.as_result());
+                }
+                let held = u64::from_le_bytes(bytes);
+                for offset in 0..64 {
+                    let fd = word * 64 + offset;
+                    if fd < interest.len() && held & (1u64 << offset) != 0 {
+                        interest[fd] |= bit;
+                    }
+                }
+            }
+        }
+        let watched: Vec<Watched> = interest
+            .iter()
+            .enumerate()
+            .filter(|(_, bits)| **bits != 0)
+            .filter_map(|(fd, bits)| {
+                Some(Watched {
+                    fd: fd as i32,
+                    description: self.files.description_index(fd as i32).ok()?,
+                    reported: 0,
+                    events: *bits as u16 as u32,
+                    // The descriptor, because `select`'s answer is written
+                    // back per descriptor rather than per event.
+                    data: fd as u64,
+                })
+            })
+            .collect();
+        // A descriptor in a set that is not open is `EBADF`, which is
+        // `select`'s one difference from `poll` — where it would be
+        // `POLLNVAL` in the answer rather than an error.
+        if watched.len() != interest.iter().filter(|bits| **bits != 0).count() {
+            return Outcome::Done(Errno::BadFile.as_result());
+        }
+        let timeout = match number == crate::syscall::number::PSELECT6 {
+            // `pselect6`'s is a `timespec` and a null pointer means forever.
+            true => match self.timespec_at(arguments.get(4)) {
+                Ok(Some(0)) => Wait::Immediately,
+                Ok(Some(nanoseconds)) => Wait::Until(nanoseconds),
+                Ok(None) => Wait::Forever,
+                Err(errno) => return Outcome::Done(errno.as_result()),
+            },
+            // `select`'s is a `timeval`: seconds and *micro*seconds.
+            false => match arguments.get(4) {
+                0 => Wait::Forever,
+                at => {
+                    let mut bytes = [0u8; 16];
+                    if self.pages.read(at as u64, &mut bytes).is_err() {
+                        return Outcome::Done(Errno::Fault.as_result());
+                    }
+                    let seconds = u64::from_le_bytes(bytes[0..8].try_into().expect("eight"));
+                    let micros = u64::from_le_bytes(bytes[8..16].try_into().expect("eight"));
+                    match seconds == 0 && micros == 0 {
+                        true => Wait::Immediately,
+                        false => Wait::Until(
+                            seconds.saturating_mul(1_000_000_000).saturating_add(micros * 1000),
+                        ),
+                    }
+                }
+            },
+        };
+        let set = self.epolls.borrow_mut().hold(watched);
+        let answer = self.begin_wait(
+            Watch::Select {
+                set,
+                first: arguments.get(1) as u64,
+                second: arguments.get(2) as u64,
+                third: arguments.get(3) as u64,
+                highest: highest as u64,
+            },
+            timeout,
+        );
+        // `begin_wait` holds the set only when it parks; when it answered at
+        // once, this one is ours to let go of.
+        if !matches!(answer, Outcome::Blocked) {
+            self.epolls.borrow_mut().release(set);
+        }
+        answer
     }
 
     /// `epoll_create` and `epoll_create1`.
@@ -442,6 +636,7 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
                     set.watched.push(Watched {
                         fd,
                         description,
+                        reported: 0,
                         events,
                         data,
                     });
@@ -450,9 +645,13 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
             },
             control::MOD => match existing {
                 Some(index) => {
+                    // A `MOD` re-arms: it is how a program brings a
+                    // one-shot registration back, and how it changes what an
+                    // edge-triggered one is watching for.
                     set.watched[index] = Watched {
                         fd,
                         description,
+                        reported: 0,
                         events,
                         data,
                     };
@@ -568,8 +767,69 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
                 }
                 ready
             }
+            Watch::Select {
+                set,
+                first,
+                second,
+                third,
+                highest,
+            } => {
+                // Rewritten in place: every bit the caller set that is not
+                // ready is cleared, which is `select`'s whole calling
+                // convention and the reason a caller has to rebuild the sets
+                // before every call.
+                let ready = self.epoll_ready(set);
+                let mut answered = 0;
+                let words = (highest as usize).div_ceil(64);
+                for (at, bit) in [
+                    (first, event::IN),
+                    (second, event::OUT),
+                    (third, event::ERR),
+                ] {
+                    if at == 0 {
+                        continue;
+                    }
+                    for word in 0..words {
+                        let mut kept = 0u64;
+                        for offset in 0..64 {
+                            let fd = (word * 64 + offset) as i32;
+                            let reported = ready.iter().any(|(data, events)| {
+                                *data == fd as u64 && *events as i16 & bit != 0
+                            });
+                            if reported {
+                                kept |= 1u64 << offset;
+                                answered += 1;
+                            }
+                        }
+                        if self
+                            .pages
+                            .write(at + word as u64 * 8, &kept.to_le_bytes())
+                            .is_err()
+                        {
+                            return Errno::Fault.as_result();
+                        }
+                    }
+                }
+                answered
+            }
             Watch::Epoll { epoll, at, max } => {
-                let ready = self.epoll_ready(epoll);
+                let held = self.epoll_edges(epoll);
+                // Every registration's current state written back, not just
+                // the ones being reported — that is what makes a bit which
+                // goes away able to fire when it returns. And a one-shot
+                // entry that fired is disarmed, which is what
+                // `EPOLLONESHOT` means and why a program must `MOD` it back.
+                {
+                    let mut epolls = self.epolls.borrow_mut();
+                    for entry in &held {
+                        epolls.record(epoll, entry.index, entry.ready, entry.reportable != 0);
+                    }
+                }
+                let ready: Vec<(u64, u32)> = held
+                    .into_iter()
+                    .filter(|entry| entry.reportable != 0)
+                    .map(|entry| (entry.data, entry.reportable as u16 as u32))
+                    .collect();
                 let mut written = 0;
                 for (data, events) in ready.into_iter().take(max as usize) {
                     let mut bytes = [0u8; EPOLL_EVENT as usize];
@@ -595,7 +855,8 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
         match watch {
             // Both from the kernel's own copy of the set, and never from
             // the caller's array — see [`Watch`].
-            Watch::Poll { set, .. } => !self.epoll_ready(set).is_empty(),
+            Watch::Poll { set, .. }
+            | Watch::Select { set, .. } => !self.epoll_ready(set).is_empty(),
             Watch::Epoll { epoll, .. } => !self.epoll_ready(epoll).is_empty(),
         }
     }
@@ -628,6 +889,7 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
             watched.push(Watched {
                 fd,
                 description,
+                reported: 0,
                 events: interest as u16 as u32,
                 data: 0,
             });
@@ -637,13 +899,16 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
 
     /// Lets go of the set a parked `poll` was holding.
     pub(crate) fn release_watch(&mut self, watch: Watch) {
-        if let Watch::Poll { set, .. } = watch {
-            self.epolls.borrow_mut().release(set);
+        match watch {
+            Watch::Poll { set, .. } | Watch::Select { set, .. } => {
+                self.epolls.borrow_mut().release(set);
+            }
+            Watch::Epoll { .. } => {}
         }
     }
 
     /// The monotonic clock in nanoseconds, or `None` when none is mounted.
-    fn monotonic(&mut self) -> Option<u64> {
+    pub(crate) fn monotonic(&mut self) -> Option<u64> {
         let mut bytes = Vec::new();
         if self.store.read(crate::paths::TIME_MONOTONIC, &mut bytes)
             != crate::abi::StoreOutcome::Present
@@ -667,7 +932,7 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
 
     /// Reads a `timespec`, answering `None` for a null pointer — which is
     /// what `ppoll` means by "no timeout".
-    fn timespec_at(&self, at: i64) -> Result<Option<u64>, Errno> {
+    pub(crate) fn timespec_at(&self, at: i64) -> Result<Option<u64>, Errno> {
         if at == 0 {
             return Ok(None);
         }
@@ -696,6 +961,14 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
     }
 }
 
+/// One registration's answer: what is true of it, and what of that is new.
+struct Registration {
+    index: usize,
+    data: u64,
+    ready: i16,
+    reportable: i16,
+}
+
 /// What a parked wait is watching.
 ///
 /// Both carry a *set identifier*, which is kernel state, and an address,
@@ -712,6 +985,15 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
 pub enum Watch {
     Poll { set: u32, at: u64, count: u64 },
     Epoll { epoll: u32, at: u64, max: u64 },
+    /// `select`, whose answer is written back into the caller's three
+    /// bitmaps rather than into an array.
+    Select {
+        set: u32,
+        first: u64,
+        second: u64,
+        third: u64,
+        highest: u64,
+    },
 }
 
 /// How long a wait is willing to wait.

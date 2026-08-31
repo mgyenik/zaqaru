@@ -57,6 +57,8 @@ pub enum Backing {
     /// acquires them at `connect` or `accept` and a descriptor's backing
     /// does not change — the arena is asked. See [`crate::socket`].
     Socket(u32),
+    /// An `eventfd`: a counter in the arena the process tree shares.
+    Event(u32),
     /// An `epoll` instance, named the same way and shared for the same
     /// reason. A descriptor that *is* a set rather than a file is the whole
     /// idea of `epoll`, and it is why it needs a backing of its own.
@@ -340,6 +342,7 @@ impl FdTable {
                     Backing::Console(stream) => format!("console:{stream:?}"),
                     Backing::Pipe { ring, end } => format!("pipe{ring}:{end:?}"),
                     Backing::Socket(id) => format!("socket{id}"),
+                    Backing::Event(id) => format!("event{id}"),
                     Backing::Epoll(id) => format!("epoll{id}"),
                 };
                 Some((fd, what))

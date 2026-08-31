@@ -30,6 +30,8 @@ pub enum Errno {
     /// rather than accepted, because a `getsockopt` that returns zero for an
     /// option it does not know hands the caller a value it will believe.
     NoProtocolOption = 92,
+    /// `ETIMEDOUT`: the wait was the whole of the time it asked for.
+    TimedOut = 110,
     /// `ENOTSOCK`: the descriptor is open and is not a socket, which is a
     /// different fact from `EBADF` and one every socket row has to keep
     /// apart — a program that passes a file where a socket was wanted has a
@@ -146,6 +148,7 @@ impl Errno {
             Self::NotSupported => "ENOTSUP",
             Self::AddressFamily => "EAFNOSUPPORT",
             Self::NoProtocolOption => "ENOPROTOOPT",
+            Self::TimedOut => "ETIMEDOUT",
             Self::NotSocket => "ENOTSOCK",
             Self::AddressInUse => "EADDRINUSE",
             Self::AddressUnavailable => "EADDRNOTAVAIL",

@@ -177,8 +177,14 @@ fn a_failing_log_store_is_not_reported_through_itself() {
 /// rather than passing quietly.
 #[test]
 fn an_unimplemented_syscall_faults_and_names_itself() {
-    /// `setuid(2)`.
-    const UNIMPLEMENTED: i64 = 105;
+    /// `init_module(2)`: loading a kernel module.
+    ///
+    /// Chosen because it will *stay* unimplemented. This test needs a
+    /// number the kernel does not know, and the previous choice — `setuid`
+    /// — stopped being one the day nginx's traced privilege drop put it on
+    /// the worklist. A container has no kernel to load a module into, so
+    /// this one is safe from the same fate.
+    const UNIMPLEMENTED: i64 = 175;
     let mut kernel = Kernel::new(Recording::default(), Registers::default(), empty_image());
     let outcome = kernel.dispatch(UNIMPLEMENTED, Arguments::new([0; 6]));
     let Outcome::Fault(fault) = outcome else {
@@ -197,7 +203,7 @@ fn an_unimplemented_syscall_faults_and_names_itself() {
     fault.message(&mut message);
     assert_eq!(
         message,
-        "kisal: unimplemented syscall 105 with (0, 0, 0, 0, 0, 0)"
+        "kisal: unimplemented syscall 175 with (0, 0, 0, 0, 0, 0)"
     );
 }
 

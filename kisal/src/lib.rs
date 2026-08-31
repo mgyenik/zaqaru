@@ -22,6 +22,7 @@
 
 pub mod abi;
 pub mod errno;
+pub mod eventfd;
 pub mod exec;
 pub mod fd;
 pub mod file;
@@ -231,6 +232,13 @@ pub(crate) fn traced<S: Store, M: machine::Machine>(
     outcome: &str,
 ) -> String {
     let mut line = String::new();
+    // The pid, the way `strace -f` prefixes one. Not decoration once a
+    // container is a process tree: five processes interleaved with no
+    // attribution is a trace nobody can read, and it is also what the
+    // eventual diff against a native `strace -f` has to line up against.
+    line.push('[');
+    push_decimal(&mut line, i64::from(kernel.pid));
+    line.push_str("] ");
     match syscall::number::name(number) {
         Some(name) => line.push_str(name),
         None => {

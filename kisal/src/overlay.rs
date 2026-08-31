@@ -1062,6 +1062,22 @@ impl Overlay<'_> {
         Ok(())
     }
 
+    /// Writes an owner onto a node.
+    ///
+    /// `-1` means "leave this one", which is how `chown(path, uid, -1)`
+    /// changes the user and not the group — and which nginx uses on the
+    /// scratch directories its worker will write to.
+    pub fn set_owner(&mut self, number: u32, uid: i64, gid: i64) -> Result<(), Errno> {
+        let node = self.node_mut(number)?;
+        if uid != -1 {
+            node.inode.uid = uid as u32;
+        }
+        if gid != -1 {
+            node.inode.gid = gid as u32;
+        }
+        Ok(())
+    }
+
     /// Moves a name from one directory to another.
     ///
     /// The source has to be upper first: a rename is a deletion and a

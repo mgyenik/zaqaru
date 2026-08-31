@@ -79,6 +79,12 @@ pub mod ioctl_request {
     pub const TIOCSWINSZ: u64 = 0x5414;
     /// Set close-on-exec, and clear it — `fcntl(F_SETFD, FD_CLOEXEC)`
     /// spelled as an `ioctl`, and the spelling CPython uses.
+    /// How many bytes are waiting to be read.
+    pub const FIONREAD: u64 = 0x541b;
+    /// Ask for `SIGIO` on readiness; see the row.
+    pub const FIOASYNC: u64 = 0x5452;
+    /// `O_NONBLOCK` by another name; see the row.
+    pub const FIONBIO: u64 = 0x5421;
     pub const FIONCLEX: u64 = 0x5450;
     pub const FIOCLEX: u64 = 0x5451;
 }
@@ -224,13 +230,14 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
     /// The image inode a descriptor names, for the rows that only make sense
     /// against one. `not_a_file` is what a console descriptor answers, which
     /// differs per row: `ESPIPE` for a seek, `ENOTDIR` for a directory read.
-    fn image_inode(&self, fd: i32, not_a_file: Errno) -> Result<Vnode, Errno> {
+    pub(crate) fn image_inode(&self, fd: i32, not_a_file: Errno) -> Result<Vnode, Errno> {
         match self.files.description(fd)?.backing {
             Backing::Image(inode) => Ok(inode),
             Backing::Console(_)
             | Backing::Pipe { .. }
             | Backing::Epoll(_)
-            | Backing::Socket(_) => Err(not_a_file),
+            | Backing::Socket(_)
+            | Backing::Event(_) => Err(not_a_file),
         }
     }
 
@@ -241,7 +248,7 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
         unsafe { self.memory().c_string(address as u64, PATH_MAX) }
     }
 
-    fn resolve_at(&self, dirfd: i64, path: i64, lookup: Lookup) -> Result<Vnode, Errno> {
+    pub(crate) fn resolve_at(&self, dirfd: i64, path: i64, lookup: Lookup) -> Result<Vnode, Errno> {
         let path = self.path_at(path)?;
         // An absolute path ignores the descriptor, so the descriptor is not
         // validated either — Linux never dereferences `dirfd` once it has
@@ -449,11 +456,75 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
                     Err(errno) => errno.as_result(),
                 })
             }
+            // `O_NONBLOCK` under another name. nginx sets it this way and
+            // CPython sets it with `fcntl`, and they are one bit — a check
+            // that consults only one spelling makes one of the two block
+            // where Linux would not. (`docs/network-plan.md`, pitfall 6.)
+            ioctl_request::FIONBIO => {
+                let at = arguments.get(2) as u64;
+                let mut bytes = [0u8; 4];
+                if self.pages.read(at, &mut bytes).is_err() {
+                    return Outcome::Done(Errno::Fault.as_result());
+                }
+                let wanted = i32::from_le_bytes(bytes) != 0;
+                Outcome::Done(match self.files.description_mut(fd) {
+                    Ok(file) => {
+                        match wanted {
+                            true => file.flags |= open_flags::NONBLOCK,
+                            false => file.flags &= !open_flags::NONBLOCK,
+                        }
+                        0
+                    }
+                    Err(errno) => errno.as_result(),
+                })
+            }
+            // How many bytes could be read without waiting, which for
+            // everything here is a ring's length.
+            ioctl_request::FIONREAD => {
+                let queued = self.readable_bytes(fd) as i32;
+                let at = arguments.get(2) as u64;
+                Outcome::Done(match self.pages.write(at, &queued.to_le_bytes()) {
+                    Ok(()) => 0,
+                    Err(_) => Errno::Fault.as_result(),
+                })
+            }
+            // Asks for `SIGIO` when the descriptor becomes ready, and this
+            // kernel never sends one. **Recorded with the divergence
+            // stated**, which the loud-error policy allows only with
+            // evidence — and here there is some: nginx's master sets it on
+            // its own end of the worker channel and then waits in
+            // `rt_sigsuspend` for `SIGTERM`, while the *worker* learns
+            // everything through `epoll_wait`. The N0 trace shows the
+            // shutdown command arriving that way, so nothing in this stack
+            // reads the signal this flag asks for.
+            //
+            // What would break if something did: a program that sets
+            // `FIOASYNC` and then blocks with no other readiness source
+            // would never wake. That is the shape to look for if this ever
+            // has to become real.
+            ioctl_request::FIOASYNC => Outcome::Done(0),
             _ => Outcome::Fault(Fault::detailed(
                 number::IOCTL,
                 arguments,
                 "an ioctl request this kernel has no driver for",
             )),
+        }
+    }
+
+    /// How many bytes a descriptor could hand over without waiting.
+    fn readable_bytes(&self, fd: i32) -> usize {
+        let Ok(file) = self.files.description(fd) else {
+            return 0;
+        };
+        match file.backing {
+            Backing::Pipe { ring, end } if end == crate::ring::End::Read => {
+                self.rings.borrow().queued(ring)
+            }
+            Backing::Socket(id) => match self.sockets.borrow().endpoint(id) {
+                Some(endpoint) => self.rings.borrow().queued(endpoint.receive),
+                None => 0,
+            },
+            _ => 0,
         }
     }
 
@@ -468,7 +539,8 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
                 Backing::Console(_)
                 | Backing::Pipe { .. }
                 | Backing::Epoll(_)
-                | Backing::Socket(_) => None,
+                | Backing::Socket(_)
+                | Backing::Event(_) => None,
             },
             Err(_) => None,
         };
@@ -523,6 +595,9 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
                 return Outcome::Done(errno.as_result());
             }
             crate::socket::Reach::Elsewhere => {}
+        }
+        if let Some((event, flags)) = self.event_of(fd) {
+            return self.transfer_event(event, flags, false, arguments.get(1) as u64, count as u64);
         }
         let offset = match self.files.description(fd) {
             Ok(file) => file.offset,
@@ -593,6 +668,8 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
             // reason it answers a pipe: the transfer can park. `pread` on
             // a socket has no position to read at.
             Backing::Socket(_) => return Err(Errno::NotSeekable),
+            // Answered by `read` before this; an `eventfd` has no position.
+            Backing::Event(_) => return Err(Errno::NotSeekable),
         };
         // An `O_PATH` descriptor refers to a file without opening it, so
         // there is nothing to read from.
@@ -700,6 +777,55 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
     }
 
     /// What a character device does with bytes written to it.
+    /// The store path a console device writes to, or `None` for a device
+    /// that is not one.
+    ///
+    /// `/dev/stdout` and `/dev/stderr` are the container's console rather
+    /// than the calling process's descriptors 1 and 2, which is the one way
+    /// they differ from the `/proc/self/fd` symlinks a base image ships —
+    /// and for a container whose output *is* the console, the same thing.
+    pub(crate) fn console_device(rdev: u64) -> Option<&'static [&'static [u8]]> {
+        match split_device(rdev) {
+            crate::synthetic::CONSOLE_OUTPUT_DEVICE => Some(crate::paths::CONSOLE_STDOUT),
+            crate::synthetic::CONSOLE_ERROR_DEVICE => Some(crate::paths::CONSOLE_STDERR),
+            _ => None,
+        }
+    }
+
+    /// Sends already-materialised bytes to a console device.
+    pub(crate) fn write_console_device(
+        &mut self,
+        rdev: u64,
+        bytes: &[u8],
+    ) -> Option<Result<u64, Errno>> {
+        let path = Self::console_device(rdev)?;
+        let length = bytes.len() as u64;
+        Some(match self.store.write(path, bytes) {
+            crate::abi::StoreOutcome::Failed => {
+                self.report_store_failure(path);
+                Err(Errno::Io)
+            }
+            _ => Ok(length),
+        })
+    }
+
+    /// The same for bytes still in the guest's memory.
+    pub(crate) fn write_console_device_from(
+        &mut self,
+        rdev: u64,
+        buffer: i64,
+        count: u64,
+    ) -> Option<Result<u64, Errno>> {
+        Self::console_device(rdev)?;
+        // SAFETY: bounds-checked here, and the slice is handed straight to
+        // the store without anything running in between.
+        let bytes = match unsafe { self.memory().slice(buffer as u64, count) } {
+            Ok(bytes) => bytes,
+            Err(errno) => return Some(Err(errno)),
+        };
+        self.write_console_device(rdev, bytes)
+    }
+
     pub(crate) fn device_write_bytes(&mut self, rdev: u64, count: u64) -> Result<u64, Errno> {
         match split_device(rdev) {
             // Accepted and discarded, which is the whole job.
@@ -712,6 +838,11 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
             // it keeps the stream a function of the boot seed alone — which
             // is what makes a run replayable.
             crate::synthetic::RANDOM_DEVICE | crate::synthetic::URANDOM_DEVICE => Ok(count),
+            // Answered by `device_write_console` before this is reached; a
+            // count alone cannot say where the bytes went.
+            crate::synthetic::CONSOLE_OUTPUT_DEVICE
+            | crate::synthetic::CONSOLE_ERROR_DEVICE
+            | crate::synthetic::CONSOLE_INPUT_DEVICE => Err(Errno::NoDevice),
             _ => Err(Errno::NoDevice),
         }
     }
@@ -903,6 +1034,7 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
                 Backing::Pipe { ring, .. } => self.write_pipe_stat(ring, arguments.get(1)),
                 Backing::Epoll(id) => self.write_epoll_stat(id, arguments.get(1)),
                 Backing::Socket(id) => self.write_socket_stat(id, arguments.get(1)),
+                Backing::Event(id) => self.write_epoll_stat(id, arguments.get(1)),
             },
             Err(errno) => Outcome::Done(errno.as_result()),
         }
@@ -1003,6 +1135,7 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
                 Ok(Backing::Pipe { ring, .. }) => self.write_pipe_stat(ring, arguments.get(2)),
                 Ok(Backing::Epoll(id)) => self.write_epoll_stat(id, arguments.get(2)),
                 Ok(Backing::Socket(id)) => self.write_socket_stat(id, arguments.get(2)),
+                Ok(Backing::Event(id)) => self.write_epoll_stat(id, arguments.get(2)),
                 Err(errno) => Outcome::Done(errno.as_result()),
             };
         }
@@ -1072,7 +1205,10 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
                         Err(errno) => Outcome::Done(errno.as_result()),
                     };
                 }
-                Ok(Backing::Epoll(id)) => {
+                // An `eventfd` reports the way an anonymous inode does, the
+                // same as an `epoll` descriptor: a mode with no file-type
+                // bits at all, which is what `fstat` on one answers.
+                Ok(Backing::Epoll(id)) | Ok(Backing::Event(id)) => {
                     let mut buffer = [0u8; STATX_SIZE];
                     let number = EPOLL_INODE_BASE + u64::from(id);
                     buffer[0..4].copy_from_slice(&STATX_BASIC_STATS.to_le_bytes());
@@ -1382,7 +1518,8 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
                 Ok(Backing::Console(_))
                 | Ok(Backing::Pipe { .. })
                 | Ok(Backing::Epoll(_))
-                | Ok(Backing::Socket(_)) => {
+                | Ok(Backing::Socket(_))
+                | Ok(Backing::Event(_)) => {
                     return Outcome::Done(Errno::Invalid.as_result());
                 }
                 Err(errno) => return Outcome::Done(errno.as_result()),
@@ -1485,7 +1622,7 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
                 }
                 // A socket is readable and writable and never executable,
                 // whichever direction it is currently able to move bytes in.
-                Ok(Backing::Socket(_)) => {
+                Ok(Backing::Socket(_)) | Ok(Backing::Event(_)) => {
                     return Outcome::Done(match mode & access_mode::EXECUTE != 0 {
                         true => Errno::Access.as_result(),
                         false => 0,
@@ -1588,7 +1725,8 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
                     Backing::Console(_)
                     | Backing::Pipe { .. }
                     | Backing::Epoll(_)
-                    | Backing::Socket(_) => Ok(None),
+                    | Backing::Socket(_)
+                    | Backing::Event(_) => Ok(None),
                 }
             }
             number::LGETXATTR | number::LLISTXATTR => self
@@ -1805,11 +1943,28 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
                     "record locks, which the design places in kisal as in-guest state",
                 ));
             }
-            fcntl_command::SETOWN | fcntl_command::GETOWN | fcntl_command::GETOWN_EX => {
+            // Who gets the `SIGIO` that `FIOASYNC` asks for — and this
+            // kernel never sends one, so the owner is recorded and answered
+            // and nothing reads it. The same divergence as `FIOASYNC`, with
+            // the same evidence: nginx's master sets both on its own end of
+            // the worker channel and then waits for `SIGTERM` instead, and
+            // the worker learns everything through `epoll_wait`.
+            fcntl_command::SETOWN => {
+                self.owners.insert(fd, arguments.get(2) as i32);
+                return Outcome::Done(0);
+            }
+            fcntl_command::GETOWN => {
+                return Outcome::Done(i64::from(
+                    self.owners.get(&fd).copied().unwrap_or(0),
+                ));
+            }
+            fcntl_command::GETOWN_EX => {
                 return Outcome::Fault(Fault::detailed(
                     number::FCNTL,
                     arguments,
-                    "descriptor ownership, which needs signals",
+                    "`F_GETOWN_EX`, which distinguishes a thread owner from a \
+                     process one — and nothing here sends the signal that \
+                     distinction is about",
                 ));
             }
             // Genuinely unknown to Linux too, where `EINVAL` is the answer.

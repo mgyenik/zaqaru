@@ -279,6 +279,7 @@ impl<'a, S: Store> Process<'a, S> {
         self.resume_transfers();
         self.resume_watches();
         self.resume_accepts();
+        self.resume_events();
         self.resume_paused();
         // A process can be given the processor back with its current thread
         // still parked: `Progress::Idle` hands the turn away without
@@ -374,14 +375,34 @@ impl<'a, S: Store> Process<'a, S> {
                 // a container whose only pending work is a timeout spins
                 // until it fires. There is no sleep to call: the boundary is
                 // two `ll-store` imports and neither of them waits.
+                // A deadline is *not* readiness. Answering that it is makes
+                // every process waiting on a timeout look busy, and a
+                // container whose processes wait on sixty-second timeouts
+                // then spends its whole processor re-checking them —
+                // starving the one process with work to do. Deadlines are
+                // handled once per idle pass, by the system, which is the
+                // only place that can read a clock without a scheduling
+                // decision depending on when it did.
                 crate::thread::State::Watching(watching) => {
-                    watching.deadline.is_some() || self.kernel.watch_ready(watching.watch)
+                    self.kernel.watch_ready(watching.watch)
                 }
                 // Waiting for a connection, and one has queued. All arena
                 // state, which is what lets a scheduling decision ask it.
                 crate::thread::State::Accepting(waiting) => {
                     self.kernel.sockets.borrow().queued(waiting.listener) > 0
                 }
+                // The counter has moved, or has room.
+                crate::thread::State::Eventing(waiting) => {
+                    let events = self.kernel.events.borrow();
+                    match waiting.writing {
+                        true => events.writable(waiting.event, waiting.value),
+                        false => events.readable(waiting.event),
+                    }
+                }
+                // Not runnable, and neither is a sleeper: see the comment on
+                // `Watching` above. Both are woken by `expire`.
+                crate::thread::State::Waiting { .. }
+                | crate::thread::State::Sleeping { .. } => false,
                 // Waiting for a signal, and one has arrived.
                 crate::thread::State::Paused => thread.deliverable().is_some(),
                 _ => thread.is_runnable(),
@@ -440,15 +461,6 @@ impl<'a, S: Store> Process<'a, S> {
     /// the order the guest observes: the frame the handler returns through
     /// carries the interrupted call's answer, so `sigreturn` lands back in
     /// `pause` with the error it is documented to always give.
-    fn resume_paused(&mut self) {
-        for thread in self.kernel.machine.threads.all_mut() {
-            if thread.state == crate::thread::State::Paused && thread.deliverable().is_some() {
-                thread.state = crate::thread::State::Runnable;
-                thread.tcb.registers[0] = crate::errno::Errno::Interrupted.as_result() as u64;
-            }
-        }
-    }
-
     /// Completes every parked `accept` whose connection has arrived.
     ///
     /// On the parked process's own turn, because the peer's address is
@@ -476,6 +488,125 @@ impl<'a, S: Store> Process<'a, S> {
             thread.state = crate::thread::State::Runnable;
             thread.tcb.registers[0] = answer as u64;
         }
+    }
+
+    /// Completes every parked `eventfd` read or write whose counter moved.
+    fn resume_events(&mut self) {
+        let parked: Vec<(usize, crate::thread::Eventing)> = self
+            .kernel
+            .machine
+            .threads
+            .all()
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, thread)| match thread.state {
+                crate::thread::State::Eventing(waiting) => Some((slot, waiting)),
+                _ => None,
+            })
+            .collect();
+        for (slot, waiting) in parked {
+            let Some(answer) = self.kernel.complete_event(waiting) else {
+                continue;
+            };
+            let thread = &mut self.kernel.machine.threads.all_mut()[slot];
+            thread.state = crate::thread::State::Runnable;
+            thread.tcb.registers[0] = answer as u64;
+        }
+    }
+
+    fn resume_paused(&mut self) {
+        for thread in self.kernel.machine.threads.all_mut() {
+            if thread.state == crate::thread::State::Paused && thread.deliverable().is_some() {
+                thread.state = crate::thread::State::Runnable;
+                thread.tcb.registers[0] = crate::errno::Errno::Interrupted.as_result() as u64;
+                // A suspend put a mask aside for the length of the wait, and
+                // it goes back *before* the handler runs — which is what
+                // `rt_sigsuspend` promises and what makes it different from
+                // `pause`.
+                if let Some(previous) = thread.owned.suspended_mask.take() {
+                    thread.owned.blocked_signals = previous;
+                }
+            }
+            // A sleep is cut short by a signal too, and Linux reports the
+            // time remaining — which nothing here asks for, so the answer is
+            // `EINTR` and no remainder.
+            if matches!(thread.state, crate::thread::State::Sleeping { .. })
+                && thread.deliverable().is_some()
+            {
+                thread.state = crate::thread::State::Runnable;
+                thread.tcb.registers[0] = crate::errno::Errno::Interrupted.as_result() as u64;
+            }
+        }
+    }
+
+    /// The soonest moment anything in this process is waiting for, in
+    /// nanoseconds on the monotonic clock.
+    ///
+    /// What the system asks when nothing can run: it is how long the whole
+    /// container may be left alone for, and — once there is a host wait to
+    /// hand it to — how long to sleep.
+    pub fn earliest_deadline(&self) -> Option<u64> {
+        self.kernel
+            .machine
+            .threads
+            .all()
+            .iter()
+            .filter_map(|thread| match thread.state {
+                crate::thread::State::Sleeping { deadline } => Some(deadline),
+                crate::thread::State::Waiting { deadline, .. } => deadline,
+                crate::thread::State::Watching(watching) => watching.deadline,
+                _ => None,
+            })
+            .min()
+    }
+
+    /// Wakes every thread whose deadline has passed, and answers whether any
+    /// did.
+    ///
+    /// Given the time rather than reading it, because the system reads the
+    /// clock **once** for the whole container: a clock read crosses the host
+    /// boundary, and one per process per pass is a boundary crossing in the
+    /// scheduler's inner loop.
+    pub fn expire(&mut self, now: u64) -> bool {
+        let mut woken = false;
+        let mut watches: Vec<(usize, crate::thread::Watching)> = Vec::new();
+        for (slot, thread) in self.kernel.machine.threads.all_mut().iter_mut().enumerate() {
+            match thread.state {
+                crate::thread::State::Sleeping { deadline } if now >= deadline => {
+                    thread.state = crate::thread::State::Runnable;
+                    thread.tcb.registers[0] = 0;
+                    woken = true;
+                }
+                // `ETIMEDOUT` is what `pthread_cond_timedwait` reads to
+                // learn its wait was the whole of the time it asked for.
+                crate::thread::State::Waiting {
+                    deadline: Some(deadline),
+                    ..
+                } if now >= deadline => {
+                    thread.state = crate::thread::State::Runnable;
+                    thread.tcb.registers[0] =
+                        crate::errno::Errno::TimedOut.as_result() as u64;
+                    woken = true;
+                }
+                // A `poll` or `select` whose time ran out answers *zero*,
+                // not an error: no descriptor was ready, and that is a
+                // complete answer to the question it asked.
+                crate::thread::State::Watching(watching)
+                    if watching.deadline.is_some_and(|deadline| now >= deadline) =>
+                {
+                    watches.push((slot, watching));
+                }
+                _ => {}
+            }
+        }
+        for (slot, watching) in watches {
+            self.kernel.release_watch(watching.watch);
+            let thread = &mut self.kernel.machine.threads.all_mut()[slot];
+            thread.state = crate::thread::State::Runnable;
+            thread.tcb.registers[0] = 0;
+            woken = true;
+        }
+        woken
     }
 
     fn resume_transfers(&mut self) {
