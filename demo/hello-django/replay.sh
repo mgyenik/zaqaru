@@ -23,7 +23,11 @@ rm -f "$OUT/session.bin" "$OUT/served.txt" "$OUT/replayed.txt"
 
 "$RUN" "$OUT/hello-django.wasm" -p "$PORT:80" --record "$OUT/session.bin" > "$OUT/served.txt" 2>&1 &
 container=$!
-trap 'kill $container 2>/dev/null || true' EXIT
+# Reaps whatever is still running however this exits. Kept armed to the end
+# rather than disarmed once the container is stopped: a script that turns its
+# own cleanup off part-way through is one leaked server away from a core
+# burning until somebody notices, and nobody notices quickly.
+trap 'kill -9 $(jobs -p) 2>/dev/null' EXIT INT TERM
 
 for _ in $(seq 40); do
     code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 "http://localhost:$PORT/" || true)
@@ -34,7 +38,6 @@ sleep 3
 kill -INT "$container"
 for _ in $(seq 20); do kill -0 "$container" 2>/dev/null || break; sleep 2; done
 kill -9 "$container" 2>/dev/null || true
-trap - EXIT
 
 # No `-p`. Nothing is listening, nothing is mounted at `/iso/net`, and the
 # session is served entirely from the tape.

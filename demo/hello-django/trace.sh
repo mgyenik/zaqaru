@@ -8,6 +8,10 @@
 # the repo) and regenerates demo/hello-django/baseline/n0-surface.txt, which
 # is the worklist and the baseline N5 diffs the interpreted run against.
 set -euo pipefail
+# However this exits — finished, interrupted, or timed out — what it started
+# goes with it. A backgrounded container that outlives its script is a core
+# burning until somebody notices, and nobody notices quickly.
+trap 'kill -9 $(jobs -p) 2>/dev/null; docker rm -f zaqaru-n0 >/dev/null 2>&1' EXIT INT TERM
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 REPO=${ZAQARU_REPO:-$(cd "$HERE/../.." && pwd)}

@@ -11,6 +11,7 @@
 # native trace's calls live in that thread and a comparison that stops
 # before the other run got there is comparing durations, not kernels.
 set -u
+trap 'kill -9 $(jobs -p) 2>/dev/null' EXIT INT TERM
 REPO=${ZAQARU_REPO:-$(cd "$(dirname "$0")/../.." && pwd)}
 PORT=8104
 OUT=${ZAQARU_DEMO_OUT:-/tmp/zaqaru-demo}/n0/interpreted.txt
