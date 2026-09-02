@@ -18,6 +18,10 @@ flate2 = { version = "1.1", default-features = false, features = ["rust_backend"
 # its own copy of the layout is a writer that can drift from the reader.
 kisal = { path = "../kisal" }
 zaqaru = { path = ".." }
+# Compressing the image's files. The C encoder, because the bake is native
+# and the ratio at level 3 is what the module's size is decided by; the
+# kernel decodes with a pure-Rust decoder of the same format.
+zstd = "0.13"
 
 [dev-dependencies]
 libc = "0.2"

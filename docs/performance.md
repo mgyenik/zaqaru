@@ -29,6 +29,7 @@ below.
 | sequential throughput | 2358 req/s | 46–49 req/s | 50× | 19–20 req/s |
 | four clients, p50 | 1.5 ms | 70–73 ms | — | 129–136 ms |
 | four clients, throughput | 2060 req/s | **52–55 req/s** | 38× | 29 req/s |
+| module on disk | — | **70 MB** | — | 170 MB |
 
 The ranges are two clients: `curl` at the low end, `latency.py`'s
 `http.client` at the high, on the same module in the same minute. A boot
@@ -44,7 +45,9 @@ client waits on, which is why they get more throughput.
 
 The "before" column is the same day, before the process switch stopped
 copying whole address spaces — step 1, which took the thirty milliseconds
-a warm request was spending outside the interpreter down to about nine.
+a warm request was spending outside the interpreter down to about nine —
+and before the rootfs was compressed, which is gate T0 of
+[tier1-plan.md](tier1-plan.md) and costs nothing measurable at boot.
 
 Compiling the 170 MB module costs 0.23 s and is not in those figures — it
 is paid once, it parallelises, and it scales with *code* rather than image

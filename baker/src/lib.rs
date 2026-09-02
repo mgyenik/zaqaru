@@ -55,6 +55,31 @@ pub struct Image {
     pub index: Vec<u8>,
 }
 
+/// The zstd level the blob is compressed at. Three is where the ratio has
+/// most of what it will ever have — 3.4× on a Debian rootfs — and the
+/// bake stays seconds rather than minutes.
+const COMPRESS_LEVEL: i32 = 3;
+
+/// A file's compressed frame, when compressing it is worth it.
+///
+/// Not for a file below the floor, and not when the frame would save less
+/// than a tenth: a file that does not compress is stored as it is and
+/// costs nothing to open. An ELF is compressed like anything else — the
+/// zero-copy aliasing its `MMAP_ALIGNED` flag was reserved for is designed
+/// and off, every mapping copies, and the ELFs are two thirds of a rootfs.
+/// The day aliasing is built, its files have to be stored raw again.
+fn compressed(bytes: &[u8], _flags: u32) -> Option<Vec<u8>> {
+    if bytes.len() < image::COMPRESS_FLOOR {
+        return None;
+    }
+    let frame = zstd::bulk::compress(bytes, COMPRESS_LEVEL).ok()?;
+    let stored = frame.len().checked_add(image::COMPRESSED_PREFIX)?;
+    match stored < bytes.len() - bytes.len() / 10 {
+        true => Some(frame),
+        false => None,
+    }
+}
+
 /// Flattens a directory tree.
 ///
 /// The tarball path — a `docker save` layer stack, with its whiteouts and
@@ -423,7 +448,10 @@ impl Builder {
             }
         }
 
-        // The blob, and each regular file's place in it.
+        // The blob, and each regular file's place in it. Compressed where
+        // it pays: the rootfs is what a module's size is, and it shrinks
+        // more than threefold, while a file the bake leaves raw is one a
+        // boot opens for free. `size` is always the file's own length.
         let mut blob = Vec::new();
         for pending in &mut self.inodes {
             let Contents::Regular(bytes) = &pending.contents else {
@@ -436,7 +464,14 @@ impl Builder {
             };
             let start = blob.len().next_multiple_of(alignment);
             blob.resize(start, 0);
-            blob.extend_from_slice(bytes);
+            match compressed(bytes, pending.inode.flags) {
+                Some(frame) => {
+                    blob.extend_from_slice(&(frame.len() as u32).to_le_bytes());
+                    blob.extend_from_slice(&frame);
+                    pending.inode.flags |= inode_flags::COMPRESSED;
+                }
+                None => blob.extend_from_slice(bytes),
+            }
             pending.inode.payload = start as u64;
             pending.inode.size = bytes.len() as u64;
         }

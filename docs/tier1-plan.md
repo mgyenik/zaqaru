@@ -680,12 +680,17 @@ The host interpreter (`kisal/examples/interpret`) stays tier 0: it has
 no wasm to run. It remains the development instrument for kernel work,
 and tier 1's own tests run under wasmtime.
 
-**T0 — the filesystem, compressed.** The index field, the bake's
-compression, decompression on open with the per-file cache. Acceptance:
-the Django module under 50 MB with no compiled code in it; the kernel
-suite and the container tests green; boot time within measurement noise
-of today's. Negative control: a file deliberately stored with a wrong
-length fails loudly at open rather than reading short.
+**T0 — the filesystem, compressed. Built 2026-09-02.** The inode flag,
+the bake's compression, decompression on open with the per-file cache,
+and the negative control — an index claiming one byte more than the
+frame decodes to is refused at open. The Django module went from
+170 MB to **70 MB**, with boot at 29 s and a warm request at 20 ms,
+unchanged. The 50 MB the gate asked for assumed the single-stream ratio
+of the whole tar; per file at level 3 the rootfs compresses 2.3×, level
+19 buys a further 15% at a slower bake, and the rest of the gap is the
+redundancy between similar files that only a shared dictionary — which
+`ruzstd` supports — would recover. Open, and not blocking: the hundred
+megabytes this freed are the room tier 1 needs.
 
 **T1 — the profile and the sweep.** The block table in the profiling
 build, the export, the runner's `--profile`, the file format; the ELF

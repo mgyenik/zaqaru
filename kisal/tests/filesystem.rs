@@ -3176,6 +3176,77 @@ fn writing_to_an_image_file_copies_it_up() {
     );
 }
 
+/// **A compressed file reads back byte for byte, and a wrong length is
+/// loud.**
+///
+/// The bake compresses what pays and leaves the rest raw, and a reader
+/// cannot tell which is which — except by the flag, which this checks so
+/// that the test is known to be exercising both paths. The control is the
+/// one failure the format can have: a frame that decodes to a length other
+/// than the index's, which must be an error at open rather than a short
+/// file a guest fails on somewhere far away.
+#[test]
+fn compressed_contents_round_trip_and_a_wrong_length_is_loud() {
+    use kisal::image::{Image, INODE_SIZE, inode_flags};
+
+    let tree = tree("compressed");
+    // Repetitive enough to compress, and large enough to be worth it.
+    let text: Vec<u8> = (0..4096u32)
+        .flat_map(|line| format!("line {line:05} of a file that compresses\n").into_bytes())
+        .collect();
+    // Noise does not compress, and must be stored raw.
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    let noise: Vec<u8> = (0..65536)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 24) as u8
+        })
+        .collect();
+    write(&tree.root.join("etc/text"), &text);
+    write(&tree.root.join("etc/noise"), &noise);
+    let baked = baker::bake_directory(&tree.root).expect("bake");
+    let image = Image::parse(&baked.index, &baked.blob).expect("parse");
+    assert!(
+        baked.blob.len() < text.len() + noise.len(),
+        "the blob is not smaller than the files in it"
+    );
+
+    let root = image.inode(image.root()).expect("root");
+    let etc = image.lookup(&root, b"etc").expect("lookup").expect("etc");
+    let etc = image.inode(etc.inode).expect("inode");
+    let find = |name: &[u8]| {
+        let entry = image.lookup(&etc, name).expect("lookup").expect("entry");
+        (entry.inode, image.inode(entry.inode).expect("inode"))
+    };
+    let (text_number, text_inode) = find(b"text");
+    let (_, noise_inode) = find(b"noise");
+    assert_ne!(text_inode.flags & inode_flags::COMPRESSED, 0, "text was not compressed");
+    assert_eq!(noise_inode.flags & inode_flags::COMPRESSED, 0, "noise was compressed");
+    assert_eq!(text_inode.size, text.len() as u64, "st_size is the file's own length");
+    assert_eq!(image.contents(&text_inode).expect("contents"), &text[..]);
+    assert_eq!(image.contents(&noise_inode).expect("contents"), &noise[..]);
+    // Asked twice, answered from the cache the second time, identically.
+    assert_eq!(image.contents(&text_inode).expect("contents"), &text[..]);
+
+    // The control: the same blob under an index that claims one more byte.
+    // The header's inode offset is its fourth word; the size is the third
+    // field of the record.
+    let mut index = baked.index.clone();
+    let inode_offset = u32::from_le_bytes(index[12..16].try_into().expect("four")) as usize;
+    let at = inode_offset + text_number as usize * INODE_SIZE + 16;
+    let claimed = u64::from_le_bytes(index[at..at + 8].try_into().expect("eight"));
+    assert_eq!(claimed, text.len() as u64, "the size field is where this test thinks it is");
+    index[at..at + 8].copy_from_slice(&(claimed + 1).to_le_bytes());
+    let lying = Image::parse(&index, &baked.blob).expect("parse");
+    let lied = lying.inode(text_number).expect("inode");
+    assert!(
+        lying.contents(&lied).is_err(),
+        "a frame that decodes to the wrong length was handed out anyway"
+    );
+}
+
 /// Appending goes to the end as it stands *now*, which is what the flag
 /// exists for.
 #[test]

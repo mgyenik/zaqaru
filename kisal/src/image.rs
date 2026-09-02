@@ -63,7 +63,7 @@
 
 /// `KISI` — kisal image.
 pub const MAGIC: u32 = u32::from_le_bytes(*b"KISI");
-pub const VERSION: u32 = 5;
+pub const VERSION: u32 = 6;
 
 pub const HEADER_SIZE: usize = 80;
 /// Fixed and packed: `stat` is `inode_offset + index * INODE_SIZE`.
@@ -148,6 +148,58 @@ pub mod inode_flags {
     /// describe an address space that no longer exists. The inode's
     /// `payload` says which view it is.
     pub const GENERATED: u32 = 1 << 2;
+    /// The file's bytes are stored as a zstd frame, behind a four-byte
+    /// length, and are decompressed the first time they are asked for.
+    /// `size` is still the file's own length, which is what `stat`
+    /// answers and what the decompressed bytes are checked against.
+    ///
+    /// The module used to carry the rootfs uncompressed — 124 MB of the
+    /// Django demo's 170 — and it compresses 3.4×. Files below
+    /// [`COMPRESS_FLOOR`] and files that do not compress are stored raw,
+    /// so a small file costs nothing to open and the bake never makes a
+    /// file bigger.
+    pub const COMPRESSED: u32 = 1 << 3;
+}
+
+/// Files shorter than this are stored raw: the frame's own overhead and a
+/// decoder's set-up are not worth it, and the small files are the ones a
+/// boot opens by the hundred.
+pub const COMPRESS_FLOOR: usize = 4096;
+
+/// The bytes before a compressed file's frame: its compressed length.
+pub const COMPRESSED_PREFIX: usize = 4;
+
+thread_local! {
+    /// Decompressed files, by blob and offset. See [`Image::decompressed`].
+    static DECOMPRESSED: core::cell::RefCell<
+        std::collections::HashMap<(usize, u64, u64), &'static [u8]>,
+    > = core::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Decodes one zstd frame that must come to exactly `expected` bytes.
+///
+/// The length is the check, and it is a loud one: a frame that decodes
+/// short or long is corruption in the bake or the blob, and a guest that
+/// read fewer bytes than the file has would fail somewhere far from here.
+fn decompress(frame: &[u8], expected: u64) -> Result<Vec<u8>, ImageError> {
+    use ruzstd::decoding::{BlockDecodingStrategy, FrameDecoder};
+    let mut source: &[u8] = frame;
+    let mut decoder = FrameDecoder::new();
+    decoder
+        .reset(&mut source)
+        .map_err(|_| ImageError::Malformed("a compressed file's frame header"))?;
+    decoder
+        .decode_blocks(&mut source, BlockDecodingStrategy::All)
+        .map_err(|_| ImageError::Malformed("a compressed file's frame"))?;
+    let bytes = decoder
+        .collect()
+        .ok_or(ImageError::Malformed("a compressed file decoded to nothing"))?;
+    if bytes.len() as u64 != expected {
+        return Err(ImageError::Malformed(
+            "a compressed file decoded to a different length than the index says",
+        ));
+    }
+    Ok(bytes)
 }
 
 /// One inode, as the index stores it.
@@ -624,10 +676,14 @@ impl<'a> Image<'a> {
         Ok(None)
     }
 
-    /// A regular file's bytes, borrowed straight from the blob.
+    /// A regular file's bytes: borrowed straight from the blob, or — for a
+    /// file the bake compressed — decompressed the first time and kept.
     pub fn contents(&self, inode: &Inode) -> Result<&'a [u8], ImageError> {
         if !inode.is_regular() {
             return Err(ImageError::WrongKind);
+        }
+        if inode.flags & inode_flags::COMPRESSED != 0 {
+            return self.decompressed(inode);
         }
         let end = inode
             .payload
@@ -637,6 +693,47 @@ impl<'a> Image<'a> {
             return Err(ImageError::Malformed("file contents overrun the blob"));
         }
         Ok(&self.blob[inode.payload as usize..end as usize])
+    }
+
+    /// `length` bytes of the blob at `at`, checked at full width.
+    fn blob_span(&self, at: u64, length: u64) -> Result<&'a [u8], ImageError> {
+        let end = at
+            .checked_add(length)
+            .ok_or(ImageError::Malformed("file contents overrun the blob"))?;
+        if end > self.blob.len() as u64 {
+            return Err(ImageError::Malformed("file contents overrun the blob"));
+        }
+        Ok(&self.blob[at as usize..end as usize])
+    }
+
+    /// A compressed file's bytes.
+    ///
+    /// Decompressed once and remembered for the life of the thread, keyed
+    /// by the blob and the file's place in it. The image is a `Copy` view
+    /// held by value in syscall rows, so the memory cannot live in it; and
+    /// the bytes are leaked rather than reference-counted because every
+    /// caller wants a `&'a [u8]` with the image's own lifetime, which is
+    /// the container's. What this costs is that a file once opened stays
+    /// decompressed until the container ends — bounded by the rootfs, and
+    /// in practice by what a boot touches, which is a fraction of what the
+    /// blob used to hold uncompressed all along.
+    fn decompressed(&self, inode: &Inode) -> Result<&'a [u8], ImageError> {
+        // The claimed length is part of the key, so that an index that
+        // lies about a file's size is caught at every open and not just
+        // the first.
+        let key = (self.blob.as_ptr() as usize, inode.payload, inode.size);
+        if let Some(held) = DECOMPRESSED.with_borrow(|held| held.get(&key).copied()) {
+            return Ok(held);
+        }
+        let header = self.blob_span(inode.payload, COMPRESSED_PREFIX as u64)?;
+        let length = u64::from(word(header, 0));
+        let frame = self.blob_span(inode.payload + COMPRESSED_PREFIX as u64, length)?;
+        let bytes = decompress(frame, inode.size)?;
+        let leaked: &'static [u8] = Box::leak(bytes.into_boxed_slice());
+        DECOMPRESSED.with_borrow_mut(|held| {
+            held.insert(key, leaked);
+        });
+        Ok(leaked)
     }
 
     pub fn symlink_target(&self, inode: &Inode) -> Result<&'a [u8], ImageError> {

@@ -136,6 +136,7 @@ dependencies = [
  "kisal",
  "libc",
  "zaqaru",
+ "zstd",
 ]
 
 [[package]]
@@ -928,6 +929,7 @@ dependencies = [
  "baker",
  "libc",
  "runner",
+ "ruzstd",
  "targum",
 ]
 

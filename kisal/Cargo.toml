@@ -18,6 +18,12 @@ crate-type = ["staticlib", "rlib"]
 # Real kernels keep both for the same reason. The tree answers questions;
 # the table is what every access tests, so it has to be a load and a shift.
 targum = { path = "../targum" }
+# Decompressing the image's files on first open. The pure-Rust decoder
+# rather than the C one, because this runs inside the module; without its
+# default features, because the checksum it would verify is replaced by a
+# length the index already knows, and the hasher is a dependency the
+# module does not need.
+ruzstd = { version = "0.9", default-features = false }
 
 [dev-dependencies]
 # The tests name the address space directly, because some of them are about
