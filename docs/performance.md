@@ -344,15 +344,20 @@ started before it.
    code runs natively — the per-process memory files are gone — so the
    kernel suite tests what the module does. Expected 15 ms a request;
    measured 20–22 ms, with the interpreter now the whole of the profile.
-2. **Tier 1: hot-block translation to wasm at run time — waiting.** The
-   only lever that reaches boot and request latency both. The ceiling is
-   measured, not guessed: the AOT transpiler with register promotion
-   reached parity with clang's own wasm backend on the integer and memory
-   kernels, about a hundred times above the interpreter. A trace compiler
-   lands well short of that; five to twenty times is the band this shape
-   sits in, which is a boot of a few seconds and requests of a few
-   milliseconds. [tier1-plan.md](tier1-plan.md) is the design, written
-   2026-09-02 for discussion; `docs/vm.md` section 8 was the sketch.
+2. **Tier 1: hot blocks compiled to wasm at bake time, from a profile —
+   waiting.** The only lever that reaches boot and request latency both,
+   and it needs nothing from the host: a wasm module cannot create code,
+   so the compile happens in the bake, from a profile of one warm-up
+   run, and the result is linked in beside the interpreter and keyed by
+   its bytes — a block that never runs or has been overwritten is a
+   function nobody enters. The ceiling is measured, not guessed: the AOT
+   transpiler with register promotion reached parity with clang's own
+   wasm backend on the integer and memory kernels, about a hundred times
+   above the interpreter. A block compiler lands short of that; five to
+   twenty times is the band this shape sits in, which is a boot of a few
+   seconds and requests of a few milliseconds. Size is the profile's:
+   everything the Django warm-up executed is about 5 MB of wasm against
+   a 170 MB module. [tier1-plan.md](tier1-plan.md) is the design.
 3. **Snapshot a booted container — waiting.** The alternative for boot
    that does not depend on engine speed. The interpreter holds no guest
    state on the wasm stack and kisal's state is a graph in linear memory,

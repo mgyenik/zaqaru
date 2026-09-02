@@ -97,15 +97,18 @@ Current documents:
   which is what found three defects in the close path that a long-lived
   nginx cannot show you.
 - [tier1-plan.md](tier1-plan.md) — **design**: hot blocks compiled to
-  wasm at run time, step 2 of the performance plan. A plain-language
-  introduction first, then the design: the trace unit and its exits, the
-  seam with the run loop, the one-import host contract, the `Quick`
-  lowering compiled with a helper for everything it declines, registers
-  and lazy flags in locals, exits to the interpreter as the whole of the
-  fault model, invalidation shared with the block cache, regions as the
-  source of speed, selection and batching, the budget rule that keeps a
-  tape replayable across tiers, gates T0–T3 with negative controls,
-  risks, and a seeded pitfalls index.
+  wasm at *bake* time from a profile, step 2 of the performance plan,
+  with the host untouched. A plain-language introduction first, then the
+  design: the two runs (profile, then bake), the compiled block and its
+  exits, keying by bytes so that a wrong guess is a function nobody
+  enters, the seam with the run loop, the `Quick` lowering compiled with
+  a helper for everything it declines, registers and lazy flags in
+  locals, exits to the interpreter as the whole of the fault model,
+  invalidation shared with the block cache, regions as the source of
+  speed, the profile and its size curve, the budget rule that keeps a
+  tape replayable across bakes, gates T0–T3 with negative controls,
+  risks — with the run-time compile kept as an optional later addition —
+  and a seeded pitfalls index.
 - [performance.md](performance.md) — **reference**: what a container
   costs, where the time goes, and what has been tried. The Django demo
   native against wasm and the nine workload shapes with their ratios; the
