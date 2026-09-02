@@ -173,7 +173,7 @@ impl<'a, S: Store + Clone> System<'a, S> {
         let parent = self.current_pid();
         let (kernel, cache) = {
             let process = &self.containers[self.current].process;
-            let machine = process.kernel.machine.fork(&process.kernel.pages)?;
+            let machine = process.kernel.machine.fork(&process.kernel.mapped_ranges())?;
             (process.kernel.fork(machine), BlockCache::new())
         };
         let pid = self.next;
@@ -1001,61 +1001,42 @@ impl Interpreted {
     /// implementation, because the other threads' control blocks are simply
     /// not copied.
     ///
-    /// The child is born *dormant*: the parent returns from `fork` first, so
-    /// the parent is the one that stays at the guest's addresses.
-    pub fn fork(&self, pages: &targum::space::Space) -> Option<Self> {
-        let _ = pages;
+    /// The child is born *displaced*: it maps every page the parent does,
+    /// at the same addresses, and the parent is the one running — so the
+    /// child holds a copy of each and gets them back when it first runs.
+    /// The one shape that stays a copy of the whole address space, paid
+    /// once per fork rather than on every switch; see `crate::resident`.
+    pub fn fork(&self, ranges: &[(u64, u64)]) -> Option<Self> {
+        let token = crate::resident::new_token();
+        crate::resident::fork(self.token, token, ranges);
         Some(Self {
             threads: self.threads.only_current(),
-            // One kernel-side copy of a file, and no bytes through this
-            // process at all.
-            #[cfg(not(target_arch = "wasm32"))]
-            memory: self.memory.duplicate()?,
-            // The bytes the parent has right now, which is what `fork`
-            // means.
-            #[cfg(target_arch = "wasm32")]
-            dormant: Some(crate::machine::Dormant::copied(pages)),
+            token,
         })
     }
 
-    /// Puts this process's address space at the guest's addresses.
+    /// Makes this process the one whose bytes are at every page it maps.
     ///
-    /// Natively one `MAP_FIXED` mapping of the file the bytes live in;
-    /// inside the module a copy of the pages the table describes. Same
-    /// invariant either way, and it is the one the whole process table rests
-    /// on: **exactly one address space is at the guest's addresses**, so
-    /// touching a process's memory is only ever done to the current one.
+    /// The invariant the whole process table rests on — **exactly one
+    /// process's bytes are at any page it maps** — is kept per page now
+    /// rather than per address space: what comes back here is only what
+    /// somebody else took while this process was not running.
     pub fn activate(&mut self, pages: &targum::space::Space) {
         let _ = pages;
-        #[cfg(not(target_arch = "wasm32"))]
-        self.memory.activate();
-        #[cfg(target_arch = "wasm32")]
-        if let Some(held) = self.dormant.take() {
-            held.restore();
-        }
+        crate::resident::activate(self.token);
     }
 
     /// Lets go of this process's address space entirely, which is what
-    /// ending does — natively the file the bytes lived in, and in the module
-    /// the copy of them the kernel's heap was holding.
+    /// ending does: its copies are dropped and whatever it owned is
+    /// garbage to the next claimant.
     pub fn relinquish(&mut self) {
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            self.memory = targum::arena::LinearMemory::new();
-        }
-        #[cfg(target_arch = "wasm32")]
-        {
-            self.dormant = Some(crate::machine::Dormant::default());
-        }
+        crate::resident::retire(self.token);
     }
 
+    /// Nothing leaves when a process stops running: its pages stay where
+    /// they are until somebody else maps the same address, and are saved
+    /// then, by that process's claim.
     pub fn deactivate(&mut self, pages: &targum::space::Space) {
         let _ = pages;
-        #[cfg(not(target_arch = "wasm32"))]
-        self.memory.deactivate();
-        #[cfg(target_arch = "wasm32")]
-        if self.dormant.is_none() {
-            self.dormant = Some(crate::machine::Dormant::taken(pages));
-        }
     }
 }

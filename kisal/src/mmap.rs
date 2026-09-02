@@ -36,13 +36,25 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
         // a shrunk break makes its pages unreachable, as Linux does, so a
         // program that frees its way down and then reads what it freed
         // faults rather than finding its own old bytes.
+        // And whose bytes those pages hold, for the same reason: the heap
+        // is the one mapping that never passes through `sync_pages`, so it
+        // claims and releases here — before the fill, which goes over the
+        // top of a page the claim zeroed. A partly used page at either end
+        // stays the process's own.
         match result.cmp(&was) {
-            core::cmp::Ordering::Greater => self.pages.protect(
-                was,
-                result - was,
-                targum::space::Protection::READ_WRITE,
-            ),
-            core::cmp::Ordering::Less => self.pages.unmap(result, was - result),
+            core::cmp::Ordering::Greater => {
+                self.machine.claim_pages(was, result);
+                self.pages.protect(
+                    was,
+                    result - was,
+                    targum::space::Protection::READ_WRITE,
+                );
+            }
+            core::cmp::Ordering::Less => {
+                self.machine
+                    .release_pages(result.next_multiple_of(crate::space::PAGE), was);
+                self.pages.unmap(result, was - result);
+            }
             core::cmp::Ordering::Equal => {}
         }
         if let Err(errno) = self.zero(fill) {

@@ -977,6 +977,13 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
         // linker's data, the shadow stack, and anything the kernel's own
         // allocator has taken. Everything the guest is given comes from
         // there up.
+        // The block is the same for every process — its ceiling is what
+        // keeps the kernel's heap out of the guest's reach — and where a
+        // program starts inside it is the machine's choice.
+        let start = match reserved {
+            true => machine.guest_start(start, ceiling),
+            false => start,
+        };
         let space = match reserved {
             true => crate::space::Space::within(start, ceiling),
             // The reservation always succeeds inside a module, where memory
@@ -1024,12 +1031,24 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             return;
         }
         self.pages.unmap(start, end - start);
+        // Whose bytes are at these pages is decided here too, because this
+        // is the one place every mapping row passes through and it runs
+        // *before* anything is written into a new mapping — the claim
+        // zeroes a page that was somebody else's, and the fill or the file
+        // copy that follows goes over the top. Ownership is given up for
+        // whatever the range no longer maps; see `crate::resident`.
+        let mut mapped = start;
         for vma in self.space.vmas() {
             let from = vma.start.max(start);
             let to = vma.end().min(end);
             if to <= from {
                 continue;
             }
+            if from > mapped {
+                self.machine.release_pages(mapped, from);
+            }
+            mapped = to;
+            self.machine.claim_pages(from, to);
             self.pages.protect(
                 from,
                 to - from,
@@ -1040,6 +1059,27 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
                 },
             );
         }
+        if end > mapped {
+            self.machine.release_pages(mapped, end);
+        }
+    }
+
+    /// Every range this process maps, for a fork to copy: the tree, and the
+    /// heap, which is a bump pointer with no VMA behind it and is where a
+    /// child's `stdio` buffers live — a fork that copied the tree alone
+    /// gave the child a parent's unflushed output and no heap of its own.
+    pub(crate) fn mapped_ranges(&self) -> Vec<(u64, u64)> {
+        let mut ranges: Vec<(u64, u64)> = self
+            .space
+            .vmas()
+            .iter()
+            .map(|vma| (vma.start, vma.end()))
+            .collect();
+        let heap = (self.space.brk_start(), self.space.brk_current());
+        if heap.1 > heap.0 {
+            ranges.push(heap);
+        }
+        ranges
     }
 
     /// Takes the boot seed, once.

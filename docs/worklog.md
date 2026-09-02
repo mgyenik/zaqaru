@@ -3145,3 +3145,62 @@ wrapper whose command line quoted the pattern, so a readiness check waited
 on a process that was never busy; and `pkill -f trace.sh` killed the shell
 running it. Neither cost more than a rerun, and both are the kind of thing
 the trace scripts under `/tmp/microbench/serve` now avoid.
+
+## 2026-09-02 — the process switch stops copying the world
+
+### What it was
+
+Inside the module every process shared one address range and there is no
+page table to swap, so a switch was `Dormant::gather` — copy every mapped
+page of the outgoing process into the kernel's heap and zero it — and
+`restore`, the reverse. Thirty of a warm request's forty-one milliseconds
+were that, for a 60 MB worker against a 4 MB nginx that overlapped its
+first four megabytes and nothing above them.
+
+### What it is now
+
+`kisal/src/resident.rs`: pages stay where they are, an owner table says
+whose bytes are resident at each page, and a page moves only when the
+running process maps an address somebody else's bytes occupy — the owner's
+bytes are displaced to the heap and come back when it next runs. Three
+invariants carry it: the running process owns every page it maps
+(`activate` brings back what was taken, `claim` in `sync_pages` takes what
+is newly mapped), a live owner maps the page (`release` on unmap,
+`retire` on exit and `exec`), and a displaced process holds a copy of
+every page it maps and does not own (a fork child starts wholly displaced).
+
+The same code runs natively. The per-process `memfd` files and their
+`MAP_FIXED` switch are gone; the native arena is one committed prefix held
+by the container for its life, which serialises the kernel's own suite on
+the arena lock — 5 s serial against 2.5 s parallel, and the module's
+exact switch code under test in exchange.
+
+### Two things the first version got wrong, and one it did not go far enough on
+
+- **The heap is not in the VMA tree.** `brk` is a bump pointer beside it,
+  and a fork that copied the tree alone gave the child no heap of its own
+  — it printed the parent's unflushed stdout buffer, twice. `brk` claims
+  and releases its pages itself, and `mapped_ranges` includes the arena.
+- **The vDSO placed its bytes before the mapping was synced**, so the
+  claim in the sync zeroed the image after it was written and glibc fell
+  back to the syscall two thousand times. The sync moved above the place.
+  Every other mapping row already had the order right: map, sync, fill,
+  copy.
+- **Ownership alone left `memmove` at 21%**, all of it under `activate`.
+  Every program bump-allocates from the same base, so nginx's binary,
+  libraries and heap sat exactly where the worker's did — the colliding
+  set was most of nginx, on every switch. An `exec`'d program is now
+  placed in the emptiest quarter of the 512 MB block, and the colliding
+  set for the demo is empty. The block's ceiling never moves, because the
+  kernel's heap lives above it.
+
+Also taken out of the per-page path: SipHash on page numbers, a zeroed
+allocation per displaced page, and a hash of the owner token per page.
+A pool of page buffers and a multiplicative hash on a token-indexed table.
+
+### Numbers
+
+Warm request 41–48 ms to 20–22 ms; four clients 129 ms and 29 req/s to
+70 ms and 52–55 req/s; boot 32–35 s to 29–30 s. Under four clients the
+profile is `quick` 68%, `Engine::run` 14%, `step` 6% — the interpreter,
+and nothing above 1.5% that is not.

@@ -16,18 +16,19 @@ because anything checked.
 
 `demo/hello-django` — an ordinary Dockerfile, `python:3.12-slim` plus
 nginx, gunicorn and Django — run by `docker run` and by `zaqaru-run`, same
-image, same client. Measured 2026-09-02 with the socket fix of that day,
-and with readiness read off the process's CPU use rather than asked for
-with requests, which section 3 explains changed every number below.
+image, same client. Measured 2026-09-02, after step 1 of the plan in
+section 7, with readiness read off the process's CPU use rather than
+asked for with requests, which section 3 explains changed every number
+below.
 
-| | native | wasm | ratio |
-| --- | --- | --- | --- |
-| boot, until the process goes quiet | 0.26 s | **32–35 s** | ~130× |
-| first request after that | 2.0 ms | 106–162 ms | — |
-| warm request, sequential p50 | 0.3 ms | **41–48 ms** | 140× |
-| sequential throughput | 2358 req/s | 19–20 req/s | 120× |
-| four clients, p50 | 1.5 ms | 129–136 ms | — |
-| four clients, throughput | 2060 req/s | **29 req/s** | 70× |
+| | native | wasm | ratio | before step 1 |
+| --- | --- | --- | --- | --- |
+| boot, until the process goes quiet | 0.26 s | **29–30 s** | ~110× | 32–35 s |
+| first request after that | 2.0 ms | 33–90 ms | — | 106–162 ms |
+| warm request, sequential p50 | 0.3 ms | **20–22 ms** | 70× | 41–48 ms |
+| sequential throughput | 2358 req/s | 46–49 req/s | 50× | 19–20 req/s |
+| four clients, p50 | 1.5 ms | 70–73 ms | — | 129–136 ms |
+| four clients, throughput | 2060 req/s | **52–55 req/s** | 38× | 29 req/s |
 
 The ranges are two clients: `curl` at the low end, `latency.py`'s
 `http.client` at the high, on the same module in the same minute. A boot
@@ -35,12 +36,15 @@ retires **3.29 G** instructions, all of it interpretation at about
 100 MIPS. A warm request retires **1.1 M** — the difference between a boot
 with forty requests and one with none, and the host interpreter's own
 count agrees to three digits — which is 11 ms of interpretation inside a
-41 ms request. **The other thirty milliseconds are not the interpreter**:
-section 4 puts them in the process switch, which inside the module copies
-the outgoing process's whole address space out and the incoming one's back
-in. Four clients at once queue honestly behind the single sync worker
-(129 ms is about four requests deep), and overlap the host round trips
-that a single client waits on, which is why they get more throughput.
+20 ms request; the rest is host round trips and the edge pump, and the
+profile of section 4 is now the interpreter and nothing else. Four
+clients at once queue honestly behind the single sync worker (70 ms is
+about four requests deep), and overlap the host round trips that a single
+client waits on, which is why they get more throughput.
+
+The "before" column is the same day, before the process switch stopped
+copying whole address spaces — step 1, which took the thirty milliseconds
+a warm request was spending outside the interpreter down to about nine.
 
 Compiling the 170 MB module costs 0.23 s and is not in those figures — it
 is paid once, it parallelises, and it scales with *code* rather than image
@@ -219,18 +223,26 @@ another mislaid function.
 
 **Serving is a different profile from booting**, and it was measured for
 the first time on 2026-09-02 by attaching `perf` only for the requests.
-Thirty sequential requests: `Cpu::quick` 44%, **`__memmove` 23%**,
-`Engine::run` 12%, `__memset` 3%, `Dormant::gather` 2%, plus 3.5% of
-`realloc` growing the vector the pages are gathered into. Four clients at
-once, after the socket fix: `quick` 39%, **`memmove` 32%**, `memset` 5%,
-`gather` 3%. The `memmove` is the process switch. Inside the module there
-is no page table, every process shares one address range, and
-`Dormant::gather` copies every mapped page of the outgoing process into
-the kernel's heap and zeroes it, then `restore` copies the incoming one's
-back — for a 60 MB CPython worker against a 4 MB nginx, that is a few
-hundred megabytes of memory traffic per request round trip, and it is
-the thirty milliseconds of a 41 ms request that are not interpretation.
-Section 7 says what to do about it.
+Thirty sequential requests, as found: `Cpu::quick` 44%, **`__memmove`
+23%**, `Engine::run` 12%, `__memset` 3%, `Dormant::gather` 2%, plus 3.5%
+of `realloc` growing the vector the pages were gathered into. Four
+clients at once, after the socket fix: `quick` 39%, **`memmove` 32%**,
+`memset` 5%, `gather` 3%. The `memmove` was the process switch. Inside
+the module there is no page table, every process shared one address
+range, and `Dormant::gather` copied every mapped page of the outgoing
+process into the kernel's heap and zeroed it, then `restore` copied the
+incoming one's back — for a 60 MB CPython worker against a 4 MB nginx, a
+few hundred megabytes of memory traffic per request round trip.
+
+After step 1 (`kisal/src/resident.rs`), four clients at once: `quick`
+68%, `Engine::run` 14%, `step` 6%, `note_code_write` 4%,
+`BlockCache::entry` 3%. No `memmove` above the 1.5% line. The first
+version of step 1 — ownership without placement — still had `memmove` at
+21%, all of it under `activate`: every program bump-allocated from the
+same base, so nginx's binary, libraries and heap sat exactly where the
+worker's did and a few thousand pages moved on every switch. Placing each
+exec'd program in the emptiest quarter of the 512 MB guest block is what
+made the colliding set empty.
 
 **A request's instruction mix is the boot's**: the histogram of a hundred
 requests, taken by difference, is `Mov` 36%, `Je` 6%, `Test` 6%, `Cmp` 6%,
@@ -314,23 +326,55 @@ functions at all, so a helper LLVM declined becomes a real call per use.
 Both directions are written at the call sites with the numbers that
 decided them, because none of it can be recovered by reading.
 
-## 7. What is open
+## 7. The plan
 
-- **The process switch copies the world.** Thirty of a warm request's 41
-  ms, and 40% of the processor under four clients, is `memmove`: every
-  switch copies the outgoing process's whole mapped memory out and zeroes
-  it, then copies the incoming one's in, whether or not the two overlap.
-  They mostly do not. Every process bump-allocates from the same base, so
-  nginx's 4 MB collides with the first 4 MB of the 60 MB worker and with
-  nothing above it — yet all 60 MB move, twice, on every round trip. The
-  shaped fix is page ownership: linear memory keeps each process's pages
-  in place, an owner table says whose bytes are resident where, and only
-  a page the incoming process maps *and* somebody else's bytes occupy is
-  saved and restored. A fork child collides with its parent everywhere
-  by construction, and that is the case that stays a copy; an `execve`'d
-  process could be placed at a staggered base inside the 512 MB guest
-  block so that unrelated programs never collide at all. Expected: a
-  request at about 15 ms, and the concurrent case better than that.
+Three steps, decided 2026-09-02, in the order they pay. Step 1 is being
+built; steps 2 and 3 wait on a design discussion and are not to be
+started before it.
+
+1. **Page ownership for the process switch — built, 2026-09-02.**
+   Linear memory keeps every process's pages in place. An owner table
+   (`kisal/src/resident.rs`) says whose bytes are resident at each page; a
+   switch walks only the pages the incoming process has had taken from
+   it, and a page moves only when two processes map the same address and
+   one of them is running. A fork child collides with its parent
+   everywhere by construction and stays a copy, paid once per fork; an
+   `execve`'d program is placed in the emptiest quarter of the 512 MB
+   guest block, so unrelated programs do not collide at all. The same
+   code runs natively — the per-process memory files are gone — so the
+   kernel suite tests what the module does. Expected 15 ms a request;
+   measured 20–22 ms, with the interpreter now the whole of the profile.
+2. **Tier 1: hot-block translation to wasm at run time — waiting.** The
+   only lever that reaches boot and request latency both. The ceiling is
+   measured, not guessed: the AOT transpiler with register promotion
+   reached parity with clang's own wasm backend on the integer and memory
+   kernels, about a hundred times above the interpreter. A trace compiler
+   lands well short of that; five to twenty times is the band this shape
+   sits in, which is a boot of a few seconds and requests of a few
+   milliseconds. `docs/vm.md` section 8 is the design; the `install`
+   import, the trace granularity and the shared invalidation are already
+   decided there.
+3. **Snapshot a booted container — waiting.** The alternative for boot
+   that does not depend on engine speed. The interpreter holds no guest
+   state on the wasm stack and kisal's state is a graph in linear memory,
+   so a memory image taken at a quantum boundary, with the run loop
+   re-entered rather than restarted, is a booted container in well under a
+   second. The host-side state to reconstruct is the mount table and the
+   listeners; open connections are the reason to snapshot before the
+   first one.
+
+## 8. What is open
+
+- **A fork family still moves together.** gunicorn's arbiter and its
+  worker map the same 20 MB at the same addresses, so the arbiter's
+  once-a-second wake-up moves those pages out and back: a few
+  milliseconds a second, invisible in the request path, and the one
+  shape step 1 leaves as a copy. Copy-on-write at page granularity —
+  skip a page whose bytes the two still agree on — is the refinement if
+  a workload ever forks and keeps both sides busy.
+- **The nine milliseconds a request spends outside the interpreter** are
+  host round trips: the edge pump's reads and writes, and the slice
+  boundary the inbound read waits for. Not profiled yet.
 - **Boot dominates and is untouched.** 32–35 s, all of it interpretation
   of 3.29 G instructions, most of them Python's import graph — re-executed
   identically on every start. Halving the engine again gets 16 s.

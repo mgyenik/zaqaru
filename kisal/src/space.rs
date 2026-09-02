@@ -261,6 +261,10 @@ impl Space {
         &self.vmas
     }
 
+    pub fn brk_start(&self) -> u64 {
+        self.brk_start
+    }
+
     pub fn brk_current(&self) -> u64 {
         self.brk_current
     }

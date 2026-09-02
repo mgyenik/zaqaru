@@ -155,6 +155,27 @@ pub trait Machine {
         let _ = pages;
     }
 
+    /// This process is about to map `[start, end)`, or has stopped mapping
+    /// it. Nothing to do by default, for the reason `activate` gives; the
+    /// interpreter's machine keeps the owner table — see `crate::resident`.
+    fn claim_pages(&mut self, start: u64, end: u64) {
+        let _ = (start, end);
+    }
+
+    fn release_pages(&mut self, start: u64, end: u64) {
+        let _ = (start, end);
+    }
+
+    /// Where a fresh program's address space starts, inside the block
+    /// `[base, ceiling)`. The base by default — one program, one place —
+    /// and the interpreter's machine chooses a slot nobody live is using,
+    /// so that unrelated programs do not share addresses; see
+    /// `crate::resident::SLOTS`.
+    fn guest_start(&mut self, base: u64, ceiling: u64) -> u64 {
+        let _ = ceiling;
+        base
+    }
+
 
     /// Ends this thread, and answers how many are left.
     ///
@@ -358,54 +379,26 @@ pub struct Interpreted {
     /// Every thread this process has, and which one is running. A context
     /// switch is choosing a different index.
     pub threads: crate::thread::Threads,
-    /// Linear memory, natively: a reservation with a committed prefix,
-    /// backed by a file so that a process that is not running still has its
-    /// bytes somewhere. Making one current is one `MAP_FIXED` mapping of it
-    /// over the guest's range — a page-table swap, and nothing is copied.
-    #[cfg(not(target_arch = "wasm32"))]
-    pub(crate) memory: targum::arena::LinearMemory,
-    /// The same thing inside the module, where there is no page table to
-    /// swap: a dormant process's pages, held in the kernel's own heap.
+    /// Who this process is to the owner table — see [`crate::resident`].
     ///
-    /// `Some` exactly when this process is *not* the one at the guest's
-    /// addresses, which is the invariant `activate` and `deactivate`
-    /// maintain between them.
-    #[cfg(target_arch = "wasm32")]
-    pub(crate) dormant: Option<Dormant>,
+    /// The address space itself is nowhere in here, and that is the design:
+    /// every process's pages stay in linear memory at the guest's addresses,
+    /// and the table says whose bytes are at which page. A switch moves only
+    /// the pages two processes both map. The arrangement before this one
+    /// copied a dormant process's whole address space out to the heap and
+    /// back, which cost thirty of a warm request's forty-one milliseconds
+    /// for a worker and a proxy that overlapped on four megabytes.
+    pub(crate) token: crate::resident::Token,
 }
 
-/// A process's bytes while some other process is the one running.
+/// Where the guest's address space starts — decided once, at the first
+/// process, and the same for every process after it.
 ///
-/// Inside the module linear memory is shared with the engine — the
-/// program's segments low, the module's own data above them, the guest's
-/// arenas above that, all in one memory — so this cannot be a range. It is
-/// the pages the guest's own page table describes, and nothing else, which
-/// is what keeps a switch from writing over the engine that is performing
-/// it.
-///
-/// The bill, stated: a switch is a copy, not a mapping, and it costs a
-/// memcpy of everything the process has mapped. Natively the same operation
-/// is free. What keeps it affordable is that a switch happens only when the
-/// running process cannot continue or has used a whole process quantum —
-/// and the shape that matters, a `fork` whose parent immediately waits,
-/// costs two.
-#[cfg(target_arch = "wasm32")]
-#[derive(Default)]
-pub struct Dormant {
-    /// Page address and its contents, ascending.
-    pages: Vec<(u64, [u8; PAGE_BYTES])>,
-}
-
-#[cfg(target_arch = "wasm32")]
-const PAGE_BYTES: usize = targum::space::PAGE_SIZE as usize;
-
-/// Where the guest's address space starts inside the module — decided once,
-/// at the first process, and the same for every process after it.
-///
-/// **Every process uses the same range**, which it can because only one
-/// process's bytes are at the guest's addresses at a time: that is the
-/// invariant `activate` and `deactivate` maintain between them, and a fork
-/// already depends on it, since a child needs the parent's addresses.
+/// **Every process uses the same range**, which the owner table makes safe:
+/// a page holds the bytes of whichever process is running and maps it, and
+/// everyone else's copy of that page lives in the heap until they run. A
+/// fork already depends on the sharing, since a child needs the parent's
+/// addresses.
 ///
 /// Carving a *fresh* region off the top of memory for each one instead —
 /// which is what the boot path does, correctly, when the bytes live
@@ -414,10 +407,8 @@ const PAGE_BYTES: usize = targum::space::PAGE_SIZE as usize;
 /// gets `ENOEXEC` from a load that had nowhere to go. Which is exactly how
 /// this was found: `python`, a captured subprocess, a shell pipeline,
 /// `uname`, `ls | wc`, and then nothing.
-#[cfg(target_arch = "wasm32")]
 static GUEST_BASE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-#[cfg(target_arch = "wasm32")]
 fn guest_base() -> u64 {
     use core::sync::atomic::Ordering;
     let recorded = GUEST_BASE.load(Ordering::Relaxed);
@@ -426,76 +417,33 @@ fn guest_base() -> u64 {
     }
     // The top of whatever the module already occupies: the linker's data,
     // the shadow stack, and anything the kernel's own allocator has taken
-    // before the first process exists.
-    let base = core::arch::wasm32::memory_size(0) as u64 * 65536;
+    // before the first process exists. Natively, the top of what the first
+    // process committed for its program.
+    let base = top_of_memory();
     GUEST_BASE.store(base, Ordering::Relaxed);
     base
 }
 
+/// One past the highest address the guest's memory reaches right now.
 #[cfg(target_arch = "wasm32")]
-impl Dormant {
-    /// A copy of everything the page table says is mapped, leaving it where
-    /// it is. What a `fork` takes, because the parent goes on running.
-    pub(crate) fn copied(pages: &targum::space::Space) -> Self {
-        Self::gather(pages, false)
-    }
+fn top_of_memory() -> u64 {
+    core::arch::wasm32::memory_size(0) as u64 * 65536
+}
 
-    /// The same, and then **zeroes what it took**. What `deactivate` does,
-    /// because the process is leaving.
-    ///
-    /// Not tidiness. Every process shares one range — see `GUEST_BASE` — and
-    /// [`crate::space::Space`] states its invariant plainly: above a fresh
-    /// address space's high-water mark, memory "is freshly grown and
-    /// therefore zero", so nothing there is filled before the guest sees it.
-    /// Inside the module that is only true if whoever left made it true.
-    /// Leaving the bytes hands the next program's `brk`, its initial stack
-    /// and its anonymous `mmap`s whatever the last one had there — which is
-    /// not a subtle wrongness: CPython's second process died with `SIGSEGV`
-    /// at once.
-    ///
-    /// Restoring only one's own pages does not cover it, because the pages
-    /// the *outgoing* process had and the incoming one does not are exactly
-    /// the ones nobody would rewrite. Zeroing on the way out is the local
-    /// rule that covers every case, and a switch, an `execve` and a process
-    /// ending are all the same case: somebody left.
-    pub(crate) fn taken(pages: &targum::space::Space) -> Self {
-        Self::gather(pages, true)
-    }
+#[cfg(not(target_arch = "wasm32"))]
+fn top_of_memory() -> u64 {
+    targum::arena::committed()
+}
 
-    /// # Safety
-    /// A guest address is a linear-memory offset, so a mapped page is
-    /// `PAGE_BYTES` readable bytes at that offset — which is the identity
-    /// the whole design rests on, and the same one every load and store in
-    /// [`targum::space`] uses.
-    fn gather(pages: &targum::space::Space, clear: bool) -> Self {
-        let mut held = Vec::new();
-        for address in pages.mapped_pages() {
-            let mut bytes = [0u8; PAGE_BYTES];
-            // SAFETY: the page is inside the limit and mapped, which is what
-            // `mapped_pages` answered.
-            let there = unsafe {
-                core::slice::from_raw_parts_mut(address as usize as *mut u8, PAGE_BYTES)
-            };
-            bytes.copy_from_slice(there);
-            if clear {
-                there.fill(0);
-            }
-            held.push((address, bytes));
-        }
-        Self { pages: held }
-    }
+/// Grows the guest's memory to reach `to`, and answers whether it did.
+#[cfg(target_arch = "wasm32")]
+fn grow_memory(to: u64) -> bool {
+    GuestMachine::default().grow(to)
+}
 
-    /// Writes them back where they came from.
-    pub(crate) fn restore(&self) {
-        for (address, bytes) in &self.pages {
-            // SAFETY: the page was inside the limit when it was taken, and
-            // linear memory never shrinks.
-            let into = unsafe {
-                core::slice::from_raw_parts_mut(*address as usize as *mut u8, PAGE_BYTES)
-            };
-            into.copy_from_slice(bytes);
-        }
-    }
+#[cfg(not(target_arch = "wasm32"))]
+fn grow_memory(to: u64) -> bool {
+    targum::arena::commit(to)
 }
 
 impl Default for Interpreted {
@@ -533,28 +481,27 @@ impl Interpreted {
     }
 
     pub fn new() -> Self {
+        // A process that is being built is the process that is running:
+        // `exec` writes the program's segments into memory, and natively
+        // the program's region has to be committed before it can.
+        let token = crate::resident::new_token();
         #[cfg(not(target_arch = "wasm32"))]
-        let memory = {
-            let mut memory = targum::arena::LinearMemory::new();
-            // A process that is being built is the process that is running:
-            // `exec` writes the program's segments into it, and there is
-            // nowhere for those bytes to go until the address space is at
-            // the guest's addresses.
-            memory.activate();
-            assert!(
-                memory.grow(PROGRAM_REGION),
-                "reserving the program's region failed"
-            );
-            memory
-        };
+        assert!(
+            targum::arena::commit(targum::arena::FLOOR + PROGRAM_REGION),
+            "reserving the program's region failed"
+        );
         Self {
             threads: crate::thread::Threads::new(),
-            #[cfg(not(target_arch = "wasm32"))]
-            memory,
-            // A process that is being built is the process that is running.
-            #[cfg(target_arch = "wasm32")]
-            dormant: None,
+            token,
         }
+    }
+}
+
+impl Drop for Interpreted {
+    /// A machine that is gone is a process that is gone, or one that has
+    /// become another program: either way its bytes are nobody's.
+    fn drop(&mut self) {
+        crate::resident::retire(self.token);
     }
 }
 
@@ -636,7 +583,6 @@ impl Machine for Interpreted {
         true
     }
 
-    #[cfg(target_arch = "wasm32")]
     fn guest_base(&mut self) -> u64 {
         guest_base()
     }
@@ -659,6 +605,18 @@ impl Machine for Interpreted {
 
     fn deactivate(&mut self, pages: &targum::space::Space) {
         Interpreted::deactivate(self, pages);
+    }
+
+    fn claim_pages(&mut self, start: u64, end: u64) {
+        crate::resident::claim(self.token, start, end);
+    }
+
+    fn guest_start(&mut self, base: u64, ceiling: u64) -> u64 {
+        crate::resident::choose_start(base, ceiling)
+    }
+
+    fn release_pages(&mut self, start: u64, end: u64) {
+        crate::resident::release(self.token, start, end);
     }
 
     fn raise_process(&mut self, signal: i32) -> bool {
@@ -699,24 +657,15 @@ impl Machine for Interpreted {
         self.thread_mut().x87.reset();
     }
 
-    #[cfg(target_arch = "wasm32")]
     fn memory_limit(&self) -> u64 {
-        core::arch::wasm32::memory_size(0) as u64 * 65536
+        // Memory only ever grows, so this is read per syscall rather than
+        // cached: a growth between two syscalls must widen what the second
+        // one accepts.
+        top_of_memory()
     }
 
-    #[cfg(target_arch = "wasm32")]
     fn grow(&mut self, to: u64) -> bool {
-        GuestMachine::default().grow(to)
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    fn memory_limit(&self) -> u64 {
-        self.memory.limit()
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    fn grow(&mut self, to: u64) -> bool {
-        self.memory.grow(to)
+        grow_memory(to)
     }
 }
 

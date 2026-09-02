@@ -38,6 +38,7 @@ pub mod poll;
 pub mod ring;
 pub mod socket;
 pub mod random;
+pub mod resident;
 pub mod signal;
 pub mod run;
 pub mod vm;

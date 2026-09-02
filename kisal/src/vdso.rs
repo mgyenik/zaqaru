@@ -180,7 +180,13 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
         };
         let timebase = placed.0;
         let image = timebase + page;
-        // The bytes first, while the whole span is still one plain readable
+        // The table learns the mapping before anything is written into it:
+        // the sync is where the pages become this process's, and a page
+        // that was somebody else's is zeroed as it does — so bytes placed
+        // ahead of it would be placed into the wrong process and then
+        // erased.
+        self.sync_pages(timebase, timebase + span);
+        // The bytes next, while the whole span is still one plain readable
         // mapping — `place` is the kernel writing its own memory and does
         // not consult protections, but the *tree* is about to say this is
         // not writable and the two must never disagree about anything.

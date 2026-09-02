@@ -105,9 +105,11 @@ Current documents:
   numbers this file used to carry were artefacts of the harness; the
   table of six changes that were argued from the code and measured at
   nothing or worse; and the inlining rule that every real win since
-  turned out to be. Carries what is open, led by the process switch that
-  copies a whole address space, and the record of the concurrency collapse
-  that turned out to be a ring slot reused under a half-closed socket.
+  turned out to be. Carries the three-step plan of 2026-09-02 — page
+  ownership for the process switch (built: a warm request from 41 to 20
+  ms), tier 1 (waiting), a boot snapshot (waiting) — what is open, and the
+  record of the concurrency collapse that turned out to be a ring slot
+  reused under a half-closed socket.
 - [fidelity.md](fidelity.md) — **reference**: the index of where kisal
   differs from Linux, read out of the code rather than the plans. The
   three answers a guest can get for something not fully built — a loud
