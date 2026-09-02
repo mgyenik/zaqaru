@@ -2254,6 +2254,11 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
         // pending reply has not been sent yet. Both censuses were taken
         // before any of this, so the counts do not care which runs first.
         let mut retired: Vec<(u32, u32)> = Vec::new();
+        // The endpoints that went with those sockets. The rings are told
+        // *after* the ring ends below are released: an endpoint naming a
+        // ring is what keeps the slot from being reused, and it has to
+        // outlive the last end — see `Ring::attached`.
+        let mut gone: Vec<crate::socket::Endpoint> = Vec::new();
         {
             let mut arena = self.sockets.borrow_mut();
             for held in distinct(&before.sockets, &after.sockets) {
@@ -2266,8 +2271,11 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
                     // Asked before the release, because a retired socket is
                     // gone and the host still has to be told.
                     let edge = arena.edge_of(held);
-                    if let (Some(endpoint), Some(conn)) = (arena.release(held), edge) {
-                        retired.push((conn, endpoint.transmit));
+                    if let Some(endpoint) = arena.release(held) {
+                        if let Some(conn) = edge {
+                            retired.push((conn, endpoint.transmit));
+                        }
+                        gone.push(endpoint);
                     }
                 }
             }
@@ -2290,6 +2298,10 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
                 for _ in now..was {
                     rings.release(held.0, held.1);
                 }
+            }
+            for endpoint in gone {
+                rings.detach(endpoint.receive);
+                rings.detach(endpoint.transmit);
             }
         }
         let mut epolls = self.epolls.borrow_mut();

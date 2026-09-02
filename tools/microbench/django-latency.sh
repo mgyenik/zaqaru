@@ -43,7 +43,9 @@ echo "== wasm: zaqaru-run =="
 "$REPO/target/release/zaqaru-run" "$OUT/hello-django.wasm" -p "$WASM_PORT:80" \
     >"$OUT/wasm.log" 2>&1 &
 container=$!
-uv run --script "$REPO/tools/microbench/latency.py" wasm "$WASM_PORT" 900
+# The module's pid, so readiness is read off its CPU use rather than asked
+# for with requests that would queue behind the boot -- see `await_idle`.
+uv run --script "$REPO/tools/microbench/latency.py" wasm "$WASM_PORT" 900 "$container"
 echo
 echo "-- what the module reported --"
 grep -E 'compiled|instructions in' "$OUT/wasm.log" || true

@@ -3082,3 +3082,66 @@ unanswered, while its own §12 recorded V2 and V3 built and G2 answered at
 had already replaced with a design and a build. A document that disagrees
 with itself is worse than one that is merely out of date, because the
 reader cannot tell which half to trust.
+
+## 2026-09-02 — the concurrency collapse was the arena, and the latency numbers were the poll's
+
+### What the review found
+
+Getting up to speed for a run at the Django container's performance, three
+measurements nobody had taken:
+
+- **Serving had never been profiled apart from booting.** `perf` attached
+  only for the requests put 23% of a sequential request and 32% of the
+  concurrent case in `__memmove`, under `Dormant::gather` and `restore` —
+  the process switch, which inside the module copies the whole outgoing
+  address space out and the incoming one back. A warm request is 1.1 M
+  guest instructions, 11 ms of interpretation, inside 41 ms.
+- **The readiness poll was inflating every latency figure.** `latency.py`
+  asked for a 200 every quarter second with a thirty-second timeout. Under
+  the module each of those queues behind the importing worker and is
+  served in full once it is up, so "boot to first 200" included draining
+  most of them and the thirty timed requests interleaved with the rest.
+  The moment readiness was read off the process's CPU use instead, the
+  same module answered a warm request in 43 ms where the document said
+  149. A boot-only run retiring *more* instructions than a boot plus thirty
+  requests was the tell.
+- **The concurrency collapse had a constant in it.** Four clients measured
+  a p50 of 2.1 s with almost no CPU: `perf` collected a second of samples
+  in fifteen. A timestamped syscall trace put every gap on the worker's
+  `poll(fd, POLLIN, 2000)` after `shutdown(SHUT_WR)` — gunicorn waiting for
+  nginx to hang up — returning only by timeout, while nginx had closed its
+  side at once and gone on to `connect` the next queued request.
+
+### The defect
+
+Two, and they needed each other. A socket's readiness reported end of file
+only as `POLLRDHUP`, never as `POLLIN`, so a caller asking for `POLLIN`
+alone woke only through `POLLHUP` — which needs the local transmit ring
+to have no reader. That ring had no ends at all after the local
+`shutdown(SHUT_WR)` and the peer's `close`, and `Rings::release` freed it
+at zero readers and zero writers even though the endpoint still named it.
+nginx's next `connect` took the slot; the worker's readiness then read the
+new connection's reader as its own peer alive again, `POLLHUP` went away,
+and the poll slept out two seconds. Sequentially nobody reconnects in the
+gap, which is why the pump arrangements tried before could not have found
+it.
+
+The fix: a ring carries `attached`, the number of endpoints naming it, and
+is freed only when that is zero as well; and end of file is readable,
+which is what Linux reports. `poll_sees_end_of_file_when_the_peer_has_reconnected`
+reproduces both in one program — `in` for the first, `hup` for the second —
+and fails at once without the fix. The C program polls with no timeout on
+purpose: the harness's clock is fixed, and the first version of the test,
+with gunicorn's two-second wait in it, hung rather than failed.
+
+Four clients at once: 32 requests in 1.1 s at 29 req/s and a p50 of
+129 ms, against 15.1 s, 2.1 req/s and 2.1 s before. Honest queueing, four
+deep, behind one sync worker.
+
+### What it cost to find
+
+Two harness mistakes of my own on the way. `pgrep -f` matched the shell
+wrapper whose command line quoted the pattern, so a readiness check waited
+on a process that was never busy; and `pkill -f trace.sh` killed the shell
+running it. Neither cost more than a rerun, and both are the kind of thing
+the trace scripts under `/tmp/microbench/serve` now avoid.

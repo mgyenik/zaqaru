@@ -57,6 +57,22 @@ struct Ring {
     bytes: VecDeque<u8>,
     readers: u32,
     writers: u32,
+    /// How many socket endpoints name this ring, whether or not they still
+    /// hold an end of it open.
+    ///
+    /// The counts above say who can still read and write; this says who
+    /// can still *ask about* it, and the two part company at a half-close.
+    /// An endpoint that has `shutdown(SHUT_WR)` has given up its writer, and
+    /// when the peer then closes its reader the ring has no ends left — but
+    /// the endpoint still names it, to answer whether the peer is reading.
+    /// Freeing the slot at that moment let the next `connect` reuse it, and
+    /// the half-closed endpoint then saw the new connection's reader as its
+    /// own peer come back to life: no `POLLHUP`, a `poll` that slept out its
+    /// whole timeout, and a request that took two seconds under concurrent
+    /// load and nothing sequentially.
+    ///
+    /// Pipes never attach, and are freed as they always were.
+    attached: u32,
 }
 
 /// Every pipe in the container.
@@ -67,9 +83,9 @@ struct Ring {
 #[derive(Clone, Default, Debug)]
 pub struct Rings {
     /// An arena, so an identifier is an index and stays valid while anything
-    /// holds it. A freed slot is reused, which is safe because a slot is
-    /// only freed when both counts reach zero and therefore nothing names
-    /// it any more.
+    /// holds it. A freed slot is reused, which is safe only because a slot
+    /// is freed when both counts reach zero *and* no endpoint names it —
+    /// see [`Ring::attached`] for the day the second condition was missing.
     rings: Vec<Option<Ring>>,
 }
 
@@ -81,6 +97,7 @@ impl Rings {
             bytes: VecDeque::new(),
             readers: 1,
             writers: 1,
+            attached: 0,
         };
         if let Some(free) = self.rings.iter().position(Option::is_none) {
             self.rings[free] = Some(ring);
@@ -117,7 +134,33 @@ impl Rings {
             End::Read => ring.readers = ring.readers.saturating_sub(1),
             End::Write => ring.writers = ring.writers.saturating_sub(1),
         }
-        if ring.readers == 0 && ring.writers == 0 {
+        self.free_if_unused(id);
+    }
+
+    /// One more endpoint names the ring. See [`Ring::attached`].
+    pub fn attach(&mut self, id: u32) {
+        if let Some(ring) = self.ring_mut(id) {
+            ring.attached += 1;
+        }
+    }
+
+    /// One fewer endpoint names the ring, which may be what frees it.
+    pub fn detach(&mut self, id: u32) {
+        if let Some(ring) = self.ring_mut(id) {
+            ring.attached = ring.attached.saturating_sub(1);
+        }
+        self.free_if_unused(id);
+    }
+
+    /// A ring goes when nothing can read it, nothing can write it, and
+    /// nothing names it — all three, because any one of them alone is a
+    /// slot something still expects to find its own ring in.
+    fn free_if_unused(&mut self, id: u32) {
+        if let Some(ring) = self.ring(id)
+            && ring.readers == 0
+            && ring.writers == 0
+            && ring.attached == 0
+        {
             self.rings[id as usize] = None;
         }
     }

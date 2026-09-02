@@ -66,7 +66,7 @@ Current documents:
   overlay and the synthetic `/dev` and `/proc`) and M5 (`brk`, `mmap` and
   the VMA tree) are built. Each milestone's section carries what an
   adversarial review found after it was first reported done.
-- [network-plan.md](network-plan.md) — **draft**: the design and plan for
+- [network-plan.md](network-plan.md) — **built**: the design and plan for
   networking under the interpreter, aimed at the nginx+gunicorn+django
   demo served by `zaqaru-run` and answered by `curl`: the two-network
   split (loopback as arena state, the edge as host-terminated streams —
@@ -105,8 +105,9 @@ Current documents:
   numbers this file used to carry were artefacts of the harness; the
   table of six changes that were argued from the code and measured at
   nothing or worse; and the inlining rule that every real win since
-  turned out to be. Carries what is open, including a concurrency
-  collapse nobody has explained.
+  turned out to be. Carries what is open, led by the process switch that
+  copies a whole address space, and the record of the concurrency collapse
+  that turned out to be a ring slot reused under a half-closed socket.
 - [fidelity.md](fidelity.md) — **reference**: the index of where kisal
   differs from Linux, read out of the code rather than the plans. The
   three answers a guest can get for something not fully built — a loud

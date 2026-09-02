@@ -51,22 +51,62 @@ def fetch(port: int, timeout: float = 300.0) -> tuple[int, float, int]:
         connection.close()
 
 
-def await_ready(port: int, limit: float) -> float:
-    """Seconds until the stack answers 200.
+def cpu_ticks(pid: int) -> int:
+    with open(f"/proc/{pid}/stat") as stat:
+        fields = stat.read().rsplit(")", 1)[1].split()
+    # utime and stime, in clock ticks, after the parenthesised command.
+    return int(fields[11]) + int(fields[12])
 
-    Not until it answers *something*: nginx comes up before gunicorn does
-    and says 502 in the meantime, which is correct of it and is not the
-    stack being ready.
+
+def await_idle(pid: int, limit: float) -> float:
+    """Seconds until the process has been busy and then gone quiet.
+
+    For the module, whose boot is one process interpreting for as long as
+    it takes. Readiness is *not* asked for with requests, and this is not
+    fussiness: a request made while gunicorn's worker is still importing
+    Django queues behind it and is served, in full, once the worker comes
+    up -- so a poll every quarter second for thirty seconds becomes a
+    hundred queued requests, the first 200 arrives only after most of them
+    have been answered, and every timing taken afterwards is interleaved
+    with the rest of the queue draining. The figures this tool used to
+    report -- 24 s to the first 200 and 149 ms a request -- were that.
+    """
+    started = time.perf_counter()
+    previous = cpu_ticks(pid)
+    busy = False
+    calm = 0
+    while time.perf_counter() - started < limit:
+        time.sleep(1.0)
+        current = cpu_ticks(pid)
+        used, previous = current - previous, current
+        if used >= 40:
+            busy, calm = True, 0
+        elif busy:
+            calm += 1
+        if calm >= 2:
+            # The two quiet seconds are not the boot's.
+            return time.perf_counter() - started - 2.0
+    raise SystemExit(f"process {pid} never went quiet within {limit}s")
+
+
+def await_ready(port: int, limit: float) -> float:
+    """Seconds until the stack answers 200, by asking it.
+
+    For the native container, where a request costs a third of a
+    millisecond and asking every couple of seconds queues nothing worth
+    counting. Not until it answers *something*: nginx comes up before
+    gunicorn does and says 502 in the meantime, which is correct of it and
+    is not the stack being ready.
     """
     started = time.perf_counter()
     while time.perf_counter() - started < limit:
         try:
-            status, _, _ = fetch(port, timeout=30.0)
+            status, _, _ = fetch(port, timeout=2.0)
             if status == 200:
                 return time.perf_counter() - started
         except Exception:
             pass
-        time.sleep(0.25)
+        time.sleep(2.0)
     raise SystemExit(f"nothing answered 200 on port {port} within {limit}s")
 
 
@@ -127,7 +167,12 @@ def main() -> None:
     which = sys.argv[1]
     port = int(sys.argv[2])
     limit = float(sys.argv[3]) if len(sys.argv) > 3 else 600.0
-    ready = await_ready(port, limit)
+    # A pid means "wait for it to go quiet" rather than "ask it".
+    pid = int(sys.argv[4]) if len(sys.argv) > 4 else None
+    ready = await_idle(pid, limit) if pid else await_ready(port, limit)
+    status, _, _ = fetch(port)
+    if status != 200:
+        raise SystemExit(f"{which}: quiet, but answered {status} rather than 200")
     result = measure(port, which, ready)
     out = f"/tmp/microbench/latency.{which}.json"
     with open(out, "w") as file:

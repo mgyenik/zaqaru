@@ -7,9 +7,12 @@ in the pothole list: egress above all — a guest connecting anywhere off
 `127.0.0.0/8` gets `ENETUNREACH`, which is the truthful answer for a
 namespace holding only `lo` and not a working outbound path — along with
 `SCM_RIGHTS`, `MAP_SHARED` across `fork`, and DNS. A concurrency defect
-found afterwards is recorded in [performance.md](performance.md): four
-clients at once measure *worse* throughput than one, which no arrangement
-of the pump explains.
+found afterwards — four clients at once measured *worse* throughput than
+one — turned out to be the arena, not the pump: a ring freed at a
+half-close while the endpoint still named it, reused by the next
+`connect`, and a `poll(POLLIN)` that could not see end of file. Fixed
+2026-09-02 (`Ring::attached`, and EOF is readable); the numbers are in
+[performance.md](performance.md).
 
 The text below is the plan as written.
 

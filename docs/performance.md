@@ -1,6 +1,6 @@
 # Performance: what it costs, where it goes, and what has been tried
 
-Status: **reference** — current as of 2026-08-31, and every number in it
+Status: **reference** — current as of 2026-09-02, and every number in it
 was measured on one machine (Ryzen AI 9 HX PRO 370, 24 threads, 5.16 GHz
 boost, a laptop with a scaling governor) on the commit named beside it.
 Where this disagrees with a plan document, this is right and the plan is
@@ -16,29 +16,46 @@ because anything checked.
 
 `demo/hello-django` — an ordinary Dockerfile, `python:3.12-slim` plus
 nginx, gunicorn and Django — run by `docker run` and by `zaqaru-run`, same
-image, same client. Measured at `ba24d46`.
+image, same client. Measured 2026-09-02 with the socket fix of that day,
+and with readiness read off the process's CPU use rather than asked for
+with requests, which section 3 explains changed every number below.
 
 | | native | wasm | ratio |
 | --- | --- | --- | --- |
-| boot to first HTTP 200 | 0.26 s | **24.4 s** | 94× |
-| first request after that | 2.0 ms | 169 ms | 85× |
-| sequential p50 | 0.3 ms | **149 ms** | 496× |
-| sequential p90 / p99 | 0.9 / 1.3 ms | 166 / 171 ms | — |
-| throughput | 2358 req/s | **6.66 req/s** | 354× |
-| four clients, p50 | 1.5 ms | 2214 ms | — |
-| four clients, throughput | 2060 req/s | 1.61 req/s | 1280× |
+| boot, until the process goes quiet | 0.26 s | **32–35 s** | ~130× |
+| first request after that | 2.0 ms | 106–162 ms | — |
+| warm request, sequential p50 | 0.3 ms | **41–48 ms** | 140× |
+| sequential throughput | 2358 req/s | 19–20 req/s | 120× |
+| four clients, p50 | 1.5 ms | 129–136 ms | — |
+| four clients, throughput | 2060 req/s | **29 req/s** | 70× |
 
-The run retires 3.36 G instructions in 49.6 s: **67.7 MIPS**. Compiling
-the 162 MB module costs 0.23 s and is not in those figures — it is paid
-once, it parallelises, and it scales with *code* rather than image size,
-because a container's filesystem is data the compiler walks past.
+The ranges are two clients: `curl` at the low end, `latency.py`'s
+`http.client` at the high, on the same module in the same minute. A boot
+retires **3.29 G** instructions, all of it interpretation at about
+100 MIPS. A warm request retires **1.1 M** — the difference between a boot
+with forty requests and one with none, and the host interpreter's own
+count agrees to three digits — which is 11 ms of interpretation inside a
+41 ms request. **The other thirty milliseconds are not the interpreter**:
+section 4 puts them in the process switch, which inside the module copies
+the outgoing process's whole address space out and the incoming one's back
+in. Four clients at once queue honestly behind the single sync worker
+(129 ms is about four requests deep), and overlap the host round trips
+that a single client waits on, which is why they get more throughput.
 
-Against the same measurement at the start of this work (`32b5ed3`): boot
-55.1 s, p50 252 ms, 3.90 req/s, 38.0 MIPS. So the container is **2.3×
-faster**, and its request latency has gone from about 490× native to 496×
-— which is not a contradiction but a warning about single numbers: the
-native side is also noisy between runs, and 2358 req/s here against 1504
-in the previous run is the same native binary on the same machine.
+Compiling the 170 MB module costs 0.23 s and is not in those figures — it
+is paid once, it parallelises, and it scales with *code* rather than image
+size, because a container's filesystem is data the compiler walks past.
+
+What this table used to say, and why it was wrong: 24.4 s to the first
+200, 149 ms a request, 6.66 req/s, and four clients at 1.61 req/s. The
+first three were the readiness poll's doing — see section 3 — and the
+fourth was a kernel defect, found by tracing it and fixed the same day:
+under concurrent load nginx's next `connect` reused a ring slot the
+half-closed worker socket still named, the worker lost `POLLHUP`, and
+every request paid gunicorn's full two-second close timeout. Sequentially
+nobody reconnects in the gap, which is why it never showed. The engine
+figures at the start of this work (`32b5ed3`: 38.0 MIPS, p50 252 ms) were
+polluted the same way and are not comparable with anything here.
 
 ## 2. What the shapes cost
 
@@ -120,6 +137,19 @@ billion instructions a second, about three times what the machine can do.
 scales.** Three timings of programs that computed different things are not
 three timings of the same thing.
 
+**Readiness is never asked for with requests.** A request made while
+gunicorn's worker is still importing Django queues behind it and is served,
+in full, once the worker is up — so a poll every quarter second for thirty
+seconds is a hundred queued requests, the first 200 arrives only after most
+of them have been answered, and the timings taken afterwards interleave
+with the rest of the queue draining. That is where 24.4 s to the first 200
+and 149 ms a request came from; the same run measured 43 ms a request the
+moment the poll was replaced. `latency.py` now reads the module's
+readiness off its own CPU use (busy, then two quiet seconds), and asks the
+native container every two seconds, where a request costs a third of a
+millisecond and nothing worth counting queues. The boot figure is the
+process going quiet, not the first 200.
+
 ### What not to report
 
 `kisal/examples/interpret` runs the same engine compiled to x86-64 instead
@@ -186,6 +216,26 @@ Django's import at `ba24d46`: `Cpu::quick` 53%, `Engine::run` 16%,
 `Flags::status` 1.2%. The dispatch and the run loop are 69% between them,
 so further gains mean less work per instruction rather than finding
 another mislaid function.
+
+**Serving is a different profile from booting**, and it was measured for
+the first time on 2026-09-02 by attaching `perf` only for the requests.
+Thirty sequential requests: `Cpu::quick` 44%, **`__memmove` 23%**,
+`Engine::run` 12%, `__memset` 3%, `Dormant::gather` 2%, plus 3.5% of
+`realloc` growing the vector the pages are gathered into. Four clients at
+once, after the socket fix: `quick` 39%, **`memmove` 32%**, `memset` 5%,
+`gather` 3%. The `memmove` is the process switch. Inside the module there
+is no page table, every process shares one address range, and
+`Dormant::gather` copies every mapped page of the outgoing process into
+the kernel's heap and zeroes it, then `restore` copies the incoming one's
+back — for a 60 MB CPython worker against a 4 MB nginx, that is a few
+hundred megabytes of memory traffic per request round trip, and it is
+the thirty milliseconds of a 41 ms request that are not interpretation.
+Section 7 says what to do about it.
+
+**A request's instruction mix is the boot's**: the histogram of a hundred
+requests, taken by difference, is `Mov` 36%, `Je` 6%, `Test` 6%, `Cmp` 6%,
+`Push` 5%, `Pop` 5%, `Lea` 4%, `Jne` 4% — the same shape as the import and
+lowered the same way. Nothing about serving is exotic to the engine.
 
 Two things it cannot do. **valgrind cannot run this at all**: under it the
 client binary loads inside the guest's 0x10000–4 GiB reservation and the
@@ -266,23 +316,42 @@ decided them, because none of it can be recovered by reading.
 
 ## 7. What is open
 
-- **Concurrency is broken.** Four clients get a p99 of 4.5 s and 1.61
-  req/s — *worse* than one client at a time, where honest queueing behind
-  a single sync worker would have held throughput flat. It survived every
-  pump arrangement tried, so the cause is elsewhere and is not known.
-- **Boot dominates and is untouched.** 24 s, and 2.1 G of the run's 3.36 G
-  instructions, is Python's import graph — re-executed identically on
-  every start. Halving the engine again gets 12 s. Snapshotting a booted
-  container gets 0.2 s, and it is the only idea on the table at the right
-  order of magnitude. The determinism the design already has is what makes
-  it plausible; kisal's state being an `Rc`/`RefCell` graph is what makes
-  it work.
-- **`string` at 913×.** glibc's SSE routines, unlowered, 30 MIPS against
-  41–115 everywhere else. Only ~2.4% of the *import*, but HTTP serving has
-  not been profiled separately and is where those routines live.
+- **The process switch copies the world.** Thirty of a warm request's 41
+  ms, and 40% of the processor under four clients, is `memmove`: every
+  switch copies the outgoing process's whole mapped memory out and zeroes
+  it, then copies the incoming one's in, whether or not the two overlap.
+  They mostly do not. Every process bump-allocates from the same base, so
+  nginx's 4 MB collides with the first 4 MB of the 60 MB worker and with
+  nothing above it — yet all 60 MB move, twice, on every round trip. The
+  shaped fix is page ownership: linear memory keeps each process's pages
+  in place, an owner table says whose bytes are resident where, and only
+  a page the incoming process maps *and* somebody else's bytes occupy is
+  saved and restored. A fork child collides with its parent everywhere
+  by construction, and that is the case that stays a copy; an `execve`'d
+  process could be placed at a staggered base inside the 512 MB guest
+  block so that unrelated programs never collide at all. Expected: a
+  request at about 15 ms, and the concurrent case better than that.
+- **Boot dominates and is untouched.** 32–35 s, all of it interpretation
+  of 3.29 G instructions, most of them Python's import graph — re-executed
+  identically on every start. Halving the engine again gets 16 s.
+  Snapshotting a booted container gets under a second, and it is the only
+  idea on the table at the right order of magnitude. The determinism the
+  design already has is what makes it plausible; kisal's state being an
+  `Rc`/`RefCell` graph in linear memory, and the interpreter holding no
+  guest state on the wasm stack, is what makes it work.
+- **`string` at 882×.** glibc's SSE routines, unlowered, 32 MIPS against
+  41–115 everywhere else. About 2.4% of the import, and the request-path
+  histogram says it is no larger there.
 - **`Cpu::quick` at 53% and `Engine::run` at 16%.** The dispatch and the
   loop. Fusing `cmp`/`test` with the `jcc` that follows is the shaped idea
   here — the histogram puts those at 14.4% and 16.4% of the stream — and
-  it removes a dispatch, a flag record and a flag read per pair.
-- **Tier 1 is still the step change**, and section 4 is the argument that
-  it would work rather than thrash.
+  it removes a dispatch, a flag record and a flag read per pair. Worth
+  perhaps 1.3× on the engine; not the order of magnitude.
+- **Tier 1 is the step change**, and section 4 is the argument that it
+  would work rather than thrash. The ceiling is known: the AOT transpiler
+  with register promotion reached parity with clang's own wasm backend on
+  the integer and memory kernels (`docs/archive/promotion-plan.md`), about
+  a hundred times where the interpreter sits. A trace compiler will not
+  get all of that, but five to twenty is the band the literature puts
+  this shape in, and it is the only lever that reaches boot and request
+  latency both.

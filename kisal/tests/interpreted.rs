@@ -2368,6 +2368,87 @@ int main(void) {
     );
 }
 
+/// **`poll(POLLIN)` on a half-closed socket whose peer has gone**, with the
+/// peer's next connection landing in the slot the old rings left.
+///
+/// What gunicorn does after every response: `shutdown(SHUT_WR)`, then a
+/// `recv` under a two-second socket timeout, waiting for nginx to close its
+/// side. Two things have to be true for that to return at once. End of file
+/// has to count as readable — Linux reports a `FIN` as `POLLIN | POLLRDHUP`,
+/// and a caller that asked only for `POLLIN` must not sleep through it. And
+/// the server's own transmit ring, which has no ends left once it gave up
+/// its writer and the client closed its reader, must not be handed to the
+/// client's *next* `connect` while the server still names it — or the
+/// server reads that new connection's reader as its old peer come back,
+/// loses `POLLHUP`, and waits out the whole timeout. Four clients at once
+/// measured two seconds a request from exactly this, and one at a time
+/// measured nothing, because one at a time nobody reconnects in the gap.
+#[test]
+fn poll_sees_end_of_file_when_the_peer_has_reconnected() {
+    agrees_with_native(
+        "poll-eof-reconnect",
+        r#"
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <poll.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+int main(void) {
+    int listener = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in bound = {0};
+    bound.sin_family = AF_INET;
+    bound.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    bind(listener, (struct sockaddr *)&bound, sizeof bound);
+    listen(listener, 8);
+    socklen_t length = sizeof bound;
+    getsockname(listener, (struct sockaddr *)&bound, &length);
+
+    /* One request and its answer, the way a proxy and a worker do it. */
+    int client = socket(AF_INET, SOCK_STREAM, 0);
+    connect(client, (struct sockaddr *)&bound, sizeof bound);
+    int served = accept(listener, 0, 0);
+    char buffer[16] = {0};
+    send(client, "hi", 2, 0);
+    recv(served, buffer, sizeof buffer, 0);
+    send(served, "ok", 2, 0);
+    /* The worker is done sending and waits for the proxy to hang up. */
+    shutdown(served, SHUT_WR);
+    recv(client, buffer, sizeof buffer, 0);
+    ssize_t eof = recv(client, buffer, sizeof buffer, 0);
+    close(client);
+
+    /* The proxy's next request arrives before the worker has looked. */
+    int next = socket(AF_INET, SOCK_STREAM, 0);
+    connect(next, (struct sockaddr *)&bound, sizeof bound);
+
+    /* Asked without waiting, on purpose. gunicorn waits two seconds here,
+       and what went wrong was the *answer*, which is computed the same way
+       whether or not the caller waits — so a regression should fail this
+       at once rather than wait on a timeout, which under this harness's
+       fixed clock never arrives. Both
+       defects are visible separately: `in` is end of file being readable,
+       and `hup` is the server still seeing its own transmit ring rather
+       than the one the reconnect was handed. */
+    struct pollfd watch = { .fd = served, .events = POLLIN };
+    int ready = poll(&watch, 1, 0);
+    ssize_t after = recv(served, buffer, sizeof buffer, 0);
+    printf("client eof %zd, poll %d in=%d hup=%d, server eof %zd\n",
+           eof, ready, (watch.revents & POLLIN) != 0,
+           (watch.revents & POLLHUP) != 0, after);
+
+    close(served);
+    close(next);
+    close(listener);
+    return 0;
+}
+"#,
+        Linkage::Dynamic,
+    );
+}
+
 /// **`epoll` on a connected socket**, which is how nginx reads a response
 /// from an upstream it proxied to.
 ///

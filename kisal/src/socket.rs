@@ -495,15 +495,22 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
                 let rings = self.rings.borrow();
                 let mut bits = 0;
                 let queued = rings.queued(endpoint.receive);
-                if queued > 0 {
-                    bits |= event::IN | event::RDNORM;
-                }
                 // The peer will send nothing more. `EPOLLRDHUP` is the
                 // half-close a program watches for when it wants to keep
                 // writing after the peer has stopped — nginx registers it,
                 // in the traced baseline — and `POLLHUP` is only for when
                 // *both* directions are done.
                 let peer_writing = rings.writers(endpoint.receive) > 0;
+                // Readable when there are bytes, and readable when there
+                // never will be: end of file is something a `read` returns
+                // without waiting, which is what `POLLIN` asks. Linux
+                // reports a `FIN` as `POLLIN | POLLRDHUP`, and a program
+                // that asked only for `POLLIN` — CPython's `recv` under a
+                // socket timeout, which is how gunicorn waits for nginx to
+                // close its side — must not sleep through it.
+                if queued > 0 || !peer_writing || endpoint.read_shut {
+                    bits |= event::IN | event::RDNORM;
+                }
                 if !peer_writing && !endpoint.read_shut {
                     bits |= event::RDHUP;
                 }
@@ -625,6 +632,7 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
                     read_shut: false,
                     write_shut: false,
                 });
+attach_endpoint(&mut self.rings.borrow_mut(), backward, forward);
             }
             if let Some(socket) = sockets.get_mut(b) {
                 socket.state = State::Connected(Endpoint {
@@ -635,6 +643,7 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
                     read_shut: false,
                     write_shut: false,
                 });
+attach_endpoint(&mut self.rings.borrow_mut(), forward, backward);
             }
         }
         let mut bytes = [0u8; 8];
@@ -754,6 +763,24 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
             rings.release(ring, end);
         }
         Outcome::Done(0)
+    }
+}
+
+/// Records that a freshly connected endpoint names two rings.
+///
+/// Paired with [`detach_endpoint`], and both exist because the rings are
+/// named by the endpoint for longer than the endpoint holds an end of them
+/// open — see `Ring::attached` in `ring.rs`.
+fn attach_endpoint(rings: &mut crate::ring::Rings, receive: u32, transmit: u32) {
+    rings.attach(receive);
+    rings.attach(transmit);
+}
+
+/// The endpoint a released socket had, if any, no longer names its rings.
+fn detach_endpoint(rings: &mut crate::ring::Rings, retired: Option<Endpoint>) {
+    if let Some(endpoint) = retired {
+        rings.detach(endpoint.receive);
+        rings.detach(endpoint.transmit);
     }
 }
 
@@ -1118,11 +1145,13 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
                 read_shut: false,
                 write_shut: false,
             });
+attach_endpoint(&mut self.rings.borrow_mut(), up, down);
         }
         if let Err(errno) = sockets.enqueue(listener, far) {
-            sockets.release(far);
+            let retired = sockets.release(far);
             drop(sockets);
             let mut rings = self.rings.borrow_mut();
+            detach_endpoint(&mut rings, retired);
             for ring in [up, down] {
                 rings.release(ring, End::Read);
                 rings.release(ring, End::Write);
@@ -1138,6 +1167,7 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
                 read_shut: false,
                 write_shut: false,
             });
+attach_endpoint(&mut self.rings.borrow_mut(), down, up);
         }
         Outcome::Done(0)
     }
@@ -1205,7 +1235,8 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
             .map(|endpoint| endpoint.peer.clone())
             .unwrap_or_default();
         if let Err(errno) = self.write_address(waiting.at, waiting.length_at, &peer) {
-            self.sockets.borrow_mut().release(accepted);
+            let retired = self.sockets.borrow_mut().release(accepted);
+            detach_endpoint(&mut self.rings.borrow_mut(), retired);
             return Some(errno.as_result());
         }
         let flags = crate::file::open_flags::READ_WRITE
@@ -1220,7 +1251,8 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
         ) {
             Ok(fd) => Some(i64::from(fd)),
             Err(errno) => {
-                self.sockets.borrow_mut().release(accepted);
+                let retired = self.sockets.borrow_mut().release(accepted);
+                detach_endpoint(&mut self.rings.borrow_mut(), retired);
                 Some(errno.as_result())
             }
         }
@@ -1853,6 +1885,7 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
                 read_shut: false,
                 write_shut: false,
             });
+attach_endpoint(&mut self.rings.borrow_mut(), down, up);
         }
         sockets.enqueue(listener, accepted).is_ok()
     }
