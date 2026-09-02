@@ -28,10 +28,19 @@ fn targum_staticlib() -> std::path::PathBuf {
 /// hard: no seam object, because a syscall is a Rust call; no translated
 /// guest objects, because there is no translation; no exec map and no
 /// resume bodies, because nothing holds guest state on the wasm stack.
-fn link_engine(workspace: &WorkingDirectory, image: &[u8], label: &str) -> std::path::PathBuf {
+fn link_engine(
+    workspace: &WorkingDirectory,
+    image: &[u8],
+    label: &str,
+    compiled: Vec<u8>,
+) -> std::path::PathBuf {
     let image = workspace.write(&format!("image.{label}.wasm.o"), image);
+    // The engine references the tier 1 table unconditionally; with nothing
+    // compiled it is the empty one.
+    let table = workspace.write(&format!("tier1.{label}.wasm.o"), compiled);
     let objects = vec![
         image,
+        table,
         support::kisal_staticlib(),
         targum_staticlib(),
         support::x87_staticlib(),
@@ -133,8 +142,39 @@ fn module_for(
 
     let baked = baker::bake_directory(&root).expect("bake");
     let object = baker::object::emit(&baked).expect("emit the image object");
-    let module = link_engine(&workspace, &object, label);
+    let compiled = tier1_for(&root);
+    let module = link_engine(&workspace, &object, label, compiled);
     (workspace, module)
+}
+
+/// With `ZAQARU_TIER1` set, every ELF in the tree swept and compiled — the
+/// whole program running through compiled blocks wherever they attach,
+/// against the same native oracle. Without it, the empty table.
+fn tier1_for(root: &Path) -> Vec<u8> {
+    if std::env::var_os("ZAQARU_TIER1").is_none() {
+        return zaqaru::tier1::object::empty();
+    }
+    let mut candidates = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(directory) = stack.pop() {
+        for entry in std::fs::read_dir(&directory).expect("read the tree") {
+            let path = entry.expect("entry").path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if let Ok(bytes) = std::fs::read(&path)
+                && bytes.starts_with(b"\x7fELF")
+                && let Ok(found) = zaqaru::tier1::sweep(&bytes)
+            {
+                candidates.extend(found);
+            }
+        }
+    }
+    let built = zaqaru::tier1::build(&candidates, 256 << 20);
+    eprintln!(
+        "tier 1: {} blocks compiled ({} instructions, {} deferred)",
+        built.functions, built.instructions, built.deferred
+    );
+    built.object
 }
 
 /// Boots a module against a given world and answers what it did.

@@ -76,6 +76,17 @@ pub unsafe extern "C" fn targum_boot() -> i32 {
         other => {
             let mut message = String::from("kisal: the container stopped: ");
             describe(&other, &mut message);
+            // The compiled blocks entered last, when there were any: the
+            // one that went wrong is usually among them and never the one
+            // that faulted.
+            let recent = targum::tier1::recent_entries();
+            if !recent.is_empty() {
+                message.push_str("; compiled blocks entered last:");
+                for entry in recent {
+                    message.push(' ');
+                    crate::push_hex(&mut message, entry);
+                }
+            }
             crate::report_to(&mut system.current().kernel, &message);
             UNIMPLEMENTED
         }

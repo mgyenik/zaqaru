@@ -83,6 +83,11 @@ pub struct Block {
     /// path still wants the original and a lowered op that had to carry one
     /// would save nothing.
     pub quick: Vec<crate::quick::Quick>,
+    /// The function the bake compiled for exactly these bytes, if it
+    /// compiled one: a table index the run loop calls instead of
+    /// interpreting. Looked up when the block is decoded and never again,
+    /// which is what makes it free — see [`crate::tier1`].
+    pub compiled: Option<u32>,
 }
 
 impl Block {
@@ -330,6 +335,7 @@ fn decode(address: u64, space: &Space) -> Result<Block, FetchError> {
                     end,
                     quick: lower_all(&instructions),
                     simple: straight_through(&instructions),
+                    compiled: crate::tier1::lookup(&bytes[..(end - address) as usize]),
                     instructions,
                 }),
                 DecoderError::NoMoreBytes => Err(FetchError::Fault(Fault {
@@ -353,6 +359,7 @@ fn decode(address: u64, space: &Space) -> Result<Block, FetchError> {
         end,
         quick: lower_all(&instructions),
         simple: straight_through(&instructions),
+        compiled: crate::tier1::lookup(&bytes[..(end - address) as usize]),
         instructions,
     })
 }

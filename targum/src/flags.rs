@@ -59,28 +59,33 @@ use crate::state::Width;
 /// `dec`'s famous property, and stating it as a variant rather than as a
 /// special case at every `dec` site is what keeps it from being forgotten.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
 pub enum Rule {
     /// Nothing pending: all six flags are in [`Flags::bits`].
-    Materialized,
+    Materialized = 0,
     /// `result = left + right`.
-    Add,
+    Add = 1,
     /// `result = left - right`.
-    Sub,
+    Sub = 2,
     /// Bitwise. Carry and overflow are cleared.
-    Logic,
+    Logic = 3,
     /// `inc`: as [`Rule::Add`] with a right-hand side of one, but the carry
     /// is whatever it already was.
-    Increment,
+    Increment = 4,
     /// `dec`: as [`Rule::Sub`], carry preserved.
-    Decrement,
+    Decrement = 5,
     /// `adc`: `result = left + right + carry_in`.
-    AddCarry,
+    AddCarry = 6,
     /// `sbb`: `result = left - right - carry_in`.
-    SubBorrow,
+    SubBorrow = 7,
 }
 
 /// The last flag-writing operation, plus the bits no rule covers.
+/// `repr(C)`, with the two enums a byte each at the front and five `u64`s
+/// behind: compiled code writes the record at `crate::state::layout`'s
+/// offsets, and this is the layout those numbers describe.
 #[derive(Clone, Copy, Debug)]
+#[repr(C)]
 pub struct Flags {
     rule: Rule,
     width: Width,
@@ -348,26 +353,51 @@ impl Flags {
 /// the point of the whole module: `jne` asks one question and gets one
 /// comparison.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
 pub enum Condition {
-    Overflow,
-    NoOverflow,
-    Below,
-    AboveOrEqual,
-    Equal,
-    NotEqual,
-    BelowOrEqual,
-    Above,
-    Sign,
-    NoSign,
-    Parity,
-    NoParity,
-    Less,
-    GreaterOrEqual,
-    LessOrEqual,
-    Greater,
+    Overflow = 0,
+    NoOverflow = 1,
+    Below = 2,
+    AboveOrEqual = 3,
+    Equal = 4,
+    NotEqual = 5,
+    BelowOrEqual = 6,
+    Above = 7,
+    Sign = 8,
+    NoSign = 9,
+    Parity = 10,
+    NoParity = 11,
+    Less = 12,
+    GreaterOrEqual = 13,
+    LessOrEqual = 14,
+    Greater = 15,
 }
 
 impl Condition {
+    /// The condition with x86's own encoding — the low four bits of a
+    /// `jcc` opcode — which is what compiled code hands a helper.
+    pub fn from_code(code: u8) -> Option<Self> {
+        Some(match code {
+            0 => Condition::Overflow,
+            1 => Condition::NoOverflow,
+            2 => Condition::Below,
+            3 => Condition::AboveOrEqual,
+            4 => Condition::Equal,
+            5 => Condition::NotEqual,
+            6 => Condition::BelowOrEqual,
+            7 => Condition::Above,
+            8 => Condition::Sign,
+            9 => Condition::NoSign,
+            10 => Condition::Parity,
+            11 => Condition::NoParity,
+            12 => Condition::Less,
+            13 => Condition::GreaterOrEqual,
+            14 => Condition::LessOrEqual,
+            15 => Condition::Greater,
+            _ => return None,
+        })
+    }
+
     #[inline(always)]
     pub fn holds(self, flags: &Flags) -> bool {
         match self {

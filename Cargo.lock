@@ -2188,6 +2188,7 @@ dependencies = [
  "object 0.40.0",
  "rand",
  "runner",
+ "targum",
  "wasmparser 0.258.0",
  "wasmprinter 0.258.0",
  "wasmtime",

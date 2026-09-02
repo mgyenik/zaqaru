@@ -45,6 +45,32 @@ pub const PAGE_SHIFT: u32 = 12;
 /// expensive request.
 pub const CEILING: u64 = 1 << 32;
 
+/// The address space as compiled code sees it: three bitmaps and a limit,
+/// at fixed offsets, handed to every compiled block by address.
+///
+/// Addresses rather than references because the reader is a wasm function
+/// the bake emitted, and `u32` because that reader is wasm32 whatever the
+/// engine is compiled for here; natively the vitals are built and never
+/// read. Built once per `Engine::run`: nothing inside a quantum can move a
+/// bitmap, because only the mapping rows grow one and they run between
+/// quanta, and a store to a page already marked as code clears a bit that
+/// exists.
+///
+/// Offsets, which `crate::tier1` and the bake agree on: `readable` 0,
+/// `readable_words` 4, `writable` 8, `writable_words` 12, `code` 16,
+/// `code_words` 20, `limit` 24.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct Vitals {
+    pub readable: u32,
+    pub readable_words: u32,
+    pub writable: u32,
+    pub writable_words: u32,
+    pub code: u32,
+    pub code_words: u32,
+    pub limit: u64,
+}
+
 /// What an access was trying to do, so a fault can say so.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Access {
@@ -159,6 +185,11 @@ pub struct Space {
     executable: Bitmap,
     /// Pages a cached block took bytes from.
     code: Bitmap,
+    /// Under `verify`: the bytes every store overwrote since the journal was
+    /// opened, so that an interpreted run can be undone and the same block
+    /// run again compiled from the same memory. See `crate::tier1::verify_before`.
+    #[cfg(feature = "verify")]
+    journal: Option<Vec<(u64, Vec<u8>)>>,
     /// Code pages a store has landed on since the last drain. The store path
     /// pushes here and clears the page's `code` bit; the run loop drains the
     /// list into the block cache before the next instruction is fetched, so
@@ -183,10 +214,42 @@ impl Space {
             writable: Bitmap::default(),
             executable: Bitmap::default(),
             code: Bitmap::default(),
+            #[cfg(feature = "verify")]
+            journal: None,
             dirty: Vec::new(),
         };
         space.set_limit(limit);
         space
+    }
+
+    /// Opens the undo journal. Verify builds only.
+    #[cfg(feature = "verify")]
+    pub fn journal_begin(&mut self) {
+        self.journal = Some(Vec::new());
+    }
+
+    /// Puts back every byte a store overwrote since the journal was opened,
+    /// most recent first, and closes it.
+    #[cfg(feature = "verify")]
+    pub fn journal_undo(&mut self) {
+        let Some(journal) = self.journal.take() else {
+            return;
+        };
+        for (address, old) in journal.into_iter().rev() {
+            // SAFETY: the same bytes a checked store overwrote.
+            unsafe {
+                core::ptr::copy_nonoverlapping(old.as_ptr(), Self::pointer(address), old.len());
+            }
+        }
+    }
+
+    #[cfg(feature = "verify")]
+    fn journal_store(&mut self, address: u64, length: u64) {
+        if let Some(journal) = self.journal.as_mut() {
+            // SAFETY: the caller checked the range.
+            let old = unsafe { core::slice::from_raw_parts(Self::pointer(address), length as usize) };
+            journal.push((address, old.to_vec()));
+        }
     }
 
     pub fn limit(&self) -> u64 {
@@ -401,6 +464,8 @@ impl Space {
     #[inline(always)]
     pub fn store(&mut self, address: u64, width: Width, value: u64) -> Result<(), Fault> {
         self.permitted(address, u64::from(width.bytes()), Access::Write)?;
+        #[cfg(feature = "verify")]
+        self.journal_store(address, u64::from(width.bytes()));
         self.note_code_write(address, u64::from(width.bytes()));
         // SAFETY: checked immediately above.
         unsafe {
@@ -434,6 +499,8 @@ impl Space {
     /// overlaps the file it is reading.
     pub fn write(&mut self, address: u64, from: &[u8]) -> Result<(), Fault> {
         self.permitted(address, from.len() as u64, Access::Write)?;
+        #[cfg(feature = "verify")]
+        self.journal_store(address, from.len() as u64);
         self.note_code_write(address, from.len() as u64);
         // SAFETY: checked immediately above.
         unsafe {
@@ -638,7 +705,24 @@ impl Space {
 
     /// Queues the pages a write landed on, if any of them hold code.
     #[inline]
-    fn note_code_write(&mut self, address: u64, length: u64) {
+    /// What compiled code needs to check an access: where the bitmaps are
+    /// and how far they reach. See [`Vitals`].
+    pub fn vitals(&self) -> Vitals {
+        Vitals {
+            readable: self.readable.words.as_ptr() as usize as u32,
+            readable_words: self.readable.words.len() as u32,
+            writable: self.writable.words.as_ptr() as usize as u32,
+            writable_words: self.writable.words.len() as u32,
+            code: self.code.words.as_ptr() as usize as u32,
+            code_words: self.code.words.len() as u32,
+            limit: self.limit,
+        }
+    }
+
+    /// Queues the pages of a store for invalidation, if any holds code.
+    /// Public because compiled code calls it through a helper before
+    /// leaving — see `crate::tier1`.
+    pub fn note_code_write(&mut self, address: u64, length: u64) {
         if length == 0 {
             return;
         }

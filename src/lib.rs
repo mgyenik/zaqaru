@@ -25,6 +25,7 @@ pub mod reader;
 pub mod seam;
 pub mod structurer;
 pub mod thunks;
+pub mod tier1;
 pub mod translate;
 pub mod transpile;
 pub mod wasm_reader;

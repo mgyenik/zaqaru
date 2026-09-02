@@ -37,11 +37,12 @@ pub const STACK_POINTER: usize = 4;
 /// each size does to the rest of the register, which [`Tcb::write_register`]
 /// is the single statement of.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, PartialOrd, Ord)]
+#[repr(u8)]
 pub enum Width {
-    Byte,
-    Word,
-    Dword,
-    Qword,
+    Byte = 0,
+    Word = 1,
+    Dword = 2,
+    Qword = 3,
 }
 
 impl Width {
@@ -159,17 +160,26 @@ impl Slice {
 /// wasm globals, no shadow stack, no resume chain. A snapshot is a copy of
 /// this struct plus the pages of linear memory the thread can reach.
 #[derive(Clone)]
+#[repr(C)]
 pub struct Tcb {
     /// The general-purpose registers, indexed by encoding number.
     pub registers: [u64; REGISTER_COUNT],
     pub rip: u64,
-    /// The lazy-flag record. See [`crate::flags`] for why the flags are not
-    /// six booleans.
-    pub flags: Flags,
+    /// Retired instructions, this thread's share. The counter is the
+    /// preemption quantum, the deterministic time base `rdtsc` answers from,
+    /// and the profiling signal a hot-block tier promotes on: one mechanism,
+    /// three jobs, no polling emitted anywhere.
+    ///
+    /// Up here, ahead of the vector and x87 state, because compiled code
+    /// reaches it at a fixed offset — see [`layout`].
+    pub retired: u64,
     /// The `%fs` base — the thread pointer, as far as every libc is
     /// concerned. `arch_prctl` is what moves it; guest code never writes it,
     /// because `wrfsbase` is not implemented and would be a loud error.
     pub fs_base: u64,
+    /// The lazy-flag record. See [`crate::flags`] for why the flags are not
+    /// six booleans.
+    pub flags: Flags,
     /// The XMM registers, low half first. Two `u64`s rather than a `u128`
     /// because SSE's grain is the half — a scalar operation writes the low
     /// 64 bits and preserves the high 64, which here is "touch element 0".
@@ -185,11 +195,30 @@ pub struct Tcb {
     /// static, which is the `x87_save`/`x87_load` integration the thread
     /// design named, arriving in the simpler form.
     pub x87: x87::state::X87State,
-    /// Retired instructions, this thread's share. The counter is the
-    /// preemption quantum, the deterministic time base `rdtsc` answers from,
-    /// and the profiling signal a hot-block tier promotes on: one mechanism,
-    /// three jobs, no polling emitted anywhere.
-    pub retired: u64,
+}
+
+/// Where compiled code finds the control block's fields.
+///
+/// A block compiled at bake time reads and writes the `Tcb` at these byte
+/// offsets, on a machine the bake never sees. So the struct is `repr(C)`,
+/// the fields compiled code touches are all `u64`s and `u8`s at the front —
+/// the same on every target — and the numbers here are asserted against
+/// `offset_of!` by a test, so that reordering a field is a failed test
+/// rather than a compiled block writing `%rax` into the flags.
+pub mod layout {
+    pub const REGISTERS: u32 = 0;
+    pub const RIP: u32 = 128;
+    pub const RETIRED: u32 = 136;
+    pub const FS_BASE: u32 = 144;
+    pub const FLAGS: u32 = 152;
+    /// Within [`FLAGS`]: see `crate::flags::Flags`.
+    pub const FLAGS_RULE: u32 = FLAGS;
+    pub const FLAGS_WIDTH: u32 = FLAGS + 1;
+    pub const FLAGS_LEFT: u32 = FLAGS + 8;
+    pub const FLAGS_RIGHT: u32 = FLAGS + 16;
+    pub const FLAGS_RESULT: u32 = FLAGS + 24;
+    pub const FLAGS_CARRY_IN: u32 = FLAGS + 32;
+    pub const FLAGS_BITS: u32 = FLAGS + 40;
 }
 
 impl Default for Tcb {
@@ -381,5 +410,22 @@ mod tests {
         assert_eq!(Width::Word.sign_extend(0x8000), 0xffff_ffff_ffff_8000);
         assert_eq!(Width::Dword.sign_extend(0x7fff_ffff), 0x7fff_ffff);
         assert_eq!(Width::Qword.sign_extend(0x8000_0000), 0x8000_0000);
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    /// The numbers compiled code is built against are the struct's.
+    #[test]
+    fn the_control_block_is_where_compiled_code_expects_it() {
+        assert_eq!(core::mem::offset_of!(Tcb, registers) as u32, layout::REGISTERS);
+        assert_eq!(core::mem::offset_of!(Tcb, rip) as u32, layout::RIP);
+        assert_eq!(core::mem::offset_of!(Tcb, retired) as u32, layout::RETIRED);
+        assert_eq!(core::mem::offset_of!(Tcb, fs_base) as u32, layout::FS_BASE);
+        assert_eq!(core::mem::offset_of!(Tcb, flags) as u32, layout::FLAGS);
+        assert_eq!(core::mem::size_of::<Flags>(), 48);
+        assert_eq!(Width::Qword as u8, 3);
     }
 }

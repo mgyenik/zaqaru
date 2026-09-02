@@ -21,6 +21,11 @@ histogram = []
 # counted exactly, at the cost of running several times slower while it is
 # being counted.
 profile = []
+# Tier 1 under audit: every compiled block is re-run interpreted from a
+# snapshot of the control block and the two machines compared, so that
+# the first disagreement is named where it happens rather than where it
+# is finally noticed. Several times slower; a debugging instrument.
+verify = []
 
 [dependencies]
 # Decoding and the RFLAGS-effect tables, and nothing else: no encoder, no

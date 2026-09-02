@@ -699,21 +699,31 @@ warm-up produces a profile whose coverage curve reproduces the table of
 section 10; a profile taken from a replayed tape is byte-identical to one
 taken live; the sweep of the Django image ranks python, libc, the loader,
 nginx and the extension modules first and stops at the budget, and its
-block set contains every block the profile found.
+block set contains every block the profile found. *The sweep, the
+ranking and the budget are built (2026-09-02, `src/tier1/sweep.rs`,
+`bake-vm --tier1`); the profile is not yet.*
 
-**T2 — single blocks.** The compiler for every lowered op with
-`targum_step` for the rest, the locals and flags discipline, the exits,
-the object, the table, attachment at decode, invalidation. Acceptance:
-**the differential suite green with every block it executes compiled** —
-each corpus program profiled, baked with its whole profile, run under
-wasmtime and compared against native, for the faults, the self-modifying
-code, the preempted `rep`, the forks; and green again baked from the
-sweep alone. Negative controls: a page write that invalidates an
-attached block mid-run, with invalidation disabled observably failing; a
-fault inside compiled code reaching its handler with the same frame the
-interpreter builds; the same tape replaying against the profiled bake
-and the plain one; a block whose bytes were deliberately altered in the
-image after profiling never attaching.
+**T2 — single blocks. Built 2026-09-02, in its single-block form.** The
+compiler for every lowered op with `targum_step` for the rest, the
+locals and flags discipline, the exits, the object, the table,
+attachment at decode, invalidation (`src/tier1/compile.rs`,
+`object.rs`; `targum/src/tier1.rs`). What stands: the seven container
+tests green with every block of their programs compiled from the sweep
+alone (`ZAQARU_TIER1=1`), including the fork, the exec chain, the
+sockets and record-and-replay; a static hello green under the engine's
+own verify mode, which interprets every compiled block first on an undo
+journal and compares the two machines after each; and the block
+differential (`examples/tier1-diff.rs`), which runs every block of a
+binary from random state compiled and interpreted, 21,000 blocks with
+no disagreement. `alu` runs at 1.5× the interpreter — the single-block
+ceiling the plan named, with the loads and stores of a whole register
+file around five instructions. Three defects the instruments found on
+the way, each a lesson about the frame rather than an op: a budget
+decline that ran the epilogue over locals never loaded; a call target
+parked in a scratch local the stack check reused; and an operand read
+that clobbered the flags record before the access was known to succeed.
+The other acceptance items — the profiled bake, the tape across bakes,
+the altered-bytes control — wait on T1's profile.
 
 **T3 — regions.** Formation at bake, the dispatcher, internal branches,
 region-wide locals, the budget rule, folded conditions, verification of

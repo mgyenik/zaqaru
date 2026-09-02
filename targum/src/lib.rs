@@ -42,6 +42,7 @@ pub mod profile;
 pub mod quick;
 pub mod space;
 pub mod state;
+pub mod tier1;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub mod arena;
@@ -106,6 +107,14 @@ impl Engine {
         quantum: u64,
     ) -> Outcome {
         let mut budget = quantum;
+        // What compiled code needs to check its accesses, built once: see
+        // `space::Vitals` for why nothing inside a quantum can move it.
+        let vitals = space.vitals();
+        // The one rule a compiled block's `Interpret` exit imposes: the
+        // block it names is run interpreted once before compiled code is
+        // consulted for it again. Without it a block that hands back its
+        // own entry is re-entered forever.
+        let mut interpret_next = false;
         while budget > 0 {
             // Before anything is fetched, so a block decoded from bytes the
             // last block overwrote cannot exist.
@@ -118,6 +127,51 @@ impl Engine {
                 }
             };
             let block = cache.block(index);
+            if let Some(function) = block.compiled
+                && !interpret_next
+            {
+                // The block the bake compiled for these bytes. It retires
+                // what it retires into the control block, stops exactly
+                // where the interpreter would when the budget runs out,
+                // and answers where execution goes next — see `tier1`.
+                tier1::enter(space, cache, index);
+                let before = tcb.retired;
+                #[cfg(feature = "verify")]
+                let states = tier1::verify_before(tcb, space, block);
+                let exit = tier1::call(function, tcb, &vitals, block.entry, budget);
+                #[cfg(feature = "verify")]
+                tier1::verify_after(&states, tcb, block, exit);
+                debug_assert!(
+                    tcb.retired >= before && tcb.retired - before <= budget,
+                    "a compiled block at {:#x} ({} instructions) retired {} to {} against a budget of {}, exit {:#x}",
+                    block.entry,
+                    block.instructions.len(),
+                    before,
+                    tcb.retired,
+                    budget,
+                    exit
+                );
+                let retired = tcb.retired.wrapping_sub(before);
+                budget = budget.saturating_sub(retired);
+                tcb.rip = tier1::exit_rip(exit);
+                match tier1::exit_kind(exit) {
+                    // A block that retired nothing and points at itself —
+                    // the budget rule declining to start — must not be
+                    // called again with the same budget: the interpreter
+                    // takes the block, and the quantum ends where it
+                    // always did.
+                    tier1::KIND_CONTINUE => {
+                        interpret_next = retired == 0;
+                        continue;
+                    }
+                    tier1::KIND_SYSCALL => return Outcome::Syscall,
+                    _ => {
+                        interpret_next = true;
+                        continue;
+                    }
+                }
+            }
+            interpret_next = false;
             let mut cpu = Cpu::new(tcb, space);
             let mut position = 0usize;
             while position < block.instructions.len() {

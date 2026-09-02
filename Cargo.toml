@@ -16,6 +16,9 @@ clap = { version = "4.6.6", features = ["derive"] }
 iced-x86 = "1.21.0"
 object = "0.40.0"
 wasmprinter = "0.258.0"
+# Tier 1's compiler lowers the interpreter's own pre-decoded form and mirrors
+# its block rule, so the bake compiles exactly what the engine will look up.
+targum = { path = "targum" }
 
 [dev-dependencies]
 baker = { path = "baker" }
