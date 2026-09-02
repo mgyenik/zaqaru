@@ -1,9 +1,11 @@
-# Tier 1: hot blocks compiled to wasm at bake time, from a profile
+# Tier 1: hot blocks compiled to wasm at bake time
 
 Status: **design, 2026-09-02** — written for discussion before anything
-is built, and rewritten the same day around a bake-time compile after the
-run-time one was found to need the one thing the design is not allowed
-to need: help from the host. Step 2 of the plan in
+is built. Rewritten twice the same day: first around a bake-time compile
+after the run-time one was found to need the one thing this project's
+host contract refuses, help loading code; then around three block
+sources after a profile of the user's own container was found to be a
+step nobody can be expected to take. Step 2 of the plan in
 [performance.md](performance.md) §7. Section 8 of [vm.md](vm.md) was the
 sketch this replaces; where the two disagree, this one is current.
 
@@ -17,37 +19,45 @@ booting costs thirty seconds — the interpreter does about a hundred
 million guest instructions a second, and a boot is three billion of them.
 
 Tier 1 is how virtual machines of this shape close most of that gap: the
-code that turns out to be hot is translated into real machine code, and
-the interpreter keeps everything else. Usually that translation happens
+code that matters is translated into real machine code, and the
+interpreter keeps everything else. Usually that translation happens
 while the program runs. It cannot here, because a wasm module cannot
 create code — that is the sandbox's whole promise — and the only thing
 that can load new code is the host, which this project has decided must
 know nothing but two store imports. So the translation happens at
-**bake** time instead, and what makes that possible is a property the
+**bake** time instead, and what makes that safe is a property the
 interpreter already has: **a compiled block is only ever used for bytes
 that match exactly the bytes it was compiled from.** The bake is
 therefore free to guess. A block compiled for code that never runs, or
 that has been overwritten, is a function nobody enters — never a wrong
 answer.
 
-Which blocks to compile is answered by running the container once and
-watching. The image is baked with a profiling engine, driven through a
-boot and some requests, and stopped; the runner writes out the list of
-code blocks the run executed and how often. A second bake compiles that
-list into wasm functions and links them into the module beside the
-interpreter, keyed by their bytes. At run time, whenever the interpreter
-decodes a block, it looks the bytes up; on a match, that block runs as
-machine code the host's own compiler produced from our wasm, with guest
-registers in real registers and guest branches as real branches. Cold
-code, rare instructions, faults and everything strange run interpreted,
-which remains the only place correctness lives.
+Which blocks to compile is the question, and it is answered without
+running the user's container. Most of the native code in any container
+is the runtime it was built on — libpython, glibc, the loader, nginx,
+openssl — and those bytes are identical across every image that shares
+the base. So the bake draws on **three sources**, in order: a *corpus*
+of profiles taken once per runtime and matched by bytes, which covers
+boot and the runtime's own hot loops for any image built on a common
+base; a *static sweep* of the ELFs the image's entrypoint can reach,
+ranked by evidence and capped by a size budget, which covers what the
+corpus never saw, including code the user built themselves; and, for
+whoever can drive their container and wants the last few percent, a
+*profile* of their own workload. The first two need nothing but the
+image. At run time, whenever the interpreter decodes a block, it looks
+the bytes up; on a match, that block runs as machine code the host's own
+compiler produced from our wasm. Cold code, rare instructions, faults
+and everything strange run interpreted, which remains the only place
+correctness lives.
 
-The size question answers itself from the same profile. The Django run
-executed 213,562 distinct instruction addresses in its whole life —
-under a megabyte of x86, about 5 MB as wasm, against a 170 MB module
-that is almost entirely the filesystem. Ninety percent of what it
-retired is 20,000 addresses, half a megabyte compiled. The cutoff is a
-knob, and every setting of it is small.
+Size was measured before this was written. The image's 745 ELFs hold
+39 MB of executable text, of which 34 MB is package tooling no server
+runs; the runtime's text is 5 MB, and the Django run executed under one
+megabyte of it. Compiled, the runtime is on the order of 20 MB, or half
+that with a knob. The module it goes into is 170 MB today because it
+carries the filesystem uncompressed, and the filesystem compresses 3.4×;
+section 11 makes compressing it part of this plan, and once it is, a
+module with tier 1 in it is smaller than a module without it is now.
 
 What to expect: systems of this shape land five to twenty times off the
 interpreter on integer code, which is a boot of a few seconds and a
@@ -55,12 +65,12 @@ request of a few milliseconds. The ceiling is measured rather than
 guessed — this project's own ahead-of-time translator reached parity
 with clang's wasm backend on integer and memory kernels, about a hundred
 times above the interpreter — and a translator that works block by block
-will land short of it. Section 12 says how the number is taken and
-section 13 what could stop it.
+will land short of it. Section 13 says how the number is taken and
+section 14 what could stop it.
 
 ## Outline
 
-1. **The two runs** — a profiling run, then a bake.
+1. **The three block sources** — corpus, static sweep, workload profile.
 2. **What a compiled block is** — the unit, its signature, its exits.
 3. **Keyed by bytes** — attachment at decode, and why a miss is harmless.
 4. **The seam with the run loop.**
@@ -72,46 +82,64 @@ section 13 what could stop it.
 8. **Invalidation** — the block cache's, shared.
 9. **Regions** — many blocks in one function, which is where the speed
    is.
-10. **The profile** — what is recorded, how it leaves the module, the
-    cutoff.
-11. **Determinism, preemption, threads and signals.**
-12. **Where the code lives, and the gates** T0–T3.
-13. **Risks and open questions** — including the run-time compile, kept
+10. **The sources in detail** — what a profile records, how the corpus
+    is built and matched, how the sweep ranks and budgets, the sizes.
+11. **Paying for code with data** — the rootfs, compressed.
+12. **Determinism, preemption, threads and signals.**
+13. **Where the code lives, and the gates** T0–T4.
+14. **Risks and open questions** — including the run-time compile, kept
     as an optional later addition.
-14. **Pitfalls index** — seeded.
+15. **Pitfalls index** — seeded.
 
-## 1. The two runs
+## 1. The three block sources
 
 ```
-zaqaru-bake --profiling image.tar warm.wasm      # an engine that counts
-zaqaru-run  warm.wasm -p 8080:80 --profile hot.blocks
-    ... boot, curl it, Ctrl-C ...
-zaqaru-bake --hot hot.blocks image.tar app.wasm  # the engine plus the compiled set
-zaqaru-run  app.wasm -p 8080:80                  # the host as it is today
+zaqaru-bake image.tar app.wasm               # corpus + static sweep; no run
+zaqaru-bake --hot hot.blocks image.tar app.wasm   # ...plus a workload profile
+zaqaru-run  app.wasm -p 8080:80              # the host as it is today
 ```
 
-The profiling module is the ordinary module with the engine's `profile`
-feature on, which already exists: it counts retired instructions per
-guest address and costs a few times the speed while it does. The runner's
-`--profile` calls one *export* on the way out — `targum_profile`, which
-hands back the list of blocks the run entered, each as its bytes and its
-counts — and writes it to a file. An export is not host support in the
-sense this design forbids: the host already calls `targum_boot`, and it
-is a development-time convenience, not part of what a container needs
-to run. A browser harness does the same in five lines, or not at all.
+A bake compiles blocks from three sources and links them into one
+object beside the image and the engine, exactly as the image object is
+linked today. The output is a module the unchanged runner runs. Nothing
+about the host contract changes: two store imports, one boot export, as
+it is now.
 
-The second bake reads the list, decides the cutoff (section 10),
-compiles what is above it into one wasm object, and links that object
-beside the image and the engine exactly as the image object is linked
-today. The output is a module the unchanged runner runs. Nothing about
-the host contract changes: two store imports, one boot export, as it is
-now.
+**The corpus** is a set of block profiles taken once per runtime — a
+libpython, a glibc, an nginx — on representative workloads, by whoever
+maintains this tool, and shipped with it. Each entry is a block's bytes
+and how much it retired. At bake, the image's ELFs are matched against
+the corpus by *content*: an ELF whose bytes are a corpus entry's
+contributes that entry's blocks, and blocks are keyed by their own bytes
+besides (section 3), so even a differently built library that shares
+routines matches where the routines match. This is the source that needs
+nothing from the user and covers the most: booting is the loader, libc's
+start-up and the runtime's initialisation, all corpus code; and a
+runtime's hot loops — CPython's eval loop, glibc's `memcpy`, nginx's
+event loop — are hot in every program that uses the runtime.
 
-A profile is a property of a workload, not of an image, and it is honest
-about that: an image profiled through a boot and a page fetch is fast at
-booting and fetching pages, and everything else it does later runs
-interpreted, correctly. A workload that does new things gets a new
-profile. Section 10 says what a profile costs to take.
+**The static sweep** covers what the corpus has not seen. The image's
+ELFs are ranked by evidence the bake can read without running anything:
+the binaries the entrypoint names, their `DT_NEEDED` closure, the
+directories a runtime loads extensions from, anything under
+`/usr/local`; then the rest, last. Each ELF's executable segments are
+decoded from their symbols and direct branch targets into blocks, and
+compiled in rank order until a size budget is spent. A wrong guess
+about what is code costs bytes and never correctness, so the ranking
+only has to be reasonable, and the budget is what keeps a bake's size
+predictable.
+
+**The workload profile** is the third source and the only one that runs
+the container. For someone who can drive their image — a boot, the
+requests that matter, Ctrl-C — a profiling bake counts blocks, the
+runner writes them out through one export, and a second bake compiles
+exactly what ran. It is the most precise source and the one that cannot
+be asked of everyone, which is why it is last and optional. It is also
+how the corpus is built: a corpus entry is this profile, taken by us, of
+a runtime we ship.
+
+All three feed the same compiler, the same object and the same table,
+and a block that appears in more than one is compiled once.
 
 ## 2. What a compiled block is
 
@@ -173,8 +201,9 @@ itself is.
 **Why bytes are enough.** Two x86 sequences with identical bytes have
 identical semantics, so the same compiled function is correct for both —
 in different processes, in different mappings of the same library, in
-two libraries that happen to share a routine. Every constant in a block
-that refers to an address does so *relative to the block*: rip-relative
+two libraries that happen to share a routine, in an image the corpus
+never saw that carries a runtime it did. Every constant in a block that
+refers to an address does so *relative to the block*: rip-relative
 operands and direct branch targets are encoded as displacements from the
 instruction, so the bytes are the same wherever the code is mapped. The
 compiled function is therefore written entirely in terms of `entry`
@@ -184,18 +213,19 @@ difference. A block that happened to contain an *absolute* address (a
 `mov rax, imm64` of a pointer) is fine too: the immediate is part of the
 bytes, and bytes that differ do not match.
 
-**Why a miss is harmless.** A profile block whose bytes never appear in
-a run is a function nobody enters. A block whose bytes the guest has
-since overwritten never attaches, because the re-decode after the write
-sees the new bytes. A block the run-time decode cut shorter than the
-bake did — a page boundary, the instruction cap, a page that stopped
-being executable — has a different length and does not match. There is
-no such thing as attaching wrongly, only not attaching, and not
-attaching is the interpreter, which is correct. This is the property
-that lets the bake guess, and it is the property the ahead-of-time
-translator never had: there, a wrong guess about where code was became a
-wrong answer, and a thousand lines of `code-discovery.md` were the
-price. Here a wrong guess is a slightly larger module.
+**Why a miss is harmless.** A block whose bytes never appear in a run is
+a function nobody enters. A block whose bytes the guest has since
+overwritten never attaches, because the re-decode after the write sees
+the new bytes. A block the run-time decode cut shorter than the bake did
+— a page boundary, the instruction cap, a page that stopped being
+executable — has a different length and does not match. There is no
+such thing as attaching wrongly, only not attaching, and not attaching
+is the interpreter, which is correct. This is the property that lets
+the bake guess, and it is the property the ahead-of-time translator
+never had: there, a wrong guess about where code was became a wrong
+answer, and a thousand lines of `code-discovery.md` were the price.
+Here a wrong guess is a slightly larger module, and section 10's budget
+bounds even that.
 
 **Anonymous code** — a JIT's output, code the guest wrote — is recorded
 by the profiler like any other and *could* be compiled, since the key is
@@ -333,11 +363,13 @@ after one iteration, passes unchanged under compiled code because the
 code never gets past the store.
 
 Whether the inline checks are affordable is a measurement, and section
-12 takes it. They are not optional: they are what makes a wild pointer a
+13 takes it. They are not optional: they are what makes a wild pointer a
 `SIGSEGV` with a faithful address rather than a silent read of somebody
 else's bytes, which the design document lists as the fidelity class the
-AOT tier could not have. They are also most of the compiled code's
-size, which section 10 comes back to.
+AOT tier could not have. They cannot be replaced by hardware either — a
+wasm out-of-bounds access is a trap, and a trap is unrecoverable: it
+unwinds to the host, and the guest's signal handler never runs. They are
+also most of the compiled code's size, which section 10 comes back to.
 
 ## 7. Correctness: exits to the interpreter
 
@@ -360,7 +392,7 @@ rule of section 4 exists: the instruction is run exactly once,
 interpreted, before the loop goes back to trusting compiled code.
 
 The consequence for the differential suite is the acceptance criterion of
-milestone T1: **every program the suite runs must produce identical
+milestone T2: **every program the suite runs must produce identical
 output, syscall trace and exit status when baked with every block it
 executes compiled**, including the programs that fault on purpose, the
 ones that write code and run it, and the ones that are preempted
@@ -386,15 +418,14 @@ reintroducing.
 
 Nothing leaks. The compiled functions are part of the module, there for
 its whole life whether attached or not, and detaching is clearing a
-field. The instance leak the run-time design had to accept does not
-exist here.
+field.
 
 ## 9. Regions
 
 A single compiled block is a proof of the seam, not a speed-up. Blocks
 average five instructions, and calling a function that loads a dozen
 locals, runs five instructions and stores the locals back is not faster
-than interpreting them. The speed is in **regions**: a set of hot blocks
+than interpreting them. The speed is in **regions**: a set of blocks
 connected by constant-target branches, compiled into one wasm function.
 
 A region has one entry function whose body is a `br_table` on which of
@@ -410,27 +441,28 @@ inside a single `loop`. Within the region:
   the same block folds to a direct comparison as in section 6;
 - a hot loop becomes a real wasm loop, which Cranelift allocates
   registers across — the shape the AOT tier reached clang parity with,
-  applied to whatever the profile found hot.
+  applied to whatever the sources found.
 
-At bake, region formation starts at a hot block and follows its
+At bake, region formation starts at a block and follows its
 constant-target successors — fall-through, taken branch, near `jmp` and
-`call` targets — while they are in the profile and hot, up to a cap of
-64 blocks. A region's blocks are therefore at fixed *relative* offsets
-from its entry, which is what the bytes-keying needs: the region's table
-entry records every block's delta from the entry and every block's
-bytes, and attachment (section 3) verifies all of them at the moment the
-entry block is decoded — reading a few kilobytes at `entry + delta` for
-each, checking each page is executable, comparing. A block that belongs
-to a region is also compiled alone, so that a region that fails to
-verify because one of its blocks has changed still leaves the entry
-block fast.
+`call` targets — while they are among the blocks being compiled, up to a
+cap of 64 blocks. For a profiled block the successors are the hot ones;
+for a swept block they are whatever the sweep decoded. A region's blocks
+are therefore at fixed *relative* offsets from its entry, which is what
+the bytes-keying needs: the region's table entry records every block's
+delta from the entry and every block's bytes, and attachment (section 3)
+verifies all of them at the moment the entry block is decoded — reading
+a few kilobytes at `entry + delta` for each, checking each page is
+executable, comparing. A block that belongs to a region is also
+compiled alone, so that a region that fails to verify because one of its
+blocks has changed still leaves the entry block fast.
 
 `Call` inside a region pushes the return address and dispatches to the
 target if it is in the region; `Ret` pops and exits with `Continue`,
 because a return address is not a constant and the loop's lookup is the
 honest way to follow it. Every block entry in a region is a dispatch
 target in version one; whether single-entry regions are worth their
-smaller dispatch is an open question (section 13).
+smaller dispatch is an open question (section 14).
 
 The size cap is not tunable in the sense of "larger is better". Cranelift
 does not split a function it cannot allocate registers for, and the
@@ -440,57 +472,149 @@ instructions is a few hundred wasm instructions per block body and a
 function Cranelift handles comfortably; the cap moves when a measurement
 says so, and not before.
 
-## 10. The profile
+## 10. The sources in detail
 
-**What is recorded.** The profiling engine already counts retired
-instructions per guest address. What the bake needs is per *block*:
-its bytes, how many times it was entered, and how many instructions it
-retired. So the profiling build counts at block entry rather than at
-every instruction — cheaper than the address profile, and the same
-`profile` feature grows a second table keyed by the block's bytes. The
-bytes are the key rather than the address for the reason of section 3:
-the same routine in two processes, or in one library mapped twice, is
-one entry with the counts summed, and nothing has to attribute an
-address to a file.
+### What a profile records
 
-**How it leaves the module.** `targum_profile(into: i32, capacity: i32)
--> i32` is an export that serialises the table into guest memory the
-runner reads back — bytes, entries, retired, one record per block. The
-runner's `--profile` calls it once after `targum_boot` returns and
-writes the file. A run that ends by Ctrl-C ends the same way it does
-today, with the tree told and reaped, and then the export is called; the
-profile is of everything up to that moment.
+The profiling engine already counts retired instructions per guest
+address. What the bake needs is per *block*: its bytes, how many times
+it was entered, and how many instructions it retired. So the profiling
+build counts at block entry rather than at every instruction — cheaper
+than the address profile, and the same `profile` feature grows a second
+table keyed by the block's bytes. The bytes are the key rather than the
+address for the reason of section 3: the same routine in two processes,
+or in one library mapped twice, is one entry with the counts summed, and
+nothing has to attribute an address to a file.
 
-**The cutoff.** The bake sorts blocks by instructions retired and
-compiles from the top until a chosen share of the run is covered. The
-Django import's address profile is what the curve looks like:
+`targum_profile(into: i32, capacity: i32) -> i32` is an export that
+serialises the table into guest memory the runner reads back — bytes,
+entries, retired, one record per block. The runner's `--profile` calls
+it once after `targum_boot` returns and writes the file. A run that ends
+by Ctrl-C ends the same way it does today, with the tree told and
+reaped, and then the export is called; the profile is of everything up
+to that moment. An export is not host support in the sense this design
+forbids: the host already calls `targum_boot`, and this is a
+development-time convenience a browser harness can do in five lines or
+skip. A tape recorded by the runner replays deterministically, so a
+profile can also be taken from a recording after the fact.
 
-| coverage of retired instructions | distinct addresses | as blocks, roughly | compiled, roughly |
-| --- | --- | --- | --- |
-| 50% | 2,301 | 500 | 60 KB |
-| 90% | 20,392 | 4,000 | 0.5 MB |
-| 99% | ~80,000 | 16,000 | 2 MB |
-| everything the run executed | 213,562 | 40,000 | 5 MB |
+### The corpus
 
-The compiled figures assume four to eight bytes of wasm per byte of x86,
+A corpus entry is a profile of a runtime, taken on a workload chosen to
+be representative — for a Python, a boot, a stdlib import and the
+interpreter loop under a benchmark; for nginx, a boot and a few thousand
+requests — and stored as the profile file plus the content hash of each
+ELF it was taken from. The corpus ships with the bake tool and grows as
+runtimes are added; it is ours to build and to keep current as
+distributions ship new builds, and its value is proportional to how many
+images share a base, which for the Python, Node, Ruby and nginx worlds is
+nearly all of them.
+
+Matching is by content, twice over. An ELF in the image whose bytes hash
+to a corpus entry's contributes the entry's blocks outright. And every
+block is keyed by its own bytes at attach, so a library the corpus never
+saw that shares routines with one it did — a static glibc in a Go
+binary, say — matches where the routines match, with no entry for it.
+
+What the corpus does not cover: native code the user built, and code
+paths in a runtime that no representative workload exercises. The first
+is the sweep's job; the second is small and runs interpreted.
+
+### The static sweep
+
+For ELFs the corpus does not match, the bake decodes blocks from the
+files themselves. Two questions: which ELFs, and where the code is.
+
+Which ELFs is a ranking, from evidence the image carries:
+
+1. the binaries the entrypoint and command name, if they are ELFs, and
+   the shell if they are scripts;
+2. their `DT_NEEDED` closure, resolved the way the loader will;
+3. the directories a matched runtime loads extensions from
+   (`lib-dynload`, `site-packages`, `node_modules` builds);
+4. anything under `/usr/local`, which is where an image's own build
+   lands;
+5. everything else, last.
+
+Where the code is: a recursive descent from each ELF's symbols and
+entry points, following direct branch and call targets, then a linear
+sweep of the remaining bytes of each executable segment. This is the
+AOT translator's discovery problem again, and here it has no teeth: a
+byte sequence that was not code compiles to a function nobody enters,
+and a real entry the descent missed is interpreted. The sweep's blocks
+are the cache's blocks — from an entry to the first unconditional
+transfer — starting at every instruction the descent reached and,
+within a region, dispatched on every block entry (section 9), so a
+jump-table target inside a swept function attaches without anyone
+having recovered the table.
+
+The budget is what makes the sweep safe to size. Ranks are compiled in
+order until the budget is spent, and the default is a fraction of the
+image rather than a constant, so a small image is not dominated by its
+compiled code. A `--budget` overrides it, and `--sweep none` turns the
+sweep off for someone who wants only the corpus.
+
+### The sizes
+
+Measured on the Django image, 2026-09-02:
+
+| | size |
+| --- | --- |
+| executable text, all 745 ELFs | 39.4 MB |
+| of which package tooling no server runs (apt, dpkg, perl, sqv, libdb, libstdc++…) | ~34 MB |
+| text of python, libc, the loader, nginx and the extension modules | 5.1 MB |
+| what the Django run executed, by distinct address | ~0.85 MB |
+| rootfs on disk | 124 MB |
+| rootfs with zstd -3 | 37 MB |
+
+Compiled wasm runs four to eight times the size of the x86 it came from,
 which is what a block with inline permission checks on every memory
 operand comes to; a check routed through a helper would halve it at a
-cost in speed, and is a knob rather than a decision. Against a 170 MB
-module that is almost entirely the filesystem, every row is small, and
-the default should be generous — everything the warm-up executed — so
-that a profile does not have to be taken carefully to be useful. The
-cutoff exists for images where it matters.
+cost in speed, and is a knob rather than a decision. So the sources
+land at, roughly:
 
-**What a profile costs to take.** One run of the profiling module, at a
-few times the interpreter's cost while it counts: a boot and a handful
-of requests, a minute or two. It is the workload's, not the image's:
-the same image profiled under a different workload compiles a different
-set, and any code outside the set is interpreted, correctly. A tape
-recorded by the runner replays deterministically, so a profile can also
-be taken from a recording after the fact, which is what a fleet would do
-rather than driving each image by hand.
+| source | compiled |
+| --- | --- |
+| corpus, 90% of a runtime's retired instructions | 0.5 MB per runtime |
+| corpus, everything a runtime's workload executed | 5 MB per runtime |
+| static sweep of the ranked runtime text, 5.1 MB | 20–40 MB, or 10–20 with helper checks |
+| static sweep of everything | 150–300 MB — which is why there is a budget |
 
-## 11. Determinism, preemption, threads and signals
+The last row is what the sweep would cost without the ranking and the
+budget, and it is the number that makes section 11 part of this plan
+rather than a separate one: the module that carries tier 1 has to be
+smaller than the module that does not, and the filesystem is where the
+bytes are.
+
+## 11. Paying for code with data
+
+The 170 MB module is the filesystem, uncompressed, plus a few megabytes
+of engine. The filesystem compresses 3.4× with zstd at its cheapest
+level. So the bake compresses file contents, and kisal decompresses on
+open.
+
+The image is read-only, so this touches one place: `Filesystem::contents`,
+which hands back a file's bytes for `read`, `mmap` and `exec`. It
+decompresses on first use into a per-file cache the kernel owns, and
+frees it when the file is closed everywhere — the same lifetime an inode
+already has. Decompression is kisal code compiled to wasm, on the order
+of half a gigabyte a second, so a boot that opens a hundred files and
+twenty megabytes pays some tens of milliseconds, once, against thirty
+seconds of interpretation. Files below a size floor, and files that do
+not compress, are stored raw. The index format of `container-plan.md`
+gains a compression field per file and nothing else changes: the
+overlay, the synthetic filesystems and the bake's layer handling are
+above this.
+
+With the filesystem at about 40 MB, a module carrying the corpus and a
+budgeted sweep of the runtime is on the order of 60 to 80 MB — under
+half of today's 170 — and a module carrying tier 1 is smaller than one
+without it is now. This is the largest size win available anywhere in
+the project, it needs no run and no host change, and it comes first in
+the gates because it makes every other size question in this document a
+small one.
+
+## 12. Determinism, preemption, threads and signals
 
 **The interleaving is unchanged.** Scheduling is a pure function of
 retired instructions, and record and replay depend on that. Compiled
@@ -503,7 +627,7 @@ the quantum one instruction at a time and stops where it always stops.
 Block lengths are constants at compile time, so this is one compare per
 block. It makes the schedule identical whether a module carries no
 compiled code, some, or all of it — and that becomes a test: **the same
-tape replays against the profiled bake and the plain one**, which
+tape replays against a bake with tier 1 and one without**, which
 `vm.md` §12 already asks for at V5.
 
 **Preemption** is that rule. **Threads** are unaffected: compiled code is
@@ -523,8 +647,12 @@ profile of section 10 is the one instrument that runs beside attachment,
 and it counts at entry in the loop, before the compiled check, so it is
 exact too.
 
-## 12. Where the code lives, and the gates
+## 13. Where the code lives, and the gates
 
+- `baker` — `compress.rs` (the per-file compression and the index
+  field), `sweep.rs` (the ELF ranking, the descent and linear sweep, the
+  budget), `corpus.rs` (loading and matching entries by content), and
+  the `--hot`, `--budget`, `--sweep` and `--profiling` options.
 - `targum/src/tier1/` — `profile.rs` (the block table and its
   serialisation), `attach.rs` (the linked table, the probe at decode, the
   region verification), `compile.rs` (a block or region to a wasm
@@ -538,65 +666,89 @@ exact too.
   produces objects `wasm-ld` accepts. Pure Rust, no dependencies, already
   written and already producing objects the bake links. The root crate
   goes on using it through the same paths.
+- `kisal` — decompression on open in `Filesystem::contents`, and nothing
+  else. The kernel does not know which tier executed an instruction, and
+  that is the design.
 - Three exported engine helpers: `targum_step`, `targum_condition`,
   `targum_code_write`, thin wrappers over `Cpu::step`, `Condition::holds`
   and `Space::note_code_write`; and the `targum_profile` export.
-- `baker` — `--profiling` selects the counting engine, `--hot` reads a
-  profile, runs the compiler, and adds the object to the link.
 - `runner` — `--profile`, which calls one export and writes one file.
-- `kisal` — untouched. The kernel does not know which tier executed an
-  instruction, and that is the design.
+- `corpus/` — the shipped profiles, one directory per runtime, each with
+  the content hashes it was taken from and the workload that took it.
 
 The host interpreter (`kisal/examples/interpret`) stays tier 0: it has
 no wasm to run. It remains the development instrument for kernel work,
 and tier 1's own tests run under wasmtime.
 
-**T0 — the profile.** The block table in the profiling build, the
-export, the runner's `--profile`, the file format. Acceptance: the Django
+**T0 — the filesystem, compressed.** The index field, the bake's
+compression, decompression on open with the per-file cache. Acceptance:
+the Django module under 50 MB with no compiled code in it; the kernel
+suite and the container tests green; boot time within measurement noise
+of today's. Negative control: a file deliberately stored with a wrong
+length fails loudly at open rather than reading short.
+
+**T1 — the profile and the sweep.** The block table in the profiling
+build, the export, the runner's `--profile`, the file format; the ELF
+ranking, the descent and sweep, the budget. Acceptance: the Django
 warm-up produces a profile whose coverage curve reproduces the table of
 section 10; a profile taken from a replayed tape is byte-identical to one
-taken live.
+taken live; the sweep of the Django image ranks python, libc, the loader,
+nginx and the extension modules first and stops at the budget, and its
+block set contains every block the profile found.
 
-**T1 — single blocks.** The compiler for every lowered op with
+**T2 — single blocks.** The compiler for every lowered op with
 `targum_step` for the rest, the locals and flags discipline, the exits,
 the object, the table, attachment at decode, invalidation. Acceptance:
 **the differential suite green with every block it executes compiled** —
 each corpus program profiled, baked with its whole profile, run under
 wasmtime and compared against native, for the faults, the self-modifying
-code, the preempted `rep`, the forks. Negative controls: a page write
-that invalidates an attached block mid-run, with invalidation disabled
-observably failing; a fault inside compiled code reaching its handler
-with the same frame the interpreter builds; the same tape replaying
-against the profiled bake and the plain one; a block whose bytes were
-deliberately altered in the image after profiling never attaching.
+code, the preempted `rep`, the forks; and green again baked from the
+sweep alone. Negative controls: a page write that invalidates an
+attached block mid-run, with invalidation disabled observably failing; a
+fault inside compiled code reaching its handler with the same frame the
+interpreter builds; the same tape replaying against the profiled bake
+and the plain one; a block whose bytes were deliberately altered in the
+image after profiling never attaching.
 
-**T2 — regions.** Formation at bake, the dispatcher, internal branches,
+**T3 — regions.** Formation at bake, the dispatcher, internal branches,
 region-wide locals, the budget rule, folded conditions, verification of
 every block at attach. The same acceptance, with regions. Plus the first
-speed number: the nine kernels of `tools/microbench`, each profiled and
-baked with everything, against the interpreter, recorded in
-`performance.md` §2 as a new column.
+speed number: the nine kernels of `tools/microbench`, each baked from
+the sweep alone and from its profile, against the interpreter, recorded
+in `performance.md` §2 as new columns.
 
-**T3 — the container.** The Django demo profiled through a boot and a
-page fetch, baked at the default cutoff: boot, warm request, four
-clients, module size, load time, and the share of retired instructions
-that ran compiled — reported at exit beside the MIPS figure. Recorded
-against the literature band of `vm.md` §11 and the AOT tier's ceiling,
-in `performance.md` §1, honestly, whatever it turns out to be.
+**T4 — the container and the corpus.** The first corpus entries —
+`python:3.12-slim`'s libpython, glibc and loader, and nginx — taken on
+stated workloads. The Django demo baked three ways: corpus and sweep
+with no run of the image; with its own profile added; sweep alone.
+Boot, warm request, four clients, module size, load time, and the share
+of retired instructions that ran compiled, reported at exit beside the
+MIPS figure, for each. Recorded against the literature band of `vm.md`
+§11 and the AOT tier's ceiling, in `performance.md` §1, honestly,
+whatever it turns out to be. The number that decides whether the corpus
+idea holds is the compiled share of the no-run bake against the
+profiled one.
 
-## 13. Risks and open questions
+## 14. Risks and open questions
 
-- **Coverage is the workload's.** A container that does something its
-  profile did not see runs that part interpreted. That is graceful, and
-  it is also the reason the default cutoff is everything the warm-up
-  executed rather than the hot 90%. The number to watch in T3 is the
-  compiled share of retired instructions on a workload the profile did
-  not include, which says how far a boot-and-one-request profile carries.
+- **Coverage without a run is the corpus's and the sweep's.** The
+  corpus covers what a representative workload of the runtime did; the
+  sweep covers what it decoded, within a budget. What neither reaches
+  runs interpreted, correctly. T4's compiled-share figure on the no-run
+  bake is the measurement, and it is the one that matters most to
+  whether this design delivers what it promises for images nobody drove.
+- **The corpus is ours to keep.** A new Debian build of glibc is new
+  bytes and a stale entry, matched only where routines happen to be
+  unchanged. Entries have to be retaken as bases move, which is a chore
+  proportional to the number of runtimes, and a chore is not a risk so
+  long as somebody owns it.
 - **The checks per access.** Five wasm instructions on every load and
-  store is real, and memory operands are most instructions. If T2's
+  store is real, and memory operands are most instructions. If T3's
   kernels say the checks are the ceiling, the answer is a cheaper
   representation of the same fact — one bitmap for "readable and not
-  code", say — and never dropping the fact.
+  code", say — and never dropping the fact. They also set the floor on
+  size, at about 2.5× the x86 with helpers, which the budget already
+  assumes.
 - **`targum_step` on a hot path.** If an unlowered op sits inside a hot
   loop, the helper's write-back and reload dominate a region. The
   histogram says which op to lower next, and lowering it helps both
@@ -604,19 +756,26 @@ in `performance.md` §1, honestly, whatever it turns out to be.
   MIPS where everything else clears forty, and `rep movsb` is a loop in
   either tier.
 - **Load time.** wasmtime compiles the module's code at load — 0.23 s
-  today, because the filesystem is data it walks past. Five megabytes
-  more code is perhaps a second more, once, and wasmtime caches compiled
-  modules. To be measured in T3 and reported beside the size.
+  today, because the filesystem is data it walks past. Twenty megabytes
+  more code is a few seconds more, once, and wasmtime caches compiled
+  modules; a browser's baseline compiler is faster still. Measured in
+  T4 and reported beside the size; if it matters, the budget is the
+  knob.
+- **Runtimes that JIT.** Node, the JVM and a JITting Ruby emit code at
+  run time that no bake can see, and it runs interpreted. Their
+  interpreter-only modes exist and are the right setting under this
+  engine; the corpus entry for such a runtime is taken that way.
 - **Cranelift on region bodies.** The cap is a guess at where register
   allocation stops being good, informed by the interpreter's own inlining
-  history. Measured in T2; moves only then.
+  history. Measured in T3; moves only then.
 - **Open: entries into a region.** Every block entry is a dispatch
   target in version one. Whether single-entry regions are worth their
   smaller dispatch and fewer write-back points is a measurement.
-- **Open: sharing compiled sets across images.** The key is bytes, so a
-  libpython compiled once is right for every image carrying that
-  libpython. A bake cache keyed the same way would make the second image
-  free to bake; nothing here prevents it and nothing here needs it.
+- **Open: the sweep's descent.** Symbols and direct targets find most
+  code; what they miss inside a function is found by the linear sweep,
+  and what the linear sweep decodes wrongly costs bytes. Whether the
+  budget is better spent on descent-reached code only is a T4 question
+  with the compiled-share figure as its answer.
 - **Later, optional: compiling at run time.** The same compiler,
   compiled to wasm32 inside the engine, could translate blocks a run
   finds hot and hand the bytes to a host through one import,
@@ -626,14 +785,14 @@ in `performance.md` §1, honestly, whatever it turns out to be.
   base index. That was the first version of this design, and it is kept
   here as an addition rather than an alternative: it needs the host's
   help, it needs batching to amortise the host's compile time, and it
-  leaks an instance per invalidated region. A bake covers boot and the
-  workload it saw; a run-time compile would cover what it did not.
+  leaks an instance per invalidated region. A bake covers what the
+  sources saw; a run-time compile would cover what they did not.
   Nothing in sections 2 through 9 changes for it.
 
-## 14. Pitfalls index
+## 15. Pitfalls index
 
-Seeded from the interpreter's own history and from the first version of
-this design; to be extended as T1 finds things.
+Seeded from the interpreter's own history and from the earlier versions
+of this design; to be extended as T2 finds things.
 
 1. **A hash hit is not a match.** Compare the bytes. A collision that
    attached the wrong function would be a wrong answer with no
@@ -648,7 +807,7 @@ this design; to be extended as T1 finds things.
    handed back.** `Interpret` means one interpreted instruction before
    `compiled` is consulted again, or an exit at a region's own entry is
    an infinite loop. Section 4.
-5. **Stop where the interpreter stops.** The budget rule of section 11
+5. **Stop where the interpreter stops.** The budget rule of section 12
    is what keeps a tape replayable across bakes; checking "budget
    exhausted" only at region exits would overrun by a block and change
    the schedule.
@@ -680,3 +839,11 @@ this design; to be extended as T1 finds things.
     interpreter saw, not of what the guest ran; the block profile is the
     one that counts before the compiled check, and is the only one that
     may run beside it.
+14. **The sweep has no budget until it has one.** A sweep of everything
+    is 150 to 300 MB of wasm. The ranking and the budget are not
+    refinements to add later; they are what makes the sweep a source at
+    all.
+15. **A compressed file that decompresses short is a loud error, not a
+    short file.** The index says the length; a mismatch is corruption,
+    and a guest that reads fewer bytes than the file has will fail
+    somewhere far from here.
