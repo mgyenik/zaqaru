@@ -351,9 +351,8 @@ started before it.
    kernels, about a hundred times above the interpreter. A trace compiler
    lands well short of that; five to twenty times is the band this shape
    sits in, which is a boot of a few seconds and requests of a few
-   milliseconds. `docs/vm.md` section 8 is the design; the `install`
-   import, the trace granularity and the shared invalidation are already
-   decided there.
+   milliseconds. [tier1-plan.md](tier1-plan.md) is the design, written
+   2026-09-02 for discussion; `docs/vm.md` section 8 was the sketch.
 3. **Snapshot a booted container — waiting.** The alternative for boot
    that does not depend on engine speed. The interpreter holds no guest
    state on the wasm stack and kisal's state is a graph in linear memory,
