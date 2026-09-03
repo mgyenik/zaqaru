@@ -35,6 +35,26 @@ static uint64_t next_random(uint64_t *state) {
     return x;
 }
 
+/* Mixed, to pin the bytecode-vs-x86 multiplier on a realistic instruction
+ * shape: an LCG (arithmetic), a permission-checked load and store into a
+ * 16 KB region, and a data-dependent branch that the predictor cannot win —
+ * the mix an interpreter loop actually runs. Kept semantically identical to
+ * the bytecode version so the comparison is of speed, not of work. */
+static uint64_t buf_mixed[2048];
+static uint64_t kernel_mixed(uint64_t rounds) {
+    for (int i = 0; i < 2048; i++) buf_mixed[i] = (uint64_t)i * 2654435761u + 1;
+    uint64_t state = 1, sum = 0, idx = 0;
+    for (uint64_t i = 0; i < rounds; i++) {
+        uint64_t x = buf_mixed[(idx & 0x3ff8) >> 3];
+        state = state * 6364136223846793005ULL + 1442695040888963407ULL;
+        x ^= state >> 33;
+        buf_mixed[((idx + 64) & 0x3ff8) >> 3] = x;
+        if (x & 0x100) sum += x;
+        idx += 24;
+    }
+    return sum ^ state ^ buf_mixed[0];
+}
+
 /* Component kernels: each iteration is sixty of one instruction class plus
  * the loop's own dec/jnz, so the interpreter's retired-instruction rate is
  * that instruction's per-op cost, near enough. Differencing them decomposes
@@ -246,7 +266,8 @@ struct entry {
 /* Sized so that each runs for roughly the same short time natively, which
  * keeps one slow shape from dominating the wall clock of the whole set. */
 static const struct entry entries[] = {
-{"nops", kernel_nops, 1000000},
+{"mixed", kernel_mixed, 200000},
+    {"nops", kernel_nops, 1000000},
     {"regmov", kernel_regmov, 1000000},
     {"regadd", kernel_regadd, 1000000},
     {"loads", kernel_loads, 1000000},
