@@ -88,7 +88,7 @@ pub struct Block {
     /// the run loop calls instead of interpreting. Looked up when the block
     /// is decoded and never again, which is what makes it free — see
     /// [`crate::tier1`].
-    pub compiled: Option<(u32, u32)>,
+    pub compiled: Option<(u32, u32, u64)>,
     /// Pages the compiled region's other members sit on, which the block
     /// is registered against too: a write to any of them drops the block,
     /// because the region was compiled for all of them together.
@@ -390,9 +390,9 @@ fn decode(address: u64, space: &Space) -> Result<Block, FetchError> {
 /// What the bake compiled for a decoded block's bytes, if anything: the
 /// region's function and member, and the pages of the region's other
 /// members. See [`crate::tier1::lookup`].
-fn attach(bytes: &[u8], address: u64, end: u64, space: &Space) -> (Option<(u32, u32)>, Vec<u64>) {
+fn attach(bytes: &[u8], address: u64, end: u64, space: &Space) -> (Option<(u32, u32, u64)>, Vec<u64>) {
     match crate::tier1::lookup(&bytes[..(end - address) as usize], address, space) {
-        Some(found) => (Some((found.function, found.which)), found.pages),
+        Some(found) => (Some((found.function, found.which, found.base)), found.pages),
         None => (None, Vec::new()),
     }
 }

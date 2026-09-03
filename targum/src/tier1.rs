@@ -84,6 +84,10 @@ pub const TABLE_MEMBER: usize = 12;
 pub struct Attached {
     pub function: u32,
     pub which: u32,
+    /// The region's base address as this block is mapped: `entry` less the
+    /// entered member's delta. Passed to the compiled function so it need
+    /// not recover it from `entry` and `which` at run time.
+    pub base: u64,
     pub pages: Vec<u64>,
 }
 
@@ -185,7 +189,7 @@ pub fn lookup(bytes: &[u8], address: u64, space: &Space) -> Option<Attached> {
                         }
                     }
                 }
-                return Some(Attached { function, which, pages });
+                return Some(Attached { function, which, base, pages });
             }
         }
         index += 1;
@@ -262,16 +266,16 @@ pub fn recent_entries() -> Vec<u64> {
 /// On wasm32 a function pointer *is* a table index, so the cast is the
 /// call. Natively nothing is ever compiled and this is unreachable.
 #[cfg(target_arch = "wasm32")]
-pub fn call(function: u32, tcb: &mut Tcb, vitals: &Vitals, entry: u64, budget: u64, which: u32) -> u64 {
+pub fn call(function: u32, tcb: &mut Tcb, vitals: &Vitals, base: u64, budget: u64, which: u32) -> u64 {
     type Compiled = unsafe extern "C" fn(*mut Tcb, *const Vitals, u64, u64, u32) -> u64;
     // SAFETY: the index came from the bake's table, whose functions all
     // have this signature, and the linker put them in the module's table.
     let compiled: Compiled = unsafe { core::mem::transmute(function as usize) };
-    unsafe { compiled(tcb, vitals, entry, budget, which) }
+    unsafe { compiled(tcb, vitals, base, budget, which) }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub fn call(_function: u32, _tcb: &mut Tcb, _vitals: &Vitals, _entry: u64, _budget: u64, _which: u32) -> u64 {
+pub fn call(_function: u32, _tcb: &mut Tcb, _vitals: &Vitals, _base: u64, _budget: u64, _which: u32) -> u64 {
     unreachable!("nothing is compiled natively")
 }
 

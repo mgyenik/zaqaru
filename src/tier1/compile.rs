@@ -70,7 +70,8 @@ pub struct Compiled {
 // The parameters.
 const TCB: u32 = 0;
 const VITALS: u32 = 1;
-const ENTRY: u32 = 2;
+/// Parameter 2 is the region's base address, handed in by the run loop.
+const BASE_PARAM: u32 = 2;
 const BUDGET: u32 = 3;
 const WHICH: u32 = 4;
 // The locals, declared in this order.
@@ -408,29 +409,25 @@ impl Emitter<'_> {
     fn function(&mut self) {
         let count = self.members.len() as u32;
         self.prologue();
-        // BASE = ENTRY - delta(WHICH).
-        for (index, member) in self.members.iter().enumerate() {
-            self.body.local_get(WHICH);
-            self.body.i32_const(index as i32);
-            self.body.i32_eq();
-            self.body.if_();
-            self.body.local_get(ENTRY);
-            self.body.i64_const(member.address.wrapping_sub(self.base) as i64);
-            self.body.i64_sub();
-            self.body.local_set(BASE);
-            self.body.end();
-        }
+        // BASE is handed in — the run loop knew it from the attach — so
+        // there is no scan over the members to recover it.
+        self.body.local_get(BASE_PARAM);
+        self.body.local_set(BASE);
         self.body.local_get(WHICH);
         self.body.local_set(NEXT);
         self.body.i64_const(0);
         self.body.local_set(DONE);
 
         // The exit block: every way out branches to it with RIP, KIND and
-        // DONE set, and the epilogue below it writes the world back.
-        self.body.block();
-        self.body.loop_();
-        // One label per member, innermost first, and the dispatcher at the
-        // bottom of the nest.
+        // DONE set, and the epilogue below it writes the world back. Inside
+        // it the dispatcher loop; inside that the `$resolve` block wrapping
+        // the member blocks, so a runtime target — an indirect jump, a
+        // `ret` — branches to `$resolve` and the shared resolver after it
+        // turns the address into a member or an exit, once, rather than a
+        // scan per site.
+        self.body.block(); // $exit
+        self.body.loop_(); // $dispatch
+        self.body.block(); // $resolve
         for _ in 0..count {
             self.body.block();
         }
@@ -442,19 +439,91 @@ impl Emitter<'_> {
             self.member_depth = count - 1 - index as u32;
             self.member(index);
         }
-        self.body.end(); // loop
-        self.body.end(); // exit
+        self.body.end(); // $resolve
+        self.resolver();
+        self.body.end(); // $dispatch (loop)
+        self.body.end(); // $exit
         self.epilogue();
+    }
+
+    /// The shared resolver, run when a member branches to `$resolve` with a
+    /// runtime target in `RIP`: it turns `RIP` into a member and
+    /// re-dispatches, or exits with `KIND_CONTINUE` when the target is not
+    /// in the region. A balanced binary search over the members' deltas —
+    /// `log n` comparisons at run time, one copy of the search rather than
+    /// one per indirect transfer.
+    fn resolver(&mut self) {
+        self.body.local_get(RIP);
+        self.body.local_get(BASE);
+        self.body.i64_sub();
+        self.body.local_set(T);
+        let mut sorted: Vec<(i64, usize)> = self
+            .members
+            .iter()
+            .enumerate()
+            .map(|(index, member)| (member.address.wrapping_sub(self.base) as i64, index))
+            .collect();
+        sorted.sort_by_key(|(delta, _)| *delta);
+        self.search(&sorted, 0);
+    }
+
+    /// One level of the resolver's balanced search. `ifs` is how many `if`
+    /// blocks are open; from inside them the loop is at depth `ifs` and the
+    /// exit at `ifs + 1`.
+    fn search(&mut self, sorted: &[(i64, usize)], ifs: u32) {
+        match sorted.len() {
+            0 => {
+                self.body.i64_const(KIND_CONTINUE as i64);
+                self.body.local_set(KIND);
+                self.body.branch(ifs + 1);
+            }
+            1 => {
+                let (delta, index) = sorted[0];
+                self.body.local_get(T);
+                self.body.i64_const(delta);
+                self.body.i64_eq();
+                self.body.if_();
+                self.body.i32_const(index as i32);
+                self.body.local_set(NEXT);
+                self.body.branch(ifs + 1);
+                self.body.else_();
+                self.body.i64_const(KIND_CONTINUE as i64);
+                self.body.local_set(KIND);
+                self.body.branch(ifs + 2);
+                self.body.end();
+            }
+            _ => {
+                let mid = sorted.len() / 2;
+                self.body.local_get(T);
+                self.body.i64_const(sorted[mid].0);
+                self.body.i64_lt_signed();
+                self.body.if_();
+                self.search(&sorted[..mid], ifs + 1);
+                self.body.else_();
+                self.search(&sorted[mid..], ifs + 1);
+                self.body.end();
+            }
+        }
     }
 
     /// The branch depth to the dispatcher loop and to the exit block, from
     /// inside the current member's code and whatever `if`s are open.
+    /// The depth to the dispatcher loop, for a static internal branch that
+    /// re-runs the `br_table`. The `$resolve` block wraps the member blocks,
+    /// so the loop is one further out than the members.
     fn dispatch_depth(&self) -> u32 {
+        self.member_depth + 1 + self.depth
+    }
+
+    /// The depth to the `$resolve` block, for a runtime target — an indirect
+    /// jump or a `ret` — which the shared resolver turns into a member
+    /// dispatch or an exit.
+    fn resolve_depth(&self) -> u32 {
         self.member_depth + self.depth
     }
 
     fn exit_depth(&self) -> u32 {
-        self.member_depth + 1 + self.depth
+        self.member_depth + 2 + self.depth
     }
 
     /// One member's code, after its label.
@@ -524,32 +593,6 @@ impl Emitter<'_> {
             }
             None => self.leave(KIND_CONTINUE),
         }
-    }
-
-    /// Dispatches on the runtime value in `RIP`: if it is a member's
-    /// address, branch to that member; else exit. `RIP` and `DONE` are set.
-    ///
-    /// A linear scan over the members' deltas. A region holds at most
-    /// [`super::region::MAX_MEMBERS`], and the common `ret` lands on the
-    /// return site pulled in beside its callee, near the front; a sorted
-    /// search is the refinement if a measurement asks for it.
-    fn dispatch_rip(&mut self) {
-        for (index, member) in self.members.iter().enumerate() {
-            // RIP == BASE + delta ?
-            self.body.local_get(RIP);
-            self.body.local_get(BASE);
-            self.body.i64_const(member.address.wrapping_sub(self.base) as i64);
-            self.body.i64_add();
-            self.body.i64_eq();
-            self.body.if_();
-            self.depth += 1;
-            self.body.i32_const(index as i32);
-            self.body.local_set(NEXT);
-            self.body.branch(self.dispatch_depth());
-            self.depth -= 1;
-            self.body.end();
-        }
-        self.leave(KIND_CONTINUE);
     }
 
     // ---- the frame ------------------------------------------------------
@@ -1352,9 +1395,13 @@ impl Emitter<'_> {
                 match quick.source {
                     Source::Immediate(target) => self.go_to(target),
                     source => {
+                        // A computed jump — the eval loop's dispatch is one.
+                        // Set RIP and hand it to the shared resolver, which
+                        // stays in the region if the target is a member and
+                        // exits only if it is not.
                         self.read(quick, source, Width::Qword, instruction);
                         self.body.local_set(RIP);
-                        self.leave(KIND_CONTINUE);
+                        self.body.branch(self.resolve_depth());
                     }
                 }
                 return;
@@ -1400,7 +1447,7 @@ impl Emitter<'_> {
                 // indirect call, or one that leaves, exits with `RIP` set.
                 match quick.source {
                     Source::Immediate(target) => self.go_to_target(target),
-                    _ => self.leave(KIND_CONTINUE),
+                    _ => self.body.branch(self.resolve_depth()),
                 }
                 return;
             }
@@ -1422,9 +1469,9 @@ impl Emitter<'_> {
                 self.count_done();
                 // The return address is a runtime value: if it is a member
                 // of this region — which it is when the caller's return
-                // site was pulled in beside the callee — dispatch to it;
-                // else leave and let the loop look it up.
-                self.dispatch_rip();
+                // site was pulled in beside the callee — the shared resolver
+                // dispatches to it; else it exits and the loop looks it up.
+                self.body.branch(self.resolve_depth());
                 return;
             }
         }

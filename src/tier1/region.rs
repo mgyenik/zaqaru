@@ -91,7 +91,7 @@ fn edges(instructions: &[Instruction]) -> Vec<u64> {
     targets
 }
 
-/// Gathers the candidates into regions.
+/// Gathers the candidates into regions, each capped at [`MAX_MEMBERS`].
 pub fn form(candidates: &[Candidate]) -> Vec<Region> {
     let by_address: BTreeMap<u64, usize> = candidates
         .iter()

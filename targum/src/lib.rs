@@ -127,7 +127,7 @@ impl Engine {
                 }
             };
             let block = cache.block(index);
-            if let Some((function, which)) = block.compiled
+            if let Some((function, which, base)) = block.compiled
                 && !interpret_next
             {
                 // The region the bake compiled for these bytes, entered
@@ -135,12 +135,11 @@ impl Engine {
                 // control block, stops exactly where the interpreter would
                 // when the budget runs out, and answers where execution
                 // goes next — see `tier1`.
-                let entry = block.entry;
                 #[cfg(feature = "verify")]
                 let trace = tier1::verify_before(tcb, space, cache, 8192);
                 tier1::enter(space, cache, index);
                 let before = tcb.retired;
-                let exit = tier1::call(function, tcb, &vitals, entry, budget, which);
+                let exit = tier1::call(function, tcb, &vitals, base, budget, which);
                 #[cfg(feature = "verify")]
                 tier1::verify_after(&trace, tcb, space, cache.block(index), exit);
                 let block = cache.block(index);
