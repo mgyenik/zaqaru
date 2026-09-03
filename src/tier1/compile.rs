@@ -532,12 +532,24 @@ impl Emitter<'_> {
         let length = member.instructions.len() as i64;
         let address = member.address;
         let end = member.end();
+        // Where this segment stops. Members are in address order and a
+        // block that reaches into a later one shares its tail with it — the
+        // overlap that made the eval loop compile at 3x its instruction
+        // count. So a segment emits only up to the next member's address and
+        // falls through into it; the shared tail is emitted once, by the
+        // member that owns its start. Every distinct instruction is lowered
+        // exactly once across the region.
+        let limit = self.members.get(index + 1).map(|next| next.address);
         self.done = 0;
         self.known = None;
         // The budget rule: a member that would overrun the quantum is not
         // started; the interpreter finishes the quantum and stops exactly
         // where it always stops. Through the epilogue, which is right
-        // because the prologue has run: the locals hold the machine.
+        // because the prologue has run: the locals hold the machine. The
+        // length is the whole block's, not the segment's, and it composes:
+        // a member's length is its own segment plus the length of the
+        // member it falls through into, so a fall-through's re-check passes
+        // whenever the entry check did.
         self.body.local_get(BUDGET);
         self.body.local_get(DONE);
         self.body.i64_sub();
@@ -557,10 +569,16 @@ impl Emitter<'_> {
             .zip(member.quicks.iter().copied())
             .collect();
         for (position, (instruction, quick)) in instructions.iter().enumerate() {
+            // Reached the next member's start: its segment owns the rest.
+            // Settle the count and fall through into it.
+            if limit.is_some_and(|limit| instruction.ip() >= limit) {
+                self.count_done();
+                return;
+            }
             self.instruction(position, instruction, quick);
         }
         // Fell out of the last instruction: into the next member if it is
-        // one, else out.
+        // one, else out. (Dead after a terminator, which already branched.)
         self.count_done();
         self.go_to(end);
     }
