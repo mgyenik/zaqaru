@@ -25,6 +25,35 @@
 //! a diagnostic.
 
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
+
+/// A one-multiply hash for the block cache's `u64` keys — guest instruction
+/// addresses and page numbers, never an adversary's choice, so the
+/// `HashMap` default's SipHash buys nothing here and costs a lookup on
+/// every recent-cache miss. The constant is FxHash's; a single `write_u64`
+/// is the whole of it, because every key this hashes is one `u64`.
+#[derive(Default)]
+struct FastHasher(u64);
+
+impl Hasher for FastHasher {
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        // Only the `u64` path is used; this keeps the trait honest.
+        for &byte in bytes {
+            self.write_u64(u64::from(byte));
+        }
+    }
+    #[inline]
+    fn write_u64(&mut self, value: u64) {
+        self.0 = (self.0 ^ value).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+    }
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+type FastMap<K, V> = HashMap<K, V, BuildHasherDefault<FastHasher>>;
 
 use iced_x86::{Decoder, DecoderError, DecoderOptions, FlowControl, Instruction, Mnemonic};
 
@@ -54,7 +83,12 @@ pub const CAPACITY: usize = 64 * 1024;
 /// Slots in the direct-mapped lookup. A power of two, so the index is a
 /// mask, and large enough that a working set of a few thousand blocks —
 /// which is what a Python import graph turns out to be — mostly fits.
-const RECENT: usize = 4096;
+/// The direct-mapped cache in front of the block map. Sixteen thousand
+/// entries so a container's hot set — the eval loop's handlers and the
+/// functions they call, a couple of thousand blocks — mostly avoids the
+/// collisions that would fall through to the map. A power of two, for the
+/// mask.
+const RECENT: usize = 16384;
 
 /// A decoded run of instructions, entered at one address.
 pub struct Block {
@@ -151,7 +185,7 @@ pub struct BlockCache {
     /// index is stable for as long as the block lives.
     blocks: Vec<Option<Block>>,
     free: Vec<usize>,
-    entries: HashMap<u64, usize>,
+    entries: FastMap<u64, usize>,
     /// A direct-mapped cache in front of `entries`.
     ///
     /// Blocks end at the first control transfer, and control transfers turn
@@ -173,7 +207,7 @@ pub struct BlockCache {
     recent: Vec<(u64, usize)>,
     /// Which blocks took bytes from each page. The list is short —
     /// a page holds a few dozen blocks — so removal is a scan.
-    registry: HashMap<u64, Vec<usize>>,
+    registry: FastMap<u64, Vec<usize>>,
     /// How many blocks have been decoded since the cache was last emptied,
     /// for the diagnostics that ask how much decoding a workload does.
     pub decoded: u64,
@@ -189,11 +223,11 @@ impl Default for BlockCache {
         Self {
             blocks: Vec::new(),
             free: Vec::new(),
-            entries: HashMap::new(),
+            entries: FastMap::default(),
             // Allocated once, here, rather than checked for on a path that
             // runs every fifth instruction.
             recent: vec![(u64::MAX, 0); RECENT],
-            registry: HashMap::new(),
+            registry: FastMap::default(),
             decoded: 0,
             attached: 0,
             flushes: 0,
