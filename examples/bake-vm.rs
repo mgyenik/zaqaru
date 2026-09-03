@@ -35,6 +35,7 @@ fn main() -> anyhow::Result<()> {
     // bisection tool, not a feature.
     let mut only: Option<(u64, u64)> = None;
     let mut hot: Option<String> = None;
+    let mut cluster = false;
     let mut positional: Vec<String> = Vec::new();
     let mut index = 0;
     while index < raw.len() {
@@ -62,6 +63,9 @@ fn main() -> anyhow::Result<()> {
                 hot = Some(raw[index + 1].clone());
                 index += 1;
             }
+            // Gather each file's kept blocks into one region rather than
+            // many, so transfers among them stay in wasm — the cluster.
+            "--cluster" => cluster = true,
             other => positional.push(other.to_string()),
         }
         index += 1;
@@ -161,7 +165,7 @@ fn main() -> anyhow::Result<()> {
                     before
                 );
             }
-            let built = zaqaru::tier1::build(&candidates, budget);
+            let built = zaqaru::tier1::build(&candidates, budget, cluster);
             eprintln!(
                 "tier 1: {} blocks from the sweep, {} compiled in {} regions ({:.1} MB of code, {} instructions, {} deferred), {} mostly deferred and left interpreted, {} past the budget, in {:.2}s",
                 candidates.len(),

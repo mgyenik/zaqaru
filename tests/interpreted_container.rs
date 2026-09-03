@@ -169,7 +169,7 @@ fn tier1_for(root: &Path) -> Vec<u8> {
             }
         }
     }
-    let built = zaqaru::tier1::build(&candidates, 256 << 20);
+    let built = zaqaru::tier1::build(&candidates, 256 << 20, false);
     eprintln!(
         "tier 1: {} blocks compiled in {} regions ({} instructions, {} deferred)",
         built.members, built.functions, built.instructions, built.deferred

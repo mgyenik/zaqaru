@@ -59,7 +59,7 @@ pub struct Built {
 ///
 /// Identical bytes are one entry: the same block in two libraries, or
 /// found twice by the sweep, is compiled once and looked up once.
-pub fn build(candidates: &[Candidate], budget: usize) -> Built {
+pub fn build(candidates: &[Candidate], budget: usize, cluster: bool) -> Built {
     use targum::quick::{Op, Quick};
 
     let mut wasm = WasmObject::new();
@@ -166,9 +166,25 @@ pub fn build(candidates: &[Candidate], budget: usize) -> Built {
     for candidate in kept {
         by_module.entry(candidate.module).or_default().push(candidate);
     }
+    // In cluster mode the whole of a file's kept blocks — the hot set a
+    // profile named — becomes ONE region, uncapped, so that the calls,
+    // returns and computed gotos among them are internal dispatches that
+    // keep the machine in wasm locals rather than region crossings that
+    // reload it. This is the in-wasm-transfer architecture, reusing the
+    // region's own resolver for every indirect transfer. Ordinary formation
+    // otherwise: the computed goto scatters an interpreter's handlers, so
+    // only a deliberate cluster gathers them.
     let regions: Vec<_> = by_module
         .values()
-        .flat_map(|module| super::region::form(module))
+        .flat_map(|module| {
+            if cluster {
+                let mut members = module.clone();
+                members.sort_by_key(|candidate| candidate.address);
+                vec![super::region::Region { members }]
+            } else {
+                super::region::form(module)
+            }
+        })
         .collect();
 
     // One function per region, in order, until the budget; one table
@@ -339,5 +355,5 @@ pub fn build(candidates: &[Candidate], budget: usize) -> Built {
 /// An object with no compiled blocks: the table the engine references,
 /// empty. What a bake links when tier 1 is off.
 pub fn empty() -> Vec<u8> {
-    build(&[], 0).object
+    build(&[], 0, false).object
 }

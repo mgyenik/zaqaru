@@ -15,7 +15,7 @@ fn main() -> anyhow::Result<()> {
     let region = regions.iter().find(|r| r.members.iter().any(|m| m.address == address)).expect("a region at that address");
     eprintln!("region base {:#x}: {} members: {:?}", region.base(), region.members.len(),
         region.members.iter().map(|m| format!("{:#x}", m.address)).collect::<Vec<_>>());
-    let built = zaqaru::tier1::build(&region.members, usize::MAX);
+    let built = zaqaru::tier1::build(&region.members, usize::MAX, false);
     if !run {
         println!("{}", wasmprinter::print_bytes(&built.object)?);
         return Ok(());

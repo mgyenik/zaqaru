@@ -234,7 +234,7 @@ fn main() -> anyhow::Result<()> {
         for region in &regions {
             if region.members.len() < 2 { continue; }
             if let Some(only) = only && region.base() != only { continue; }
-            let built = zaqaru::tier1::build(&region.members, usize::MAX);
+            let built = zaqaru::tier1::build(&region.members, usize::MAX, false);
             if built.functions == 0 { skipped += 1; continue; }
             checked += 1;
             let entry = region.members[0].clone();
@@ -266,7 +266,7 @@ fn main() -> anyhow::Result<()> {
         {
             continue;
         }
-        let built = zaqaru::tier1::build(std::slice::from_ref(candidate), usize::MAX);
+        let built = zaqaru::tier1::build(std::slice::from_ref(candidate), usize::MAX, false);
         if built.functions == 0 {
             skipped += 1;
             continue;
