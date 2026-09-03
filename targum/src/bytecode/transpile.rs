@@ -21,7 +21,7 @@
 //! Every other transfer sets `rip` and exits to the run loop, which resolves
 //! it (through the address cache, once that is wired) and re-enters.
 
-use iced_x86::{FlowControl, Instruction, Mnemonic, OpKind};
+use iced_x86::{FlowControl, Instruction, Mnemonic, OpKind, Register};
 
 use super::{Op, Trace, Word, encode};
 use crate::quick::{self, Address, Quick, Source};
@@ -105,6 +105,14 @@ enum FlagEffect {
     WriteExceptCarry,
     /// Reads the flags a condition names, writes none — `jcc`.
     Read { carry: bool, other: bool },
+    /// Writes the flags when its count is non-zero, but *preserves* them when
+    /// the count is zero — the shifts and rotates. Because the count is a
+    /// run-time value, the pass cannot know which happened: it may decide the
+    /// op's own flags are dead (nothing downstream reads them), but it must
+    /// never treat the op as killing an upstream producer's flags, since a
+    /// zero count would let those flow through. So it leaves liveness
+    /// unchanged.
+    WriteMaybePreserve,
     /// Touches no status flag — `mov`/`lea`/loads/stores/`push`/`pop`/`nop`/
     /// widening moves/`not`/`jmp`/`call`/`ret`.
     None,
@@ -139,8 +147,14 @@ fn flag_effect(quick: &Quick, instruction: &Instruction) -> FlagEffect {
         | quick::Op::Ret => FlagEffect::None,
         // The ops lowered straight from the instruction.
         quick::Op::General => match instruction.mnemonic() {
-            Mnemonic::Neg => FlagEffect::FullWrite,
+            // `imul`/`mul` overwrite the flags (only CF/OF are defined, the
+            // rest undefined) and read none — a full writer for liveness,
+            // whether it is transpiled or deferred.
+            Mnemonic::Neg | Mnemonic::Imul | Mnemonic::Mul => FlagEffect::FullWrite,
             Mnemonic::Inc | Mnemonic::Dec => FlagEffect::WriteExceptCarry,
+            Mnemonic::Shl | Mnemonic::Sal | Mnemonic::Shr | Mnemonic::Sar => {
+                FlagEffect::WriteMaybePreserve
+            }
             Mnemonic::Not => FlagEffect::None,
             _ => FlagEffect::Unknown,
         },
@@ -198,6 +212,12 @@ fn flag_liveness(block: &crate::block::Block) -> Vec<bool> {
             FlagEffect::Read { carry, other } => {
                 carry_live |= carry;
                 other_live |= other;
+            }
+            FlagEffect::WriteMaybePreserve => {
+                // The op's own flags are dead if nothing downstream reads
+                // them; but liveness is left unchanged, never killed, because
+                // a zero count preserves an upstream producer's flags.
+                dead[index] = !(carry_live || other_live);
             }
             FlagEffect::None => {}
             FlagEffect::Unknown => {
@@ -495,7 +515,10 @@ impl Emitter {
             quick::Op::Jcc => self.emit_jcc_branch(quick),
             // Not lowered by `Quick`, but simple enough to lower straight
             // from the instruction.
-            quick::Op::General => self.emit_extra(instruction),
+            quick::Op::General => self
+                .emit_extra(instruction)
+                .or_else(|| self.emit_mul(instruction))
+                .or_else(|| self.emit_shift(instruction)),
             // Vector ops and everything else defer.
             _ => None,
         }
@@ -755,6 +778,106 @@ impl Emitter {
                 self.push(encode(Op::Store, 0, base, scratch, width, false, false, true, 0, disp as u32));
                 Some(())
             }
+            _ => None,
+        }
+    }
+
+    /// Two- and three-operand `imul`, straight from the instruction (`Quick`
+    /// declines it). `imul dst, src` is `dst = dst * src`; `imul dst, src,
+    /// imm` is `dst = src * imm`. Only the low half is kept, so it is a plain
+    /// truncating multiply — but only when `imul`'s flags (CF/OF) are dead,
+    /// since [`Op::Mul`] does not compute them; a live-flag `imul`, and any
+    /// memory operand or the one-operand `RDX:RAX` form, defers.
+    fn emit_mul(&mut self, instruction: &Instruction) -> Option<()> {
+        if instruction.mnemonic() != Mnemonic::Imul
+            || instruction.has_lock_prefix()
+            || !self.flags_dead[self.index]
+        {
+            return None;
+        }
+        let dst = Slice::of(instruction.op_register(0))?;
+        if dst.high_byte {
+            return None;
+        }
+        let width = Width::from_bytes(instruction.op_register(0).size())?;
+        match instruction.op_count() {
+            2 => {
+                // `dst = dst * src`, src a register (memory defers).
+                if instruction.op1_kind() != OpKind::Register {
+                    return None;
+                }
+                let src = Slice::of(instruction.op_register(1))?;
+                if src.high_byte {
+                    return None;
+                }
+                self.push(encode(Op::Mul, dst.number, dst.number, src.number, width, false, false, true, 0, 0));
+                Some(())
+            }
+            3 => {
+                // `dst = src * imm`, src a register (memory defers).
+                if instruction.op1_kind() != OpKind::Register {
+                    return None;
+                }
+                let src = Slice::of(instruction.op_register(1))?;
+                if src.high_byte {
+                    return None;
+                }
+                let value = width.truncate(instruction.immediate(2));
+                if fits_immediate(width, value) {
+                    self.push(encode(Op::Mul, dst.number, src.number, 0, width, true, false, true, 0, value as u32));
+                } else {
+                    let scratch = self.temp();
+                    self.li(scratch, value, false);
+                    self.push(encode(Op::Mul, dst.number, src.number, scratch, width, false, false, true, 0, 0));
+                }
+                Some(())
+            }
+            _ => None,
+        }
+    }
+
+    /// `shl`/`sal`/`shr`/`sar` on a register, by an immediate or by `cl`.
+    /// Only when the shift's flags are dead — [`Op::Shl`] and its kin do not
+    /// compute the (fiddly, count-dependent) shift flags — so a live-flag
+    /// shift, a memory destination, or a high-byte register defers.
+    fn emit_shift(&mut self, instruction: &Instruction) -> Option<()> {
+        let op = match instruction.mnemonic() {
+            Mnemonic::Shl | Mnemonic::Sal => Op::Shl,
+            Mnemonic::Shr => Op::Shr,
+            Mnemonic::Sar => Op::Sar,
+            _ => return None,
+        };
+        if instruction.has_lock_prefix() || !self.flags_dead[self.index] {
+            return None;
+        }
+        if instruction.op0_kind() != OpKind::Register {
+            return None;
+        }
+        let dst = Slice::of(instruction.op_register(0))?;
+        if dst.high_byte {
+            return None;
+        }
+        let width = Width::from_bytes(instruction.op_register(0).size())?;
+        // The count: an immediate, or `cl` (register one), or an implicit one.
+        match instruction.op_count() {
+            1 => {
+                // `shl reg` — the implicit count of one.
+                self.push(encode(op, dst.number, dst.number, 0, width, true, true, true, 0, 1));
+                Some(())
+            }
+            2 => match instruction.op1_kind() {
+                OpKind::Immediate8 => {
+                    let count = instruction.immediate8() as u32;
+                    self.push(encode(op, dst.number, dst.number, 0, width, true, true, true, 0, count));
+                    Some(())
+                }
+                OpKind::Register if instruction.op_register(1) == Register::CL => {
+                    // Count in `cl` — register one, read masked by the op.
+                    self.push(encode(op, dst.number, dst.number, 1, width, false, true, true, 0, 0));
+                    Some(())
+                }
+                _ => None,
+            },
             _ => None,
         }
     }

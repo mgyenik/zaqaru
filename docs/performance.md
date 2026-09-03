@@ -374,50 +374,57 @@ feature) carries x86's weight: width masking on every op, the engine's
 `Space` and its permission check, retirement and flags into the control
 block. So the honest number is lower, and the design doc estimated 3–6×.
 
-**Measured lower still.** The same component kernels, baked both ways and run
-under wasmtime (`ZAQARU_ENGINE_FEATURES=targum/bytecode` bakes the
-accelerator in; each kernel is one fully-covered block whose back-edge stays
-inside the bytecode), MIPS interpreter → bytecode:
+**Measured lower still.** Component kernels, baked both ways and run under
+wasmtime (`ZAQARU_ENGINE_FEATURES=targum/bytecode` bakes the accelerator in;
+each is one fully-covered block whose back-edge stays inside the bytecode),
+MIPS interpreter → bytecode:
 
 | kernel  | interp | bytecode | ratio |
 | ---     | ---    | ---      | ---   |
 | nops    | 240    | 319      | 1.33× |
 | regmov  | 165    | 341      | 2.06× |
-| regadd  | 125    | 254      | 2.03× |
-| loads   | 118    | 220      | 1.87× |
-| stores  |  98    | 180      | 1.85× |
+| regadd  | 129    | 262      | 2.03× |
+| loads   | 123    | 221      | 1.79× |
+| stores  |  96    | 186      | 1.94× |
 
-So v1 — the switch-loop, faithful, with dead-flag elimination folded in at
+So v1 — the switch-loop, faithful, dead-flag elimination folded in at
 transpile time — is **1.3–2.1×** on fully-covered hot loops, not 7.7×. The
 gap from the prototype is the faithfulness the prototype skipped; the gap
 from the 3–6× estimate is the two optimisations the design stages after v1
 and that are *not* built: op fusion (compare-branch, the lazy-flags removal
-on the hot conditional) and tail-call threaded dispatch (the distinct
-indirect site per op, ~1.3–1.5× in the literature).
+on the hot conditional) and tail-call threaded dispatch (a distinct indirect
+site per op, ~1.3–1.5× in the literature).
 
-**The finding that matters most is about coverage, not the ratio.** A single
-op the transpiler does not cover *in the hot loop* is not neutral — it is a
-loss. The `mixed` kernel (an LCG, so a per-iteration `imul` the transpiler
-defers) ran at **69 MIPS through the bytecode against 74 interpreted**:
-slower, because a defer is exit-the-trace + interpret-one + re-enter, dearer
-than just interpreting the whole block. So the accelerator pays only where it
-covers the loop *completely*; partial coverage of a hot loop regresses it.
-This is §10 of `docs/bytecode-plan.md` arriving as a measurement: the
-multiplier lives entirely in loops the transpiler covers end to end, and the
-integer core is not yet wide enough (no `imul`, no shifts, no `setcc`/`cmov`/
-`adc`) to cover a real one. Correctness holds throughout — the 52 engine
-tests pass through the integrated run loop, self-modifying code and faults
-included — so this is a speed question, not a safety one, exactly as the
-fallback architecture intends.
+**The finding that matters most is about coverage, not the ratio: an
+uncovered op in the hot loop is a *loss*, not neutral** — a defer is
+exit-the-trace + interpret-one + re-enter, dearer than interpreting the block.
+Watch one kernel cross the line as its ops get covered. The `mixed` kernel
+(an LCG: a multiply and a shift per iteration):
 
-**Where that leaves the go/no-go.** v1 is a real but modest win on covered
-loops and a loss on anything it does not fully cover. Reaching the 3–6×
-estimate needs, in order: the common-ALU coverage that keeps a real loop from
-deferring (`imul`, shifts, `setcc`/`cmov`/`adc`), then op fusion, then
-tail-call threading — and a re-measure on a real eval-loop block, which also
-needs the address cache for the computed-goto and call/ret dispatch. None of
-those is built; v1 says the headroom is smaller and the coverage bar higher
-than the floor prototype implied.
+| coverage of `mixed`        | ratio |
+| ---                        | ---   |
+| integer core only          | 0.91× (slower than interpreting) |
+| + `imul`                   | 1.25× |
+| + shifts                   | 1.42× |
+
+Each covered op moves it up; while any op in the loop defers it is at or below
+break-even. And `alu` — a dependent chain with a rotate (`rol`) the transpiler
+still does not cover — stays at **0.91×**, a loss, for exactly that one
+deferred op per iteration. Correctness holds throughout: the 52 engine tests
+pass through the integrated run loop, self-modifying code and faults included,
+so this is a speed question, not a safety one, as the fallback architecture
+intends.
+
+**Where that leaves the go/no-go.** v1 is a real but modest win on loops it
+covers end to end (1.3–2.1×) and a loss on any loop with a deferred op in it.
+The coverage bar is therefore total, not partial: a workload is only faster if
+*every* op in its hot loops is covered. Reaching the 3–6× estimate needs, in
+order: the rest of the common ALU so real loops stop deferring (`rol`/`ror`,
+`setcc`/`cmov`/`adc`, `div`), then op fusion, then tail-call threading — and a
+re-measure on a real eval-loop block, which also needs the address cache for
+the computed-goto and call/ret dispatch. None of those is built; v1 says the
+headroom is smaller, and the coverage bar higher, than the floor prototype
+implied.
 
 ## 7. The plan
 

@@ -135,12 +135,21 @@ pub enum Op {
     /// addressing. Never faults.
     LoadFs = 26,
 
-    /// `regs[d] = regs[a] << (regs[b] & mask)` and the two right shifts, with
-    /// x86's flag semantics reproduced. Present because glibc leans on them;
-    /// the count is masked to the width as the architecture masks it.
+    /// `regs[d] = regs[a] << count` and the two right shifts (`Sar`
+    /// arithmetic). The count is `regs[b]` or the immediate, masked by 0x3f
+    /// for a 64-bit operand and 0x1f otherwise, as x86 masks it. Writes no
+    /// flags — the transpiler emits a shift only when its flags are dead
+    /// (shift flags are count-dependent and fiddly), else it defers.
     Shl = 27,
     Shr = 28,
     Sar = 29,
+
+    /// `regs[d] = trunc(regs[a] * rhs)` — the low half of `imul`, the only
+    /// half a two- or three-operand `imul` keeps. The right-hand side is
+    /// `regs[b]` or the immediate. Writes no flags: the transpiler emits it
+    /// only when `imul`'s flags are dead (else it defers), so `CF`/`OF` — the
+    /// only flags `imul` defines — need not be computed.
+    Mul = 30,
 }
 
 impl Op {
@@ -152,7 +161,7 @@ impl Op {
         // The discriminants are contiguous 0..=29, so a range check and a
         // transmute is the whole of it — the dense dispatch the format is
         // for.
-        (byte <= Op::Sar as u8).then(|| unsafe { core::mem::transmute::<u8, Op>(byte) })
+        (byte <= Op::Mul as u8).then(|| unsafe { core::mem::transmute::<u8, Op>(byte) })
     }
 }
 
@@ -605,11 +614,14 @@ pub fn run(trace: &Trace, start: usize, tcb: &mut Tcb, space: &mut Space, budget
             }
             Op::Shl | Op::Shr | Op::Sar => {
                 let width = width_of(word);
-                let count = if (word >> field::IMMEDIATE) & 1 != 0 {
+                // x86 masks the shift count by 0x3f for a 64-bit operand and
+                // by 0x1f for every narrower one — not by the operand width, so
+                // a byte shift by 20 is a shift by 20 (all bits gone), not by 4.
+                let count = (if (word >> field::IMMEDIATE) & 1 != 0 {
                     imm as u64
                 } else {
                     regs[b]
-                } & u64::from(width.bits() - 1);
+                }) & if width == Width::Qword { 0x3f } else { 0x1f };
                 let left = read!(a, width);
                 let result = width.truncate(match op {
                     Op::Shl => left.wrapping_shl(count as u32),
@@ -628,6 +640,19 @@ pub fn run(trace: &Trace, start: usize, tcb: &mut Tcb, space: &mut Space, budget
                     "a shift is only transpiled when its flags are dead"
                 );
                 write!(d, width, result);
+                if retire {
+                    spent += 1;
+                }
+            }
+            Op::Mul => {
+                let width = width_of(word);
+                let left = read!(a, width);
+                let right = if (word >> field::IMMEDIATE) & 1 != 0 {
+                    imm as u64 & width.mask()
+                } else {
+                    read!(b, width)
+                };
+                write!(d, width, width.truncate(left.wrapping_mul(right)));
                 if retire {
                     spent += 1;
                 }

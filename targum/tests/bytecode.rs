@@ -433,3 +433,52 @@ fn lea_with_displacement_agrees() {
         a.syscall().unwrap();
     });
 }
+
+#[test]
+fn imul_agrees() {
+    // Two- and three-operand imul with dead flags (an LCG-shaped chain), the
+    // op that made the mixed kernel defer. Live-flag imul defers, so also test
+    // one whose flags a jcc reads.
+    agree(|a, _| {
+        a.mov(rax, 1u64).unwrap();
+        a.mov(rcx, 6364136223846793005u64).unwrap();
+        let mut top = a.create_label();
+        a.mov(rdx, 5u64).unwrap();
+        a.set_label(&mut top).unwrap();
+        a.imul_2(rax, rcx).unwrap(); // dst *= src, flags dead
+        a.add(rax, 1442695040888963407u64 as i64 as i32 as i64 as u64 as i32).unwrap_or(());
+        a.imul_3(rbx, rax, 3i32).unwrap(); // dst = src * imm
+        a.dec(rdx).unwrap();
+        a.jnz(top).unwrap();
+        // A live-flag imul: the result's sign is read.
+        a.imul_2(rbx, rcx).unwrap();
+        a.js(top).unwrap();
+        a.syscall().unwrap();
+    });
+}
+
+#[test]
+fn shifts_agree() {
+    // Shifts by immediate and by cl, at counts within and beyond the width
+    // (x86 masks by 0x1f/0x3f, not the operand width), with dead flags.
+    agree(|a, _| {
+        a.mov(rax, 0x0123_4567_89ab_cdefu64).unwrap();
+        a.shl(rax, 7u32).unwrap();
+        a.shr(rax, 3u32).unwrap();
+        a.sar(rax, 1u32).unwrap();
+        a.mov(cl, 40u32).unwrap();
+        a.shl(rbx, cl).unwrap();
+        a.mov(edx, 0xdead_beefu32).unwrap();
+        a.sar(edx, 20u32).unwrap();
+        // A shift feeding a branch whose flags it must NOT eliminate wrongly:
+        // here the flags are dead (overwritten by the cmp), so it is safe.
+        a.mov(rsi, 8u64).unwrap();
+        a.shr(rsi, 1u32).unwrap();
+        a.cmp(rsi, 4i32).unwrap();
+        let mut eq = a.create_label();
+        a.je(eq).unwrap();
+        a.mov(rdi, 0xbadu64).unwrap();
+        a.set_label(&mut eq).unwrap();
+        a.syscall().unwrap();
+    });
+}
