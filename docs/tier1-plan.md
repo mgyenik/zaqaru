@@ -828,6 +828,58 @@ Until it is built, tier 1 is a 3–11× accelerator for compute-bound guests
 and a no-op for the CPython-bound container, and it is off by default for
 exactly that reason.
 
+**The whole-function experiment, run 2026-09-03: blocked by a hard wasm
+limit, but the block that blocks it is not the loop's real size.**
+`_PyEval_EvalFrameDefault` is one function, 50,905 bytes, 11,476
+instructions by linear disassembly, with 185 computed-goto sites
+(`jmp *%rax`), one per handler-ish over ~200 handlers. Formed as one
+uncapped region it is 3,243 blocks, and compiled it is a **14.8 MB** wasm
+function body. wasmtime refuses it: `wasmparser` caps a single function
+body at `MAX_WASM_FUNCTION_SIZE = 7,654,321` bytes (~7.3 MiB), a hardcoded
+constant checked before Cranelift ever sees the module, not reachable
+through `wasmtime::Config`. The body is ~2× the ceiling.
+
+But the 14.8 MB is not the loop. The region compiled **34,267**
+instructions where the function has **11,476** — a **3.0× duplication
+factor**. A block runs *through* conditional branches to the first
+unconditional transfer, so every forward branch inside a handler starts a
+second block that shares the tail down to the handler's `jmp *%rax`, and
+the per-block compiler emits that shared tail once per block. At the
+measured ~432 bytes of wasm per lowered instruction, the loop's *distinct*
+11,476 instructions are ~5.0 MB — **under the limit.** So the first lever
+is not splitting the function; it is **not duplicating it**: coalesce a
+region's overlapping members into one instruction stream laid out once in
+address order, with the `br_table` entering at each member's start and
+fall-through between adjacent instructions. That shrinks every region's
+code and, on this one, plausibly brings the whole eval loop under the
+ceiling as a single function — the original whole-function plan, revived.
+
+**If coalescing still overshoots — a bigger loop, a higher per-instruction
+cost — the fallback is a split, and it composes with the resolver.** Cut
+the coalesced loop into K sub-functions each under the ceiling. A computed
+goto resolves its target against the cluster's members (the binary-search
+resolver, extended cluster-wide): a target in *this* function is an
+internal `br_table` with the registers still in locals, no frame; a target
+in a sibling is a `return_call_indirect` into it (tail calls are on by
+default in wasmtime 48, so the dispatch loop does not grow the stack),
+with guest state handed over through the control block — the region
+prologue and epilogue already are that store and reload. This is strictly
+cheaper than today's indirect jump, which exits to the Rust run loop, hash
+lookups the next block, and re-enters: the split keeps the whole dispatch
+in wasm and pays only the state store/reload on a crossing.
+
+**What decides the split's value is the crossing rate, and it is set by
+hotness, not adjacency.** The executed-opcode distribution is heavily
+skewed — a couple dozen opcodes (`LOAD_FAST`, `STORE_FAST`, `LOAD_CONST`,
+`CALL`, `BINARY_OP`, `COMPARE_OP`, the jumps) are the large majority of
+bytecodes retired. Partition by hotness, not by address: put the hot
+handlers together in one sub-function and the dispatches that stay inside
+it — paying no frame — are the same large majority, while only the rare
+cold opcode crosses. The measurement that turns this from argument into a
+number is an execution-weighted opcode histogram over a Django request,
+simulated against a hotness partition to count crossings; it is the next
+thing to take before building either path.
+
 **Lowering more of the declined 5–8% was tried and does not help
 (2026-09-02).** `inc`, `dec`, `neg`, `not`, `setcc` and `cmovcc` were
 lowered into `quick.rs` and `Cpu::quick`, correct against the interpreted
