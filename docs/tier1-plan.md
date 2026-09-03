@@ -919,6 +919,41 @@ fewer of the handler's own exits — the `~2.5%` of its instructions the
 lowering still declines, and the budget bail. The attachment is fixed;
 what is left is to keep execution inside the region once it is there.
 
+**The exit decomposition, taken 2026-09-03, corrects that last guess.**
+Counting *why* compiled code hands control back, over a Django run at the
+8 MB budget: 8.26 M entries, each retiring ~21 instructions, and then —
+deferred-op exits **0**, budget bails **853**, syscalls **1101**,
+transfers to another compiled block **359 k (4.4%)**, and exits to a block
+the bake never compiled **7.9 M (95.6%)**. So the eval loop does not leak
+to the computed goto or to declined ops or to the quantum; it runs its
+twenty instructions, calls into libpython's C runtime — `getattr`, a dict
+lookup, a refcount, a type slot — and *that* is uncompiled, so the
+interpreter takes it and everything under it. The lever is not the whole
+eval loop in one region; it is **the eval loop's hot callees, compiled**.
+
+**But compiling them naively backfires, and why is unresolved.** Raising
+the budget so the callees compile too — 24 MB reaches 40 k regions, 64 MB
+reaches 128 k and a 152 MB module — did not speed the container up; the
+curl-timed request rate fell, 35 to 8 to 10 per second as the budget rose.
+The tempting read is that a higher attach means more region entries and
+the per-entry frame reload swamps the saving. It is not that simple: the
+24 MB module is the slowest of the three yet has the *fewest* transfers,
+so the slowdown does not track the transfer count. What it tracks is
+module size, and the honest caveat is that these measurements are
+confounded — a 152 MB module has far more JIT code to warm than a warm-up
+of five requests reaches, so the big modules are timed part-cold. The
+question "does compiling the callees help or hurt" is therefore **open**,
+and answering it needs a warm-up-controlled benchmark, not another budget
+sweep.
+
+**What is settled is the target: the hot callees, and only those.** A
+profile of one real request names exactly the handful of C functions the
+eval loop calls hot — the design's profile block source, §10 — and
+compiling that small set, rather than a budget's worth of everything,
+compiles the 95.6% the decomposition found while keeping the module small
+enough to sidestep the size question entirely. That is the next thing to
+build, and the next thing to measure, with warm-up controlled.
+
 **Lowering more of the declined 5–8% was tried and does not help
 (2026-09-02).** `inc`, `dec`, `neg`, `not`, `setcc` and `cmovcc` were
 lowered into `quick.rs` and `Cpu::quick`, correct against the interpreted
