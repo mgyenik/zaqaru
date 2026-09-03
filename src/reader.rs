@@ -251,6 +251,12 @@ pub struct ObjectFile {
     /// relocatable object, which is not loaded and has no base; one entry
     /// for a single linked file; one per file after [`ObjectFile::merge`].
     pub modules: Vec<Module>,
+    /// Addresses named by an `R_X86_64_RELATIVE`/`IRELATIVE` relocation —
+    /// the code and data pointers the file holds, which the instruction
+    /// stream does not name. The computed-goto targets of an interpreter's
+    /// dispatch loop are here and nowhere else, so a block finder that wants
+    /// them (see `crate::tier1::sweep`) seeds from these.
+    pub relocated: Vec<u64>,
 }
 
 impl ObjectFile {
@@ -293,6 +299,40 @@ impl ObjectFile {
     /// where the choice is made — `baker::layout::DYNAMIC_BASE`. What is
     /// right here is to say what the choice costs.
     pub fn parse_at(bytes: &[u8], base: u64) -> Result<Self> {
+        let mut object = Self::survey_at(bytes, base)?;
+        let evidence = crate::discover::FileEvidence {
+            base,
+            entry: object.entry,
+            relocated: object.relocated.clone(),
+        };
+        object.functions = crate::discover::discover(
+            &object.symbols,
+            &object.sections,
+            object.layout,
+            &evidence,
+        )?;
+        // Discovery is not finished until the passes downstream of it stop
+        // producing evidence it needed. Run here, at the one place a
+        // fully-analysed object comes into existence, because a function
+        // list that a later pass would still revise must never be
+        // observable — see [`crate::frontend::settle`].
+        crate::frontend::settle(&mut object)?;
+        Ok(object)
+    }
+
+    /// Reads a file's placement without analysing its code: the segments a
+    /// loader maps, the symbols it defines, and the addresses its
+    /// relocations name — and none of the function discovery or `switch`
+    /// recovery that [`Self::parse_at`] runs on top.
+    ///
+    /// The block finder (`crate::tier1::sweep`) wants exactly this and no
+    /// more: it decodes blocks straight from the bytes and needs only where
+    /// the code is and which addresses to start at. The heavier analysis is
+    /// not just unnecessary there, it is fragile — a `switch` its recovery
+    /// cannot reconcile aborts the whole parse, which for `libpython` meant
+    /// the interpreter's own eval loop was never swept at all — so the
+    /// survey deliberately does without it.
+    pub fn survey_at(bytes: &[u8], base: u64) -> Result<Self> {
         let file =
             object::read::File::parse(bytes).context("parsing the input as an object file")?;
 
@@ -383,12 +423,11 @@ impl ObjectFile {
             Layout::Linked => file.entry() + base,
             Layout::Relocatable => 0,
         };
-        let evidence = crate::discover::FileEvidence {
-            base,
-            entry,
-            relocated: harvest_relocation_targets(&file, base),
-        };
-        let functions = crate::discover::discover(&symbols, &sections, layout, &evidence)?;
+        let relocated = harvest_relocation_targets(&file, base);
+        // No discovery here — see the method doc. Function analysis and
+        // `switch` recovery live in `parse_at`, which calls this and runs
+        // them on top.
+        let functions = Vec::new();
         let segments = read_segments(&file, base);
 
         let modules = match layout {
@@ -414,19 +453,8 @@ impl ObjectFile {
             symbols,
             functions,
             modules,
+            relocated,
         };
-        // Discovery is not finished until the passes downstream of it stop
-        // producing evidence it needed. Run here, at the one place an object
-        // comes into existence, because a function list that a later pass
-        // would still revise must never be observable — see
-        // [`crate::frontend::settle`].
-        //
-        // A merge needs none of its own: it concatenates modules whose
-        // sections stay distinct, and a jump table's arms are instruction
-        // boundaries *in the dispatching function's own section*
-        // (`read_linked_table`), so no arm can cross a module boundary and
-        // nothing a merge does can strand one.
-        crate::frontend::settle(&mut object)?;
         Ok(object)
     }
 
@@ -460,6 +488,7 @@ impl ObjectFile {
         let mut functions: Vec<Function> = Vec::new();
         let mut segments: Vec<Segment> = Vec::new();
         let mut modules: Vec<Module> = Vec::new();
+        let mut relocated: Vec<u64> = Vec::new();
         let mut entry = 0;
 
         for (name, input) in inputs {
@@ -492,6 +521,7 @@ impl ObjectFile {
             sections.extend(input.sections);
             symbols.extend(input.symbols);
             segments.extend(input.segments);
+            relocated.extend(input.relocated);
         }
 
         Ok(Self {
@@ -502,6 +532,7 @@ impl ObjectFile {
             symbols,
             functions,
             modules,
+            relocated,
         })
     }
 

@@ -91,7 +91,11 @@ fn edges(instructions: &[Instruction]) -> Vec<u64> {
     targets
 }
 
-/// Gathers the candidates into regions, each capped at [`MAX_MEMBERS`].
+/// Gathers the candidates of one file into regions, each capped at
+/// [`MAX_MEMBERS`]. One file: the members of a region are addressed by a
+/// delta from a single base, so they must all load at that base, and two
+/// files' blocks — swept at colliding file addresses — must never share a
+/// region. The bake calls this per file; see `super::object::build`.
 pub fn form(candidates: &[Candidate]) -> Vec<Region> {
     let by_address: BTreeMap<u64, usize> = candidates
         .iter()

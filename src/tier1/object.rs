@@ -156,7 +156,20 @@ pub fn build(candidates: &[Candidate], budget: usize) -> Built {
         }
         kept.push(candidate.clone());
     }
-    let regions = super::region::form(&kept);
+    // Regions are formed within one file, never across two. The sweep gives
+    // every file its own addresses starting near zero, so two files' blocks
+    // collide in address; a region gathered across the seam would address
+    // members from one file at the other's base and, at run time, read the
+    // wrong bytes and decline to attach. Grouping by file first keeps every
+    // region's members in one address space — the file's own.
+    let mut by_module: BTreeMap<u32, Vec<Candidate>> = BTreeMap::new();
+    for candidate in kept {
+        by_module.entry(candidate.module).or_default().push(candidate);
+    }
+    let regions: Vec<_> = by_module
+        .values()
+        .flat_map(|module| super::region::form(module))
+        .collect();
 
     // One function per region, in order, until the budget; one table
     // entry per member.

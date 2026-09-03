@@ -39,6 +39,13 @@ pub struct Candidate {
     pub address: u64,
     pub bytes: Vec<u8>,
     pub instructions: usize,
+    /// Which ELF the block came from. Every shared object is swept at its
+    /// own file addresses, which start near zero and so collide across
+    /// files; a region must not gather members from two of them, since its
+    /// members are addressed by a delta from one base and at run time each
+    /// file sits at its own. The sweep of one file leaves this zero; the
+    /// bake sets it per file — see `examples/bake-vm::sweep_tree`.
+    pub module: u32,
 }
 
 /// An executable segment, padded to its memory size so that a block
@@ -61,7 +68,11 @@ impl Text {
 /// Every block in an ELF's executable segments, descent first and then the
 /// walk, each address at most once.
 pub fn sweep(elf: &[u8]) -> Result<Vec<Candidate>> {
-    let object = ObjectFile::parse(elf)?;
+    // Survey, not parse: the finder needs the code's placement and the
+    // relocation-named entries, not the function discovery and `switch`
+    // recovery that `parse` runs — and whose failure on `libpython` skipped
+    // the eval loop entirely. See [`ObjectFile::survey_at`].
+    let object = ObjectFile::survey_at(elf, 0)?;
     let texts: Vec<Text> = object
         .segments
         .iter()
@@ -94,6 +105,19 @@ pub fn sweep(elf: &[u8]) -> Result<Vec<Candidate>> {
             continue;
         };
         starts.push_back(section.address + symbol.offset);
+    }
+    // The code pointers a relocation names, kept only where they land in an
+    // executable segment. An interpreter's dispatch loop reaches its opcode
+    // handlers through a computed goto over a relocated jump table, and the
+    // handlers begin right after an indirect `jmp` that ends the block
+    // before them — so nothing in the instruction stream names them and the
+    // walk, which starts a block only at an address descent left uncovered,
+    // does not reach one that descent covered as a handler's interior. The
+    // relocations are the one witness that names the handler's own entry.
+    for &target in &object.relocated {
+        if texts.iter().any(|text| text.contains(target)) {
+            starts.push_back(target);
+        }
     }
 
     let mut blocks: BTreeMap<u64, Candidate> = BTreeMap::new();
@@ -239,6 +263,7 @@ fn decode_block(text: &Text, address: u64) -> Option<(Candidate, Vec<u64>)> {
             address,
             bytes,
             instructions: count,
+            module: 0,
         },
         successors,
     ))

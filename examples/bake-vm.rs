@@ -254,10 +254,16 @@ fn sweep_tree(tree: &baker::tree::Tree) -> Vec<zaqaru::tier1::Candidate> {
     }
     elfs.sort_by(|left, right| (left.0, &left.1).cmp(&(right.0, &right.1)));
     let mut candidates = Vec::new();
-    for (_, path, bytes) in elfs {
+    for (module, (_, path, bytes)) in elfs.into_iter().enumerate() {
         match zaqaru::tier1::sweep(bytes) {
-            Ok(found) => {
+            Ok(mut found) => {
                 eprintln!("  swept {path}: {} blocks", found.len());
+                // Tag every block with its file, so region formation keeps
+                // members of one file together: their file addresses collide
+                // with another's, but they load at their own base.
+                for candidate in &mut found {
+                    candidate.module = module as u32;
+                }
                 candidates.extend(found);
             }
             Err(error) => eprintln!("  skipped {path}: {error}"),
