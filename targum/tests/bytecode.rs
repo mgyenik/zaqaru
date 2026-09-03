@@ -419,3 +419,17 @@ fn flags_live_into_the_next_block_agree() {
         a.syscall().unwrap();
     });
 }
+
+#[test]
+fn lea_with_displacement_agrees() {
+    // The bug real glibc caught: `lea reg, [base + disp]` must be base + disp,
+    // not 2*base + disp — positive and negative, and base == dest.
+    agree(|a, entry| {
+        a.mov(rbx, entry + 0x1000).unwrap();
+        a.lea(rax, qword_ptr(rbx + 24)).unwrap();
+        a.lea(rcx, qword_ptr(rbx - 16)).unwrap();
+        a.lea(rbx, qword_ptr(rbx + 8)).unwrap(); // dest == base
+        a.lea(rdx, qword_ptr(rbx + rax * 4 + 32)).unwrap(); // with index too
+        a.syscall().unwrap();
+    });
+}

@@ -10,6 +10,12 @@ description = "The in-guest Linux-personality kernel: syscalls handled inside th
 # Rust either way — that is the point of the whole arrangement.
 crate-type = ["staticlib", "rlib"]
 
+[features]
+# Forwards the engine's bytecode accelerator into the baked module, for
+# measuring the multiplier under wasmtime. Off by default: a baked container
+# is byte-identical to before unless the bake asks for it.
+bytecode = ["targum/bytecode"]
+
 [dependencies]
 # The address space. `targum/src/space.rs` is the page table — one bit per
 # page per permission, plus the bitmap that says which pages a decoded block

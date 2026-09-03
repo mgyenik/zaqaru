@@ -180,6 +180,35 @@ impl Engine {
                     }
                 }
             }
+            // The bytecode accelerator, when built and when this block was not
+            // just told to interpret (a defer, or a tier-1 decline): run the
+            // trace, which keeps a loop's back-edge inside itself. It retires
+            // into the control block and leaves exactly where the interpreter
+            // would — an exit sets `rip` and the loop continues, a defer hands
+            // one instruction back by forcing interpretation of the block at
+            // `rip`, a fault traps, a preemption stops. Anything it cannot run
+            // it declined at transpile time, so the interpreter below still
+            // owns correctness.
+            #[cfg(feature = "bytecode")]
+            if !interpret_next
+                && let Some(trace) = &block.trace
+            {
+                let before = tcb.retired;
+                let leave = crate::bytecode::run(trace, 0, tcb, space, budget);
+                budget = budget.saturating_sub(tcb.retired.wrapping_sub(before));
+                match leave {
+                    crate::bytecode::Leave::Exit | crate::bytecode::Leave::Preempted => continue,
+                    crate::bytecode::Leave::Fault(fault) => {
+                        return Outcome::Trap(Trap::Fault(fault));
+                    }
+                    crate::bytecode::Leave::Defer { .. } => {
+                        // `rip` names the one instruction the trace could not
+                        // run; interpret the block there once, then resume.
+                        interpret_next = true;
+                        continue;
+                    }
+                }
+            }
             interpret_next = false;
             let mut cpu = Cpu::new(tcb, space);
             let mut position = 0usize;

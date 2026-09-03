@@ -235,7 +235,8 @@ fn staticlib(package: &str, name: &str) -> Result<PathBuf> {
     if !built.exists() {
         eprintln!("zaqaru-bake: building {package} for wasm32");
     }
-    let output = Command::new(env!("CARGO"))
+    let mut command = Command::new(env!("CARGO"));
+    command
         .current_dir(&root)
         .env("CARGO_TARGET_DIR", &target)
         .args([
@@ -245,7 +246,19 @@ fn staticlib(package: &str, name: &str) -> Result<PathBuf> {
             "--target",
             "wasm32-unknown-unknown",
             "--release",
-        ])
+        ]);
+    // A measurement hook: `ZAQARU_ENGINE_FEATURES=bytecode` builds the engine
+    // staticlib with that cargo feature, so a container can be baked with the
+    // bytecode accelerator on and its rate compared against a default bake.
+    // Only the engine crate carries these features, so only its build gets
+    // them.
+    if package == "kisal"
+        && let Ok(features) = std::env::var("ZAQARU_ENGINE_FEATURES")
+        && !features.is_empty()
+    {
+        command.args(["--features", &features]);
+    }
+    let output = command
         .output()
         .with_context(|| format!("running cargo to build {package} for wasm32"))?;
     if !output.status.success() {

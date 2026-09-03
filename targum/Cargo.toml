@@ -26,6 +26,13 @@ profile = []
 # the first disagreement is named where it happens rather than where it
 # is finally noticed. Several times slower; a debugging instrument.
 verify = []
+# The bytecode accelerator (crate::bytecode) wired into the run loop: every
+# decoded block is transpiled to a trace and run by the switch-loop
+# interpreter, anything unmodelled deferring to the interpreter. Off by
+# default, so a default build's run loop is byte-identical to before — the
+# trace field does not exist and the fast path is untouched. On, to measure
+# the multiplier under wasmtime and, once it pays, to ship.
+bytecode = []
 
 [dependencies]
 # Decoding and the RFLAGS-effect tables, and nothing else: no encoder, no

@@ -127,6 +127,13 @@ pub struct Block {
     /// is registered against too: a write to any of them drops the block,
     /// because the region was compiled for all of them together.
     pub also: Vec<u64>,
+    /// The bytecode trace transpiled from this block, when the `bytecode`
+    /// feature is on — an accelerator the run loop runs in place of
+    /// interpreting, with anything unmodelled deferring back. `None` when the
+    /// transpiler declined the block outright; the field itself does not exist
+    /// in a default build, so the interpreter path is untouched there.
+    #[cfg(feature = "bytecode")]
+    pub trace: Option<crate::bytecode::Trace>,
 }
 
 impl Block {
@@ -369,6 +376,17 @@ impl BlockCache {
     }
 }
 
+/// Attaches the bytecode trace to a freshly decoded block, when the feature
+/// is on. A no-op — and compiled away entirely — in a default build.
+#[allow(unused_mut, clippy::let_and_return)]
+fn finalize(mut block: Block) -> Block {
+    #[cfg(feature = "bytecode")]
+    {
+        block.trace = crate::bytecode::transpile(&block);
+    }
+    block
+}
+
 /// Decodes one block starting at `address`.
 fn decode(address: u64, space: &Space) -> Result<Block, FetchError> {
     let cap = MAX_INSTRUCTION_BYTES * MAX_INSTRUCTIONS as u64;
@@ -391,15 +409,18 @@ fn decode(address: u64, space: &Space) -> Result<Block, FetchError> {
                 // than the longest instruction.
                 DecoderError::NoMoreBytes if !instructions.is_empty() => {
                     let (compiled, also) = attach(bytes, address, end, space);
-                    Ok(Block {
+                    let block = Block {
                         entry: address,
                         end,
                         quick: lower_all(&instructions),
                         simple: straight_through(&instructions),
                         compiled,
                         also,
+                        #[cfg(feature = "bytecode")]
+                        trace: None,
                         instructions,
-                    })
+                    };
+                    return Ok(finalize(block));
                 }
                 DecoderError::NoMoreBytes => Err(FetchError::Fault(Fault {
                     address: address + bytes.len() as u64,
@@ -418,15 +439,18 @@ fn decode(address: u64, space: &Space) -> Result<Block, FetchError> {
         }
     }
     let (compiled, also) = attach(bytes, address, end, space);
-    Ok(Block {
+    let block = Block {
         entry: address,
         end,
         quick: lower_all(&instructions),
         simple: straight_through(&instructions),
         compiled,
         also,
+        #[cfg(feature = "bytecode")]
+        trace: None,
         instructions,
-    })
+    };
+    Ok(finalize(block))
 }
 
 /// What the bake compiled for a decoded block's bytes, if anything: the

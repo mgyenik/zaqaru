@@ -555,8 +555,14 @@ impl Emitter {
         if disp == 0 {
             self.push(encode(Op::Mov, dst.number, base, 0, Width::Qword, false, false, true, 0, 0));
         } else {
-            // `regs[dst] = regs[base] + disp`, via `Lea` with a zero index.
-            self.push(encode(Op::Lea, dst.number, base, base, Width::Qword, false, false, true, 0, disp as u32));
+            // `regs[dst] = regs[base] + sign_extend(disp)`. There is no zero
+            // register to feed `Lea`'s index, so the displacement — which is
+            // signed, and would be zero-extended by an immediate `Add` — is
+            // materialised full-width and added. (`Add` with the no-flags
+            // modifier, since `lea` touches no flags.)
+            let scratch = self.temp();
+            self.li(scratch, disp as i64 as u64, false);
+            self.push(encode(Op::Add, dst.number, base, scratch, Width::Qword, false, true, true, 0, 0));
         }
         Some(())
     }

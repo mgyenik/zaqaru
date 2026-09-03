@@ -1,14 +1,19 @@
 //! A register-machine bytecode, and a switch-loop interpreter for it, that
-//! runs x86-64 faster than interpreting x86 directly.
+//! runs x86-64 faster than interpreting x86 directly on the loops it covers.
 //!
-//! The measurement this rests on is in `docs/bytecode-plan.md` and
-//! `tools/bytecode-floor/`: a minimal register-machine bytecode interpreter,
-//! under wasmtime, runs a realistic mixed kernel several times faster than
-//! the same work interpreted as x86 through [`crate::quick`] — because the
-//! stream is flat (a direct branch is `pc = offset`, not a re-entry of the
-//! run loop), the dispatch is dense (a `br_table` over a `u8`, not a
-//! seventeen-hundred-way match), and the operands are already resolved (no
-//! `iced` re-derivation per execution).
+//! The idea is in `docs/bytecode-plan.md` and `tools/bytecode-floor/`: a flat
+//! register-machine bytecode a block transpiles into, run by a dense
+//! switch-loop, because the stream is flat (a direct branch is `pc = offset`,
+//! not a re-entry of the run loop), the dispatch is dense (a `br_table` over a
+//! `u8`, not a seventeen-hundred-way match), and the operands are already
+//! resolved (no `iced` re-derivation per execution). The floor prototype put
+//! that at 7.7× idealised; the faithful transpiler here, carrying x86's
+//! widths, flags, and the engine's `Space`, measures **1.3–2.1×** under
+//! wasmtime on fully-covered hot loops (`docs/performance.md` §6c) — and a
+//! *loss* on any loop it does not cover end to end, since a [`Op::Defer`]
+//! costs more than interpreting. So the win is real, modest, and entirely a
+//! function of coverage; the staged optimisations (op fusion, tail-call
+//! threading) that would lift it toward the 3–6× estimate are not built.
 //!
 //! **This is an accelerator layered over the interpreter, never a
 //! replacement.** The one architectural rule, from which the whole safety
@@ -306,9 +311,32 @@ pub fn run(trace: &Trace, start: usize, tcb: &mut Tcb, space: &mut Space, budget
     }
     // Copy the register file back to the control block. Called at every
     // leave, so the `Tcb` a fault or a syscall sees is current.
-    macro_rules! sync {
-        () => {
+    // Leave the interpreter: flush the locally accumulated retirement to the
+    // control block and copy the register file back, so the `Tcb` a fault,
+    // syscall, or preemption sees is current. Retirement is kept in a local
+    // (`spent`) and written once here rather than through the control-block
+    // pointer on every op — the hot path touches only the local.
+    macro_rules! flush {
+        () => {{
+            tcb.retired = tcb.retired.wrapping_add(spent);
             tcb.registers.copy_from_slice(&regs[..crate::state::REGISTER_COUNT]);
+        }};
+    }
+    // Self-modifying code: a store that landed on a page some cached block —
+    // possibly this very trace — was decoded from must stop execution, so the
+    // run loop's drain sees current bytes before the next fetch, exactly as
+    // the interpreter breaks its block loop on `has_dirty_code`. Checked only
+    // after a store, and only when the next word belongs to a *different*
+    // guest instruction: when it belongs to this instruction's own
+    // fall-through exit stub (the store was the block's last instruction), the
+    // stub already sets `rip` to the right place, so leaving is its job.
+    macro_rules! break_on_dirty {
+        () => {
+            if space.has_dirty_code() && trace.ip[pc] != trace.ip[pc - 1] {
+                tcb.rip = trace.ip[pc];
+                flush!();
+                return Leave::Exit;
+            }
         };
     }
 
@@ -328,9 +356,9 @@ pub fn run(trace: &Trace, start: usize, tcb: &mut Tcb, space: &mut Space, budget
 
         match op {
             Op::ExitTo => {
-                tcb.retired += 1;
+                spent += 1;
                 tcb.rip = regs[d];
-                sync!();
+                flush!();
                 return Leave::Exit;
             }
             Op::Defer => {
@@ -340,25 +368,23 @@ pub fn run(trace: &Trace, start: usize, tcb: &mut Tcb, space: &mut Space, budget
                 let address = code[pc];
                 pc += 1;
                 tcb.rip = address;
-                sync!();
+                flush!();
                 return Leave::Defer { resume: pc };
             }
             Op::Br => {
-                let target = imm as usize;
-                // A back-edge is where the budget is spent and checked —
-                // once per loop body, not per op. Retirement stays exact
-                // (every retiring op counts itself); only the check is
-                // coarsened.
-                if target <= pc {
+                // The guest `jmp` retires; then, on a back-edge, the budget is
+                // checked — once per loop body, not per op. `spent` counts
+                // retired instructions, so the check is in the same units as
+                // the quantum, and the over-run is bounded by one loop body.
+                if retire {
                     spent += 1;
-                    if spent >= budget {
-                        // The run loop resumes at the branch target: that is
-                        // where execution is, and the trace is re-entered
-                        // there rather than through the front.
-                        tcb.rip = trace.ip[target];
-                        sync!();
-                        return Leave::Preempted;
-                    }
+                }
+                let target = imm as usize;
+                if target <= pc && spent >= budget {
+                    // Resume where execution is: at the branch target.
+                    tcb.rip = trace.ip[target];
+                    flush!();
+                    return Leave::Preempted;
                 }
                 pc = target;
             }
@@ -366,23 +392,31 @@ pub fn run(trace: &Trace, start: usize, tcb: &mut Tcb, space: &mut Space, budget
                 let condition = Condition::from_code(((word >> field::CONDITION) & 0xf) as u8)
                     .expect("a four-bit condition is always one of sixteen");
                 if retire {
-                    tcb.retired += 1;
+                    spent += 1;
                 }
                 if condition.holds(&tcb.flags) {
-                    pc = imm as usize;
+                    let target = imm as usize;
+                    // A taken back-edge is a loop iteration boundary: check the
+                    // budget there, in retired-instruction units.
+                    if target <= pc && spent >= budget {
+                        tcb.rip = trace.ip[target];
+                        flush!();
+                        return Leave::Preempted;
+                    }
+                    pc = target;
                 }
             }
             Op::Li => {
                 regs[d] = imm as u64;
                 if retire {
-                    tcb.retired += 1;
+                    spent += 1;
                 }
             }
             Op::Li64 => {
                 regs[d] = code[pc];
                 pc += 1;
                 if retire {
-                    tcb.retired += 1;
+                    spent += 1;
                 }
             }
             Op::Mov => {
@@ -390,7 +424,7 @@ pub fn run(trace: &Trace, start: usize, tcb: &mut Tcb, space: &mut Space, budget
                 let value = read!(a, width);
                 write!(d, width, value);
                 if retire {
-                    tcb.retired += 1;
+                    spent += 1;
                 }
             }
             Op::Add
@@ -426,7 +460,7 @@ pub fn run(trace: &Trace, start: usize, tcb: &mut Tcb, space: &mut Space, budget
                     write!(d, width, result);
                 }
                 if retire {
-                    tcb.retired += 1;
+                    spent += 1;
                 }
             }
             Op::Inc | Op::Dec => {
@@ -442,7 +476,7 @@ pub fn run(trace: &Trace, start: usize, tcb: &mut Tcb, space: &mut Space, budget
                 }
                 write!(d, width, result);
                 if retire {
-                    tcb.retired += 1;
+                    spent += 1;
                 }
             }
             Op::Neg => {
@@ -454,7 +488,7 @@ pub fn run(trace: &Trace, start: usize, tcb: &mut Tcb, space: &mut Space, budget
                 }
                 write!(d, width, result);
                 if retire {
-                    tcb.retired += 1;
+                    spent += 1;
                 }
             }
             Op::Not => {
@@ -462,7 +496,7 @@ pub fn run(trace: &Trace, start: usize, tcb: &mut Tcb, space: &mut Space, budget
                 let value = read!(a, width);
                 write!(d, width, width.truncate(!value));
                 if retire {
-                    tcb.retired += 1;
+                    spent += 1;
                 }
             }
             Op::Load => {
@@ -472,12 +506,12 @@ pub fn run(trace: &Trace, start: usize, tcb: &mut Tcb, space: &mut Space, budget
                     Ok(value) => write!(d, width, value),
                     Err(fault) => {
                         tcb.rip = trace.ip[pc - 1];
-                        sync!();
+                        flush!();
                         return Leave::Fault(fault);
                     }
                 }
                 if retire {
-                    tcb.retired += 1;
+                    spent += 1;
                 }
             }
             Op::Store => {
@@ -486,12 +520,13 @@ pub fn run(trace: &Trace, start: usize, tcb: &mut Tcb, space: &mut Space, budget
                 let value = read!(b, width);
                 if let Err(fault) = space.store(address, width, value) {
                     tcb.rip = trace.ip[pc - 1];
-                    sync!();
+                    flush!();
                     return Leave::Fault(fault);
                 }
                 if retire {
-                    tcb.retired += 1;
+                    spent += 1;
                 }
+                break_on_dirty!();
             }
             Op::Widen | Op::WidenSigned => {
                 let width = width_of(word);
@@ -508,7 +543,7 @@ pub fn run(trace: &Trace, start: usize, tcb: &mut Tcb, space: &mut Space, budget
                 };
                 write!(d, width, widened);
                 if retire {
-                    tcb.retired += 1;
+                    spent += 1;
                 }
             }
             Op::Push => {
@@ -518,13 +553,14 @@ pub fn run(trace: &Trace, start: usize, tcb: &mut Tcb, space: &mut Space, budget
                     .wrapping_sub(u64::from(width.bytes()));
                 if let Err(fault) = space.store(at, width, value) {
                     tcb.rip = trace.ip[pc - 1];
-                    sync!();
+                    flush!();
                     return Leave::Fault(fault);
                 }
                 regs[crate::state::STACK_POINTER] = at;
                 if retire {
-                    tcb.retired += 1;
+                    spent += 1;
                 }
+                break_on_dirty!();
             }
             Op::Pop => {
                 let width = width_of(word);
@@ -537,12 +573,12 @@ pub fn run(trace: &Trace, start: usize, tcb: &mut Tcb, space: &mut Space, budget
                     }
                     Err(fault) => {
                         tcb.rip = trace.ip[pc - 1];
-                        sync!();
+                        flush!();
                         return Leave::Fault(fault);
                     }
                 }
                 if retire {
-                    tcb.retired += 1;
+                    spent += 1;
                 }
             }
             Op::Lea => {
@@ -552,19 +588,19 @@ pub fn run(trace: &Trace, start: usize, tcb: &mut Tcb, space: &mut Space, budget
                     .wrapping_add(imm as i32 as i64 as u64);
                 regs[d] = value;
                 if retire {
-                    tcb.retired += 1;
+                    spent += 1;
                 }
             }
             Op::Narrow => {
                 regs[d] = regs[a] & 0xffff_ffff;
                 if retire {
-                    tcb.retired += 1;
+                    spent += 1;
                 }
             }
             Op::LoadFs => {
                 regs[d] = tcb.fs_base;
                 if retire {
-                    tcb.retired += 1;
+                    spent += 1;
                 }
             }
             Op::Shl | Op::Shr | Op::Sar => {
@@ -593,7 +629,7 @@ pub fn run(trace: &Trace, start: usize, tcb: &mut Tcb, space: &mut Space, budget
                 );
                 write!(d, width, result);
                 if retire {
-                    tcb.retired += 1;
+                    spent += 1;
                 }
             }
         }

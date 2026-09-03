@@ -235,9 +235,20 @@ fn main() -> anyhow::Result<()> {
 /// here because a tool with no shelf is a tool that works.
 fn staticlib(crate_name: &str, library: &str, verify: bool) -> anyhow::Result<PathBuf> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    // A separate target directory for the verifying build, so the two do
-    // not keep rebuilding each other.
-    let suffix = if verify { "-verify" } else { "" };
+    // A measurement hook: `ZAQARU_ENGINE_FEATURES=targum/bytecode` bakes the
+    // module with the engine's bytecode accelerator on, so its rate can be
+    // compared against a default bake.
+    let engine_features = std::env::var("ZAQARU_ENGINE_FEATURES").unwrap_or_default();
+    let extra = (!engine_features.is_empty() && crate_name != "x87").then_some(&engine_features);
+    // A separate target directory per feature set, so the builds do not keep
+    // rebuilding each other.
+    let suffix = if verify {
+        "-verify".to_string()
+    } else if extra.is_some() {
+        "-features".to_string()
+    } else {
+        String::new()
+    };
     let target = root.join("target").join(format!("wasm-{crate_name}{suffix}"));
     let mut command = Command::new(env!("CARGO"));
     command
@@ -253,6 +264,8 @@ fn staticlib(crate_name: &str, library: &str, verify: bool) -> anyhow::Result<Pa
         ]);
     if verify && crate_name != "x87" {
         command.args(["--features", "targum/verify"]);
+    } else if let Some(features) = extra {
+        command.args(["--features", features]);
     }
     let output = command.output()?;
     anyhow::ensure!(
