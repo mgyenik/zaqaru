@@ -34,6 +34,7 @@ fn main() -> anyhow::Result<()> {
     // `--only lo-hi` compiles only blocks whose address is in the range: a
     // bisection tool, not a feature.
     let mut only: Option<(u64, u64)> = None;
+    let mut hot: Option<String> = None;
     let mut positional: Vec<String> = Vec::new();
     let mut index = 0;
     while index < raw.len() {
@@ -50,6 +51,15 @@ fn main() -> anyhow::Result<()> {
                     u64::from_str_radix(lo.trim_start_matches("0x"), 16).expect("hex"),
                     u64::from_str_radix(hi.trim_start_matches("0x"), 16).expect("hex"),
                 ));
+                index += 1;
+            }
+            // A file of hot instruction addresses (one hex per line, file
+            // virtual addresses), from a profile of the runtime on
+            // representative work: keep only blocks that contain one. This
+            // is the corpus experiment — compile the small hot set a profile
+            // of *our* CPython names, not a budget's worth of everything.
+            "--hot" if index + 1 < raw.len() => {
+                hot = Some(raw[index + 1].clone());
                 index += 1;
             }
             other => positional.push(other.to_string()),
@@ -129,6 +139,27 @@ fn main() -> anyhow::Result<()> {
             let mut candidates = sweep_tree(&tree);
             if let Some((lo, hi)) = only {
                 candidates.retain(|candidate| candidate.address >= lo && candidate.address < hi);
+            }
+            if let Some(path) = &hot {
+                let text = std::fs::read_to_string(path).expect("read the hot list");
+                let mut hots: Vec<u64> = text
+                    .lines()
+                    .filter_map(|line| u64::from_str_radix(line.trim().trim_start_matches("0x"), 16).ok())
+                    .collect();
+                hots.sort_unstable();
+                let before = candidates.len();
+                // A block is kept if any hot address falls within it.
+                candidates.retain(|candidate| {
+                    let end = candidate.address + candidate.bytes.len() as u64;
+                    let at = hots.partition_point(|&h| h < candidate.address);
+                    hots.get(at).is_some_and(|&h| h < end)
+                });
+                eprintln!(
+                    "tier 1: hot list {} kept {} of {} swept blocks",
+                    path,
+                    candidates.len(),
+                    before
+                );
             }
             let built = zaqaru::tier1::build(&candidates, budget);
             eprintln!(

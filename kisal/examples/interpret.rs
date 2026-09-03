@@ -373,6 +373,24 @@ fn main() {
     // the whole server.
     if let Some((hot, total)) = targum::profile::hot() {
         eprint!("{}", attribute(&hot, total, &process.kernel.render_maps()));
+        // The whole profile, raw, for building a corpus of hot blocks: every
+        // address and its count, plus the maps to turn addresses into file
+        // offsets. Written when asked, so the corpus experiment has the full
+        // distribution rather than the printed head.
+        if let Ok(path) = std::env::var("ZAQARU_PROFILE_OUT") {
+            use std::fmt::Write;
+            let mut dump = String::new();
+            let _ = writeln!(dump, "# total {total}");
+            let _ = writeln!(dump, "# maps");
+            for line in process.kernel.render_maps().lines() {
+                let _ = writeln!(dump, "# {line}");
+            }
+            for (address, count) in &hot {
+                let _ = writeln!(dump, "{address:#x} {count}");
+            }
+            let _ = std::fs::write(&path, dump);
+            eprintln!("wrote raw profile to {path}");
+        }
     }
     match exit {
         Exit::Status(status) => std::process::exit(status),
