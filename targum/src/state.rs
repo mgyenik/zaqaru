@@ -195,6 +195,12 @@ pub struct Tcb {
     /// static, which is the `x87_save`/`x87_load` integration the thread
     /// design named, arriving in the simpler form.
     pub x87: x87::state::X87State,
+    /// Instructions retired inside a tier-1 compiled region, this thread's
+    /// share — the numerator of the compiled share, a run's measure of
+    /// whether the bake's regions are where the time goes. Not read by
+    /// compiled code, so it sits past the vector and x87 state where no
+    /// [`layout`] offset reaches it.
+    pub compiled: u64,
 }
 
 /// Where compiled code finds the control block's fields.
@@ -268,6 +274,7 @@ impl Tcb {
             mxcsr: 0x1f80,
             x87: x87::state::X87State::new(),
             retired: 0,
+            compiled: 0,
         }
     }
 

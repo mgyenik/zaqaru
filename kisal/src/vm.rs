@@ -104,8 +104,12 @@ pub unsafe extern "C" fn targum_boot() -> i32 {
 fn report_statistics(system: &mut System<'_, HostStore>) {
     let mut message = String::from("retired ");
     crate::push_decimal(&mut message, system.retired() as i64);
+    message.push_str("\ncompiled ");
+    crate::push_decimal(&mut message, system.compiled() as i64);
     message.push_str("\ndecoded ");
     crate::push_decimal(&mut message, system.decoded() as i64);
+    message.push_str("\nattached ");
+    crate::push_decimal(&mut message, system.attached() as i64);
     message.push('\n');
     let _ = crate::abi::Store::write(
         &mut system.current().kernel.store,

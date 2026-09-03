@@ -116,7 +116,9 @@ pub struct System<'a, S: Store> {
     /// work in children: a rate computed from the survivors would understate
     /// the engine by however much the guest chose to fan out.
     departed: u64,
+    departed_compiled: u64,
     departed_blocks: u64,
+    departed_attached: u64,
 }
 
 impl<'a, S: Store + Clone> System<'a, S> {
@@ -135,7 +137,9 @@ impl<'a, S: Store + Clone> System<'a, S> {
             stopping: false,
             ending: None,
             departed: 0,
+            departed_compiled: 0,
             departed_blocks: 0,
+            departed_attached: 0,
         }
     }
 
@@ -156,12 +160,29 @@ impl<'a, S: Store + Clone> System<'a, S> {
             .fold(self.departed, u64::saturating_add)
     }
 
+    /// Instructions retired inside tier-1 compiled regions, every process.
+    pub fn compiled(&self) -> u64 {
+        self.containers
+            .iter()
+            .flat_map(|container| container.process.kernel.machine.threads.all())
+            .map(|thread| thread.tcb.compiled)
+            .fold(self.departed_compiled, u64::saturating_add)
+    }
+
     /// Blocks decoded by every process, living or gone.
     pub fn decoded(&self) -> u64 {
         self.containers
             .iter()
             .map(|container| container.process.cache.decoded as u64)
             .fold(self.departed_blocks, u64::saturating_add)
+    }
+
+    /// Of those, how many had a tier-1 function attached, every process.
+    pub fn attached(&self) -> u64 {
+        self.containers
+            .iter()
+            .map(|container| container.process.cache.attached as u64)
+            .fold(self.departed_attached, u64::saturating_add)
     }
 
     /// Forks the running process, and answers the child's identifier.
@@ -882,9 +903,20 @@ impl<'a, S: Store + Clone> System<'a, S> {
                 .iter()
                 .map(|thread| thread.tcb.retired)
                 .fold(self.departed, u64::saturating_add);
+            self.departed_compiled = process
+                .kernel
+                .machine
+                .threads
+                .all()
+                .iter()
+                .map(|thread| thread.tcb.compiled)
+                .fold(self.departed_compiled, u64::saturating_add);
             self.departed_blocks = self
                 .departed_blocks
                 .saturating_add(process.cache.decoded as u64);
+            self.departed_attached = self
+                .departed_attached
+                .saturating_add(process.cache.attached as u64);
             process.kernel.relinquish();
             process.kernel.deactivate();
             process.kernel.machine.relinquish();
@@ -893,6 +925,7 @@ impl<'a, S: Store + Clone> System<'a, S> {
             // is a number that will be added twice by whoever comes next.
             for thread in process.kernel.machine.threads.all_mut() {
                 thread.tcb.retired = 0;
+                thread.tcb.compiled = 0;
             }
         }
         let parent = self.containers[index].parent;

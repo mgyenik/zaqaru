@@ -177,6 +177,10 @@ pub struct BlockCache {
     /// How many blocks have been decoded since the cache was last emptied,
     /// for the diagnostics that ask how much decoding a workload does.
     pub decoded: u64,
+    /// Of those, how many got a tier-1 compiled function attached — the
+    /// numerator of the attach rate, which separates "the bake compiled
+    /// nothing that matches" from "it matched but never ran".
+    pub attached: u64,
     pub flushes: u64,
 }
 
@@ -191,6 +195,7 @@ impl Default for BlockCache {
             recent: vec![(u64::MAX, 0); RECENT],
             registry: HashMap::new(),
             decoded: 0,
+            attached: 0,
             flushes: 0,
         }
     }
@@ -246,6 +251,9 @@ impl BlockCache {
     fn install(&mut self, block: Block, space: &mut Space) -> usize {
         if self.entries.len() >= CAPACITY {
             self.flush(space);
+        }
+        if block.compiled.is_some() {
+            self.attached += 1;
         }
         let pages: Vec<u64> = block.all_pages();
         let entry = block.entry;

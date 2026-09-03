@@ -154,6 +154,7 @@ impl Engine {
                     exit
                 );
                 let retired = tcb.retired.wrapping_sub(before);
+                tcb.compiled = tcb.compiled.wrapping_add(retired);
                 budget = budget.saturating_sub(retired);
                 tcb.rip = tier1::exit_rip(exit);
                 match tier1::exit_kind(exit) {
