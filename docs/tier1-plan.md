@@ -750,14 +750,27 @@ not a constant), so a region on this workload is rarely longer than a few
 blocks. The interpreter, meanwhile, is already at 95 MIPS after the
 process-switch work, so there is little frame overhead to beat.
 
-The two things that would move the container are therefore not the region
-cap: **lowering more of the declined 5–8%** (the string and SSE routines
-that `string` runs at 32 MIPS, the `dec`/`inc`/`div` the histogram counts),
-which shrinks both the deferred-helper cost and the frames; and **letting
-a call stay inside a region**, which is the whole-function frame the AOT
-tier already has and the trace the profile of T1 would select. Tier 1 is
-built, correct, and off by default (`--tier1`), because on the container
-it is 30 MB of code for no measured gain until one of those lands.
+What would move the container is **letting a call stay inside a region**,
+the whole-function frame the AOT tier already has and the trace the
+profile of T1 would select: a region that spans a call keeps the machine
+in locals across it, so the frame is paid once per trace rather than once
+per five instructions.
+
+**Lowering more of the declined 5–8% was tried and does not help
+(2026-09-02).** `inc`, `dec`, `neg`, `not`, `setcc` and `cmovcc` were
+lowered into `quick.rs` and `Cpu::quick`, correct against the interpreted
+suite and the differential. Measured against the committed engine, pinned,
+best of three: the `alu` microbench went from 74.3 to 73.3 MIPS and the
+Django boot stayed within noise. It is a small *regression*, and the
+reason is the interpreter's own version of the pitfall in section 9:
+`Cpu::quick` is one hot function, and six more arms and six more `Op`
+variants grow it enough to slow the common `mov`/`cmp`/`add` more than
+lowering `dec` speeds the rare one. The interpreter's dispatch is already
+near its floor; the declined ops are better left to `step`. The change
+was reverted. What is left for the container is the frame, and only a
+longer frame — a call-spanning region — pays it down. Tier 1 is built,
+correct, and off by default (`--tier1`), because on the container it is
+30 MB of code for no measured gain until that lands.
 
 **T4 — the container and the corpus.** The first corpus entries —
 `python:3.12-slim`'s libpython, glibc and loader, and nginx — taken on
