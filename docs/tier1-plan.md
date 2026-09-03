@@ -954,6 +954,45 @@ compiles the 95.6% the decomposition found while keeping the module small
 enough to sidestep the size question entirely. That is the next thing to
 build, and the next thing to measure, with warm-up controlled.
 
+**Built and measured 2026-09-03: the corpus does not pay — it costs 4x.**
+The experiment is in the tree: profile our own CPython on representative
+web-serving Python (a single `python -c`, `profile` feature), keep the hot
+blocks — 90% of libpython's execution is 6,804 instructions, a small set,
+and the eval loop is only 16% of it, the callees the other 76% exactly as
+the decomposition said — and compile just those with `bake-vm --hot`. That
+is a **3.8 MB** tier-1 blob, small on purpose, so the module-size confound
+is gone. Warm-up controlled, curl-timed, 50 requests warm then 40 timed:
+
+| module | compiled | req/s |
+| --- | --- | --- |
+| baseline, 8 MB budget | 5.3% | **37.9** |
+| hot corpus, 3.8 MB | 36.5% | **8.7** |
+
+Compiling the profiled hot set makes serving **4.4x slower**, in a small
+warm module. That settles the two questions the budget sweep left open.
+The slowdown is not module size — this module is small and warm. And it is
+monotone in the compiled share — 5.3% is ~neutral, 36.5% is 4x, and the
+64 MB / 67%-compiled module was ~3.5x — so no budget or hot-list makes
+block tier 1 pay on CPython. The cause is what the `calls` kernel already
+implied: compiled code is fast *in wasm* (that kernel's in-region recursion
+is 5.8x), so the loss is not the codegen. It is that CPython's eval loop
+calls into its callees on nearly every bytecode, and every call is a region
+transfer — out of the compiled function, through the run loop, into another
+compiled function with its frame reloaded — and that per-entry cost, plus
+the compiled loop's own resolver dispatch standing in for the interpreter's
+recent-cache dispatch, together exceed the saving on a twenty-instruction
+run.
+
+**So the corpus is not worth pursuing on its own, and neither is any
+block-picking scheme.** They all raise the compiled share, and on CPython a
+higher compiled share is slower until the transfer between compiled regions
+is made cheap — kept inside wasm, the frame not reloaded, the eval loop and
+its callees running as one long compiled stretch. That is the whole-cluster
+/ in-wasm-transfer work, and it is the *only* thing that turns a correct
+hot-block list into a win. Until it exists, tier 1 stays off on the
+container — not because it fails to attach, which is fixed, but because
+attaching more of it costs more than it saves.
+
 **Lowering more of the declined 5–8% was tried and does not help
 (2026-09-02).** `inc`, `dec`, `neg`, `not`, `setcc` and `cmovcc` were
 lowered into `quick.rs` and `Cpu::quick`, correct against the interpreted
