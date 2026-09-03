@@ -195,6 +195,14 @@ pub struct Space {
     /// list into the block cache before the next instruction is fetched, so
     /// no stale byte is ever executed.
     dirty: Vec<u64>,
+    /// The last single page a store confirmed holds no code, or `u64::MAX`.
+    /// A store's code-page test is a bitmap lookup on every store, wasted on
+    /// the stack and heap pages a program writes almost all of the time; a
+    /// program's stores have strong page locality, so remembering the last
+    /// clean page and skipping the lookup when the next store lands on it
+    /// removes that cost from the common case. Made stale only by
+    /// [`Space::mark_code`], the one place a page turns into code.
+    last_clean: u64,
 }
 
 impl Default for Space {
@@ -217,6 +225,7 @@ impl Space {
             #[cfg(feature = "verify")]
             journal: None,
             dirty: Vec::new(),
+            last_clean: u64::MAX,
         };
         space.set_limit(limit);
         space
@@ -348,6 +357,10 @@ impl Space {
     /// Marks a page as holding bytes some cached block was decoded from.
     pub fn mark_code(&mut self, page: u64) {
         self.code.set(page as usize, true);
+        // The clean-page cache must not name a page that just became code.
+        if page == self.last_clean {
+            self.last_clean = u64::MAX;
+        }
     }
 
     /// Forgets that a page holds code, once no block is registered to it.
@@ -750,13 +763,27 @@ impl Space {
         if length == 0 {
             return;
         }
-        let first = (address >> PAGE_SHIFT) as usize;
-        let last = ((address + length - 1) >> PAGE_SHIFT) as usize;
-        for page in first..=last {
-            if self.code.get(page) {
+        let first = address >> PAGE_SHIFT;
+        let last = (address + length - 1) >> PAGE_SHIFT;
+        // The common case: the whole access is on one page. Skip the code
+        // bitmap when that page is the one a store last found clean.
+        if first == last {
+            if first == self.last_clean {
+                return;
+            }
+            if self.code.get(first as usize) {
                 // Cleared here rather than at the drain: the page is queued,
                 // so a second store to it before the cache catches up has
                 // nothing new to say.
+                self.code.set(first as usize, false);
+                self.dirty.push(first);
+            }
+            // Clean now, whether it was code and cleared or never code.
+            self.last_clean = first;
+            return;
+        }
+        for page in first as usize..=last as usize {
+            if self.code.get(page) {
                 self.code.set(page, false);
                 self.dirty.push(page as u64);
             }
