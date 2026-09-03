@@ -804,14 +804,29 @@ every SSE op perfectly caps at the ~4% that is libc. The lowered loops
 (the `string`, `calls`, `memory_sequential` kernels) are where tier 1
 pays 3–11×; the container is elsewhere.
 
-So the container's lever is the eval loop, not more op lowering. Two
-shapes address it, both resting on what is now built: **an indirect jump
-that can re-dispatch within a region** (the `ret`'s runtime member lookup,
-applied to the computed goto, so the eval loop stays in one frame), and —
-measured against the *serving* profile rather than the boot one, which is
-the next measurement — **string-op builtins** (recognise glibc's `memcpy`
-by its bytes and attach a hand-written `memory.copy` instead of compiling
-its loop) if serving turns out more string-bound than the import.
+So the container's lever is the eval loop, not more op lowering — and the
+serving profile, taken next, confirms it past argument. **Per Django
+request, 99% of the guest's instructions are the runtime's own code, the
+CPython eval loop; libc is 0.24%, and `memcpy` inside it is 0.14%.** A
+request retires 1.02 M instructions and all but a rounding error of them
+are `_PyEval_EvalFrameDefault` running Python bytecode. String-op builtins
+are therefore ruled out for this workload before being built: a perfect
+`memcpy` saves 0.14% of a request. So is any further op lowering.
+
+The eval loop is the whole game, and it is the one shape block-and-region
+tier 1 cannot reach as built. It is a single enormous function — thousands
+of blocks — with a computed goto (`goto *handler[opcode]`) per bytecode
+that jumps across the whole of it. A region caps at 64 blocks and an
+indirect jump exits it, so no region covers more than a sliver of the
+loop, and the frame reloads on every bytecode. Covering it means the
+thing the AOT tier already does: **the whole function as one wasm
+function, the computed goto as one internal `br_table` over every handler,
+the machine in globals so there is no per-handler frame.** That is a real
+merge of tier 1 with the AOT translator's whole-function path, not a
+region tweak, and it is the only thing measured to move the container.
+Until it is built, tier 1 is a 3–11× accelerator for compute-bound guests
+and a no-op for the CPython-bound container, and it is off by default for
+exactly that reason.
 
 **Lowering more of the declined 5–8% was tried and does not help
 (2026-09-02).** `inc`, `dec`, `neg`, `not`, `setcc` and `cmovcc` were
