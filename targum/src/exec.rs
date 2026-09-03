@@ -402,7 +402,11 @@ impl<'a> Cpu<'a> {
             // `and` and `test`, which differ only in the write-back.
             _ => left & right,
         });
-        self.tcb.flags.record(quick.rule(), width, left, right, result);
+        // The lazy-flags store is skipped when a later op overwrites these
+        // flags before anything reads them — see `Quick::flags_dead`.
+        if !quick.flags_dead {
+            self.tcb.flags.record(quick.rule(), width, left, right, result);
+        }
         match quick.writes_back() {
             true => self.quick_store(quick, quick.destination, width, result),
             false => Ok(Step::Retired),

@@ -446,7 +446,8 @@ fn attach(bytes: &[u8], address: u64, end: u64, space: &Space) -> (Option<(u32, 
 /// instruction iced calls `Next` with no repeat prefix goes to the next one
 /// whether or not [`crate::quick`] understood it.
 fn lower_all(instructions: &[Instruction]) -> Vec<crate::quick::Quick> {
-    instructions
+    use crate::quick::Op;
+    let mut quicks: Vec<crate::quick::Quick> = instructions
         .iter()
         .map(|instruction| {
             let mut lowered = crate::quick::Quick::lower(instruction);
@@ -456,7 +457,35 @@ fn lower_all(instructions: &[Instruction]) -> Vec<crate::quick::Quick> {
                 || instruction.has_repne_prefix();
             lowered
         })
-        .collect()
+        .collect();
+    // Dead-flag elimination. A backward walk of the block: a full-overwrite
+    // writer's flags are dead if nothing reads them before the next writer.
+    // `add`/`sub`/`cmp`/`and`/`or`/`xor`/`test` are the only fast-path ops
+    // that write the whole record and read none, so only they are marked;
+    // `Jcc` reads flags, and anything deferred to `step` might read or write
+    // them, so both keep the record live. Flags are live at the block's exit
+    // because the next block may read them — with one exception the block's
+    // terminator settles: nothing reads the flags across a `call` or a
+    // `ret`, the ABI making them volatile there (a callee may clobber them,
+    // no return site relies on a caller's). A block that ends in one leaves
+    // its flags dead, so the arithmetic before it — most of a short
+    // interpreter handler — can drop the record. A computed goto is
+    // deliberately not in the set: its target is arbitrary and could read
+    // flags, even where an interpreter's own dispatch never does.
+    let writes_flags = |op| {
+        matches!(op, Op::Add | Op::Sub | Op::Cmp | Op::And | Op::Or | Op::Xor | Op::Test)
+    };
+    let ends_dead = matches!(quicks.last().map(|q| q.op), Some(Op::Call) | Some(Op::Ret));
+    let mut flags_live = !ends_dead;
+    for quick in quicks.iter_mut().rev() {
+        if writes_flags(quick.op) {
+            quick.flags_dead = !flags_live;
+            flags_live = false;
+        } else if matches!(quick.op, Op::Jcc | Op::General) {
+            flags_live = true;
+        }
+    }
+    quicks
 }
 
 /// Whether every instruction but the last simply falls through.

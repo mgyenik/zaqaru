@@ -166,6 +166,15 @@ pub struct Quick {
     /// `%fs`-relative. `%gs` is never lowered — the general path refuses it,
     /// loudly, and should go on being the only place that knows that.
     pub segmented: bool,
+    /// The status flags this op writes are overwritten before anything reads
+    /// them, so neither the interpreter nor a compiled block need record
+    /// them — the lazy-flags store is the single biggest reducible cost an
+    /// arithmetic op carries, measured, and dead more often than not. Set by
+    /// a backward pass over the block in [`crate::block`], like `checks_rip`;
+    /// false and harmless until then. Only a full-overwrite writer — `add`,
+    /// `sub`, `cmp`, `and`, `or`, `xor`, `test` — is ever marked, so the
+    /// carry-preserving and flag-reading ops are never touched.
+    pub flags_dead: bool,
 }
 
 impl Quick {
@@ -185,6 +194,7 @@ impl Quick {
         // speed and not correctness.
         checks_rip: true,
         segmented: false,
+        flags_dead: false,
     };
 
     /// Lowers an instruction, or declines.
@@ -267,7 +277,7 @@ impl Quick {
             segmented = fs;
         }
         Quick { op, width, destination, source, address,
-                condition: Condition::Equal, source_width: width, checks_rip: true, segmented }
+                condition: Condition::Equal, source_width: width, checks_rip: true, segmented, flags_dead: false }
     }
 
     /// Whether the flags this op leaves behind are a logical rule's.
@@ -318,7 +328,7 @@ fn lower_vec_move(instruction: &Instruction) -> Quick {
         false => (Address::Fixed(0), false),
     };
     Quick { op: Op::VecMov, width: Width::Qword, destination, source, address,
-            condition: Condition::Equal, source_width: Width::Qword, checks_rip: false, segmented }
+            condition: Condition::Equal, source_width: Width::Qword, checks_rip: false, segmented, flags_dead: false }
 }
 
 /// `pcmpeqb`, `pand`, `pxor`: XMM destination, XMM-or-memory source.
@@ -345,7 +355,7 @@ fn lower_vec_binary(instruction: &Instruction, op: Op) -> Quick {
         false => (Address::Fixed(0), false),
     };
     Quick { op, width: Width::Qword, destination, source, address,
-            condition: Condition::Equal, source_width: Width::Qword, checks_rip: false, segmented }
+            condition: Condition::Equal, source_width: Width::Qword, checks_rip: false, segmented, flags_dead: false }
 }
 
 /// `pmovmskb`: an XMM's byte sign bits into a general register.
@@ -368,7 +378,7 @@ fn lower_vec_mask(instruction: &Instruction) -> Quick {
         return Quick::GENERAL;
     }
     Quick { op: Op::VecMask, width, destination, source, address: Address::Fixed(0),
-            condition: Condition::Equal, source_width: Width::Qword, checks_rip: false, segmented: false }
+            condition: Condition::Equal, source_width: Width::Qword, checks_rip: false, segmented: false, flags_dead: false }
 }
 
 /// The sixteen conditional near branches, by mnemonic.
@@ -478,7 +488,7 @@ fn lower_widen(instruction: &Instruction, op: Op) -> Quick {
         false => (Address::Fixed(0), false),
     };
     Quick { op, width, source_width, destination, source, address, segmented,
-            condition: Condition::Equal, checks_rip: true }
+            condition: Condition::Equal, checks_rip: true, flags_dead: false }
 }
 
 /// `push`, whose one operand is a source and whose immediate form is
@@ -505,7 +515,7 @@ fn lower_push(instruction: &Instruction) -> Quick {
         false => (Address::Fixed(0), false),
     };
     Quick { op: Op::Push, width, destination: Source::Register(PLACEHOLDER), source, address,
-            condition: Condition::Equal, source_width: width, checks_rip: true, segmented }
+            condition: Condition::Equal, source_width: width, checks_rip: true, segmented, flags_dead: false }
 }
 
 /// `pop`, whose one operand is a destination.
@@ -527,7 +537,7 @@ fn lower_pop(instruction: &Instruction) -> Quick {
         false => (Address::Fixed(0), false),
     };
     Quick { op: Op::Pop, width, destination, source: Source::Register(PLACEHOLDER), address,
-            condition: Condition::Equal, source_width: width, checks_rip: true, segmented }
+            condition: Condition::Equal, source_width: width, checks_rip: true, segmented, flags_dead: false }
 }
 
 /// Operand zero's width, which is the instruction's — the same rule
