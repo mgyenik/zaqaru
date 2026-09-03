@@ -35,6 +35,43 @@ static uint64_t next_random(uint64_t *state) {
     return x;
 }
 
+/* Component kernels: each iteration is sixty of one instruction class plus
+ * the loop's own dec/jnz, so the interpreter's retired-instruction rate is
+ * that instruction's per-op cost, near enough. Differencing them decomposes
+ * where the interpreter spends itself: `nops` is dispatch alone, `regmov`
+ * adds operand access, `regadd` adds the flags, `loads`/`stores` add the
+ * memory access and its permission check. */
+#define R60(x) x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x \
+               x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x
+static uint64_t kernel_nops(uint64_t rounds) {
+    for (uint64_t i = 0; i < rounds; i++) __asm__ volatile(R60("nop\n\t"));
+    return rounds;
+}
+static uint64_t kernel_regmov(uint64_t rounds) {
+    uint64_t x = 1, y = 2;
+    for (uint64_t i = 0; i < rounds; i++)
+        __asm__ volatile(R60("mov %0, %1\n\t") : "+r"(x), "+r"(y));
+    return x ^ y;
+}
+static uint64_t kernel_regadd(uint64_t rounds) {
+    uint64_t x = 1;
+    for (uint64_t i = 0; i < rounds; i++)
+        __asm__ volatile(R60("add $1, %0\n\t") : "+r"(x) :: "cc");
+    return x;
+}
+static uint64_t kernel_loads(uint64_t rounds) {
+    uint64_t buf = 42, *p = &buf, acc = 0;
+    for (uint64_t i = 0; i < rounds; i++)
+        __asm__ volatile(R60("mov (%1), %0\n\t") : "=&r"(acc) : "r"(p));
+    return acc;
+}
+static uint64_t kernel_stores(uint64_t rounds) {
+    uint64_t buf = 0, *p = &buf;
+    for (uint64_t i = 0; i < rounds; i++)
+        __asm__ volatile(R60("mov %%rax, (%0)\n\t") : : "r"(p) : "rax","memory");
+    return buf;
+}
+
 /* Dependent integer arithmetic: a chain where each operation needs the one
  * before it, so a native CPU cannot hide the latency and an interpreter
  * pays per instruction. The floor of what any engine can do. */
@@ -209,7 +246,12 @@ struct entry {
 /* Sized so that each runs for roughly the same short time natively, which
  * keeps one slow shape from dominating the wall clock of the whole set. */
 static const struct entry entries[] = {
-    {"alu", kernel_alu, 4000000},
+{"nops", kernel_nops, 1000000},
+    {"regmov", kernel_regmov, 1000000},
+    {"regadd", kernel_regadd, 1000000},
+    {"loads", kernel_loads, 1000000},
+    {"stores", kernel_stores, 1000000},
+        {"alu", kernel_alu, 4000000},
     {"memory_sequential", kernel_memory_sequential, 2},
     {"memory_random", kernel_memory_random, 2000000},
     {"calls", kernel_calls, 40},

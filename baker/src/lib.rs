@@ -69,6 +69,14 @@ const COMPRESS_LEVEL: i32 = 3;
 /// and off, every mapping copies, and the ELFs are two thirds of a rootfs.
 /// The day aliasing is built, its files have to be stored raw again.
 fn compressed(bytes: &[u8], _flags: u32) -> Option<Vec<u8>> {
+    // A bake with `ZAQARU_NO_COMPRESS` set stores every file raw. The image
+    // is larger and boots the same; what it is for is profiling and
+    // debugging the engine, where the zstd of a real rootfs both dominates a
+    // profile and — through its AVX/BMI2 paths — crashes valgrind before the
+    // guest runs at all. Not for shipped images.
+    if std::env::var_os("ZAQARU_NO_COMPRESS").is_some() {
+        return None;
+    }
     if bytes.len() < image::COMPRESS_FLOOR {
         return None;
     }
