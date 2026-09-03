@@ -77,6 +77,32 @@ pub enum Op {
     Widen,
     /// The same, sign-extending.
     WidenSigned,
+    /// A 128-bit move — `movups`, `movaps`, `movdqu`, `movdqa` — between an
+    /// XMM register and another XMM register or memory. The interpreter
+    /// defers all of these to its vector unit; the compiler lowers them to
+    /// a `v128` load and store, which is the whole of why the string
+    /// kernel deferred at all.
+    VecMov,
+    /// `pcmpeqb`, `pand`, `pxor`: a packed byte compare and two bitwise
+    /// operations, an XMM destination and an XMM-or-memory source.
+    VecCmpEqB,
+    VecAnd,
+    VecXor,
+    /// `pmovmskb`: the high bit of each of an XMM's sixteen bytes gathered
+    /// into a general register — `i8x16.bitmask`, exactly.
+    VecMask,
+}
+
+impl Op {
+    /// Whether the interpreter runs this through its general `step` rather
+    /// than the fast path — the vector ops, which the interpreter's own
+    /// vector unit owns and only the compiler lowers.
+    pub fn defers_to_step(self) -> bool {
+        matches!(
+            self,
+            Op::General | Op::VecMov | Op::VecCmpEqB | Op::VecAnd | Op::VecXor | Op::VecMask
+        )
+    }
 }
 
 /// Where a lowered operand's value comes from.
@@ -86,6 +112,9 @@ pub enum Op {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Source {
     Register(Slice),
+    /// An XMM register, by number 0..16. Only the compiler reads it; the
+    /// interpreter defers every op that has one.
+    Vector(u8),
     /// Already truncated to the operand width, which is what the general
     /// path does at every use.
     Immediate(u64),
@@ -186,6 +215,13 @@ impl Quick {
             Mnemonic::Movsx | Mnemonic::Movsxd => {
                 return lower_widen(instruction, Op::WidenSigned);
             }
+            Mnemonic::Movups | Mnemonic::Movaps | Mnemonic::Movdqu | Mnemonic::Movdqa => {
+                return lower_vec_move(instruction);
+            }
+            Mnemonic::Pcmpeqb => return lower_vec_binary(instruction, Op::VecCmpEqB),
+            Mnemonic::Pand => return lower_vec_binary(instruction, Op::VecAnd),
+            Mnemonic::Pxor => return lower_vec_binary(instruction, Op::VecXor),
+            Mnemonic::Pmovmskb => return lower_vec_mask(instruction),
             _ => {
                 if let Some(condition) = condition_of(instruction.mnemonic()) {
                     return lower_conditional(instruction, condition);
@@ -247,6 +283,92 @@ impl Quick {
     pub fn writes_back(&self) -> bool {
         !matches!(self.op, Op::Cmp | Op::Test)
     }
+}
+
+/// An XMM register operand as a [`Source::Vector`], or `None`.
+fn vector_of(instruction: &Instruction, operand: u32) -> Option<Source> {
+    let register = instruction.op_register(operand);
+    match register.is_xmm() {
+        true => Some(Source::Vector((register as u32 - Register::XMM0 as u32) as u8)),
+        false => None,
+    }
+}
+
+/// A 128-bit move between XMM and XMM-or-memory. One operand is a register;
+/// the other is a register or memory.
+fn lower_vec_move(instruction: &Instruction) -> Quick {
+    if instruction.op_count() != 2 || instruction.has_lock_prefix() {
+        return Quick::GENERAL;
+    }
+    let operand_source = |operand: u32| -> Option<Source> {
+        match instruction.op_kind(operand) {
+            OpKind::Register => vector_of(instruction, operand),
+            OpKind::Memory => Some(Source::Memory),
+            _ => None,
+        }
+    };
+    let (Some(destination), Some(source)) = (operand_source(0), operand_source(1)) else {
+        return Quick::GENERAL;
+    };
+    let (address, segmented) = match destination == Source::Memory || source == Source::Memory {
+        true => match address_of(instruction) {
+            Some(found) => found,
+            None => return Quick::GENERAL,
+        },
+        false => (Address::Fixed(0), false),
+    };
+    Quick { op: Op::VecMov, width: Width::Qword, destination, source, address,
+            condition: Condition::Equal, source_width: Width::Qword, checks_rip: false, segmented }
+}
+
+/// `pcmpeqb`, `pand`, `pxor`: XMM destination, XMM-or-memory source.
+fn lower_vec_binary(instruction: &Instruction, op: Op) -> Quick {
+    if instruction.op_count() != 2 || instruction.has_lock_prefix() {
+        return Quick::GENERAL;
+    }
+    let Some(destination) = vector_of(instruction, 0) else {
+        return Quick::GENERAL;
+    };
+    let source = match instruction.op_kind(1) {
+        OpKind::Register => match vector_of(instruction, 1) {
+            Some(source) => source,
+            None => return Quick::GENERAL,
+        },
+        OpKind::Memory => Source::Memory,
+        _ => return Quick::GENERAL,
+    };
+    let (address, segmented) = match source == Source::Memory {
+        true => match address_of(instruction) {
+            Some(found) => found,
+            None => return Quick::GENERAL,
+        },
+        false => (Address::Fixed(0), false),
+    };
+    Quick { op, width: Width::Qword, destination, source, address,
+            condition: Condition::Equal, source_width: Width::Qword, checks_rip: false, segmented }
+}
+
+/// `pmovmskb`: an XMM's byte sign bits into a general register.
+fn lower_vec_mask(instruction: &Instruction) -> Quick {
+    if instruction.op_count() != 2 || instruction.has_lock_prefix() {
+        return Quick::GENERAL;
+    }
+    // The destination is a general register at its own width; the source is
+    // an XMM register.
+    let Some(width) = width_at(instruction, 0) else {
+        return Quick::GENERAL;
+    };
+    let Some(destination) = source_of(instruction, 0, width) else {
+        return Quick::GENERAL;
+    };
+    let Some(source) = vector_of(instruction, 1) else {
+        return Quick::GENERAL;
+    };
+    if !matches!(destination, Source::Register(_)) {
+        return Quick::GENERAL;
+    }
+    Quick { op: Op::VecMask, width, destination, source, address: Address::Fixed(0),
+            condition: Condition::Equal, source_width: Width::Qword, checks_rip: false, segmented: false }
 }
 
 /// The sixteen conditional near branches, by mnemonic.

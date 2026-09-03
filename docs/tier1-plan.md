@@ -725,7 +725,7 @@ that clobbered the flags record before the access was known to succeed.
 The other acceptance items — the profiled bake, the tape across bakes,
 the altered-bytes control — wait on T1's profile.
 
-**T3 — regions. Built and correct (2026-09-02); up to 11x on lowered loops, still on the container.**
+**T3 — regions and vector ops. Built and correct (2026-09-02); up to 11x on lowered loops, still on the container, which is eval-loop-bound.**
 Formation at bake (`src/tier1/region.rs`), the `br_table` dispatcher,
 internal branches, the region-wide frame, the budget rule per member,
 verification of every member's bytes at attach, and the table extended
@@ -779,16 +779,39 @@ frame to amortise per instruction; and `string` barely moves because it
 is the SSE routines the lowering declines, so each one is a full flush,
 helper call and reload inside the region.
 
-**That last row is why the container still does not gain.** Its hot path
-is those declined routines — glibc's SSE `memcpy`/`memset`, CPython's eval
-loop with its computed goto — and a region carrying one pays the
-flush-and-reload the interpreter does not, cancelling the frame it saved.
-So tier 1 is now a real accelerator, up to 11× on the lowered loops that
-dominate a compute kernel, and still even on the container, which is
-declined-op-bound and served by an interpreter already at 95 MIPS. The
-container's remaining lever is lowering the vector and string ops into
-the compiler — the AOT tier's `translate/vector.rs`, entered from the
-region compiler — so the hot glibc routines stop deferring.
+That last row was the SSE the lowering declined, and **the common SSE2
+ops are now lowered too (2026-09-02).** `movups`, `movaps`, `movdqu`,
+`movdqa`, `pcmpeqb`, `pand`, `pxor` and `pmovmskb` — every declined op in
+the `string` kernel, each one wasm SIMD: the 128-bit moves are a `v128`
+load and store, `pcmpeqb` is `i8x16.eq`, the bitwise ops are `v128.and`
+and `v128.xor`, and `pmovmskb` is `i8x16.bitmask`. They are lowered in the
+*compiler only*: the interpreter defers them to its own vector unit as
+before, because adding them to `Cpu::quick` would grow the hot path the
+way the scalar ops did. The XMM registers are read and written in the
+control block rather than promoted to `v128` locals — the simple version,
+which a later experiment may promote. `string` went from 33 to **116
+MIPS, 3.5×**, checksum identical, verify clean (which settles the
+alignment question: the interpreter does not fault a misaligned `movaps`,
+so the compiler need not either).
+
+**And the container still does not gain — 95 MIPS with the SSE lowered,
+same as without.** This is the sobering measurement, and it is the boot
+profile made concrete: **90.9% of the boot is `libpython`, 4.3% is
+`libc`.** Django is not string-bound or memcpy-bound; it is CPython
+running Python bytecode, `_PyEval_EvalFrameDefault`, a computed-goto over
+mostly-lowered scalar ops with an indirect dispatch per bytecode. Lowering
+every SSE op perfectly caps at the ~4% that is libc. The lowered loops
+(the `string`, `calls`, `memory_sequential` kernels) are where tier 1
+pays 3–11×; the container is elsewhere.
+
+So the container's lever is the eval loop, not more op lowering. Two
+shapes address it, both resting on what is now built: **an indirect jump
+that can re-dispatch within a region** (the `ret`'s runtime member lookup,
+applied to the computed goto, so the eval loop stays in one frame), and —
+measured against the *serving* profile rather than the boot one, which is
+the next measurement — **string-op builtins** (recognise glibc's `memcpy`
+by its bytes and attach a hand-written `memory.copy` instead of compiling
+its loop) if serving turns out more string-bound than the import.
 
 **Lowering more of the declined 5–8% was tried and does not help
 (2026-09-02).** `inc`, `dec`, `neg`, `not`, `setcc` and `cmovcc` were

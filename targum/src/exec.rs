@@ -280,10 +280,12 @@ impl<'a> Cpu<'a> {
     pub fn advance(&mut self, quick: &Quick, instruction: &Instruction) -> Result<(), Trap> {
         crate::histogram::record(instruction, quick.op != Op::General);
         crate::profile::record(instruction.ip());
-        if quick.op == Op::General {
+        if quick.op.defers_to_step() {
             // The general path counts and sets `rip` itself. Nothing in a
             // straight-through prefix reads it, so letting it write one is
-            // cheaper than keeping a second copy of that function.
+            // cheaper than keeping a second copy of that function. The
+            // vector ops go here too — the interpreter's own vector unit
+            // owns them, and only the compiler lowers them.
             self.step(instruction)?;
             return Ok(());
         }
@@ -294,7 +296,7 @@ impl<'a> Cpu<'a> {
     pub fn run(&mut self, quick: &Quick, instruction: &Instruction) -> Result<Step, Trap> {
         crate::histogram::record(instruction, quick.op != Op::General);
         crate::profile::record(instruction.ip());
-        if quick.op == Op::General {
+        if quick.op.defers_to_step() {
             return self.step(instruction);
         }
         // The same two lines `step` opens with, and they are not
@@ -446,6 +448,7 @@ impl<'a> Cpu<'a> {
                 let at = self.quick_address(quick)?;
                 Ok(self.space.load(at, width)?)
             }
+            Source::Vector(_) => unreachable!("a vector operand is deferred to step"),
         }
     }
 
@@ -469,6 +472,7 @@ impl<'a> Cpu<'a> {
             }
             // An immediate destination is not a shape the lowering makes.
             Source::Immediate(_) => unreachable!("an immediate is never a destination"),
+            Source::Vector(_) => unreachable!("a vector operand is deferred to step"),
         }
     }
 

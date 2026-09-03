@@ -211,6 +211,10 @@ pub mod layout {
     pub const RETIRED: u32 = 136;
     pub const FS_BASE: u32 = 144;
     pub const FLAGS: u32 = 152;
+    /// The XMM registers, `[[u64; 2]; 16]` — sixteen bytes each, low half
+    /// first, which is the little-endian order a `v128` load and store use,
+    /// so compiled SSE reads and writes them in place.
+    pub const VECTORS: u32 = 200;
     /// Within [`FLAGS`]: see `crate::flags::Flags`.
     pub const FLAGS_RULE: u32 = FLAGS;
     pub const FLAGS_WIDTH: u32 = FLAGS + 1;
@@ -425,6 +429,7 @@ mod layout_tests {
         assert_eq!(core::mem::offset_of!(Tcb, retired) as u32, layout::RETIRED);
         assert_eq!(core::mem::offset_of!(Tcb, fs_base) as u32, layout::FS_BASE);
         assert_eq!(core::mem::offset_of!(Tcb, flags) as u32, layout::FLAGS);
+        assert_eq!(core::mem::offset_of!(Tcb, vectors) as u32, layout::VECTORS);
         assert_eq!(core::mem::size_of::<Flags>(), 48);
         assert_eq!(Width::Qword as u8, 3);
     }

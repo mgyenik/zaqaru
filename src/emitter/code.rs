@@ -585,7 +585,7 @@ impl FunctionBodyBuilder {
         f32x4_equal = 65, f32x4_less = 67, f32x4_greater = 68, f32x4_less_or_equal = 69,
         f64x2_equal = 71, f64x2_less = 73, f64x2_greater = 74, f64x2_less_or_equal = 75,
         v128_not = 77, v128_and = 78, v128_or = 80, v128_xor = 81,
-        i8x16_equal = 35, i8x16_greater_signed = 39,
+        i8x16_equal = 35, i8x16_greater_signed = 39, i8x16_bitmask = 100,
         i16x8_equal = 45, i16x8_greater_signed = 49,
         i32x4_equal = 55, i32x4_greater_signed = 59,
         i64x2_equal = 214, i64x2_greater_signed = 217,

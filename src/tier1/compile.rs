@@ -287,6 +287,11 @@ impl Usage {
                     usage.touch(quick.source, false);
                     usage.stack();
                 }
+                // XMM operands live in the control block, not in locals; a
+                // memory operand's address registers are marked below, for
+                // every op, and only `pmovmskb` writes a general register.
+                Op::VecMov | Op::VecCmpEqB | Op::VecAnd | Op::VecXor => {}
+                Op::VecMask => usage.touch(quick.destination, true),
             }
             if let Address::Computed { base, index, .. } = quick.address {
                 for slice in [base, index].into_iter().flatten() {
@@ -779,9 +784,15 @@ impl Emitter<'_> {
     /// whether any page holds code. One call into the object's shared
     /// check; see [`check_body`].
     fn check(&mut self, write: bool, width: Width, instruction: &Instruction) {
+        self.check_len(write, width.bytes() as u8, instruction);
+    }
+
+    /// The same, for an access of an explicit byte length — a 16-byte
+    /// `v128` move, which no [`Width`] names.
+    fn check_len(&mut self, write: bool, length: u8, instruction: &Instruction) {
         self.body.local_get(VITALS);
         self.body.local_get(A);
-        self.body.i32_const(i32::from(width.bytes() as u8));
+        self.body.i32_const(i32::from(length));
         self.body.call(match write {
             false => self.helpers.check_read,
             true => self.helpers.check_write,
@@ -861,6 +872,111 @@ impl Emitter<'_> {
         self.body.end();
     }
 
+    /// The byte offset of an XMM register in the control block.
+    fn xmm_offset(index: u8) -> u32 {
+        layout::VECTORS + u32::from(index) * 16
+    }
+
+    /// A 128-bit move: XMM to XMM, XMM from memory, or memory from XMM. The
+    /// XMM registers are read and written in the control block; a memory
+    /// operand is checked like any other, sixteen bytes wide.
+    fn vec_move(&mut self, quick: &Quick, instruction: &Instruction) {
+        match (quick.destination, quick.source) {
+            (Source::Vector(dst), Source::Vector(src)) => {
+                self.body.local_get(TCB);
+                self.body.local_get(TCB);
+                self.body.v128_load(0, Self::xmm_offset(src));
+                self.body.v128_store(0, Self::xmm_offset(dst));
+            }
+            (Source::Vector(dst), Source::Memory) => {
+                self.address(quick);
+                self.body.local_set(A);
+                self.check_len(false, 16, instruction);
+                self.body.local_get(TCB);
+                self.body.local_get(A);
+                self.body.i32_wrap_i64();
+                self.body.v128_load(0, 0);
+                self.body.v128_store(0, Self::xmm_offset(dst));
+            }
+            (Source::Memory, Source::Vector(src)) => {
+                self.address(quick);
+                self.body.local_set(A);
+                self.check_len(true, 16, instruction);
+                self.body.local_get(A);
+                self.body.i32_wrap_i64();
+                self.body.local_get(TCB);
+                self.body.v128_load(0, Self::xmm_offset(src));
+                self.body.v128_store(0, 0);
+                // A store onto a code page is reported and the region leaves,
+                // so the overwritten bytes are re-fetched — the same as a
+                // scalar store.
+                self.body.local_get(Q2);
+                self.body.if_();
+                self.depth += 1;
+                self.body.local_get(A);
+                self.body.i32_const(16);
+                self.body.call(self.helpers.code_write);
+                self.count_done_on_path(1);
+                self.set_rip_delta(instruction.next_ip());
+                self.leave(KIND_CONTINUE);
+                self.depth -= 1;
+                self.body.end();
+            }
+            _ => unreachable!("a vector move has one register and one register or memory operand"),
+        }
+    }
+
+    /// `pcmpeqb`, `pand`, `pxor`: `dst = dst OP src`, the destination an XMM
+    /// register and the source an XMM register or memory.
+    fn vec_binary(&mut self, quick: &Quick, instruction: &Instruction) {
+        let Source::Vector(dst) = quick.destination else {
+            unreachable!("a packed op writes an XMM register");
+        };
+        // The store address and the destination value first, then the
+        // source — a memory source's check may decline, and unwinding the
+        // stack it leaves behind is exactly what a branch out does.
+        self.body.local_get(TCB);
+        self.body.local_get(TCB);
+        self.body.v128_load(0, Self::xmm_offset(dst));
+        match quick.source {
+            Source::Vector(src) => {
+                self.body.local_get(TCB);
+                self.body.v128_load(0, Self::xmm_offset(src));
+            }
+            Source::Memory => {
+                self.address(quick);
+                self.body.local_set(A);
+                self.check_len(false, 16, instruction);
+                self.body.local_get(A);
+                self.body.i32_wrap_i64();
+                self.body.v128_load(0, 0);
+            }
+            _ => unreachable!("a packed op's source is an XMM register or memory"),
+        }
+        match quick.op {
+            Op::VecCmpEqB => self.body.i8x16_equal(),
+            Op::VecAnd => self.body.v128_and(),
+            _ => self.body.v128_xor(),
+        }
+        self.body.v128_store(0, Self::xmm_offset(dst));
+    }
+
+    /// `pmovmskb`: the high bit of each of an XMM's sixteen bytes into a
+    /// general register — `i8x16.bitmask`.
+    fn vec_mask(&mut self, quick: &Quick) {
+        let Source::Vector(src) = quick.source else {
+            unreachable!("pmovmskb reads an XMM register");
+        };
+        self.body.local_get(TCB);
+        self.body.v128_load(0, Self::xmm_offset(src));
+        self.body.i8x16_bitmask();
+        self.body.i64_extend_i32_unsigned();
+        let Source::Register(slice) = quick.destination else {
+            unreachable!("pmovmskb writes a general register");
+        };
+        self.reg_set(slice);
+    }
+
     /// Pushes an operand's value at a width.
     fn read(&mut self, quick: &Quick, source: Source, width: Width, instruction: &Instruction) {
         match source {
@@ -872,6 +988,7 @@ impl Emitter<'_> {
                 self.check(false, width, instruction);
                 self.load(width);
             }
+            Source::Vector(_) => unreachable!("a vector operand goes through the vector methods"),
         }
     }
 
@@ -887,6 +1004,7 @@ impl Emitter<'_> {
                 self.store(width, instruction.next_ip());
             }
             Source::Immediate(_) => unreachable!("an immediate is never a destination"),
+            Source::Vector(_) => unreachable!("a vector operand goes through the vector methods"),
         }
     }
 
@@ -1134,6 +1252,9 @@ impl Emitter<'_> {
                 self.defer(instruction);
                 return;
             }
+            Op::VecMov => self.vec_move(quick, instruction),
+            Op::VecCmpEqB | Op::VecAnd | Op::VecXor => self.vec_binary(quick, instruction),
+            Op::VecMask => self.vec_mask(quick),
             Op::Nop => {}
             Op::Mov => {
                 self.read(quick, quick.source, width, instruction);
