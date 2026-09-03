@@ -993,6 +993,42 @@ hot-block list into a win. Until it exists, tier 1 stays off on the
 container — not because it fails to attach, which is fixed, but because
 attaching more of it costs more than it saves.
 
+**Built the in-wasm-transfer architecture, and it settles the whole
+question: block compilation cannot beat the interpreter on CPython
+(2026-09-03).** `bake-vm --cluster` gathers a file's hot blocks into one
+uncapped region, so the calls, returns and computed gotos among them are
+internal dispatches — no region crossing, no frame reload, the machine
+staying in wasm locals. The Django hot set became one ~4000-member
+libpython region that compiles and boots. Keeping transfers in wasm does
+help — it serves 10.6 req/s against the same blocks in small regions'
+8.7 — but is still far under the 5.3%-compiled baseline's 37.9, and at
+36% compiled and 68 MIPS against an ~89 MIPS interpreter the compiled code
+runs ~1.85x slower *per instruction*. The suspect was the resolver's log-n
+search, hit once a bytecode over four thousand members, so it got an O(1)
+direct-mapped cache (correct by construction; the page comes out right).
+It changed nothing: 9.1 req/s with the cache. wasm-opt -O2 on the module:
+3.6% smaller, 8.7 req/s, no change. So the resolver was not the cost and
+the codegen is not the cost. What is left is the compiled code's own
+per-instruction overhead — the permission-check helper call on every
+memory access, the flag and retirement bookkeeping — which the mature
+interpreter's tight `advance` path does not carry, on a workload of short
+runs with nothing to amortize it over.
+
+That is the settled result. Tier 1 pays 3–11x on compute-bound guests
+whose loops are long and straight (the microbenchmarks) and loses on
+CPython, whose eval loop is short-run, dispatch-heavy, memory-heavy code —
+the exact shape a mature bytecode interpreter is built to run and a
+block compiler is worst at. No block-picking scheme (corpus or static),
+no region size (block, cluster), no dispatch scheme (search or O(1)
+cache), and no post-pass (wasm-opt) closes the gap, because the gap is not
+in any of those; it is that our compiled block carries more per
+instruction than CPython's interpreter does, and CPython gives it no long
+run to make that back. For interpreter-heavy containers the interpreter
+is the game: the levers are a faster interpreter (§T-block dispatch, near
+its floor) and startup, not compiling more blocks. Tier 1 stays off on the
+container, now for a reason that is measured to the bottom rather than
+assumed.
+
 **Lowering more of the declined 5–8% was tried and does not help
 (2026-09-02).** `inc`, `dec`, `neg`, `not`, `setcc` and `cmovcc` were
 lowered into `quick.rs` and `Cpu::quick`, correct against the interpreted
