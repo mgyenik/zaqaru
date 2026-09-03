@@ -10,9 +10,12 @@ fn main() -> anyhow::Result<()> {
     let elf = std::fs::read(positional[0])?;
     let address = u64::from_str_radix(positional[1].trim_start_matches("0x"), 16)?;
     let candidates = zaqaru::tier1::sweep(&elf)?;
-    let candidate = candidates.iter().find(|c| c.address == address).expect("a block at that address");
-    eprintln!("block at {:#x}: {} bytes, {} instructions", candidate.address, candidate.bytes.len(), candidate.instructions);
-    let built = zaqaru::tier1::build(std::slice::from_ref(candidate), usize::MAX);
+    // The region containing the address, formed as the bake forms it.
+    let regions = zaqaru::tier1::region::form(&candidates);
+    let region = regions.iter().find(|r| r.members.iter().any(|m| m.address == address)).expect("a region at that address");
+    eprintln!("region base {:#x}: {} members: {:?}", region.base(), region.members.len(),
+        region.members.iter().map(|m| format!("{:#x}", m.address)).collect::<Vec<_>>());
+    let built = zaqaru::tier1::build(&region.members, usize::MAX);
     if !run {
         println!("{}", wasmprinter::print_bytes(&built.object)?);
         return Ok(());
@@ -62,8 +65,8 @@ fn main() -> anyhow::Result<()> {
     memory.write(&mut store, 0x10000, &0x5555u64.to_le_bytes())?; // what `pop rsi` finds
 
     let Some(Ref::Func(Some(function))) = table.get(&mut store, 1) else { anyhow::bail!("no function in slot 1") };
-    let typed = function.typed::<(i32, i32, i64, i64), i64>(&store)?;
-    let exit = typed.call(&mut store, (TCB as i32, VITALS as i32, address as i64, 1000))?;
+    let typed = function.typed::<(i32, i32, i64, i64, i32), i64>(&store)?;
+    let exit = typed.call(&mut store, (TCB as i32, VITALS as i32, address as i64, 1000, 0))?;
     let mut after = vec![0u8; 0x200];
     memory.read(&store, TCB as usize, &mut after)?;
     let get64 = |at: u32| u64::from_le_bytes(after[at as usize..at as usize + 8].try_into().unwrap());

@@ -84,16 +84,33 @@ pub struct Block {
     /// would save nothing.
     pub quick: Vec<crate::quick::Quick>,
     /// The function the bake compiled for exactly these bytes, if it
-    /// compiled one: a table index the run loop calls instead of
-    /// interpreting. Looked up when the block is decoded and never again,
-    /// which is what makes it free — see [`crate::tier1`].
-    pub compiled: Option<u32>,
+    /// compiled one, and which member of it this block is: a table index
+    /// the run loop calls instead of interpreting. Looked up when the block
+    /// is decoded and never again, which is what makes it free — see
+    /// [`crate::tier1`].
+    pub compiled: Option<(u32, u32)>,
+    /// Pages the compiled region's other members sit on, which the block
+    /// is registered against too: a write to any of them drops the block,
+    /// because the region was compiled for all of them together.
+    pub also: Vec<u64>,
 }
 
 impl Block {
     /// The pages the block's bytes came from.
     fn pages(&self) -> std::ops::RangeInclusive<u64> {
         (self.entry >> PAGE_SHIFT)..=((self.end - 1) >> PAGE_SHIFT)
+    }
+
+    /// Every page the block is registered against: its own, and its
+    /// compiled region's.
+    fn all_pages(&self) -> Vec<u64> {
+        let mut pages: Vec<u64> = self.pages().collect();
+        for page in &self.also {
+            if !pages.contains(page) {
+                pages.push(*page);
+            }
+        }
+        pages
     }
 }
 
@@ -230,7 +247,7 @@ impl BlockCache {
         if self.entries.len() >= CAPACITY {
             self.flush(space);
         }
-        let pages: Vec<u64> = block.pages().collect();
+        let pages: Vec<u64> = block.all_pages();
         let entry = block.entry;
         let index = match self.free.pop() {
             Some(index) => {
@@ -265,7 +282,7 @@ impl BlockCache {
                 continue;
             };
             self.entries.remove(&block.entry);
-            for other in block.pages() {
+            for other in block.all_pages() {
                 if other == page {
                     continue;
                 }
@@ -330,14 +347,18 @@ fn decode(address: u64, space: &Space) -> Result<Block, FetchError> {
                 // reached the cap. Both are "the block ends here", and the
                 // empty case cannot loop forever because the cap is longer
                 // than the longest instruction.
-                DecoderError::NoMoreBytes if !instructions.is_empty() => Ok(Block {
-                    entry: address,
-                    end,
-                    quick: lower_all(&instructions),
-                    simple: straight_through(&instructions),
-                    compiled: crate::tier1::lookup(&bytes[..(end - address) as usize]),
-                    instructions,
-                }),
+                DecoderError::NoMoreBytes if !instructions.is_empty() => {
+                    let (compiled, also) = attach(bytes, address, end, space);
+                    Ok(Block {
+                        entry: address,
+                        end,
+                        quick: lower_all(&instructions),
+                        simple: straight_through(&instructions),
+                        compiled,
+                        also,
+                        instructions,
+                    })
+                }
                 DecoderError::NoMoreBytes => Err(FetchError::Fault(Fault {
                     address: address + bytes.len() as u64,
                     access: Access::Fetch,
@@ -354,14 +375,26 @@ fn decode(address: u64, space: &Space) -> Result<Block, FetchError> {
             break;
         }
     }
+    let (compiled, also) = attach(bytes, address, end, space);
     Ok(Block {
         entry: address,
         end,
         quick: lower_all(&instructions),
         simple: straight_through(&instructions),
-        compiled: crate::tier1::lookup(&bytes[..(end - address) as usize]),
+        compiled,
+        also,
         instructions,
     })
+}
+
+/// What the bake compiled for a decoded block's bytes, if anything: the
+/// region's function and member, and the pages of the region's other
+/// members. See [`crate::tier1::lookup`].
+fn attach(bytes: &[u8], address: u64, end: u64, space: &Space) -> (Option<(u32, u32)>, Vec<u64>) {
+    match crate::tier1::lookup(&bytes[..(end - address) as usize], address, space) {
+        Some(found) => (Some((found.function, found.which)), found.pages),
+        None => (None, Vec::new()),
+    }
 }
 
 /// Lowers a block's instructions and records, for each, whether the run

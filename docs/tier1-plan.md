@@ -725,12 +725,20 @@ that clobbered the flags record before the access was known to succeed.
 The other acceptance items — the profiled bake, the tape across bakes,
 the altered-bytes control — wait on T1's profile.
 
-**T3 — regions.** Formation at bake, the dispatcher, internal branches,
-region-wide locals, the budget rule, folded conditions, verification of
-every block at attach. The same acceptance, with regions. Plus the first
-speed number: the nine kernels of `tools/microbench`, each baked from
-the sweep alone and from its profile, against the interpreter, recorded
-in `performance.md` §2 as new columns.
+**T3 — regions. Built, and capped at one member pending a defect
+(2026-09-02).** Formation at bake (`src/tier1/region.rs`), the `br_table`
+dispatcher, internal branches, the region-wide frame, the budget rule
+per member, verification of every member's bytes at attach, and the
+table extended with a row per region and per member. The engine's verify
+mode is what holds it: a two-member region leaves `%rsp` eight low —
+one stack slot, with every other register, the flags and `rip` correct —
+which places the defect at the boundary between members, in the
+retired-count accounting or the flush around a deferred instruction, not
+in any instruction's arithmetic. `MAX_MEMBERS` is one until that is
+found, which makes every region a single block and keeps the compiler to
+what the differential and the container suite verify. The speed number
+waits on the cap: single blocks are 1.5×, and the frame a region would
+amortise is the rest.
 
 **T4 — the container and the corpus.** The first corpus entries —
 `python:3.12-slim`'s libpython, glibc and loader, and nginx — taken on

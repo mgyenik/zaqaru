@@ -408,8 +408,8 @@ fn run_compiled(object: &[u8], candidate: &zaqaru::tier1::Candidate, start: &Sta
     let Some(Ref::Func(Some(function))) = table.get(&mut store, 1) else {
         anyhow::bail!("no function in slot 1")
     };
-    let typed = function.typed::<(i32, i32, i64, i64), i64>(&store)?;
-    let exit = typed.call(&mut store, (TCB as i32, VITALS as i32, candidate.address as i64, 1000))?;
+    let typed = function.typed::<(i32, i32, i64, i64, i32), i64>(&store)?;
+    let exit = typed.call(&mut store, (TCB as i32, VITALS as i32, candidate.address as i64, 1000, 0))?;
     let mut after = vec![0u8; TCB_BYTES];
     memory.read(&store, TCB as usize, &mut after)?;
     let mut registers = [0u64; 16];

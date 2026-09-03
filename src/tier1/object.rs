@@ -10,14 +10,16 @@
 //! table is always emitted, empty or not, because the engine's reference to
 //! it is unconditional.
 //!
-//! The table's layout is `targum::tier1`'s: a header of magic, entry count
-//! and the offset of the bytes region; entries of hash, length, offset of
-//! the bytes, function, padding, sorted by hash then length; then the bytes
-//! of every block, for the comparison a hit is confirmed by.
+//! The table's layout is `targum::tier1`'s: a header; entries of hash,
+//! length, offset of the bytes, function, member and region, sorted by hash
+//! then length; one row per region naming its member rows; one row per
+//! member with its delta from the region's base, its length and its bytes'
+//! offset; then the bytes of every block, for the comparison a hit is
+//! confirmed by and the verification of a region's other members.
 
 use std::collections::BTreeMap;
 
-use targum::tier1::{TABLE_ENTRY, TABLE_HEADER, TABLE_MAGIC, hash};
+use targum::tier1::{TABLE_ENTRY, TABLE_HEADER, TABLE_MAGIC, TABLE_MEMBER, TABLE_REGION, hash};
 
 use super::compile::{Helpers, check_body, compile};
 use super::sweep::Candidate;
@@ -35,8 +37,10 @@ pub const TABLE_SYMBOL: &str = "targum_tier1_table";
 /// What a build produced, and what it cost.
 pub struct Built {
     pub object: Vec<u8>,
-    /// Distinct blocks compiled.
+    /// Regions compiled, each one function.
     pub functions: usize,
+    /// Blocks in them.
+    pub members: usize,
     /// Candidates the budget stopped short of.
     pub left_out: usize,
     /// Candidates left interpreted because most of their instructions
@@ -49,15 +53,24 @@ pub struct Built {
     pub deferred: usize,
 }
 
-/// Compiles the candidates, in order, until the code exceeds `budget`
-/// bytes, and answers the object.
+/// Compiles the candidates — as regions, formed by `super::region` from
+/// whatever survives the policy — in order, until the code exceeds
+/// `budget` bytes, and answers the object.
 ///
-/// Identical bytes are one function: the same routine in two libraries,
-/// or found twice by the sweep, is compiled once and looked up once.
+/// Identical bytes are one entry: the same block in two libraries, or
+/// found twice by the sweep, is compiled once and looked up once.
 pub fn build(candidates: &[Candidate], budget: usize) -> Built {
+    use targum::quick::{Op, Quick};
+
     let mut wasm = WasmObject::new();
     let compiled_type = wasm.intern_type(FunctionType {
-        parameters: vec![ValueType::I32, ValueType::I32, ValueType::I64, ValueType::I64],
+        parameters: vec![
+            ValueType::I32,
+            ValueType::I32,
+            ValueType::I64,
+            ValueType::I64,
+            ValueType::I32,
+        ],
         results: vec![ValueType::I64],
     });
     let step_type = wasm.intern_type(FunctionType {
@@ -92,7 +105,7 @@ pub fn build(candidates: &[Candidate], budget: usize) -> Built {
     let step = import(&mut wasm, "targum_step", step_type);
     let condition = import(&mut wasm, "targum_condition", step_type);
     let code_write = import(&mut wasm, "targum_code_write", code_write_type);
-    // The two permission checks, defined once and called by every block.
+    // The two permission checks, defined once and called by every region.
     let define_check = |wasm: &mut WasmObject, name: &str, write: bool| -> FunctionReference {
         let function_index = wasm.next_defined_function_index();
         wasm.defined_functions.push(DefinedFunction {
@@ -117,33 +130,56 @@ pub fn build(candidates: &[Candidate], budget: usize) -> Built {
         check_write: define_check(&mut wasm, "tier1_check_write", true),
     };
 
-    // One function per distinct byte sequence, keyed for the table.
-    let mut entries: BTreeMap<(u64, Vec<u8>), (u32, u32)> = BTreeMap::new();
+    // The policy, per block, before regions are formed: a block that is
+    // mostly instructions the lowering declines runs mostly through the
+    // helper, which is slower than interpreting it and costs a great deal
+    // of code. And each distinct byte sequence once.
+    let mut mostly_deferred = 0usize;
+    let mut seen: std::collections::HashSet<(u64, usize)> = std::collections::HashSet::new();
+    let mut kept: Vec<Candidate> = Vec::new();
+    for candidate in candidates {
+        if !seen.insert((hash(&candidate.bytes), candidate.bytes.len())) {
+            continue;
+        }
+        let instructions = super::sweep::decode_instructions(candidate);
+        let deferred = instructions
+            .iter()
+            .filter(|instruction| Quick::lower(instruction).op == Op::General)
+            .count();
+        if deferred * 4 > instructions.len() {
+            mostly_deferred += 1;
+            continue;
+        }
+        kept.push(candidate.clone());
+    }
+    let regions = super::region::form(&kept);
+
+    // One function per region, in order, until the budget; one table
+    // entry per member.
+    struct Row {
+        hash: u64,
+        bytes: Vec<u8>,
+        symbol_index: u32,
+        slot: u32,
+        which: u32,
+        region: u32,
+    }
+    let mut rows: Vec<Row> = Vec::new();
+    // Per region: its member rows (delta, bytes) in dispatch order.
+    let mut region_rows: Vec<Vec<(i32, Vec<u8>)>> = Vec::new();
     let mut code_bytes = 0usize;
     let mut instructions = 0usize;
     let mut deferred = 0usize;
     let mut left_out = 0usize;
-    let mut mostly_deferred = 0usize;
     let mut next_slot = FIRST_TABLE_INDEX;
-    for candidate in candidates {
-        let key = (hash(&candidate.bytes), candidate.bytes.clone());
-        if entries.contains_key(&key) {
-            continue;
-        }
+    for region in &regions {
         if code_bytes >= budget {
-            left_out += 1;
+            left_out += region.members.len();
             continue;
         }
-        let Some(compiled) = compile(candidate, helpers) else {
+        let Some(compiled) = compile(region, helpers) else {
             continue;
         };
-        // A block that is mostly instructions the lowering declines runs
-        // mostly through the helper, which is slower than interpreting it
-        // and costs a great deal of code: not worth compiling.
-        if compiled.deferred * 4 > compiled.instructions {
-            mostly_deferred += 1;
-            continue;
-        }
         code_bytes += compiled.body.bytes.len();
         instructions += compiled.instructions;
         deferred += compiled.deferred;
@@ -153,7 +189,7 @@ pub fn build(candidates: &[Candidate], budget: usize) -> Built {
             body: compiled.body,
         });
         let symbol_index = wasm.add_symbol(Symbol {
-            name: format!("tier1_{:016x}_{}", key.0, candidate.bytes.len()),
+            name: format!("tier1_region_{:x}", region.base()),
             target: SymbolTarget::Function(function_index),
             flags: symbol_flags::LOCAL,
         });
@@ -161,40 +197,97 @@ pub fn build(candidates: &[Candidate], budget: usize) -> Built {
         wasm.uses_function_table = true;
         let slot = next_slot;
         next_slot += 1;
-        entries.insert(key, (symbol_index, slot));
+        let region_index = region_rows.len() as u32;
+        let base = region.base();
+        region_rows.push(
+            region
+                .members
+                .iter()
+                .map(|member| ((member.address.wrapping_sub(base)) as i32, member.bytes.clone()))
+                .collect(),
+        );
+        for (which, member) in region.members.iter().enumerate() {
+            rows.push(Row {
+                hash: hash(&member.bytes),
+                bytes: member.bytes.clone(),
+                symbol_index,
+                slot,
+                which: which as u32,
+                region: region_index,
+            });
+        }
     }
-    let functions = entries.len();
+    let functions = region_rows.len();
+    let members: usize = region_rows.iter().map(Vec::len).sum();
 
-    // The table: sorted by (hash, length), which the map's key order gives
-    // once the bytes' length is what the second component compares as —
-    // it is not, so sort explicitly.
-    let mut rows: Vec<(&(u64, Vec<u8>), &(u32, u32))> = entries.iter().collect();
-    rows.sort_by(|left, right| {
-        (left.0.0, left.0.1.len()).cmp(&(right.0.0, right.0.1.len()))
-    });
+    // The table. Entries sorted by (hash, length); the bytes region holds
+    // every member's bytes once, at an offset the entry and the member row
+    // both name.
+    rows.sort_by(|left, right| (left.hash, left.bytes.len()).cmp(&(right.hash, right.bytes.len())));
+    let entries_bytes = rows.len() * TABLE_ENTRY;
+    let regions_bytes = region_rows.len() * TABLE_REGION;
+    let members_bytes = members * TABLE_MEMBER;
+    let regions_at = TABLE_HEADER + entries_bytes;
+    let members_at = regions_at + regions_bytes;
+    let bytes_at = members_at + members_bytes;
+    // Each member's bytes are placed once; the offsets are handed to both
+    // the entry and the member row.
+    let mut blob: Vec<u8> = Vec::new();
+    let mut placed: BTreeMap<(u64, Vec<u8>), u32> = BTreeMap::new();
+    let mut place = |bytes: &[u8]| -> u32 {
+        let key = (hash(bytes), bytes.to_vec());
+        if let Some(at) = placed.get(&key) {
+            return *at;
+        }
+        let at = blob.len() as u32;
+        blob.extend_from_slice(bytes);
+        placed.insert(key, at);
+        at
+    };
     let mut bytes = Vec::new();
     let mut relocations = Vec::new();
-    let bytes_region = TABLE_HEADER + rows.len() * TABLE_ENTRY;
     bytes.extend_from_slice(&TABLE_MAGIC.to_le_bytes());
     bytes.extend_from_slice(&(rows.len() as u32).to_le_bytes());
-    bytes.extend_from_slice(&(bytes_region as u32).to_le_bytes());
+    bytes.extend_from_slice(&(bytes_at as u32).to_le_bytes());
+    bytes.extend_from_slice(&(regions_at as u32).to_le_bytes());
+    bytes.extend_from_slice(&(members_at as u32).to_le_bytes());
+    bytes.extend_from_slice(&(region_rows.len() as u32).to_le_bytes());
     bytes.extend_from_slice(&0u32.to_le_bytes());
-    let mut blob: Vec<u8> = Vec::new();
-    for ((hash, block), (symbol_index, slot)) in &rows {
-        bytes.extend_from_slice(&hash.to_le_bytes());
-        bytes.extend_from_slice(&(block.len() as u32).to_le_bytes());
-        bytes.extend_from_slice(&(blob.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    debug_assert_eq!(bytes.len(), TABLE_HEADER);
+    for row in &rows {
+        let offset = place(&row.bytes);
+        bytes.extend_from_slice(&row.hash.to_le_bytes());
+        bytes.extend_from_slice(&(row.bytes.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&offset.to_le_bytes());
         relocations.push(Relocation {
             kind: RelocationKind::TableIndexI32,
             offset: bytes.len() as u32,
-            symbol_index: *symbol_index,
+            symbol_index: row.symbol_index,
             addend: 0,
         });
-        bytes.extend_from_slice(&slot.to_le_bytes());
+        bytes.extend_from_slice(&row.slot.to_le_bytes());
+        bytes.extend_from_slice(&row.which.to_le_bytes());
+        bytes.extend_from_slice(&row.region.to_le_bytes());
         bytes.extend_from_slice(&0u32.to_le_bytes());
-        blob.extend_from_slice(block);
     }
-    debug_assert_eq!(bytes.len(), bytes_region);
+    debug_assert_eq!(bytes.len(), regions_at);
+    let mut first = 0u32;
+    for members in &region_rows {
+        bytes.extend_from_slice(&(members.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&first.to_le_bytes());
+        first += members.len() as u32;
+    }
+    debug_assert_eq!(bytes.len(), members_at);
+    for members in &region_rows {
+        for (delta, member_bytes) in members {
+            let offset = place(member_bytes);
+            bytes.extend_from_slice(&delta.to_le_bytes());
+            bytes.extend_from_slice(&(member_bytes.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(&offset.to_le_bytes());
+        }
+    }
+    debug_assert_eq!(bytes.len(), bytes_at);
     bytes.extend_from_slice(&blob);
     let size = bytes.len() as u32;
     let segment_index = wasm.data_segments.len() as u32;
@@ -217,6 +310,7 @@ pub fn build(candidates: &[Candidate], budget: usize) -> Built {
     Built {
         object: wasm.serialize(),
         functions,
+        members,
         left_out,
         mostly_deferred,
         code_bytes,

@@ -22,6 +22,7 @@
 
 pub mod compile;
 pub mod object;
+pub mod region;
 pub mod sweep;
 
 pub use compile::Helpers;

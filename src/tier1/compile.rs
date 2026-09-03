@@ -1,4 +1,5 @@
-//! One block to one wasm function.
+//! A region — one block, or many connected by constant-target branches —
+//! to one wasm function.
 //!
 //! The contract is `targum::tier1`'s, and the semantics are `Cpu::quick`'s
 //! in `targum/src/exec.rs`, over the same pre-decoded [`Quick`] the
@@ -6,35 +7,42 @@
 //! and an op the lowering declines is not compiled at all but handed to
 //! the interpreter through a helper, one instruction at a time.
 //!
-//! What the function holds in locals: the guest registers it touches, the
-//! `%fs` base if it needs it, and the lazy-flags record. What it stores
-//! back, and when: every register it wrote and the record if it wrote one,
-//! at every exit and before every helper call, so that the control block
-//! is complete whenever anyone else looks at it. What it never does: model
-//! a fault. An access it cannot make it declines, by handing the
-//! instruction back to the interpreter unexecuted; the interpreter's own
-//! rules then put the fault where it belongs.
+//! What the function holds in locals: the guest registers any member
+//! touches, the `%fs` base if one needs it, and the lazy-flags record. What
+//! it stores back, and when: every register it wrote and the record if it
+//! wrote one, at every exit and before every helper call, so that the
+//! control block is complete whenever anyone else looks at it. What it
+//! never does: model a fault. An access it cannot make it declines, by
+//! handing the instruction back to the interpreter unexecuted; the
+//! interpreter's own rules then put the fault where it belongs.
 //!
-//! Addresses are `entry` plus a delta throughout — the address the block
-//! is running at this time is a parameter, and the address it was compiled
-//! at is only used to turn the constants iced resolved into deltas. That is
-//! what lets one function serve the same bytes wherever they are mapped.
+//! The shape of a region is a dispatcher loop: a `br_table` on the member
+//! to run next, each member's body after its label, and a branch to a
+//! member inside the region set the next member and go round again, with
+//! every guest register still in its local. A branch anywhere else is an
+//! exit. The budget rule is applied at every member: a member that would
+//! overrun the quantum is not started, and the interpreter finishes it.
+//!
+//! Addresses are `entry` plus a delta throughout — the address the region
+//! is running at this time is what the entered member's address says, and
+//! the region's base at bake time is only used to turn the constants iced
+//! resolved into deltas. That is what lets one function serve the same
+//! bytes wherever they are mapped.
 
-use iced_x86::Instruction;
+use iced_x86::{FlowControl, Instruction};
 use targum::flags::{Condition, Rule};
 use targum::quick::{Address, Op, Quick, Source};
 use targum::state::{Slice, Width, layout};
-use targum::tier1::{
-    KIND_CONTINUE, KIND_INTERPRET, STEP_SYSCALL, STEP_TRAPPED,
-};
+use targum::tier1::{KIND_CONTINUE, KIND_INTERPRET, STEP_SYSCALL, STEP_TRAPPED};
 
+use super::region::Region;
+use super::sweep::decode_instructions;
 use crate::emitter::ValueType;
 use crate::emitter::code::{FunctionBody, FunctionBodyBuilder, FunctionReference};
-use super::sweep::{Candidate, decode_instructions};
 
 /// The functions compiled code calls: the engine's three helpers, as the
 /// object imported them, and the two permission checks the object defines
-/// once and every block shares.
+/// once and every region shares.
 #[derive(Clone, Copy)]
 pub struct Helpers {
     /// `targum_step(tcb: i32, position: i32) -> i32`
@@ -51,15 +59,62 @@ pub struct Helpers {
     pub check_write: FunctionReference,
 }
 
-/// The body of one permission check, shared by every block in the object.
-///
-/// Inline, the same test was over a hundred bytes of wasm per memory
-/// operand and most instructions have one; as a call it is a dozen. What
-/// it tests is `Space::permitted`: the page of the first byte and, when
-/// different, the page of the last, each against the bitmap's length at
-/// full width and then its bit. An address above four gigabytes wrapped
-/// first would alias a small page, which is why the length compare is
-/// done in 64 bits.
+/// A compiled region.
+pub struct Compiled {
+    pub body: FunctionBody,
+    pub instructions: usize,
+    /// How many of its instructions go through the helper.
+    pub deferred: usize,
+}
+
+// The parameters.
+const TCB: u32 = 0;
+const VITALS: u32 = 1;
+const ENTRY: u32 = 2;
+const BUDGET: u32 = 3;
+const WHICH: u32 = 4;
+// The locals, declared in this order.
+const REGISTER_BASE: u32 = 5;
+const FS: u32 = 21;
+const RULE: u32 = 22;
+const WIDTH: u32 = 23;
+const LEFT: u32 = 24;
+const RIGHT: u32 = 25;
+const RESULT: u32 = 26;
+const CARRY_IN: u32 = 27;
+const RIP: u32 = 28;
+const KIND: u32 = 29;
+/// Instructions retired by compiled code and not yet added to the control
+/// block: a running local, because a region's paths are not static.
+const DONE: u32 = 30;
+const A: u32 = 31;
+const V: u32 = 32;
+const T: u32 = 33;
+const T2: u32 = 34;
+const Q: u32 = 35;
+const Q2: u32 = 36;
+/// A branch target held across a stack write, whose checks use `T`.
+const TARGET: u32 = 37;
+/// An arithmetic op's operands, read before the record is touched: an
+/// operand read that declines must leave the flags as they were.
+const OP_LEFT: u32 = 38;
+const OP_RIGHT: u32 = 39;
+/// The address the region's base is at this time: `entry` less the
+/// entered member's delta.
+const BASE: u32 = 40;
+/// Which member to run next, for the dispatcher.
+const NEXT: u32 = 41;
+
+/// The vitals' layout — see `targum::space::Vitals`.
+const VITALS_READABLE: u32 = 0;
+const VITALS_READABLE_WORDS: u32 = 4;
+const VITALS_WRITABLE: u32 = 8;
+const VITALS_WRITABLE_WORDS: u32 = 12;
+const VITALS_CODE: u32 = 16;
+const VITALS_CODE_WORDS: u32 = 20;
+
+const STACK_POINTER: u8 = 4;
+
 pub fn check_body(write: bool) -> FunctionBody {
     const VITALS_P: u32 = 0;
     const ADDRESS: u32 = 1;
@@ -173,55 +228,7 @@ pub fn check_body(write: bool) -> FunctionBody {
     }
 }
 
-/// A compiled block.
-pub struct Compiled {
-    pub body: FunctionBody,
-    pub instructions: usize,
-    /// How many of its instructions went through the helper.
-    pub deferred: usize,
-}
-
-// The parameters.
-const TCB: u32 = 0;
-const VITALS: u32 = 1;
-const ENTRY: u32 = 2;
-const BUDGET: u32 = 3;
-// The locals, declared in this order.
-const REGISTER_BASE: u32 = 4;
-const FS: u32 = 20;
-const RULE: u32 = 21;
-const WIDTH: u32 = 22;
-const LEFT: u32 = 23;
-const RIGHT: u32 = 24;
-const RESULT: u32 = 25;
-const CARRY_IN: u32 = 26;
-const RIP: u32 = 27;
-const KIND: u32 = 28;
-const DONE: u32 = 29;
-const A: u32 = 30;
-const V: u32 = 31;
-const T: u32 = 32;
-const T2: u32 = 33;
-const Q: u32 = 34;
-const Q2: u32 = 35;
-/// A branch target held across a stack write, whose checks use `T`.
-const TARGET: u32 = 36;
-/// An arithmetic op's operands, read before the record is touched: an
-/// operand read that declines must leave the flags as they were.
-const OP_LEFT: u32 = 37;
-const OP_RIGHT: u32 = 38;
-
-/// The vitals' layout — see `targum::space::Vitals`.
-const VITALS_READABLE: u32 = 0;
-const VITALS_READABLE_WORDS: u32 = 4;
-const VITALS_WRITABLE: u32 = 8;
-const VITALS_WRITABLE_WORDS: u32 = 12;
-const VITALS_CODE: u32 = 16;
-const VITALS_CODE_WORDS: u32 = 20;
-
-const STACK_POINTER: u8 = 4;
-
-/// Which register slots a block reads or writes, and whether it needs
+/// Which register slots a region reads or writes, and whether it needs
 /// `%fs`. Everything used is loaded once at entry; everything written is
 /// stored at exit; everything used is flushed and reloaded around a helper.
 #[derive(Default)]
@@ -294,33 +301,63 @@ impl Usage {
     }
 }
 
-/// What the compiler knows about the flags at a point in the block: the
-/// operation that wrote them last, if it was one of ours.
+/// What the compiler knows about the flags at a point in a member: the
+/// operation that wrote them last, if it was one of ours in this member.
 type Known = Option<(Rule, Width)>;
+
+/// One member, decoded and lowered.
+struct Member {
+    address: u64,
+    instructions: Vec<Instruction>,
+    quicks: Vec<Quick>,
+}
+
+impl Member {
+    fn end(&self) -> u64 {
+        self.instructions.last().map_or(self.address, Instruction::next_ip)
+    }
+}
 
 struct Emitter<'a> {
     body: FunctionBodyBuilder,
     helpers: Helpers,
-    /// The address the block was compiled at, for turning constants into
-    /// deltas from `entry`.
+    /// The region's base at bake time, for turning constants into deltas.
     base: u64,
+    /// Every member's address, in dispatch order.
+    members: &'a [Member],
     usage: &'a Usage,
-    /// How many `if`s are open, which is the branch depth to the exit block.
+    /// Blocks open between the current member's code and the dispatcher
+    /// loop: the member labels still enclosing it.
+    member_depth: u32,
+    /// `if`s open on top of that.
     depth: u32,
-    /// Compiled instructions retired since the last helper flush.
+    /// Compiled instructions retired since `DONE` was last added to.
     done: i64,
     known: Known,
 }
 
-/// Compiles one candidate.
-pub fn compile(candidate: &Candidate, helpers: Helpers) -> Option<Compiled> {
-    let instructions = decode_instructions(candidate);
-    if instructions.is_empty() {
+/// Compiles one region.
+pub fn compile(region: &Region, helpers: Helpers) -> Option<Compiled> {
+    let members: Vec<Member> = region
+        .members
+        .iter()
+        .map(|candidate| {
+            let instructions = decode_instructions(candidate);
+            let quicks = instructions.iter().map(Quick::lower).collect();
+            Member {
+                address: candidate.address,
+                instructions,
+                quicks,
+            }
+        })
+        .filter(|member| !member.instructions.is_empty())
+        .collect();
+    if members.is_empty() {
         return None;
     }
-    let quicks: Vec<Quick> = instructions.iter().map(Quick::lower).collect();
-    let usage = Usage::of(&quicks);
-    let mut body = FunctionBodyBuilder::new(4);
+    let all: Vec<Quick> = members.iter().flat_map(|member| member.quicks.iter().copied()).collect();
+    let usage = Usage::of(&all);
+    let mut body = FunctionBodyBuilder::new(5);
     for _ in 0..16 {
         body.declare_local(ValueType::I64); // the registers
     }
@@ -338,60 +375,136 @@ pub fn compile(candidate: &Candidate, helpers: Helpers) -> Option<Compiled> {
     body.declare_local(ValueType::I64); // TARGET
     body.declare_local(ValueType::I64); // OP_LEFT
     body.declare_local(ValueType::I64); // OP_RIGHT
+    body.declare_local(ValueType::I64); // BASE
+    body.declare_local(ValueType::I32); // NEXT
 
+    let instructions = members.iter().map(|member| member.instructions.len()).sum();
+    let deferred = all.iter().filter(|quick| quick.op == Op::General).count();
     let mut emitter = Emitter {
         body,
         helpers,
-        base: candidate.address,
+        base: region.base(),
+        members: &members,
         usage: &usage,
+        member_depth: 0,
         depth: 0,
         done: 0,
         known: None,
     };
-    let deferred = quicks.iter().filter(|quick| quick.op == Op::General).count();
-    emitter.function(&instructions, &quicks);
+    emitter.function();
     Some(Compiled {
         body: emitter.body.finish(),
-        instructions: instructions.len(),
+        instructions,
         deferred,
     })
 }
 
 impl Emitter<'_> {
-    fn function(&mut self, instructions: &[Instruction], quicks: &[Quick]) {
-        let count = instructions.len() as i64;
-        let end = instructions.last().map_or(self.base, Instruction::next_ip);
+    fn function(&mut self) {
+        let count = self.members.len() as u32;
+        self.prologue();
+        // BASE = ENTRY - delta(WHICH).
+        for (index, member) in self.members.iter().enumerate() {
+            self.body.local_get(WHICH);
+            self.body.i32_const(index as i32);
+            self.body.i32_eq();
+            self.body.if_();
+            self.body.local_get(ENTRY);
+            self.body.i64_const(member.address.wrapping_sub(self.base) as i64);
+            self.body.i64_sub();
+            self.body.local_set(BASE);
+            self.body.end();
+        }
+        self.body.local_get(WHICH);
+        self.body.local_set(NEXT);
+        self.body.i64_const(0);
+        self.body.local_set(DONE);
 
         // The exit block: every way out branches to it with RIP, KIND and
         // DONE set, and the epilogue below it writes the world back.
         self.body.block();
+        self.body.loop_();
+        // One label per member, innermost first, and the dispatcher at the
+        // bottom of the nest.
+        for _ in 0..count {
+            self.body.block();
+        }
+        let depths: Vec<u32> = (0..count).collect();
+        self.body.local_get(NEXT);
+        self.body.branch_table(&depths, count - 1);
+        for index in 0..count as usize {
+            self.body.end();
+            self.member_depth = count - 1 - index as u32;
+            self.member(index);
+        }
+        self.body.end(); // loop
+        self.body.end(); // exit
+        self.epilogue();
+    }
 
-        // The budget rule: a block that would overrun the quantum is not
-        // run; the interpreter finishes the quantum and stops exactly
-        // where it always stops. Straight out, *not* through the exit
-        // block: nothing has been loaded yet, and the epilogue would store
-        // sixteen zeros over the registers. `KIND_CONTINUE` is zero, so
-        // the answer is the entry itself.
+    /// The branch depth to the dispatcher loop and to the exit block, from
+    /// inside the current member's code and whatever `if`s are open.
+    fn dispatch_depth(&self) -> u32 {
+        self.member_depth + self.depth
+    }
+
+    fn exit_depth(&self) -> u32 {
+        self.member_depth + 1 + self.depth
+    }
+
+    /// One member's code, after its label.
+    fn member(&mut self, index: usize) {
+        let member = &self.members[index];
+        let length = member.instructions.len() as i64;
+        let address = member.address;
+        let end = member.end();
+        self.done = 0;
+        self.known = None;
+        // The budget rule: a member that would overrun the quantum is not
+        // started; the interpreter finishes the quantum and stops exactly
+        // where it always stops. Through the epilogue, which is right
+        // because the prologue has run: the locals hold the machine.
         self.body.local_get(BUDGET);
-        self.body.i64_const(count);
+        self.body.local_get(DONE);
+        self.body.i64_sub();
+        self.body.i64_const(length);
         self.body.i64_lt_unsigned();
         self.body.if_();
-        self.body.local_get(ENTRY);
-        self.body.return_();
+        self.depth += 1;
+        self.set_rip_delta(address);
+        self.leave(KIND_CONTINUE);
+        self.depth -= 1;
         self.body.end();
 
-        self.prologue();
-
-        for (position, (instruction, quick)) in instructions.iter().zip(quicks).enumerate() {
-            self.instruction(position, instruction, quick, instructions);
+        let instructions: Vec<(Instruction, Quick)> = member
+            .instructions
+            .iter()
+            .copied()
+            .zip(member.quicks.iter().copied())
+            .collect();
+        for (position, (instruction, quick)) in instructions.iter().enumerate() {
+            self.instruction(position, instruction, quick);
         }
+        // Fell out of the last instruction: into the next member if it is
+        // one, else out.
+        self.count_done();
+        self.go_to(end);
+    }
 
-        // Fell out of the last instruction.
-        self.set_rip_delta(end);
-        self.leave(KIND_CONTINUE, self.done);
-        self.body.end();
-
-        self.epilogue();
+    /// Branches to the member at `address` if the region has one, else
+    /// exits with `KIND_CONTINUE` there. `DONE` must already be settled.
+    fn go_to(&mut self, address: u64) {
+        match self.members.iter().position(|member| member.address == address) {
+            Some(index) => {
+                self.body.i32_const(index as i32);
+                self.body.local_set(NEXT);
+                self.body.branch(self.dispatch_depth());
+            }
+            None => {
+                self.set_rip_delta(address);
+                self.leave(KIND_CONTINUE);
+            }
+        }
     }
 
     // ---- the frame ------------------------------------------------------
@@ -484,36 +597,58 @@ impl Emitter<'_> {
         }
     }
 
-    /// Branches to the exit block with a kind and a retired count; `RIP`
-    /// must already be set.
-    fn leave(&mut self, kind: u64, done: i64) {
-        self.body.i64_const(kind as i64);
-        self.body.local_set(KIND);
-        self.body.i64_const(done);
-        self.body.local_set(DONE);
-        self.body.branch(self.depth);
+    /// Adds the compiled instructions retired since the last count to
+    /// `DONE`, on the current path, and starts counting afresh.
+    fn count_done(&mut self) {
+        if self.done != 0 {
+            self.body.local_get(DONE);
+            self.body.i64_const(self.done);
+            self.body.i64_add();
+            self.body.local_set(DONE);
+            self.done = 0;
+        }
     }
 
-    /// `RIP = entry + (address - base)`.
+    /// Adds `extra` on a *conditional* path without disturbing the static
+    /// count the fall-through continues with.
+    fn count_done_on_path(&mut self, extra: i64) {
+        let total = self.done + extra;
+        if total != 0 {
+            self.body.local_get(DONE);
+            self.body.i64_const(total);
+            self.body.i64_add();
+            self.body.local_set(DONE);
+        }
+    }
+
+    /// Branches to the exit block with a kind; `RIP` and `DONE` must
+    /// already be set.
+    fn leave(&mut self, kind: u64) {
+        self.body.i64_const(kind as i64);
+        self.body.local_set(KIND);
+        self.body.branch(self.exit_depth());
+    }
+
+    /// `RIP = BASE + (address - base)`.
     fn set_rip_delta(&mut self, address: u64) {
         self.push_delta(address);
         self.body.local_set(RIP);
     }
 
-    /// Pushes `entry + (address - base)`.
+    /// Pushes `BASE + (address - base)`.
     fn push_delta(&mut self, address: u64) {
-        self.body.local_get(ENTRY);
+        self.body.local_get(BASE);
         self.body.i64_const(address.wrapping_sub(self.base) as i64);
         self.body.i64_add();
     }
 
-    /// Hands this instruction back to the interpreter, unexecuted.
+    /// Hands this instruction back to the interpreter, unexecuted. Always
+    /// on a conditional path, so the count is settled for that path only.
     fn decline(&mut self, instruction: &Instruction) {
+        self.count_done_on_path(0);
         self.set_rip_delta(instruction.ip());
-        self.leave(KIND_INTERPRET, self.done);
+        self.leave(KIND_INTERPRET);
     }
-
-    // ---- registers ------------------------------------------------------
 
     fn reg_get(&mut self, slice: Slice) {
         self.body.local_get(REGISTER_BASE + u32::from(slice.number));
@@ -598,6 +733,9 @@ impl Emitter<'_> {
 
     /// Checks that `width` bytes at the address in `A` may be accessed,
     /// declining the instruction if not. For a write, also leaves in `Q2`
+
+    /// Checks that `width` bytes at the address in `A` may be accessed,
+    /// declining the instruction if not. For a write, also leaves in `Q2`
     /// whether any page holds code. One call into the object's shared
     /// check; see [`check_body`].
     fn check(&mut self, write: bool, width: Width, instruction: &Instruction) {
@@ -649,8 +787,9 @@ impl Emitter<'_> {
 
     /// Stores the value in `V` at the address in `A`, and — if the page
     /// held code, which `check` left in `Q2` — reports it and leaves so
-    /// that the next instruction is fetched from current bytes.
-    fn store(&mut self, width: Width, next: u64, done_after: i64) {
+    /// that the next instruction is fetched from current bytes. The
+    /// instruction counts as retired on that path.
+    fn store(&mut self, width: Width, next: u64) {
         self.body.local_get(A);
         self.body.i32_wrap_i64();
         self.body.local_get(V);
@@ -675,8 +814,9 @@ impl Emitter<'_> {
         self.body.local_get(A);
         self.body.i32_const(i32::from(width.bytes() as u8));
         self.body.call(self.helpers.code_write);
+        self.count_done_on_path(1);
         self.set_rip_delta(next);
-        self.leave(KIND_CONTINUE, done_after);
+        self.leave(KIND_CONTINUE);
         self.depth -= 1;
         self.body.end();
     }
@@ -696,14 +836,7 @@ impl Emitter<'_> {
     }
 
     /// Writes the value on the stack to an operand at a width.
-    fn write(
-        &mut self,
-        quick: &Quick,
-        into: Source,
-        width: Width,
-        instruction: &Instruction,
-        done_after: i64,
-    ) {
+    fn write(&mut self, quick: &Quick, into: Source, width: Width, instruction: &Instruction) {
         match into {
             Source::Register(slice) => self.reg_set(slice),
             Source::Memory => {
@@ -711,7 +844,7 @@ impl Emitter<'_> {
                 self.address(quick);
                 self.body.local_set(A);
                 self.check(true, width, instruction);
-                self.store(width, instruction.next_ip(), done_after);
+                self.store(width, instruction.next_ip());
             }
             Source::Immediate(_) => unreachable!("an immediate is never a destination"),
         }
@@ -719,8 +852,6 @@ impl Emitter<'_> {
 
     // ---- flags ----------------------------------------------------------
 
-    /// Records a flag-writing operation: `LEFT`, `RIGHT` and `RESULT` are
-    /// already set.
     fn record(&mut self, rule: Rule, width: Width) {
         self.body.i32_const(i32::from(rule as u8));
         self.body.local_set(RULE);
@@ -876,8 +1007,11 @@ impl Emitter<'_> {
 
     // ---- the helper -----------------------------------------------------
 
+
+    // ---- the helper -----------------------------------------------------
+
     /// Runs an instruction the lowering declined through the interpreter.
-    fn defer(&mut self, position: usize, instruction: &Instruction) {
+    fn defer(&mut self, position: usize) {
         // Flush: registers, the record, and what has retired so far.
         for number in 0..16u32 {
             if self.usage.used[number as usize] {
@@ -889,15 +1023,16 @@ impl Emitter<'_> {
         if self.usage.flags {
             self.store_flags();
         }
-        if self.done != 0 {
-            self.body.local_get(TCB);
-            self.body.local_get(TCB);
-            self.body.i64_load(3, layout::RETIRED);
-            self.body.i64_const(self.done);
-            self.body.i64_add();
-            self.body.i64_store(3, layout::RETIRED);
-            self.done = 0;
-        }
+        self.count_done();
+        // retired += DONE; DONE = 0
+        self.body.local_get(TCB);
+        self.body.local_get(TCB);
+        self.body.i64_load(3, layout::RETIRED);
+        self.body.local_get(DONE);
+        self.body.i64_add();
+        self.body.i64_store(3, layout::RETIRED);
+        self.body.i64_const(0);
+        self.body.local_set(DONE);
         // The call.
         self.body.local_get(TCB);
         self.body.i32_const(position as i32);
@@ -941,40 +1076,29 @@ impl Emitter<'_> {
         self.body.i64_shl();
         self.body.i64_or();
         self.body.local_set(KIND);
-        self.body.i64_const(0);
-        self.body.local_set(DONE);
-        self.body.branch(self.depth);
+        self.body.branch(self.exit_depth());
         self.depth -= 1;
         self.body.end();
-        let _ = instruction;
     }
 
     // ---- one instruction ------------------------------------------------
 
-    fn instruction(
-        &mut self,
-        position: usize,
-        instruction: &Instruction,
-        quick: &Quick,
-        all: &[Instruction],
-    ) {
-        let _ = all;
+    fn instruction(&mut self, position: usize, instruction: &Instruction, quick: &Quick) {
         let width = quick.width;
         let next = instruction.next_ip();
-        let after = self.done + 1;
         match quick.op {
             Op::General => {
-                self.defer(position, instruction);
+                self.defer(position);
                 return;
             }
             Op::Nop => {}
             Op::Mov => {
                 self.read(quick, quick.source, width, instruction);
-                self.write(quick, quick.destination, width, instruction, after);
+                self.write(quick, quick.destination, width, instruction);
             }
             Op::Lea => {
                 self.address(quick);
-                self.write(quick, quick.destination, width, instruction, after);
+                self.write(quick, quick.destination, width, instruction);
             }
             Op::Widen | Op::WidenSigned => {
                 self.read(quick, quick.source, quick.source_width, instruction);
@@ -985,7 +1109,7 @@ impl Emitter<'_> {
                     self.body.i64_const(shift);
                     self.body.i64_shr_signed();
                 }
-                self.write(quick, quick.destination, width, instruction, after);
+                self.write(quick, quick.destination, width, instruction);
             }
             Op::Add | Op::Sub | Op::Cmp | Op::And | Op::Or | Op::Xor | Op::Test => {
                 // Both operands before the record is touched: a read that
@@ -1016,7 +1140,7 @@ impl Emitter<'_> {
                 self.record(quick.rule(), width);
                 if quick.writes_back() {
                     self.body.local_get(RESULT);
-                    self.write(quick, quick.destination, width, instruction, after);
+                    self.write(quick, quick.destination, width, instruction);
                 }
             }
             Op::Push => {
@@ -1031,7 +1155,7 @@ impl Emitter<'_> {
                 // possible, and before the store's own exit reads it.
                 self.body.local_get(A);
                 self.body.local_set(REGISTER_BASE + u32::from(STACK_POINTER));
-                self.store(width, next, after);
+                self.store(width, next);
             }
             Op::Pop => {
                 self.body.local_get(REGISTER_BASE + u32::from(STACK_POINTER));
@@ -1044,7 +1168,7 @@ impl Emitter<'_> {
                 self.body.i64_add();
                 self.body.local_set(REGISTER_BASE + u32::from(STACK_POINTER));
                 self.body.local_get(V);
-                self.write(quick, quick.destination, width, instruction, after);
+                self.write(quick, quick.destination, width, instruction);
             }
             Op::Jcc => {
                 let Source::Immediate(target) = quick.source else {
@@ -1053,20 +1177,22 @@ impl Emitter<'_> {
                 self.condition(quick.condition);
                 self.body.if_();
                 self.depth += 1;
-                self.set_rip_delta(target);
-                self.leave(KIND_CONTINUE, after);
+                self.count_done_on_path(1);
+                self.go_to(target);
                 self.depth -= 1;
                 self.body.end();
             }
             Op::Jmp => {
+                self.done += 1;
+                self.count_done();
                 match quick.source {
-                    Source::Immediate(target) => self.set_rip_delta(target),
+                    Source::Immediate(target) => self.go_to(target),
                     source => {
                         self.read(quick, source, Width::Qword, instruction);
                         self.body.local_set(RIP);
+                        self.leave(KIND_CONTINUE);
                     }
                 }
-                self.leave(KIND_CONTINUE, after);
                 return;
             }
             Op::Call => {
@@ -1102,7 +1228,9 @@ impl Emitter<'_> {
                 self.body.call(self.helpers.code_write);
                 self.depth -= 1;
                 self.body.end();
-                self.leave(KIND_CONTINUE, after);
+                self.done += 1;
+                self.count_done();
+                self.leave(KIND_CONTINUE);
                 return;
             }
             Op::Ret => {
@@ -1119,10 +1247,13 @@ impl Emitter<'_> {
                 self.body.i64_const(8 + extra as i64);
                 self.body.i64_add();
                 self.body.local_set(REGISTER_BASE + u32::from(STACK_POINTER));
-                self.leave(KIND_CONTINUE, after);
+                self.done += 1;
+                self.count_done();
+                self.leave(KIND_CONTINUE);
                 return;
             }
         }
-        self.done = after;
+        self.done += 1;
+        let _ = FlowControl::Next;
     }
 }

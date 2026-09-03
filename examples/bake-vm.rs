@@ -132,8 +132,9 @@ fn main() -> anyhow::Result<()> {
             }
             let built = zaqaru::tier1::build(&candidates, budget);
             eprintln!(
-                "tier 1: {} blocks from the sweep, {} compiled ({:.1} MB of code, {} instructions, {} deferred), {} mostly deferred and left interpreted, {} past the budget, in {:.2}s",
+                "tier 1: {} blocks from the sweep, {} compiled in {} regions ({:.1} MB of code, {} instructions, {} deferred), {} mostly deferred and left interpreted, {} past the budget, in {:.2}s",
                 candidates.len(),
+                built.members,
                 built.functions,
                 built.code_bytes as f64 / 1e6,
                 built.instructions,

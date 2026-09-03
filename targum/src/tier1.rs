@@ -63,12 +63,29 @@ pub const STEP_SYSCALL: u32 = 1;
 pub const STEP_ELSEWHERE: u32 = 2;
 pub const STEP_TRAPPED: u32 = 3;
 
-/// The table's header: magic, entry count, offset of the bytes region.
+/// The table's header: magic, entry count, offset of the bytes region,
+/// offset of the regions, offset of the members, region count, padding.
 pub const TABLE_MAGIC: u32 = u32::from_le_bytes(*b"TGT1");
-pub const TABLE_HEADER: usize = 16;
+pub const TABLE_HEADER: usize = 32;
 /// One entry: hash `u64`, length `u32`, offset of the bytes `u32`, function
-/// `u32`, and four bytes of padding. Sorted by hash, then length.
-pub const TABLE_ENTRY: usize = 24;
+/// `u32`, which member `u32`, region `u32`, padding. Sorted by hash, then
+/// length.
+pub const TABLE_ENTRY: usize = 32;
+/// One region: member count `u32`, index of its first member row `u32`.
+pub const TABLE_REGION: usize = 8;
+/// One member row: delta from the region's base `i32`, length `u32`,
+/// offset of the bytes `u32`. Rows are in dispatch order.
+pub const TABLE_MEMBER: usize = 12;
+
+/// What a lookup attaches to a decoded block: the region's function, the
+/// member the block is, and every page any member's bytes sit on — so
+/// that a write to any of them drops the block, and with it the region.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Attached {
+    pub function: u32,
+    pub which: u32,
+    pub pages: Vec<u64>,
+}
 
 /// The bytes' hash, FNV-1a: what the bake wrote and what the lookup probes
 /// with. Not a defence against anything — the bytes are compared whole on
@@ -89,7 +106,7 @@ pub fn hash(bytes: &[u8]) -> u64 {
 /// no table, and the answer is always no — the native engine is tier 0
 /// and remains the development instrument.
 #[cfg(target_arch = "wasm32")]
-pub fn lookup(bytes: &[u8]) -> Option<u32> {
+pub fn lookup(bytes: &[u8], address: u64, space: &Space) -> Option<Attached> {
     unsafe extern "C" {
         static targum_tier1_table: u8;
     }
@@ -109,6 +126,8 @@ pub fn lookup(bytes: &[u8]) -> Option<u32> {
     }
     let count = word(4) as usize;
     let bytes_at = word(8) as usize;
+    let regions_at = word(12) as usize;
+    let members_at = word(16) as usize;
     let wanted = hash(bytes);
     // Binary search on the hash, then a walk over equal hashes: a
     // collision is two entries, and the bytes decide.
@@ -132,7 +151,41 @@ pub fn lookup(bytes: &[u8]) -> Option<u32> {
             // SAFETY: the bytes region, whose entries the bake wrote whole.
             let stored = unsafe { core::slice::from_raw_parts(table.add(bytes_at + offset), length) };
             if stored == bytes {
-                return Some(word(at + 16));
+                let function = word(at + 16);
+                let which = word(at + 20);
+                let region = word(at + 24) as usize;
+                // Every other member of the region has to be where the
+                // region expects it, byte for byte, and executable: the
+                // function was compiled for all of them at fixed deltas
+                // from one another, and a region that survived with a
+                // changed member would run bytes that are not there.
+                let members = word(regions_at + region * TABLE_REGION) as usize;
+                let first = word(regions_at + region * TABLE_REGION + 4) as usize;
+                let row = |member: usize| -> (i64, usize, usize) {
+                    let at = members_at + (first + member) * TABLE_MEMBER;
+                    (i64::from(word(at) as i32), word(at + 4) as usize, word(at + 8) as usize)
+                };
+                let (my_delta, _, _) = row(which as usize);
+                let base = address.wrapping_sub(my_delta as u64);
+                let mut pages = Vec::new();
+                for member in 0..members {
+                    let (delta, length, offset) = row(member);
+                    let at = base.wrapping_add(delta as u64);
+                    let Ok(found) = space.fetch(at, length as u64) else {
+                        return None;
+                    };
+                    // SAFETY: as above.
+                    let expected = unsafe { core::slice::from_raw_parts(table.add(bytes_at + offset), length) };
+                    if found.len() != length || found != expected {
+                        return None;
+                    }
+                    for page in (at >> crate::space::PAGE_SHIFT)..=((at + length as u64 - 1) >> crate::space::PAGE_SHIFT) {
+                        if !pages.contains(&page) {
+                            pages.push(page);
+                        }
+                    }
+                }
+                return Some(Attached { function, which, pages });
             }
         }
         index += 1;
@@ -141,7 +194,7 @@ pub fn lookup(bytes: &[u8]) -> Option<u32> {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub fn lookup(_bytes: &[u8]) -> Option<u32> {
+pub fn lookup(_bytes: &[u8], _address: u64, _space: &Space) -> Option<Attached> {
     None
 }
 
@@ -209,16 +262,16 @@ pub fn recent_entries() -> Vec<u64> {
 /// On wasm32 a function pointer *is* a table index, so the cast is the
 /// call. Natively nothing is ever compiled and this is unreachable.
 #[cfg(target_arch = "wasm32")]
-pub fn call(function: u32, tcb: &mut Tcb, vitals: &Vitals, entry: u64, budget: u64) -> u64 {
-    type Compiled = unsafe extern "C" fn(*mut Tcb, *const Vitals, u64, u64) -> u64;
+pub fn call(function: u32, tcb: &mut Tcb, vitals: &Vitals, entry: u64, budget: u64, which: u32) -> u64 {
+    type Compiled = unsafe extern "C" fn(*mut Tcb, *const Vitals, u64, u64, u32) -> u64;
     // SAFETY: the index came from the bake's table, whose functions all
     // have this signature, and the linker put them in the module's table.
     let compiled: Compiled = unsafe { core::mem::transmute(function as usize) };
-    unsafe { compiled(tcb, vitals, entry, budget) }
+    unsafe { compiled(tcb, vitals, entry, budget, which) }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub fn call(_function: u32, _tcb: &mut Tcb, _vitals: &Vitals, _entry: u64, _budget: u64) -> u64 {
+pub fn call(_function: u32, _tcb: &mut Tcb, _vitals: &Vitals, _entry: u64, _budget: u64, _which: u32) -> u64 {
     unreachable!("nothing is compiled natively")
 }
 
@@ -318,32 +371,39 @@ mod tests {
 /// the compiled block had already written — a slot read and then
 /// overwritten in the same block reads differently the second time.
 #[cfg(feature = "verify")]
-pub fn verify_before(tcb: &Tcb, space: &mut Space, block: &crate::block::Block) -> Vec<Tcb> {
+pub fn verify_before(tcb: &Tcb, space: &mut Space, cache: &mut BlockCache, cap: usize) -> Vec<Tcb> {
     use crate::exec::{Cpu, Step};
     let mut check = tcb.clone();
     let mut states = vec![check.clone()];
     space.journal_begin();
-    {
+    // Across blocks, because a region runs through many: fetch at `rip`,
+    // run the block, follow where it went, up to the cap, which is more
+    // than a region can retire in one call.
+    'blocks: while states.len() <= cap {
+        let Ok(index) = cache.entry(check.rip, space) else {
+            break;
+        };
+        let block = cache.block(index);
         let mut cpu = Cpu::new(&mut check, space);
         let mut position = 0usize;
-        while position < block.instructions.len() {
+        while position < block.instructions.len() && states.len() <= cap {
             let instruction = &block.instructions[position];
             let before = cpu.tcb.retired;
             match cpu.run(&block.quick[position], instruction) {
                 Ok(Step::Retired) => {}
                 Ok(Step::Syscall) => {
                     states.push(cpu.tcb.clone());
-                    break;
+                    break 'blocks;
                 }
                 Err(_) => {
                     cpu.tcb.rip = instruction.ip();
                     cpu.tcb.retired = before;
-                    break;
+                    break 'blocks;
                 }
             }
             states.push(cpu.tcb.clone());
             if cpu.space.has_dirty_code() {
-                break;
+                break 'blocks;
             }
             if cpu.tcb.rip == instruction.ip() {
                 continue;
