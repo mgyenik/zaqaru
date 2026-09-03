@@ -297,6 +297,8 @@ why the arguments do not count.
 | `#[inline(never)]` on `step` | large | **0.0%** to three digits |
 | `#[inline(always)]` on `Cpu::read`/`write` | a win | **alu 2.59→1.49** |
 | `#[inline(always)]` on `push`/`pop` | a win | **calls 3.41→3.26** |
+| dead-flag elimination (skip the lazy record) | flags were 2.2 ns/op | **alu +5.7%**, CPython within noise |
+| a *code-page* cache in `Space` (not permission) | the store's extra check | **stores +9.5%**, CPython within noise |
 
 The permission cache is the one worth dwelling on: it would have left a
 permanent obligation — a fourth site that moves a bitmap and `mprotect`
@@ -328,6 +330,39 @@ functions at all, so a helper LLVM declined becomes a real call per use.
 
 Both directions are written at the call sites with the numbers that
 decided them, because none of it can be recovered by reading.
+
+## 6b. The interpreter's floor, measured (2026-09-03)
+
+Section 6's rejections were "reading the code was wrong." This is the
+inverse: reading the code said the interpreter was near its floor, and
+measuring said it was not — but for compute-bound guests, not for CPython.
+
+**The decomposition.** Five component kernels, each an unrolled run of one
+instruction class (`tools/microbench/bench.c`: nops, regmov, regadd, loads,
+stores), so the interpreter's retired-instruction rate is that op's per-op
+cost. Native, ns per op: dispatch (nop) **2.42**, +register 1.44, +flags
+**2.18**, +memory read 1.04, +store **3.92**. Dispatch is lean; the flags
+and the store's code-page check are the reducible parts — and the two
+changes above take them, worth ~6–9% on arithmetic- and store-heavy code.
+
+**The reference.** The same freestanding kernels through Blink — a mature
+x86-64 interpreter — pin the floor. Our interpreter, *under wasmtime and
+paying its tax*, matches or beats Blink's **native** interpreter
+(1.05–1.45×); native to native we are 1.5–2.6× ahead. So the floor, defined
+as the best interpreter anyone has built, is below us, not above. The
+ceiling above is a JIT (Blink's own, and qemu): 3–8× faster, but runtime
+native codegen the wasm sandbox forbids — the reason tier 1 is bake-time,
+and tier 1 lost on CPython (`tier1-plan.md`).
+
+**CPython is the exception that stays at the floor.** Both changes are
+within noise on it. Its blocks are short, so its arithmetic flags are live
+at the computed goto (which dead-flag deliberately will not treat as dead),
+and its stores hit varied pages the clean-page cache does not hold. So the
+headroom the decomposition found is real for compute-bound guests and
+absent for an interpreter loop — which is the shape a mature interpreter is
+already built to run. For the container, the interpreter *is* near its
+floor; the levers left are startup and, for compute-bound guests, these
+per-op wins.
 
 ## 7. The plan
 
