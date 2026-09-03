@@ -880,6 +880,45 @@ number is an execution-weighted opcode histogram over a Django request,
 simulated against a hotness partition to count crossings; it is the next
 thing to take before building either path.
 
+**And then the real reason the container gained nothing, which was not the
+frame at all (2026-09-03).** With the compiled and attached shares
+measured for the first time, the Django run showed 0.5% of instructions
+running compiled and 1.7% of decoded blocks attaching — tier 1 was barely
+executing, so the frame it pays was never the question. Three faults, each
+found by following the share down and each now fixed:
+
+- **libpython was never swept.** The finder read every ELF with the full
+  `parse`, which runs discovery and `switch` recovery, and that recovery
+  aborts on libpython — so the parse failed and the interpreter, 90% of
+  the container, was skipped whole. A new `survey_at` reads placement,
+  symbols and relocations without the fragile frontend; the finder uses
+  it.
+- **The eval loop's handlers were never found.** They are reached only
+  through the computed goto over a relocated jump table, and each begins
+  right after the indirect `jmp` that ends the block before it, so nothing
+  in the instruction stream names them and the walk cannot start one. The
+  relocation addends name them; seeding the descent from the code pointers
+  a relocation names took handler coverage from 7% to 100%.
+- **Regions mixed files.** Every shared object is swept at its own
+  addresses, which start near zero and collide, and formation ran over one
+  global address map — so a region could gather members from two files and
+  address them from one base. At run time the all-members check read the
+  other file's bytes and declined. Regions are now formed within one file.
+
+Together these took the compiled share from 0.5% to **5.3%** — libpython
+running compiled at all, which it never was. **But request latency did not
+move**, and that is the honest result: 5.3% is still far too little to
+show, because the eval loop still leaves compiled code on nearly every
+bytecode. A region caps at 64 blocks, so the computed goto's target is
+almost never a member of the region it is dispatched from — it exits, the
+next handler is interpreted, and the frame reloads, exactly the shape the
+64-block cap forces. The levers that remain are the two this section
+already named: the whole eval loop in one region so the computed goto's
+`br_table` stays internal (the coalescing above is what lets it fit), and
+fewer of the handler's own exits — the `~2.5%` of its instructions the
+lowering still declines, and the budget bail. The attachment is fixed;
+what is left is to keep execution inside the region once it is there.
+
 **Lowering more of the declined 5–8% was tried and does not help
 (2026-09-02).** `inc`, `dec`, `neg`, `not`, `setcc` and `cmovcc` were
 lowered into `quick.rs` and `Cpu::quick`, correct against the interpreted
