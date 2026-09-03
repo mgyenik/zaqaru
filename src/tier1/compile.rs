@@ -38,7 +38,7 @@ use targum::tier1::{KIND_CONTINUE, KIND_INTERPRET, STEP_SYSCALL, STEP_TRAPPED};
 use super::region::Region;
 use super::sweep::decode_instructions;
 use crate::emitter::ValueType;
-use crate::emitter::code::{FunctionBody, FunctionBodyBuilder, FunctionReference};
+use crate::emitter::code::{DataReference, FunctionBody, FunctionBodyBuilder, FunctionReference};
 
 /// The functions compiled code calls: the engine's three helpers, as the
 /// object imported them, and the two permission checks the object defines
@@ -105,6 +105,18 @@ const OP_RIGHT: u32 = 39;
 const BASE: u32 = 40;
 /// Which member to run next, for the dispatcher.
 const NEXT: u32 = 41;
+/// The address of the resolver cache slot for the target being resolved.
+const SLOT: u32 = 42;
+
+/// The resolver's direct-mapped cache: how many slots, and the byte layout
+/// of one. A slot is a target delta and the member it resolves to, plus
+/// one so that zero means empty. Sized to hold an interpreter's dispatch
+/// working set — its handlers and the return sites it loops through —
+/// without much collision; only regions past [`CACHE_MEMBERS`] carry one,
+/// since a small region's search is already cheap.
+pub const CACHE_SLOTS: u32 = 4096;
+pub const CACHE_ENTRY: u32 = 16;
+pub const CACHE_MEMBERS: usize = 256;
 
 /// The vitals' layout — see `targum::space::Vitals`.
 const VITALS_READABLE: u32 = 0;
@@ -340,10 +352,13 @@ struct Emitter<'a> {
     /// Compiled instructions retired since `DONE` was last added to.
     done: i64,
     known: Known,
+    /// The region's resolver cache, when it is large enough to warrant one:
+    /// the data address of its first slot. See [`CACHE_SLOTS`].
+    cache: Option<DataReference>,
 }
 
 /// Compiles one region.
-pub fn compile(region: &Region, helpers: Helpers) -> Option<Compiled> {
+pub fn compile(region: &Region, helpers: Helpers, cache: Option<DataReference>) -> Option<Compiled> {
     let members: Vec<Member> = region
         .members
         .iter()
@@ -383,6 +398,7 @@ pub fn compile(region: &Region, helpers: Helpers) -> Option<Compiled> {
     body.declare_local(ValueType::I64); // OP_RIGHT
     body.declare_local(ValueType::I64); // BASE
     body.declare_local(ValueType::I32); // NEXT
+    body.declare_local(ValueType::I32); // SLOT
 
     let instructions = members.iter().map(|member| member.instructions.len()).sum();
     let deferred = all.iter().filter(|quick| quick.op == Op::General).count();
@@ -396,6 +412,7 @@ pub fn compile(region: &Region, helpers: Helpers) -> Option<Compiled> {
         depth: 0,
         done: 0,
         known: None,
+        cache,
     };
     emitter.function();
     Some(Compiled {
@@ -457,6 +474,45 @@ impl Emitter<'_> {
         self.body.local_get(BASE);
         self.body.i64_sub();
         self.body.local_set(T);
+        // The direct-mapped cache, when this region has one: a slot per
+        // target delta, tried before the search and filled by it. A hit
+        // dispatches in a load and a compare rather than a log-n walk —
+        // the interpreter's own recent-cache trick, for a region whose
+        // computed goto is hit once a bytecode. On the eval loop this is
+        // the difference between the resolver costing a dozen comparisons
+        // and costing one.
+        if let Some(cache) = self.cache {
+            // SLOT = cache + ((T >> 4) & (CACHE_SLOTS - 1)) * CACHE_ENTRY
+            self.body.i32_const_data_address(cache);
+            self.body.local_get(T);
+            self.body.i64_const(4);
+            self.body.i64_shr_unsigned();
+            self.body.i64_const(i64::from(CACHE_SLOTS - 1));
+            self.body.i64_and();
+            self.body.i32_wrap_i64();
+            self.body.i32_const(CACHE_ENTRY as i32);
+            self.body.i32_mul();
+            self.body.i32_add();
+            self.body.local_set(SLOT);
+            // if slot.delta == T && slot.member != 0 { NEXT = member - 1; loop }
+            self.body.local_get(SLOT);
+            self.body.i64_load(3, 0);
+            self.body.local_get(T);
+            self.body.i64_eq();
+            self.body.local_get(SLOT);
+            self.body.i32_load(2, 8);
+            self.body.i32_const(0);
+            self.body.i32_ne();
+            self.body.i32_and();
+            self.body.if_();
+            self.body.local_get(SLOT);
+            self.body.i32_load(2, 8);
+            self.body.i32_const(1);
+            self.body.i32_sub();
+            self.body.local_set(NEXT);
+            self.body.branch(1); // the loop, one `if` deep
+            self.body.end();
+        }
         let mut sorted: Vec<(i64, usize)> = self
             .members
             .iter()
@@ -483,6 +539,17 @@ impl Emitter<'_> {
                 self.body.i64_const(delta);
                 self.body.i64_eq();
                 self.body.if_();
+                if self.cache.is_some() {
+                    // Fill the slot the fast path missed: this delta, this
+                    // member plus one so the zero of an empty slot is not a
+                    // member.
+                    self.body.local_get(SLOT);
+                    self.body.local_get(T);
+                    self.body.i64_store(3, 0);
+                    self.body.local_get(SLOT);
+                    self.body.i32_const(index as i32 + 1);
+                    self.body.i32_store(2, 8);
+                }
                 self.body.i32_const(index as i32);
                 self.body.local_set(NEXT);
                 self.body.branch(ifs + 1);

@@ -21,7 +21,9 @@ use std::collections::BTreeMap;
 
 use targum::tier1::{TABLE_ENTRY, TABLE_HEADER, TABLE_MAGIC, TABLE_MEMBER, TABLE_REGION, hash};
 
-use super::compile::{Helpers, check_body, compile};
+use super::compile::{self, Helpers, check_body, compile};
+use crate::emitter::code::DataReference;
+use crate::emitter::linking::DataSymbolLocation;
 use super::sweep::Candidate;
 use crate::emitter::data::DataSegment;
 use crate::emitter::linking::{Relocation, RelocationKind, Symbol, SymbolTarget, symbol_flags};
@@ -204,13 +206,51 @@ pub fn build(candidates: &[Candidate], budget: usize, cluster: bool) -> Built {
     let mut instructions = 0usize;
     let mut deferred = 0usize;
     let mut left_out = 0usize;
+    // The resolver caches. A region big enough that a log-n search costs —
+    // a cluster's whole function — carries a direct-mapped cache in writable
+    // data, tried before the search; a small region does not, its search
+    // being cheap. Each big region gets a slice of one zero-filled segment.
+    let mut cache_at = 0u32;
+    let cache_offsets: Vec<Option<u32>> = regions
+        .iter()
+        .map(|region| {
+            if region.members.len() > compile::CACHE_MEMBERS {
+                let at = cache_at;
+                cache_at += compile::CACHE_SLOTS * compile::CACHE_ENTRY;
+                Some(at)
+            } else {
+                None
+            }
+        })
+        .collect();
+    let cache_symbol = (cache_at > 0).then(|| {
+        let segment_index = wasm.data_segments.len() as u32;
+        wasm.data_segments.push(DataSegment {
+            name: ".bss.tier1_resolver_cache".to_string(),
+            alignment_log2: 4,
+            bytes: vec![0; cache_at as usize],
+            relocations: Vec::new(),
+        });
+        wasm.add_symbol(Symbol {
+            name: "tier1_resolver_cache".to_string(),
+            target: SymbolTarget::Data(Some(DataSymbolLocation {
+                segment_index,
+                offset: 0,
+                size: cache_at,
+            })),
+            flags: symbol_flags::LOCAL,
+        })
+    });
+
     let mut next_slot = FIRST_TABLE_INDEX;
-    for region in &regions {
+    for (region_index, region) in regions.iter().enumerate() {
         if code_bytes >= budget {
             left_out += region.members.len();
             continue;
         }
-        let Some(compiled) = compile(region, helpers) else {
+        let cache = cache_offsets[region_index]
+            .and_then(|off| cache_symbol.map(|sym| DataReference { symbol_index: sym, addend: off as i32 }));
+        let Some(compiled) = compile(region, helpers, cache) else {
             continue;
         };
         code_bytes += compiled.body.bytes.len();
