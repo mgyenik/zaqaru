@@ -26,6 +26,11 @@
 //! - [`block::BlockCache`] — decoded runs of instructions, invalidated by
 //!   any write to the pages they came from.
 //! - [`exec::Cpu`] — what each instruction means.
+//! - [`bytecode`] — an accelerator over the interpreter: a register-machine
+//!   bytecode a block transpiles into, run by a switch-loop that keeps a
+//!   loop's back-edge inside itself rather than re-entering the run loop per
+//!   block. Anything it does not model defers to [`exec::Cpu`], so it only
+//!   ever adds speed. Not yet wired into [`Engine`]; see `docs/bytecode-plan.md`.
 //! - [`Engine`] — the run loop: fetch a block, execute it, drain
 //!   invalidations, count down the quantum.
 //!
@@ -35,6 +40,7 @@
 //! unchanged by any of this.
 
 pub mod block;
+pub mod bytecode;
 pub mod exec;
 pub mod flags;
 pub mod histogram;
