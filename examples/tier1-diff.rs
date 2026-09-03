@@ -38,6 +38,7 @@ struct Data {
     address: u64,
     bytes: Vec<u8>,
     writable: bool,
+    executable: bool,
 }
 
 fn data_segments(elf: &[u8]) -> Vec<Data> {
@@ -45,14 +46,15 @@ fn data_segments(elf: &[u8]) -> Vec<Data> {
     object
         .segments
         .iter()
-        .filter(|segment| !segment.executable && segment.address + segment.memory_size <= LIMIT)
+        .filter(|segment| segment.address + segment.memory_size <= LIMIT && segment.address != 0)
         .map(|segment| {
             let mut bytes = segment.bytes.clone();
             bytes.resize(segment.memory_size.max(segment.file_size) as usize, 0);
             Data {
                 address: segment.address,
                 bytes,
-                writable: segment.writable,
+                writable: segment.writable && !segment.executable,
+                executable: segment.executable,
             }
         })
         .collect()
@@ -67,13 +69,15 @@ const TCB_BYTES: usize = std::mem::size_of::<Tcb>();
 
 /// Runs one instruction of a candidate natively against a copy of the
 /// wasm-side machine and RAM, and answers what `targum_step` would.
-fn step_natively(candidate: &zaqaru::tier1::Candidate, position: usize, image: &[u8], ram: &[u8], data: &[Data]) -> (i32, Vec<u8>, Vec<u8>, Vec<Data>) {
+fn step_natively(candidate: &zaqaru::tier1::Candidate, address: u64, image: &[u8], ram: &[u8], data: &[Data]) -> (i32, Vec<u8>, Vec<u8>, Vec<Data>) {
     use targum::exec::{Cpu, Step};
     let (mut space, _arenas) = native_world(candidate, ram, data);
     let mut cache = BlockCache::new();
     cache.drain_invalidations(&mut space);
-    let index = cache.entry(candidate.address, &mut space).expect("decode");
-    let instruction = cache.block(index).instructions[position];
+    // By address, as the engine's helper does: a block entered at the
+    // address holds the declined instruction first.
+    let index = cache.entry(address, &mut space).expect("decode");
+    let instruction = cache.block(index).instructions[0];
     let mut tcb = Tcb::new();
     // SAFETY: the leading fields are `repr(C)` plain data at this layout.
     unsafe {
@@ -208,6 +212,7 @@ fn main() -> anyhow::Result<()> {
                 trials = arguments[index + 1].parse()?;
                 index += 1;
             }
+            flag if flag.starts_with("--") => {}
             other => positional.push(other.to_string()),
         }
         index += 1;
@@ -223,6 +228,38 @@ fn main() -> anyhow::Result<()> {
     let mut checked = 0usize;
     let mut skipped = 0usize;
     let mut failed = 0usize;
+
+    if arguments.iter().any(|a| a == "--regions") {
+        let regions = zaqaru::tier1::region::form(&candidates);
+        for region in &regions {
+            if region.members.len() < 2 { continue; }
+            if let Some(only) = only && region.base() != only { continue; }
+            let built = zaqaru::tier1::build(&region.members, usize::MAX);
+            if built.functions == 0 { skipped += 1; continue; }
+            checked += 1;
+            let entry = region.members[0].clone();
+            for trial in 0..trials {
+                let start = Start::random(&mut rng);
+                let compiled = run_compiled(&built.object, &entry, &start, &data)?;
+                let quantum = compiled.retired + u64::from(compiled.kind == targum::tier1::KIND_INTERPRET);
+                let interpreted = run_interpreted(&entry, &start, quantum, &data, compiled.kind);
+                // Only a genuine divergence: the interpreter naturally runs
+                // past a region into code this harness has not mapped and
+                // faults early, which is not the compiler being wrong. Two
+                // sides that retired the same and still differ is.
+                if compiled.retired == interpreted.retired && compiled != interpreted {
+                    failed += 1;
+                    eprintln!("MISMATCH region {:#x} ({} members) trial {trial}", region.base(), region.members.len());
+                    report(&start, &compiled, &interpreted);
+                    if failed > 15 { println!("{checked} regions, {failed} mismatched (stop)"); return Ok(()); }
+                    break;
+                }
+            }
+        }
+        println!("{checked} regions checked, {skipped} skipped, {failed} mismatched");
+        return Ok(());
+    }
+
     for candidate in &candidates {
         if let Some(only) = only
             && candidate.address != only
@@ -325,7 +362,7 @@ fn run_compiled(object: &[u8], candidate: &zaqaru::tier1::Candidate, start: &Sta
     // both are copied back. Slow, and exactly what the engine does.
     let for_step = candidate.clone();
     let data_for_step: Vec<Data> = data.to_vec();
-    linker.func_wrap("env", "targum_step", move |mut caller: wasmtime::Caller<'_, ()>, tcb_at: i32, position: i32| -> i32 {
+    linker.func_wrap("env", "targum_step", move |mut caller: wasmtime::Caller<'_, ()>, tcb_at: i32, address: i64| -> i32 {
         let mut image = vec![0u8; TCB_BYTES];
         memory.read(&caller, tcb_at as usize, &mut image).expect("read the tcb");
         let mut ram = vec![0u8; RAM_BYTES as usize];
@@ -336,7 +373,7 @@ fn run_compiled(object: &[u8], candidate: &zaqaru::tier1::Candidate, start: &Sta
         for segment in current.iter_mut() {
             memory.read(&caller, segment.address as usize, &mut segment.bytes).expect("read data");
         }
-        let (code, image, ram, current) = step_natively(&for_step, position as usize, &image, &ram, &current);
+        let (code, image, ram, current) = step_natively(&for_step, address as u64, &image, &ram, &current);
         memory.write(&mut caller, tcb_at as usize, &image).expect("write the tcb");
         memory.write(&mut caller, RAM as usize, &ram).expect("write the ram");
         for segment in &current {
@@ -457,8 +494,9 @@ fn native_world(candidate: &zaqaru::tier1::Candidate, ram: &[u8], data: &[Data])
         arenas.push(targum::arena::Arena::at(page, len));
         space.protect(page, len, Protection::ALL);
         space.write(segment.address, &segment.bytes).expect("place data");
-        if !segment.writable {
-            space.protect(page, len, Protection { read: true, write: false, execute: false });
+        let prot = Protection { read: true, write: segment.writable, execute: segment.executable };
+        if !segment.writable || segment.executable {
+            space.protect(page, len, prot);
         }
     }
     (space, arenas)

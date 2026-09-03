@@ -205,7 +205,7 @@ pub fn lookup(_bytes: &[u8], _address: u64, _space: &Space) -> Option<Attached> 
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 struct Context {
     space: *mut Space,
-    cache: *const BlockCache,
+    cache: *mut BlockCache,
     block: usize,
 }
 
@@ -213,14 +213,14 @@ thread_local! {
     static CONTEXT: core::cell::Cell<Context> = const {
         core::cell::Cell::new(Context {
             space: core::ptr::null_mut(),
-            cache: core::ptr::null(),
+            cache: core::ptr::null_mut(),
             block: 0,
         })
     };
 }
 
 /// Sets what the helpers will find, for the compiled call about to be made.
-pub fn enter(space: &mut Space, cache: &BlockCache, block: usize) {
+pub fn enter(space: &mut Space, cache: &mut BlockCache, block: usize) {
     RECENT.with(|held| {
         let mut ring = held.borrow_mut();
         let at = ring.0;
@@ -230,7 +230,7 @@ pub fn enter(space: &mut Space, cache: &BlockCache, block: usize) {
     CONTEXT.with(|held| {
         held.set(Context {
             space: space as *mut Space,
-            cache: cache as *const BlockCache,
+            cache: cache as *mut BlockCache,
             block,
         })
     });
@@ -292,14 +292,25 @@ pub fn exit_rip(exit: u64) -> u64 {
 /// happened yet, and the trap happens there with the frame it builds.
 #[cfg(target_arch = "wasm32")]
 #[unsafe(no_mangle)]
-pub extern "C" fn targum_step(tcb: *mut Tcb, position: u32) -> u32 {
+pub extern "C" fn targum_step(tcb: *mut Tcb, address: u64) -> u32 {
     use crate::exec::{Cpu, Step};
     let context = CONTEXT.with(|held| held.get());
     // SAFETY: the loop set these for the duration of the compiled call.
-    let (space, cache, tcb) = unsafe { (&mut *context.space, &*context.cache, &mut *tcb) };
-    let instruction = &cache.block(context.block).instructions[position as usize];
+    let (space, cache, tcb) = unsafe { (&mut *context.space, &mut *context.cache, &mut *tcb) };
+    // One instruction, named by its guest address rather than a position
+    // into some block — a region runs instructions from many blocks, so a
+    // position names the wrong one. The block cache decodes it once and
+    // remembers, which matters because a declined instruction inside a hot
+    // loop is reached every iteration: a block entered at the address holds
+    // it as its first instruction. A fault fetching is the trap the
+    // interpreter would have raised.
+    let index = match cache.entry(address, space) {
+        Ok(index) => index,
+        Err(_) => return STEP_TRAPPED,
+    };
+    let instruction = cache.block(index).instructions[0];
     let mut cpu = Cpu::new(tcb, space);
-    match cpu.step(instruction) {
+    match cpu.step(&instruction) {
         Ok(Step::Syscall) => STEP_SYSCALL,
         Ok(Step::Retired) => {
             if cpu.tcb.rip == instruction.next_ip() && !cpu.space.has_dirty_code() {
@@ -370,12 +381,39 @@ mod tests {
 /// first and re-interpreting afterwards would hand the interpreter memory
 /// the compiled block had already written — a slot read and then
 /// overwritten in the same block reads differently the second time.
+/// What the interpreter did, step by step, so the compiled block can be
+/// checked against it afterwards: the machine after each retired
+/// instruction, and the memory each one wrote (address and its new bytes).
 #[cfg(feature = "verify")]
-pub fn verify_before(tcb: &Tcb, space: &mut Space, cache: &mut BlockCache, cap: usize) -> Vec<Tcb> {
+pub struct Trace {
+    pub states: Vec<Tcb>,
+    /// `writes[i]` is what the i-th retired instruction stored: the new
+    /// bytes, by address. Parallel to `states[1..]`.
+    pub writes: Vec<Vec<(u64, Vec<u8>)>>,
+}
+
+#[cfg(feature = "verify")]
+pub fn verify_before(tcb: &Tcb, space: &mut Space, cache: &mut BlockCache, cap: usize) -> Trace {
     use crate::exec::{Cpu, Step};
     let mut check = tcb.clone();
     let mut states = vec![check.clone()];
+    let mut writes: Vec<Vec<(u64, Vec<u8>)>> = Vec::new();
     space.journal_begin();
+    let mut cursor = 0usize;
+    // Reads the journal entries added since the cursor, capturing the bytes
+    // they now hold — the interpreter's new values, before any undo.
+    macro_rules! capture {
+        ($space:expr) => {{
+            let mut step = Vec::new();
+            while cursor < $space.journal_len() {
+                if let Some((address, length)) = $space.journal_entry(cursor) {
+                    step.push((address, $space.peek(address, length)));
+                }
+                cursor += 1;
+            }
+            writes.push(step);
+        }};
+    }
     // Across blocks, because a region runs through many: fetch at `rip`,
     // run the block, follow where it went, up to the cap, which is more
     // than a region can retire in one call.
@@ -393,6 +431,7 @@ pub fn verify_before(tcb: &Tcb, space: &mut Space, cache: &mut BlockCache, cap: 
                 Ok(Step::Retired) => {}
                 Ok(Step::Syscall) => {
                     states.push(cpu.tcb.clone());
+                    capture!(cpu.space);
                     break 'blocks;
                 }
                 Err(_) => {
@@ -402,6 +441,7 @@ pub fn verify_before(tcb: &Tcb, space: &mut Space, cache: &mut BlockCache, cap: 
                 }
             }
             states.push(cpu.tcb.clone());
+            capture!(cpu.space);
             if cpu.space.has_dirty_code() {
                 break 'blocks;
             }
@@ -415,7 +455,7 @@ pub fn verify_before(tcb: &Tcb, space: &mut Space, cache: &mut BlockCache, cap: 
         }
     }
     space.journal_undo();
-    states
+    Trace { states, writes }
 }
 
 /// The second half: the compiled block has run, and the machine it left is
@@ -424,7 +464,8 @@ pub fn verify_before(tcb: &Tcb, space: &mut Space, cache: &mut BlockCache, cap: 
 /// a store onto code, an instruction handed back — is compared where it
 /// stopped.
 #[cfg(feature = "verify")]
-pub fn verify_after(states: &[Tcb], after: &Tcb, block: &crate::block::Block, exit: u64) {
+pub fn verify_after(trace: &Trace, after: &Tcb, space: &Space, block: &crate::block::Block, exit: u64) {
+    let states = &trace.states;
     let snapshot = &states[0];
     let retired = (after.retired.wrapping_sub(snapshot.retired)) as usize;
     let Some(check) = states.get(retired) else {
@@ -460,14 +501,53 @@ pub fn verify_after(states: &[Tcb], after: &Tcb, block: &crate::block::Block, ex
     if check.fs_base != after.fs_base {
         differences.push(format!("fs_base: interpreted {:#x} compiled {:#x}", check.fs_base, after.fs_base));
     }
+    // Memory: the compiled region wrote directly, bypassing the journal, so
+    // it is compared against what the interpreter's first `retired` steps
+    // left. The last write to a byte wins.
+    if !handed_back {
+        use std::collections::BTreeMap;
+        let mut expected: BTreeMap<u64, u8> = BTreeMap::new();
+        for step in trace.writes.iter().take(retired) {
+            for (address, bytes) in step {
+                for (offset, byte) in bytes.iter().enumerate() {
+                    expected.insert(address + offset as u64, *byte);
+                }
+            }
+        }
+        let mut shown = 0;
+        for (address, byte) in &expected {
+            let found = space.peek(*address, 1)[0];
+            if found != *byte && shown < 6 {
+                differences.push(format!(
+                    "mem[{address:#x}]: interpreted {byte:#x} compiled {found:#x}"
+                ));
+                shown += 1;
+            }
+        }
+    }
     if !differences.is_empty() {
+        // Where in the interpreter's own trace the compiled machine
+        // actually sits, if anywhere: an offset here is a retired-count
+        // bug rather than an arithmetic one, and it names the boundary.
+        let matches = |state: &Tcb| -> bool {
+            state.registers == after.registers && state.rip == after.rip
+        };
+        let full_match = states.iter().position(matches);
+        let rsp_match: Vec<usize> = states
+            .iter()
+            .enumerate()
+            .filter(|(_, state)| state.registers[4] == after.registers[4] && state.rip == after.rip)
+            .map(|(index, _)| index)
+            .collect();
         panic!(
-            "tier 1 verify: the compiled block at {:#x} ({} instructions, exit {:#x}, {} retired) disagrees with the interpreter:\n  {}",
+            "tier 1 verify: the compiled block at {:#x} ({} instructions, exit {:#x}, {} retired) disagrees with the interpreter:\n  {}\n  compiled machine fully matches interpreter step {:?}; rsp+rip match steps {:?}",
             block.entry,
             block.instructions.len(),
             exit,
             retired,
-            differences.join("\n  ")
+            differences.join("\n  "),
+            full_match,
+            rsp_match,
         );
     }
 }

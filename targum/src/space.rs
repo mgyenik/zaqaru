@@ -252,6 +252,30 @@ impl Space {
         }
     }
 
+    /// How many stores the journal holds. Verify builds only.
+    #[cfg(feature = "verify")]
+    pub fn journal_len(&self) -> usize {
+        self.journal.as_ref().map_or(0, Vec::len)
+    }
+
+    /// The address and length of the `index`-th journalled store, so verify
+    /// can read the bytes it left. Verify builds only.
+    #[cfg(feature = "verify")]
+    pub fn journal_entry(&self, index: usize) -> Option<(u64, usize)> {
+        self.journal
+            .as_ref()?
+            .get(index)
+            .map(|(address, old)| (*address, old.len()))
+    }
+
+    /// The bytes at `address`, for verify to compare a compiled write.
+    /// Verify builds only.
+    #[cfg(feature = "verify")]
+    pub fn peek(&self, address: u64, length: usize) -> Vec<u8> {
+        // SAFETY: verify only asks about ranges it has already seen written.
+        unsafe { core::slice::from_raw_parts(Self::pointer(address), length).to_vec() }
+    }
+
     pub fn limit(&self) -> u64 {
         self.limit
     }

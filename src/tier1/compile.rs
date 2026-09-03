@@ -1010,8 +1010,10 @@ impl Emitter<'_> {
 
     // ---- the helper -----------------------------------------------------
 
-    /// Runs an instruction the lowering declined through the interpreter.
-    fn defer(&mut self, position: usize) {
+    /// Runs an instruction the lowering declined through the interpreter,
+    /// naming it by its guest address so the helper decodes the right one
+    /// wherever in the region it sits.
+    fn defer(&mut self, instruction: &Instruction) {
         // Flush: registers, the record, and what has retired so far.
         for number in 0..16u32 {
             if self.usage.used[number as usize] {
@@ -1033,9 +1035,9 @@ impl Emitter<'_> {
         self.body.i64_store(3, layout::RETIRED);
         self.body.i64_const(0);
         self.body.local_set(DONE);
-        // The call.
+        // The call, naming the instruction by address.
         self.body.local_get(TCB);
-        self.body.i32_const(position as i32);
+        self.push_delta(instruction.ip());
         self.body.call(self.helpers.step);
         self.body.local_set(Q);
         // Reload: the helper may have changed anything.
@@ -1084,11 +1086,12 @@ impl Emitter<'_> {
     // ---- one instruction ------------------------------------------------
 
     fn instruction(&mut self, position: usize, instruction: &Instruction, quick: &Quick) {
+        let _ = position;
         let width = quick.width;
         let next = instruction.next_ip();
         match quick.op {
             Op::General => {
-                self.defer(position);
+                self.defer(instruction);
                 return;
             }
             Op::Nop => {}

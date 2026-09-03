@@ -74,6 +74,10 @@ pub fn build(candidates: &[Candidate], budget: usize) -> Built {
         results: vec![ValueType::I64],
     });
     let step_type = wasm.intern_type(FunctionType {
+        parameters: vec![ValueType::I32, ValueType::I64],
+        results: vec![ValueType::I32],
+    });
+    let condition_type = wasm.intern_type(FunctionType {
         parameters: vec![ValueType::I32, ValueType::I32],
         results: vec![ValueType::I32],
     });
@@ -103,7 +107,7 @@ pub fn build(candidates: &[Candidate], budget: usize) -> Built {
         results: vec![ValueType::I32],
     });
     let step = import(&mut wasm, "targum_step", step_type);
-    let condition = import(&mut wasm, "targum_condition", step_type);
+    let condition = import(&mut wasm, "targum_condition", condition_type);
     let code_write = import(&mut wasm, "targum_code_write", code_write_type);
     // The two permission checks, defined once and called by every region.
     let define_check = |wasm: &mut WasmObject, name: &str, write: bool| -> FunctionReference {

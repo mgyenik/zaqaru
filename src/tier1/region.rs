@@ -30,16 +30,16 @@ use super::sweep::{Candidate, decode_instructions};
 /// interpreter's own history is a list of bodies that got slower by
 /// growing.
 ///
-/// **One, for now, which makes every region a single block.** The
-/// multi-member dispatcher is built — the `br_table` loop, the internal
-/// branches, the shared frame — and the engine's verify mode caught it
-/// disagreeing with the interpreter: a two-member region leaves `%rsp`
-/// eight low, one stack slot, with everything else right, which is a
-/// retired-count or defer-path boundary between the members and not the
-/// arithmetic of any instruction. Until that is found, the cap holds the
-/// compiler to what is verified across twenty thousand blocks. Raising it
-/// is one line and the failing case is small (`docs/tier1-plan.md` T3).
-pub const MAX_MEMBERS: usize = 1;
+/// Sixty-four blocks of five instructions is a few hundred wasm
+/// instructions per body, which Cranelift handles. The multi-member defect
+/// that held this at one earlier was the defer helper naming an
+/// instruction by its position in the *entry* block — wrong once a region
+/// runs instructions from several blocks — and it is fixed: the helper
+/// takes the instruction's guest address and the block cache decodes it.
+/// The container suite passes with every block compiled into regions this
+/// size, and the engine's verify mode is clean. What regions do *not* buy,
+/// measured, is speed on the container: see `docs/tier1-plan.md` T3.
+pub const MAX_MEMBERS: usize = 64;
 
 /// A region: its members in address order, and the address the deltas
 /// inside the compiled function are taken from.

@@ -137,12 +137,12 @@ impl Engine {
                 // goes next — see `tier1`.
                 let entry = block.entry;
                 #[cfg(feature = "verify")]
-                let states = tier1::verify_before(tcb, space, cache, 8192);
+                let trace = tier1::verify_before(tcb, space, cache, 8192);
                 tier1::enter(space, cache, index);
                 let before = tcb.retired;
                 let exit = tier1::call(function, tcb, &vitals, entry, budget, which);
                 #[cfg(feature = "verify")]
-                tier1::verify_after(&states, tcb, cache.block(index), exit);
+                tier1::verify_after(&trace, tcb, space, cache.block(index), exit);
                 let block = cache.block(index);
                 debug_assert!(
                     tcb.retired >= before && tcb.retired - before <= budget,

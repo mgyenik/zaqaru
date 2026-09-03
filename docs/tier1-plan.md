@@ -725,20 +725,39 @@ that clobbered the flags record before the access was known to succeed.
 The other acceptance items — the profiled bake, the tape across bakes,
 the altered-bytes control — wait on T1's profile.
 
-**T3 — regions. Built, and capped at one member pending a defect
-(2026-09-02).** Formation at bake (`src/tier1/region.rs`), the `br_table`
-dispatcher, internal branches, the region-wide frame, the budget rule
-per member, verification of every member's bytes at attach, and the
-table extended with a row per region and per member. The engine's verify
-mode is what holds it: a two-member region leaves `%rsp` eight low —
-one stack slot, with every other register, the flags and `rip` correct —
-which places the defect at the boundary between members, in the
-retired-count accounting or the flush around a deferred instruction, not
-in any instruction's arithmetic. `MAX_MEMBERS` is one until that is
-found, which makes every region a single block and keeps the compiler to
-what the differential and the container suite verify. The speed number
-waits on the cap: single blocks are 1.5×, and the frame a region would
-amortise is the rest.
+**T3 — regions. Built and correct (2026-09-02); no container speedup.**
+Formation at bake (`src/tier1/region.rs`), the `br_table` dispatcher,
+internal branches, the region-wide frame, the budget rule per member,
+verification of every member's bytes at attach, and the table extended
+with a row per region and per member. The defect that held the cap at one
+was the defer helper naming a declined instruction by its position in the
+entry block, which is the wrong block once a region spans several; naming
+it by guest address and decoding through the block cache fixed it, and the
+container suite passes with 64-member regions, verify clean.
+
+**What regions do not buy is speed on the container, measured.** The
+Django boot runs at 95.7 MIPS with no tier 1, 96.2 with single-block tier
+1, and 96.2 with 64-member regions — and 95.7 again with 537 MB of the
+image compiled, nearly all of it. The pure-ALU microbenchmark does gain,
+71 to 98 MIPS, so the compiler works; the container does not, and the
+reason is section 9's own warning turned into a measurement. A block
+averages five instructions, and the frame around one — loading the
+registers it uses, the inline permission check on each memory operand,
+storing them back — costs about what interpreting five does. A region
+would amortise that frame over many blocks, but a quarter of a real run's
+blocks end in a `call`, which *exits* a region here (a return address is
+not a constant), so a region on this workload is rarely longer than a few
+blocks. The interpreter, meanwhile, is already at 95 MIPS after the
+process-switch work, so there is little frame overhead to beat.
+
+The two things that would move the container are therefore not the region
+cap: **lowering more of the declined 5–8%** (the string and SSE routines
+that `string` runs at 32 MIPS, the `dec`/`inc`/`div` the histogram counts),
+which shrinks both the deferred-helper cost and the frames; and **letting
+a call stay inside a region**, which is the whole-function frame the AOT
+tier already has and the trace the profile of T1 would select. Tier 1 is
+built, correct, and off by default (`--tier1`), because on the container
+it is 30 MB of code for no measured gain until one of those lands.
 
 **T4 — the container and the corpus.** The first corpus entries —
 `python:3.12-slim`'s libpython, glibc and loader, and nginx — taken on

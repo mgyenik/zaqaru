@@ -1106,9 +1106,14 @@ pub fn wasm_staticlib(crate_name: &'static str, library: &'static str) -> PathBu
     if let Some(path) = built.get(crate_name) {
         return path.clone();
     }
+    let _ = &library;
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let target = root.join("target").join(format!("wasm-{crate_name}"));
-    let output = Command::new(env!("CARGO"))
+    let verify = crate_name == "targum" && std::env::var_os("ZAQARU_VERIFY").is_some();
+    let target = root
+        .join("target")
+        .join(format!("wasm-{crate_name}{}", if verify { "-verify" } else { "" }));
+    let mut command = Command::new(env!("CARGO"));
+    command
         .current_dir(root)
         .env("CARGO_TARGET_DIR", &target)
         .args([
@@ -1118,7 +1123,11 @@ pub fn wasm_staticlib(crate_name: &'static str, library: &'static str) -> PathBu
             "--target",
             "wasm32-unknown-unknown",
             "--release",
-        ])
+        ]);
+    if verify {
+        command.args(["--features", "verify"]);
+    }
+    let output = command
         .output()
         .unwrap_or_else(|error| panic!("run cargo to build {crate_name} for wasm32: {error}"));
     assert!(

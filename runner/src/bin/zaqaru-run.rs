@@ -233,7 +233,11 @@ fn mounts() -> runner::store::MountTable {
     // character device and never reports end of file, so a read that stops
     // at EOF does not stop: it allocates until the machine dies.
     let mut seed = [0u8; 32];
-    if let Ok(mut source) = std::fs::File::open("/dev/urandom") {
+    // `ZAQARU_SEED=<byte>` fills the seed with one repeated byte, so a run
+    // can be made to match a test's fixed seed for reproduction.
+    if let Some(byte) = std::env::var("ZAQARU_SEED").ok().and_then(|value| value.parse::<u8>().ok()) {
+        seed = [byte; 32];
+    } else if let Ok(mut source) = std::fs::File::open("/dev/urandom") {
         use std::io::Read;
         let _ = source.read_exact(&mut seed);
     }
