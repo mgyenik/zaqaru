@@ -725,7 +725,7 @@ that clobbered the flags record before the access was known to succeed.
 The other acceptance items — the profiled bake, the tape across bakes,
 the altered-bytes control — wait on T1's profile.
 
-**T3 — regions. Built and correct (2026-09-02); no container speedup.**
+**T3 — regions. Built and correct (2026-09-02); up to 11x on lowered loops, still on the container.**
 Formation at bake (`src/tier1/region.rs`), the `br_table` dispatcher,
 internal branches, the region-wide frame, the budget rule per member,
 verification of every member's bytes at attach, and the table extended
@@ -750,11 +750,45 @@ not a constant), so a region on this workload is rarely longer than a few
 blocks. The interpreter, meanwhile, is already at 95 MIPS after the
 process-switch work, so there is little frame overhead to beat.
 
-What would move the container is **letting a call stay inside a region**,
-the whole-function frame the AOT tier already has and the trace the
-profile of T1 would select: a region that spans a call keeps the machine
-in locals across it, so the frame is paid once per trace rather than once
-per five instructions.
+**Letting a call stay inside a region — built 2026-09-02, and it works.**
+A direct call whose target is a member of the region branches to it
+inside the wasm function instead of exiting, so the guest registers stay
+in locals across the call; the `ret` reads its return address and, when
+that is a member — which it is, because formation pulls in the return site
+beside the callee — dispatches to it internally. Region formation follows
+direct calls and their return sites; the `ret`'s target is a runtime
+value, matched against the members by a linear scan. Correct: the
+container suite passes with it, verify is clean, and `calls` (fib
+recursion) computes the same checksum compiled as interpreted.
+
+And it is a large win where the frame was the cost. Best of three, pinned,
+against the interpreter:
+
+| kernel | interpreter | regions | |
+| --- | --- | --- | --- |
+| memory_sequential (a 32 MB pass) | 104 MIPS | **1151** | 11× |
+| calls (fib recursion) | 115 | **670** | 5.8× |
+| alu (dependent chain) | 74 | 98 | 1.3× |
+| branches (unpredictable) | 61 | 70 | 1.2× |
+| string (glibc SSE) | 30 | 33 | 1.1× |
+
+The shape is exactly the design's: a long run of lowered instructions —
+a `memcpy` loop, a recursion — amortises the frame and runs many times
+faster; a tight dependent chain gains little because there is little
+frame to amortise per instruction; and `string` barely moves because it
+is the SSE routines the lowering declines, so each one is a full flush,
+helper call and reload inside the region.
+
+**That last row is why the container still does not gain.** Its hot path
+is those declined routines — glibc's SSE `memcpy`/`memset`, CPython's eval
+loop with its computed goto — and a region carrying one pays the
+flush-and-reload the interpreter does not, cancelling the frame it saved.
+So tier 1 is now a real accelerator, up to 11× on the lowered loops that
+dominate a compute kernel, and still even on the container, which is
+declined-op-bound and served by an interpreter already at 95 MIPS. The
+container's remaining lever is lowering the vector and string ops into
+the compiler — the AOT tier's `translate/vector.rs`, entered from the
+region compiler — so the hot glibc routines stop deferring.
 
 **Lowering more of the declined 5–8% was tried and does not help
 (2026-09-02).** `inc`, `dec`, `neg`, `not`, `setcc` and `cmovcc` were

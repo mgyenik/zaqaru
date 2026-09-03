@@ -21,7 +21,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
-use iced_x86::{FlowControl, Instruction, OpKind};
+use iced_x86::{FlowControl, Instruction, Mnemonic, OpKind};
 
 use super::sweep::{Candidate, decode_instructions};
 
@@ -56,7 +56,11 @@ impl Region {
     }
 }
 
-/// The addresses a block can branch to without leaving compiled code.
+/// The addresses a block can reach and stay compiled: a conditional or
+/// direct branch target, a fall-through, and — now that a call keeps the
+/// frame — a direct call's target and the return site after it, so the
+/// callee and the caller's continuation are both in the region and the
+/// `ret` lands on a member.
 fn edges(instructions: &[Instruction]) -> Vec<u64> {
     let mut targets = Vec::new();
     for instruction in instructions {
@@ -69,11 +73,20 @@ fn edges(instructions: &[Instruction]) -> Vec<u64> {
             _ => {}
         }
     }
-    // A block that did not end in a transfer falls through.
-    if let Some(last) = instructions.last()
-        && last.flow_control() == FlowControl::Next
-    {
-        targets.push(last.next_ip());
+    if let Some(last) = instructions.last() {
+        match last.flow_control() {
+            FlowControl::Next => targets.push(last.next_ip()),
+            // A direct call: the callee, and where it returns to. `endbr64`
+            // and the like are `Call` with a near branch; an indirect call
+            // (register or memory) has no constant target and exits.
+            FlowControl::Call if last.mnemonic() == Mnemonic::Call
+                && last.op0_kind() == OpKind::NearBranch64 =>
+            {
+                targets.push(last.near_branch64());
+                targets.push(last.next_ip());
+            }
+            _ => {}
+        }
     }
     targets
 }

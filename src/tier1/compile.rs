@@ -507,6 +507,46 @@ impl Emitter<'_> {
         }
     }
 
+    /// A direct call's target: dispatch to it as a member if it is one and
+    /// sets `RIP` on the way out if not. Unlike [`Self::go_to`] the caller
+    /// has already set `RIP` to the target, so the exit needs nothing more.
+    fn go_to_target(&mut self, address: u64) {
+        match self.members.iter().position(|member| member.address == address) {
+            Some(index) => {
+                self.body.i32_const(index as i32);
+                self.body.local_set(NEXT);
+                self.body.branch(self.dispatch_depth());
+            }
+            None => self.leave(KIND_CONTINUE),
+        }
+    }
+
+    /// Dispatches on the runtime value in `RIP`: if it is a member's
+    /// address, branch to that member; else exit. `RIP` and `DONE` are set.
+    ///
+    /// A linear scan over the members' deltas. A region holds at most
+    /// [`super::region::MAX_MEMBERS`], and the common `ret` lands on the
+    /// return site pulled in beside its callee, near the front; a sorted
+    /// search is the refinement if a measurement asks for it.
+    fn dispatch_rip(&mut self) {
+        for (index, member) in self.members.iter().enumerate() {
+            // RIP == BASE + delta ?
+            self.body.local_get(RIP);
+            self.body.local_get(BASE);
+            self.body.i64_const(member.address.wrapping_sub(self.base) as i64);
+            self.body.i64_add();
+            self.body.i64_eq();
+            self.body.if_();
+            self.depth += 1;
+            self.body.i32_const(index as i32);
+            self.body.local_set(NEXT);
+            self.body.branch(self.dispatch_depth());
+            self.depth -= 1;
+            self.body.end();
+        }
+        self.leave(KIND_CONTINUE);
+    }
+
     // ---- the frame ------------------------------------------------------
 
     fn prologue(&mut self) {
@@ -1233,7 +1273,14 @@ impl Emitter<'_> {
                 self.body.end();
                 self.done += 1;
                 self.count_done();
-                self.leave(KIND_CONTINUE);
+                // A direct call whose target is a member stays in the
+                // region — the frame is not stored and reloaded across it,
+                // which is the whole reason a region spans a call. An
+                // indirect call, or one that leaves, exits with `RIP` set.
+                match quick.source {
+                    Source::Immediate(target) => self.go_to_target(target),
+                    _ => self.leave(KIND_CONTINUE),
+                }
                 return;
             }
             Op::Ret => {
@@ -1252,7 +1299,11 @@ impl Emitter<'_> {
                 self.body.local_set(REGISTER_BASE + u32::from(STACK_POINTER));
                 self.done += 1;
                 self.count_done();
-                self.leave(KIND_CONTINUE);
+                // The return address is a runtime value: if it is a member
+                // of this region — which it is when the caller's return
+                // site was pulled in beside the callee — dispatch to it;
+                // else leave and let the loop look it up.
+                self.dispatch_rip();
                 return;
             }
         }
