@@ -194,7 +194,18 @@ impl Engine {
                 && let Some(trace) = &block.trace
             {
                 let before = tcb.retired;
-                let leave = crate::bytecode::run(trace, 0, tcb, space, budget);
+                // The address cache is the block cache itself: an indirect
+                // transfer whose target is already transpiled stays inside the
+                // interpreter, so a `call`/`ret` and CPython's computed goto do
+                // not round-trip this loop.
+                let leave = crate::bytecode::run(
+                    trace,
+                    0,
+                    tcb,
+                    space,
+                    budget,
+                    crate::bytecode::Resolver::Cache(cache),
+                );
                 budget = budget.saturating_sub(tcb.retired.wrapping_sub(before));
                 match leave {
                     crate::bytecode::Leave::Exit | crate::bytecode::Leave::Preempted => continue,
@@ -583,5 +594,39 @@ mod tests {
             2,
             "the second call ran the bytes the first call left behind"
         );
+    }
+
+    /// Deep recursion — a call and a return per level — which the bytecode
+    /// runs with the address cache keeping each `call` and `ret` inside the
+    /// interpreter. The answer proves the whole chain of internal dispatches
+    /// stayed faithful; with the `bytecode` feature it exercises the address
+    /// cache, and without it the interpreter, and both must agree with the
+    /// closed form.
+    #[test]
+    fn recursion_returns_the_right_answer() {
+        // A recursive sum: f(n) = n + f(n-1), f(0) = 0, so f(n) = n(n+1)/2.
+        let mut guest = Guest::new(|assembler, _| {
+            let mut function = assembler.create_label();
+            let mut base = assembler.create_label();
+            // rdi = 100; call f; result in rax; syscall.
+            assembler.mov(rdi, 100u64).unwrap();
+            assembler.call(function).unwrap();
+            assembler.syscall().unwrap();
+            // f(n): if n == 0 return 0; else return n + f(n-1).
+            assembler.set_label(&mut function).unwrap();
+            assembler.test(rdi, rdi).unwrap();
+            assembler.jz(base).unwrap();
+            assembler.push(rdi).unwrap();
+            assembler.dec(rdi).unwrap();
+            assembler.call(function).unwrap();
+            assembler.pop(rdi).unwrap();
+            assembler.add(rax, rdi).unwrap();
+            assembler.ret().unwrap();
+            assembler.set_label(&mut base).unwrap();
+            assembler.xor(rax, rax).unwrap();
+            assembler.ret().unwrap();
+        });
+        assert_eq!(guest.run(), Outcome::Syscall);
+        assert_eq!(guest.rax(), 100 * 101 / 2);
     }
 }

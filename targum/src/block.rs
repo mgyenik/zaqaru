@@ -289,6 +289,41 @@ impl BlockCache {
             .expect("a block index outlived its block")
     }
 
+    /// The bytecode trace of the block entered at `address`, if one is cached
+    /// and transpiled — the address cache the bytecode interpreter probes on
+    /// an indirect transfer (a computed goto, a `ret`, an indirect call) to
+    /// stay inside itself rather than returning to the run loop.
+    ///
+    /// Immutable and non-decoding: a miss (nothing cached, or the block
+    /// declined transpilation) returns `None`, and the run loop resolves it
+    /// the slow way — `entry` decodes and transpiles, warming this for next
+    /// time. It validates like `entry`'s recent cache: the block found must
+    /// still be entered at `address`, so a freed or reused slab slot misses.
+    ///
+    /// Always present so the interpreter's resolver need not be feature-gated;
+    /// without the `bytecode` feature there are no traces, so it is `None`.
+    pub fn resolve_trace(&self, address: u64) -> Option<&crate::bytecode::Trace> {
+        #[cfg(feature = "bytecode")]
+        {
+            let slot = ((address >> 4) as usize) & (RECENT - 1);
+            let (cached, index) = self.recent[slot];
+            if cached == address
+                && let Some(Some(block)) = self.blocks.get(index)
+                && block.entry == address
+            {
+                return block.trace.as_ref();
+            }
+            let index = *self.entries.get(&address)?;
+            let block = self.blocks[index].as_ref()?;
+            (block.entry == address).then(|| block.trace.as_ref()).flatten()
+        }
+        #[cfg(not(feature = "bytecode"))]
+        {
+            let _ = address;
+            None
+        }
+    }
+
     fn install(&mut self, block: Block, space: &mut Space) -> usize {
         if self.entries.len() >= CAPACITY {
             self.flush(space);

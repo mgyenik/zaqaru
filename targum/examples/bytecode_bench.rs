@@ -107,7 +107,7 @@ fn main() {
     // The loop exits (rcx == 0) straight to the syscall's address.
     let mut leaves = 0u64;
     loop {
-        match bytecode::run(&trace, 0, &mut byte.tcb, &mut byte.space, u64::MAX) {
+        match bytecode::run(&trace, 0, &mut byte.tcb, &mut byte.space, u64::MAX, bytecode::Resolver::Runloop) {
             // The loop falls through to the terminal `syscall`, which defers —
             // that is the loop finishing, and the end of the timed region.
             Leave::Defer { .. } | Leave::Exit => break,

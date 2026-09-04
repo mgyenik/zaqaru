@@ -309,19 +309,55 @@ pub enum Leave {
     Fault(Fault),
 }
 
+/// How an indirect transfer out of a trace is resolved — the address cache.
+///
+/// When the interpreter would leave a trace (a computed goto, a `ret`, an
+/// indirect or out-of-trace call), it asks the resolver for the target's
+/// trace. A hit keeps execution *inside* the interpreter — the register file,
+/// the flags, the retirement counter all carry straight over, only the stream
+/// and program counter switch — which is what keeps a `call`/`ret` and
+/// CPython's per-bytecode `jmp *reg` from round-tripping the run loop. A miss
+/// exits to the run loop, which decodes and transpiles the target (warming the
+/// cache) and re-enters.
+pub enum Resolver<'a> {
+    /// No address cache: every indirect transfer leaves to the run loop. What
+    /// the differential harness and the single-block benchmark use.
+    Runloop,
+    /// Probe this block cache's transpiled traces, staying internal on a hit.
+    Cache(&'a crate::block::BlockCache),
+}
+
+impl<'a> Resolver<'a> {
+    #[inline]
+    fn resolve(&self, address: u64) -> Option<&'a Trace> {
+        match self {
+            Resolver::Runloop => None,
+            Resolver::Cache(cache) => cache.resolve_trace(address),
+        }
+    }
+}
+
 /// Runs a trace from stream offset `start`, on the engine's own state, until
-/// it leaves.
+/// it leaves — following indirect transfers into other traces through the
+/// `resolver` (the address cache) rather than returning to the run loop, for
+/// as long as their targets are cached.
 ///
 /// The register file is copied in once and copied back at every leave, so
 /// the `Tcb` is current wherever execution stops — a fault, a defer, a
 /// preemption, an exit — and the hot path in between touches a contiguous
 /// local array rather than reaching through the control block per operand.
-/// Flags and memory are *not* copied: the flags are recorded straight into
-/// `tcb.flags` and loads and stores go straight through `space`, because a
-/// faithful fault and a faithful flag are worth more than avoiding the
-/// indirection, and neither is on the hottest path.
-pub fn run(trace: &Trace, start: usize, tcb: &mut Tcb, space: &mut Space, budget: u64) -> Leave {
-    let code = &trace.code;
+/// Memory goes straight through `space`; the flags are held in a local and
+/// flushed at a leave, because a faithful fault and a faithful flag are worth
+/// more than avoiding the indirection, and neither is on the hottest path.
+pub fn run<'a>(
+    mut trace: &'a Trace,
+    start: usize,
+    tcb: &mut Tcb,
+    space: &mut Space,
+    budget: u64,
+    resolver: Resolver<'a>,
+) -> Leave {
+    let mut code = &trace.code;
     let mut regs = [0u64; REGISTERS];
     regs[..crate::state::REGISTER_COUNT].copy_from_slice(&tcb.registers);
     // The lazy-flags record, held in a local copy through the trace and
@@ -405,10 +441,31 @@ pub fn run(trace: &Trace, start: usize, tcb: &mut Tcb, space: &mut Space, budget
 
         match op {
             Op::ExitTo => {
+                // The transfer retired; where it goes is a guest address. The
+                // budget is checked here — an indirect transfer is a trace
+                // boundary, one of the two places (with a back-edge) the
+                // quantum is honoured — and then the address cache is probed:
+                // a hit switches trace and continues inside the interpreter, a
+                // miss leaves to the run loop.
                 spent += 1;
-                tcb.rip = regs[d];
-                flush!();
-                return Leave::Exit;
+                let target = regs[d];
+                if spent >= budget {
+                    tcb.rip = target;
+                    flush!();
+                    return Leave::Preempted;
+                }
+                match resolver.resolve(target) {
+                    Some(next) => {
+                        trace = next;
+                        code = &trace.code;
+                        pc = 0;
+                    }
+                    None => {
+                        tcb.rip = target;
+                        flush!();
+                        return Leave::Exit;
+                    }
+                }
             }
             Op::Defer => {
                 // The guest address of the one instruction to interpret is

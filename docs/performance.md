@@ -438,18 +438,38 @@ core now covers `mov`/`lea`, the ALU, `imul`, shifts, rotates, `setcc`/`cmov`/
 `div`, the SSE/vector ops, and the computed-goto and call/ret dispatch — which
 needs the address cache.
 
-**Two further lifts are now built.** The lazy flags are held in a local through
-the trace, flushed to the control block only at a leave, so a `cmp`/`jcc` pair
-or an `adc` chain touches a register-resident record rather than the
-control-block pointer per op. And a flag-producer immediately followed by a
-`jcc` that consumes its flags fuses into one `FusedBranch` — the two-op
+**Three further lifts are now built.** The lazy flags are held in a local
+through the trace, flushed to the control block only at a leave, so a
+`cmp`/`jcc` pair or an `adc` chain touches a register-resident record rather
+than the control-block pointer per op. A flag-producer immediately followed by
+a `jcc` that consumes its flags fuses into one `FusedBranch` — the two-op
 dispatch becomes one, and when the flags are dead past the branch (which the
 liveness pass proves, accounting for *both* the fall-through and the taken
-target) the record is skipped entirely. Together they lift the compute chain to
-**4.2×** and the arithmetic component to 2.1×; memory- and branch-bound loops
-are unmoved (their cost is elsewhere). What remains toward the top of the range
-is tail-call threaded dispatch, then the address cache and a real eval-loop
-measurement.
+target) the record is skipped entirely. And an **address cache** — the block
+cache's own address→trace resolution — lets an indirect transfer (a computed
+goto, a `ret`, an out-of-trace `call`) whose target is already transpiled stay
+*inside* the interpreter, the register file and flags carrying over, only the
+stream switching; a miss exits to the run loop, which transpiles the target
+and warms the cache. So a whole call tree or a multi-block loop runs without
+round-tripping the run loop per transfer.
+
+The picture across shapes, under wasmtime (interpreter → bytecode MIPS):
+
+| kernel   | shape                         | ratio |
+| ---      | ---                           | ---   |
+| alu      | dependent arithmetic          | 3.5–4.2× |
+| branches | multi-block, branch-heavy     | 3.3× |
+| regadd   | arithmetic component          | 2.0–2.2× |
+| loads/stores | permission-checked memory | 1.8–1.9× |
+| calls    | recursive, call/ret-heavy     | 1.65× |
+| mixed    | memory + unpredictable branch | 1.3–1.4× |
+
+So the win runs from ~1.3× on memory- and call-bound code to ~4× on compute,
+entirely a function of how much of the hot path the bytecode covers and keeps
+internal. What remains toward the very top of the range is tail-call threaded
+dispatch — which needs the interpreter hand-emitted as wasm `return_call`,
+since Rust cannot emit tail calls, a large separate build for a projected
+1.3–1.5× — and `div`/SSE coverage, then a real CPython eval-loop measurement.
 
 ## 7. The plan
 

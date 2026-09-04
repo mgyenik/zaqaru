@@ -123,7 +123,7 @@ fn run_bytecode(guest: &mut Guest) -> Outcome {
                 other => return other,
             }
         };
-        match bytecode::run(&trace, 0, &mut guest.tcb, &mut guest.space, QUANTUM) {
+        match bytecode::run(&trace, 0, &mut guest.tcb, &mut guest.space, QUANTUM, bytecode::Resolver::Runloop) {
             Leave::Exit | Leave::Preempted => continue,
             Leave::Fault(fault) => return Outcome::Trap(Trap::Fault(fault)),
             Leave::Defer { .. } => {
