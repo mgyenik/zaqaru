@@ -203,6 +203,14 @@ pub struct Space {
     /// removes that cost from the common case. Made stale only by
     /// [`Space::mark_code`], the one place a page turns into code.
     last_clean: u64,
+    /// The last single page each access kind — read, write, fetch — confirmed
+    /// permitted, or `u64::MAX`. A guest's loads and stores have strong page
+    /// locality, so remembering the last page that passed and skipping the
+    /// bitmap lookup when the next access lands on it takes the permission
+    /// test off the common path, the same trick `last_clean` plays for the
+    /// code test. A `Cell` because a load confirms through `&self`; reset by
+    /// `protect` and `unmap`, the only two that change what a page allows.
+    permitted_page: [core::cell::Cell<u64>; 3],
 }
 
 impl Default for Space {
@@ -226,6 +234,7 @@ impl Space {
             journal: None,
             dirty: Vec::new(),
             last_clean: u64::MAX,
+            permitted_page: [const { core::cell::Cell::new(u64::MAX) }; 3],
         };
         space.set_limit(limit);
         space
@@ -322,6 +331,7 @@ impl Space {
             self.writable.set(page, protection.write);
             self.executable.set(page, protection.execute);
         }
+        self.forget_permissions();
     }
 
     /// Takes a range out of the address space entirely, as `munmap` does.
@@ -341,6 +351,7 @@ impl Space {
                 self.dirty.push(page as u64);
             }
         }
+        self.forget_permissions();
     }
 
     fn pages_of(address: u64, length: u64) -> std::ops::Range<usize> {
@@ -420,6 +431,26 @@ impl Space {
         if length == 0 {
             return Ok(());
         }
+        let slot = match access {
+            Access::Read => 0,
+            Access::Write => 1,
+            Access::Fetch => 2,
+        };
+        let first = (address >> PAGE_SHIFT) as usize;
+        // The fast path: an access wholly inside a single page this kind has
+        // already confirmed permitted, and nothing has changed the page's
+        // permission since (only `protect` and `unmap` do, and both forget the
+        // cache). A cached page passed the full check below, so it is mapped
+        // and within `limit`, and an access that neither straddles it nor
+        // exceeds a page cannot leave it. Guarded on `length <= PAGE_SIZE` so
+        // the single-page test is exact and the address arithmetic cannot
+        // wrap.
+        if length <= PAGE_SIZE {
+            let last = ((address + length - 1) >> PAGE_SHIFT) as usize;
+            if first == last && self.permitted_page[slot].get() == first as u64 {
+                return Ok(());
+            }
+        }
         let end = match address.checked_add(length) {
             Some(end) if end <= self.limit => end,
             // Off the end of linear memory, or wrapped. Either way the guest
@@ -431,7 +462,6 @@ impl Space {
             Access::Write => &self.writable,
             Access::Fetch => &self.executable,
         };
-        let first = (address >> PAGE_SHIFT) as usize;
         let last = ((end - 1) >> PAGE_SHIFT) as usize;
         for page in first..=last {
             if !map.get(page) {
@@ -446,7 +476,20 @@ impl Space {
                 });
             }
         }
+        // A single-page success is what the fast path replays; a straddling
+        // one is not cached, because the cache holds one page.
+        if first == last {
+            self.permitted_page[slot].set(first as u64);
+        }
         Ok(())
+    }
+
+    /// Forgets the per-access permitted-page cache, called wherever a page's
+    /// permission changes — `protect` and `unmap`, the only two.
+    fn forget_permissions(&self) {
+        for cell in &self.permitted_page {
+            cell.set(u64::MAX);
+        }
     }
 
     /// Whether `length` bytes at `address` may be read, for the kernel rows
@@ -800,6 +843,33 @@ mod tests {
         let mut space = Space::new(arena.limit());
         space.protect(arena.base(), arena.length(), Protection::ALL);
         space
+    }
+
+    #[test]
+    fn the_permission_cache_is_forgotten_when_permission_changes() {
+        // The fast path must never outlive the permission it cached. A page is
+        // read, which caches it permitted; then its permission is revoked, and
+        // the next access must fault — proving `protect`/`unmap` forget the
+        // cache rather than the fast path replaying a stale yes.
+        let arena = Arena::new(0x2_0000);
+        let mut space = Space::new(arena.limit());
+        space.protect(arena.base(), PAGE_SIZE, Protection::READ_WRITE);
+        // Warm the cache for read and for write on this page.
+        assert_eq!(space.load(arena.base(), Width::Qword), Ok(0));
+        assert_eq!(space.store(arena.base(), Width::Qword, 7), Ok(()));
+        // Revoke, via protect: the cached page is no longer writable.
+        space.protect(arena.base(), PAGE_SIZE, Protection::READ);
+        assert_eq!(space.load(arena.base(), Width::Qword), Ok(7)); // still readable
+        assert_eq!(
+            space.store(arena.base(), Width::Qword, 9),
+            Err(Fault { address: arena.base(), access: Access::Write })
+        );
+        // And unmap forgets read too.
+        space.unmap(arena.base(), PAGE_SIZE);
+        assert_eq!(
+            space.load(arena.base(), Width::Qword),
+            Err(Fault { address: arena.base(), access: Access::Read })
+        );
     }
 
     #[test]

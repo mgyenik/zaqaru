@@ -258,7 +258,6 @@ fn flag_effect(quick: &Quick, instruction: &Instruction) -> FlagEffect {
             // which is exactly what they need.
             _ => FlagEffect::Unknown,
         },
-        _ => FlagEffect::Unknown,
     }
 }
 
