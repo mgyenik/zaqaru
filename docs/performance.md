@@ -485,9 +485,22 @@ dispatch, the planned v2, is a measured regression under wasmtime — ~5.2×
 slower on an identical bytecode loop, root-caused in `tools/thread-dispatch/`
 to the sandbox's checked indirect tail call (~3.0 ns) against a `br_table`'s
 in-function jump. The switch-loop is already the fastest dispatch wasm offers.
-What is left is **fewer** dispatches — superinstruction fusion, extending the
-compare-branch fusion already built — and cheaper per-op work; a real CPython
-eval-loop is where those get measured next.
+What is left is **fewer** dispatches and cheaper per-op work — and revisiting
+the memory-themed benchmark that scoped this (§6b's checked-memory 5-6×) found
+both. The `Load`/`Store` ops addressed only `[base + disp]`; an indexed access,
+`[base + index*scale + disp]` — the array and object addressing x86 folds into
+every memory instruction — materialised the address with a `Li`, an `Add` and a
+`Lea` first, four dispatches for one guest load. `LoadX`/`StoreX` fold it into
+one, and the `mixed` kernel rose from 1.24× to ~1.5×, CPython compute +4%. A
+last-permitted-page cache in `Space::permitted` (the trick `last_clean` plays
+for the code test, `Cell` on the `&self` read path, forgotten by `protect`/
+`unmap`) took the permission check off the hot path for both engines:
+loads/stores +8-9%, though CPython only +1.7%, its eval loop chasing pointers
+across pages a single-page cache misses. So the memory path was not at its
+floor — the addressing and the check were costing what the ops could carry
+themselves. Superinstructions that do not touch a shared cost (memory-RMW,
+`MemRmw`) stay neutral on the memory-bound eval loop; the ones that remove
+dispatches (indexed folding) or lean a shared cost (the page cache) move it.
 
 ## 7. The plan
 
