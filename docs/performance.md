@@ -53,6 +53,53 @@ Compiling the 170 MB module costs 0.23 s and is not in those figures — it
 is paid once, it parallelises, and it scales with *code* rather than image
 size, because a container's filesystem is data the compiler walks past.
 
+### 1a. The bytecode accelerator on the stack (2026-09-04)
+
+The same `demo/hello-django` image, baked twice — the default interpreter
+and `ZAQARU_ENGINE_FEATURES=targum/bytecode` — and both run through
+`tools/microbench/latency.py` in the same session, so the ratio is clean
+even though the session measured ~1.2–1.3× slower than §1's (its
+interpreter reads 38 rather than 46 req/s; the microbenchmarks read ~75 vs
+~100 MIPS, a throttle that hits both engines).
+
+| | interpreter | bytecode | gain |
+| --- | --- | --- | --- |
+| boot, to first 200 | 42 s | **28 s** | 1.5× |
+| cold request (first after boot) | 27 ms | 40 ms | **0.7×** |
+| sequential p50 | 20.6 ms | 17.7 ms | 1.16× |
+| sequential p90 / p99 | 43.4 / 43.8 ms | 31.6 / 34.3 ms | 1.37× / 1.28× |
+| sequential throughput | 37.9 req/s | **49.2 req/s** | 1.30× |
+| four clients, p50 | 120 ms | 62.9 ms | 1.9× |
+| four clients, p90 / p99 | 163 / 174 ms | 64.7 / 66.7 ms | 2.5× / 2.6× |
+| four clients, throughput | 30.5 req/s | **63.1 req/s** | **2.07×** |
+
+Three things the shape says. **Boot is eval-loop-bound** — pure Python
+import, no host round trips — so it gets the whole ~1.5× the bytecode buys
+on the interpretation it covers. **A single warm request does not**: §1's
+own decomposition put ~11 ms of a 20 ms request in the interpreter and the
+rest in host round trips and the edge pump, which the bytecode does not
+touch, so sequential moves only 1.16× at the median. **Concurrency is
+where it shows** — four clients queue behind one sync worker, the wait is
+the worker's per-request eval-loop time, and making that ~1.5× faster
+drains the queue so much sooner that p90/p99 collapse from ~165–174 ms to
+~65 ms and throughput doubles. That is the number a server under load
+feels.
+
+The one regression is the **cold request**, 27 → 40 ms: the first hit
+through new code pays the transpile-on-first-execution cost, the
+transpiler running as a block is first executed. It is one-time per block
+and amortised immediately — every warm number is faster — and §7's
+bake-time pre-translation (transpiling hot traces at bake, byte-keyed like
+tier 1, storing only the bytecode's size rather than a slower execution
+path) is what removes it. It is the clear next lever if cold-start latency
+matters.
+
+Everything else in this document about the bytecode is §6c: it covers
+93–96 % of a real workload's instructions, is correct and deterministic
+(byte-identical retirement under a fixed seed), and reaches 3.6× on a
+compute chain but 1.3–1.5× on the memory- and host-bound eval loop — which
+is exactly what turns into +30 % sequential and 2× concurrent here.
+
 What this table used to say, and why it was wrong: 24.4 s to the first
 200, 149 ms a request, 6.66 req/s, and four clients at 1.61 req/s. The
 first three were the readiness poll's doing — see section 3 — and the
