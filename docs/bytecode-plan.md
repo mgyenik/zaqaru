@@ -134,21 +134,28 @@ retire-boundary bit — §6.3).
 
 ## 4. The interpreter
 
-### 4.1 Dispatch — two phases
+### 4.1 Dispatch — the switch-loop, and why not threading
 
-- **v1: switch-loop.** A Rust `loop { match op { … } }`. Cranelift compiles it
-  to a `br_table`. This is what the prototype measured at 7.7×; it is already
-  the win, and it is what Rust can express directly. Ship this first.
-- **v2: direct-threaded via wasm tail calls.** Each op handler ends with
-  `return_call_indirect(handlers[next_op], state…)`. wasm 48 has tail calls on
-  by default; the branch-prediction win (a distinct indirect site per op,
-  correlated, versus one central `br_table` that goes everywhere) is the last
-  ~1.3–1.5× the literature reports (wasmi, Deegen). **Rust cannot emit
-  `return_call` reliably**, so this phase hand-generates the dispatch with the
-  engine's own wasm emitter (`src/emitter`), passing the pinned VM state as
-  call arguments so Cranelift keeps them in registers across the tail call —
-  the wasm analogue of Deegen's register-pinning. v2 is an optimisation on a
-  working v1, not a prerequisite.
+- **The switch-loop.** A Rust `loop { match op { … } }`. Cranelift compiles it
+  to a `br_table`. This is what `targum::bytecode` runs, and it is the right
+  dispatch for a wasm-hosted interpreter — measurement settled it.
+- **Tail-call threaded dispatch was planned here, and is struck.** The plan
+  was a distinct `return_call_indirect(handlers[next_op])` per op, for the
+  branch-prediction win (~1.3–1.5×) the literature reports over a central
+  `br_table`. That literature is native-assembly interpreters (wasmi, Deegen),
+  where a threaded tail call compiles to a raw `jmp`. Under wasmtime it does
+  not: `tools/thread-dispatch/` measures two interpreters running the identical
+  bytecode loop, and the threaded one is **~5.2× slower** — even with the VM
+  state register-pinned through the tail calls as arguments, so it is not
+  memory traffic. The decomposition (2 B iterations each): a bare `loop`
+  ~0.2 ns/op, a direct `return_call` ~1.4 ns, a `return_call_indirect` ~3.0 ns.
+  Two costs the sandbox forces and a native `jmp` avoids — the tail call's own
+  argument-setup and frame-teardown ABI, and the indirect table dispatch's
+  bounds/funcref/signature checks — where a `br_table` is an in-function jump
+  that keeps state in registers. So threading is not slow to build, it is slow
+  to run, and the `br_table` switch-loop is already the fastest dispatch wasm
+  offers. The lever for the covered path is **fewer** dispatches
+  (superinstruction fusion, §9.2), not cheaper ones.
 
 ### 4.2 The address cache
 

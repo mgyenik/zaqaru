@@ -466,10 +466,28 @@ The picture across shapes, under wasmtime (interpreter → bytecode MIPS):
 
 So the win runs from ~1.3× on memory- and call-bound code to ~4× on compute,
 entirely a function of how much of the hot path the bytecode covers and keeps
-internal. What remains toward the very top of the range is tail-call threaded
-dispatch — which needs the interpreter hand-emitted as wasm `return_call`,
-since Rust cannot emit tail calls, a large separate build for a projected
-1.3–1.5× — and `div`/SSE coverage, then a real CPython eval-loop measurement.
+internal.
+
+**Measured on real CPython, not kernels.** A python:3.12-slim rootfs running a
+pure-Python compute loop — seven billion guest instructions through the eval
+loop — comes back correct (identical result to the interpreter) at **1.5×**;
+`os.fork` and a recursive workload at 1.6×; a JSON/regex/dict/class workload at
+1.27×. With a fixed seed the two engines retire the *identical* instruction
+count, so deterministic time and record/replay survive the bytecode path. The
+accelerator covers **93–96%** of a real workload's instructions; the rest
+defer (the wider SSE — float ops, memcpy shuffles — the vector unit still
+owns). More coverage past this has bounded upside (`div` and the common SSE2
+were added and moved the number by ~5% on the workloads that use them); the
+1.3–1.6× on real code is the covered path's *per-op* cost, not coverage.
+
+**And the per-op cost has no cheaper-dispatch lever.** Tail-call threaded
+dispatch, the planned v2, is a measured regression under wasmtime — ~5.2×
+slower on an identical bytecode loop, root-caused in `tools/thread-dispatch/`
+to the sandbox's checked indirect tail call (~3.0 ns) against a `br_table`'s
+in-function jump. The switch-loop is already the fastest dispatch wasm offers.
+What is left is **fewer** dispatches — superinstruction fusion, extending the
+compare-branch fusion already built — and cheaper per-op work; a real CPython
+eval-loop is where those get measured next.
 
 ## 7. The plan
 
