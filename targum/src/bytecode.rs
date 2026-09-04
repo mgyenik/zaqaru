@@ -220,6 +220,18 @@ pub enum Op {
     /// modifier is set. Can fault; dirties a code page like any store. This is
     /// the superinstruction CPython's reference counting turns on.
     MemRmw = 46,
+
+    /// An indexed load and store — `regs[d] = load(regs[a] + regs[b]*scale +
+    /// sdisp)` and its store — where the interpreter would materialise the
+    /// address with a `Li`, an `Add`, and a `Lea` before a plain `Load`/
+    /// `Store`, four dispatches for one guest access. Scale is `1 <<
+    /// (condition field)`; the width is the op width; `sdisp` is the
+    /// sign-extended 32-bit immediate. `StoreX`'s value is `regs[d]`. This is
+    /// the addressing x86 folds into every array and object access; folding it
+    /// here is the memory superinstruction. `%fs`-relative and 32-bit-wrapped
+    /// addressing still materialise. Can fault; `StoreX` dirties code pages.
+    LoadX = 47,
+    StoreX = 48,
 }
 
 impl Op {
@@ -231,7 +243,7 @@ impl Op {
         // The discriminants are contiguous 0..=29, so a range check and a
         // transmute is the whole of it — the dense dispatch the format is
         // for.
-        (byte <= Op::MemRmw as u8).then(|| unsafe { core::mem::transmute::<u8, Op>(byte) })
+        (byte <= Op::StoreX as u8).then(|| unsafe { core::mem::transmute::<u8, Op>(byte) })
     }
 }
 
@@ -1061,6 +1073,41 @@ pub fn run<'a>(
                     flags.record(rule, width, left, right, result);
                 }
                 if let Err(fault) = space.store(address, width, result) {
+                    tcb.rip = trace.ip[pc - 1];
+                    flush!();
+                    return Leave::Fault(fault);
+                }
+                if retire {
+                    spent += 1;
+                }
+                break_on_dirty!();
+            }
+            Op::LoadX => {
+                let width = width_of(word);
+                let scale = 1u64 << ((word >> field::CONDITION) & 0b11);
+                let address = regs[a]
+                    .wrapping_add(regs[b].wrapping_mul(scale))
+                    .wrapping_add(imm as i32 as i64 as u64);
+                match space.load(address, width) {
+                    Ok(value) => write!(d, width, value),
+                    Err(fault) => {
+                        tcb.rip = trace.ip[pc - 1];
+                        flush!();
+                        return Leave::Fault(fault);
+                    }
+                }
+                if retire {
+                    spent += 1;
+                }
+            }
+            Op::StoreX => {
+                let width = width_of(word);
+                let scale = 1u64 << ((word >> field::CONDITION) & 0b11);
+                let address = regs[a]
+                    .wrapping_add(regs[b].wrapping_mul(scale))
+                    .wrapping_add(imm as i32 as i64 as u64);
+                let value = read!(d, width);
+                if let Err(fault) = space.store(address, width, value) {
                     tcb.rip = trace.ip[pc - 1];
                     flush!();
                     return Leave::Fault(fault);

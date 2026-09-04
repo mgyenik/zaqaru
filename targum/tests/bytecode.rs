@@ -709,3 +709,24 @@ fn memory_read_modify_write_agrees() {
         a.syscall().unwrap();
     });
 }
+
+#[test]
+fn indexed_loads_and_stores_agree() {
+    // base + index*scale + disp folded into one LoadX/StoreX, across scales,
+    // widths, and a displacement — the array/object access pattern.
+    agree(|a, entry| {
+        let buf = entry + 0x1000;
+        a.mov(rbx, buf).unwrap();
+        a.mov(rcx, 3u64).unwrap();
+        a.mov(rdi, 0x1122_3344_5566_7788u64).unwrap();
+        a.mov(qword_ptr(rbx + rcx * 8), rdi).unwrap(); // StoreX scale 8
+        a.mov(rax, qword_ptr(rbx + rcx * 8)).unwrap(); // LoadX scale 8
+        a.mov(dword_ptr(rbx + rcx * 4 + 64), eax).unwrap(); // StoreX scale 4, disp
+        a.mov(rdx, qword_ptr(rbx + rcx * 4 + 64), ).unwrap_or(());
+        a.movzx(rsi, byte_ptr(rbx + rcx * 1)).unwrap(); // LoadX scale 1, byte
+        a.mov(r8, 7u64).unwrap();
+        a.mov(word_ptr(rbx + r8 * 2 + 8), r9w).unwrap(); // StoreX scale 2, word
+        a.mov(r10, qword_ptr(rbx + r8 * 2 + 8), ).unwrap_or(());
+        a.syscall().unwrap();
+    });
+}

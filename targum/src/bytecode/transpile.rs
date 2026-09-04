@@ -745,12 +745,22 @@ impl Emitter {
         match (quick.destination, quick.source) {
             (Source::Register(_), Source::Memory) => {
                 let dst = self.register(quick.destination)?;
+                // An indexed address folds into one `LoadX`; anything else is
+                // a `[base + disp]` after the addressing is resolved.
+                if let Some((base, index, scale, disp)) = indexed_address(quick) {
+                    self.push(encode(Op::LoadX, dst.number, base, index, width, false, false, true, scale, disp as u32));
+                    return Some(());
+                }
                 let (base, disp) = self.address(quick)?;
                 self.push(encode(Op::Load, dst.number, base, 0, width, false, false, true, 0, disp as u32));
                 Some(())
             }
             (Source::Memory, source) => {
                 let value = self.value_into_temp(source, width)?;
+                if let Some((base, index, scale, disp)) = indexed_address(quick) {
+                    self.push(encode(Op::StoreX, value, base, index, width, false, false, true, scale, disp as u32));
+                    return Some(());
+                }
                 let (base, disp) = self.address(quick)?;
                 self.push(encode(Op::Store, 0, base, value, width, false, false, true, 0, disp as u32));
                 Some(())
@@ -1472,6 +1482,34 @@ fn full_register(register: Option<Slice>) -> Option<Option<Slice>> {
         Some(slice) if slice.width == Width::Qword && !slice.high_byte => Some(Some(slice)),
         Some(_) => None,
     }
+}
+
+/// The `base + index*scale + disp` fields for a `LoadX`/`StoreX`, when the
+/// address has both a base and an index register at full width, an ordinary
+/// scale, a displacement that fits, and no segment or 32-bit wrap. Returns
+/// `(base, index, scale_log, disp)`; anything else materialises the address
+/// the long way.
+fn indexed_address(quick: &Quick) -> Option<(u8, u8, u8, i32)> {
+    if quick.segmented {
+        return None;
+    }
+    let Address::Computed { displacement, base: Some(base), index: Some(index), scale, narrow: false } =
+        quick.address
+    else {
+        return None;
+    };
+    if base.width != Width::Qword || base.high_byte || index.width != Width::Qword || index.high_byte {
+        return None;
+    }
+    let scale_log = match scale {
+        1 => 0,
+        2 => 1,
+        4 => 2,
+        8 => 3,
+        _ => return None,
+    };
+    let disp = i32::try_from(displacement as i64).ok()?;
+    Some((base.number, index.number, scale_log, disp))
 }
 
 /// The `MemRmw` sub-op code for a write-back ALU op, or `None` for `cmp`/
