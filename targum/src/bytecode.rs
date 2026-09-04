@@ -441,13 +441,17 @@ pub fn run<'a>(
 
         match op {
             Op::ExitTo => {
-                // The transfer retired; where it goes is a guest address. The
-                // budget is checked here — an indirect transfer is a trace
-                // boundary, one of the two places (with a back-edge) the
-                // quantum is honoured — and then the address cache is probed:
-                // a hit switches trace and continues inside the interpreter, a
-                // miss leaves to the run loop.
-                spent += 1;
+                // A retiring `ExitTo` is a guest transfer (jmp/call/ret);
+                // a non-retiring one is a fall-through or stub exit that stands
+                // for no instruction, so it must not count. The budget is
+                // checked here — an indirect transfer is a trace boundary, one
+                // of the two places (with a back-edge) the quantum is honoured
+                // — and then the address cache is probed: a hit switches trace
+                // and continues inside the interpreter, a miss leaves to the
+                // run loop.
+                if retire {
+                    spent += 1;
+                }
                 let target = regs[d];
                 if spent >= budget {
                     tcb.rip = target;

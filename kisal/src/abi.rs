@@ -334,7 +334,7 @@ mod arena {
     /// Sized for the largest single-syscall transfer M1 can provoke, with
     /// room to grow before M3 needs a real answer. Overrunning it is a loud
     /// failure, never a wrap.
-    const CAPACITY: usize = 64 * 1024;
+    const CAPACITY: usize = 16 * 1024 * 1024;
 
     static mut BYTES: [u8; CAPACITY] = [0; CAPACITY];
     static mut USED: usize = 0;

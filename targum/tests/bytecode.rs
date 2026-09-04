@@ -79,6 +79,7 @@ impl Guest {
             rip: self.tcb.rip,
             status: self.tcb.flags.status(),
             fs_base: self.tcb.fs_base,
+            retired: self.tcb.retired,
             memory,
         }
     }
@@ -91,6 +92,7 @@ struct Snapshot {
     rip: u64,
     status: u64,
     fs_base: u64,
+    retired: u64,
     memory: Vec<u8>,
 }
 
@@ -182,6 +184,11 @@ fn agree(build: impl Fn(&mut CodeAssembler, u64) + Copy) -> Outcome {
         reference.status, bytecode.status,
     );
     assert_eq!(reference.fs_base, bytecode.fs_base, "fs_base differs");
+    assert_eq!(
+        reference.retired, bytecode.retired,
+        "retired instruction count differs: interpreter {} vs bytecode {}",
+        reference.retired, bytecode.retired,
+    );
     assert!(
         reference.memory == bytecode.memory,
         "memory differs between the two machines"
