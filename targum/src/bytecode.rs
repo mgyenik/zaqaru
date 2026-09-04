@@ -210,6 +210,16 @@ pub enum Op {
     VecXor = 43,
     VecCmpEqB = 44,
     VecMask = 45,
+
+    /// A read-modify-write on memory in one op — `add`/`sub`/`or`/`xor`/`and`
+    /// `[mem], reg`, and `inc`/`dec [mem]` — where the interpreter would emit a
+    /// load, an ALU op, and a store (three dispatches). The address is
+    /// `regs[a] + sdisp`; the operation is in the condition field (0 add, 1
+    /// sub, 2 or, 3 xor, 4 and, 5 inc, 6 dec); the right-hand side is `regs[b]`
+    /// (`inc`/`dec` supply their own one). Records flags unless the no-flags
+    /// modifier is set. Can fault; dirties a code page like any store. This is
+    /// the superinstruction CPython's reference counting turns on.
+    MemRmw = 46,
 }
 
 impl Op {
@@ -221,7 +231,7 @@ impl Op {
         // The discriminants are contiguous 0..=29, so a range check and a
         // transmute is the whole of it — the dense dispatch the format is
         // for.
-        (byte <= Op::VecMask as u8).then(|| unsafe { core::mem::transmute::<u8, Op>(byte) })
+        (byte <= Op::MemRmw as u8).then(|| unsafe { core::mem::transmute::<u8, Op>(byte) })
     }
 }
 
@@ -1022,6 +1032,43 @@ pub fn run<'a>(
                 if retire {
                     spent += 1;
                 }
+            }
+            Op::MemRmw => {
+                let width = width_of(word);
+                let address = regs[a].wrapping_add(imm as i32 as i64 as u64);
+                let left = match space.load(address, width) {
+                    Ok(value) => value,
+                    Err(fault) => {
+                        tcb.rip = trace.ip[pc - 1];
+                        flush!();
+                        return Leave::Fault(fault);
+                    }
+                };
+                let sub = (word >> field::CONDITION) & 0xf;
+                // `inc`/`dec` supply their own right-hand side of one.
+                let right = if sub >= 5 { 1 } else { read!(b, width) };
+                let (value, rule) = match sub {
+                    0 => (left.wrapping_add(right), Rule::Add),
+                    1 => (left.wrapping_sub(right), Rule::Sub),
+                    2 => (left | right, Rule::Logic),
+                    3 => (left ^ right, Rule::Logic),
+                    4 => (left & right, Rule::Logic),
+                    5 => (left.wrapping_add(1), Rule::Increment),
+                    _ => (left.wrapping_sub(1), Rule::Decrement),
+                };
+                let result = width.truncate(value);
+                if (word >> field::NO_FLAGS) & 1 == 0 {
+                    flags.record(rule, width, left, right, result);
+                }
+                if let Err(fault) = space.store(address, width, result) {
+                    tcb.rip = trace.ip[pc - 1];
+                    flush!();
+                    return Leave::Fault(fault);
+                }
+                if retire {
+                    spent += 1;
+                }
+                break_on_dirty!();
             }
         }
     }

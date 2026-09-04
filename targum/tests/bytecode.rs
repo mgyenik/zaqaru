@@ -680,3 +680,32 @@ fn sse_string_ops_agree() {
         a.syscall().unwrap();
     });
 }
+
+#[test]
+fn memory_read_modify_write_agrees() {
+    // The reference-counting pattern and its kin: inc/dec/add/sub/and/or/xor
+    // directly on memory, at several widths, with the flags read afterward.
+    agree(|a, entry| {
+        let p = entry + 0x1000;
+        a.mov(rbx, p).unwrap();
+        a.mov(rdi, 100u64).unwrap();
+        a.mov(qword_ptr(rbx), rdi).unwrap();
+        a.inc(qword_ptr(rbx)).unwrap(); // 101
+        a.inc(qword_ptr(rbx)).unwrap(); // 102
+        a.dec(qword_ptr(rbx)).unwrap(); // 101
+        a.add(qword_ptr(rbx), 5i32).unwrap(); // 106, imm rhs
+        a.mov(rcx, 3u64).unwrap();
+        a.sub(qword_ptr(rbx), rcx).unwrap(); // 103, reg rhs
+        a.and(qword_ptr(rbx), 0x7fi32).unwrap();
+        a.mov(rax, qword_ptr(rbx)).unwrap();
+        // dword-width RMW with a displacement, and flags read after.
+        a.mov(dword_ptr(rbx + 16), 0u32.wrapping_sub(1)).unwrap();
+        a.add(dword_ptr(rbx + 16), 1i32).unwrap(); // wraps to 0, sets ZF
+        let mut zero = a.create_label();
+        a.jz(zero).unwrap();
+        a.mov(rdx, 0xbadu64).unwrap();
+        a.set_label(&mut zero).unwrap();
+        a.mov(rsi, dword_ptr(rbx + 16)).unwrap();
+        a.syscall().unwrap();
+    });
+}

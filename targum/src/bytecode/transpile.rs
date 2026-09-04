@@ -801,7 +801,6 @@ impl Emitter {
     fn emit_alu(&mut self, quick: &Quick, op: Op) -> Option<()> {
         let width = quick.width;
         let no_flags = self.flags_dead[self.index];
-        let writes_back = !matches!(op, Op::Cmp | Op::Test);
         // At most one operand is memory. Three shapes cover the rest.
         match (quick.destination, quick.source) {
             // `op reg, [mem]` — load the source into a scratch, compute into
@@ -814,19 +813,29 @@ impl Emitter {
                 self.push(encode(op, dst.number, dst.number, value, width, false, no_flags, true, 0, 0));
                 Some(())
             }
-            // `op [mem], reg/imm` — load the memory operand, compute,
-            // store back (unless the op does not write back).
+            // `op [mem], reg/imm`. A write-back op is a read-modify-write, so
+            // it fuses into one `MemRmw` — the superinstruction reference
+            // counting turns on. `cmp`/`test` do not write back, so they stay
+            // a load and a compare.
             (Source::Memory, source) => {
                 let (base, disp) = self.address(quick)?;
+                if let Some(sub) = mem_rmw_sub(op) {
+                    let rhs = match source {
+                        Source::Register(slice) if !slice.high_byte => slice.number,
+                        Source::Immediate(value) => {
+                            let scratch = self.temp();
+                            self.li(scratch, value, false);
+                            scratch
+                        }
+                        _ => return None,
+                    };
+                    self.push(encode(Op::MemRmw, 0, base, rhs, width, false, no_flags, true, sub, disp as u32));
+                    return Some(());
+                }
+                // `cmp`/`test [mem], …`: load then compare, no store.
                 let value = self.temp();
                 self.push(encode(Op::Load, value, base, 0, width, false, false, false, 0, disp as u32));
-                self.emit_alu_reg(op, value, value, source, width, no_flags, !writes_back)?;
-                if writes_back {
-                    // The operand registers are unchanged by the arithmetic,
-                    // so the same `(base, disp)` still names the location.
-                    self.push(encode(Op::Store, 0, base, value, width, false, false, true, 0, disp as u32));
-                }
-                Some(())
+                self.emit_alu_reg(op, value, value, source, width, no_flags, true)
             }
             // `op reg, reg/imm`.
             (Source::Register(_), _) => {
@@ -976,14 +985,23 @@ impl Emitter {
             }
             OpKind::Memory => {
                 let quick = Quick::lower(instruction);
-                // `inc`/`dec` on memory: build the address from a synthetic
-                // lowering of just the operand. Decline if the address form
-                // is one we do not handle.
+                // `inc`/`dec` on memory build the address from a synthetic
+                // lowering of just the operand, then fuse into one `MemRmw` —
+                // the reference-counting superinstruction. `neg`/`not` on
+                // memory (no `MemRmw` sub-op) stay a load, op, and store.
                 let (base, disp) = self.address_of_instruction(instruction, &quick)?;
-                let scratch = self.temp();
-                self.push(encode(Op::Load, scratch, base, 0, width, false, false, false, 0, disp as u32));
-                self.push(encode(op, scratch, scratch, 0, width, false, no_flags, false, 0, 0));
-                self.push(encode(Op::Store, 0, base, scratch, width, false, false, true, 0, disp as u32));
+                match op {
+                    Op::Inc | Op::Dec => {
+                        let sub = if matches!(op, Op::Inc) { 5 } else { 6 };
+                        self.push(encode(Op::MemRmw, 0, base, 0, width, false, no_flags, true, sub, disp as u32));
+                    }
+                    _ => {
+                        let scratch = self.temp();
+                        self.push(encode(Op::Load, scratch, base, 0, width, false, false, false, 0, disp as u32));
+                        self.push(encode(op, scratch, scratch, 0, width, false, no_flags, false, 0, 0));
+                        self.push(encode(Op::Store, 0, base, scratch, width, false, false, true, 0, disp as u32));
+                    }
+                }
                 Some(())
             }
             _ => None,
@@ -1455,6 +1473,19 @@ fn full_register(register: Option<Slice>) -> Option<Option<Slice>> {
         Some(slice) if slice.width == Width::Qword && !slice.high_byte => Some(Some(slice)),
         Some(_) => None,
     }
+}
+
+/// The `MemRmw` sub-op code for a write-back ALU op, or `None` for `cmp`/
+/// `test`, which do not write back and so are not read-modify-writes.
+fn mem_rmw_sub(op: Op) -> Option<u8> {
+    Some(match op {
+        Op::Add => 0,
+        Op::Sub => 1,
+        Op::Or => 2,
+        Op::Xor => 3,
+        Op::And => 4,
+        _ => return None,
+    })
 }
 
 /// Whether a width-truncated immediate fits the 32-bit immediate field
