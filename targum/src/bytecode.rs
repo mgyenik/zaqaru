@@ -184,6 +184,15 @@ pub enum Op {
     /// only if they are read later, and branches — and it retires *two* guest
     /// instructions. The lazy-flags record on the hot conditional, gone.
     FusedBranch = 37,
+
+    /// `div`/`idiv` at dword or qword width: `RDX:RAX / regs[a]`, quotient to
+    /// `RAX`, remainder to `RDX`, leaving the flags alone as the interpreter
+    /// does. The `#DE` cases — a zero divisor, or a quotient that does not fit
+    /// — defer back to the interpreter, which raises the fault; the common
+    /// case is done here. The byte form's `AX`/`AH` shape and a memory divisor
+    /// defer at transpile time.
+    Div = 38,
+    Idiv = 39,
 }
 
 impl Op {
@@ -195,7 +204,7 @@ impl Op {
         // The discriminants are contiguous 0..=29, so a range check and a
         // transmute is the whole of it — the dense dispatch the format is
         // for.
-        (byte <= Op::FusedBranch as u8).then(|| unsafe { core::mem::transmute::<u8, Op>(byte) })
+        (byte <= Op::Idiv as u8).then(|| unsafe { core::mem::transmute::<u8, Op>(byte) })
     }
 }
 
@@ -887,6 +896,49 @@ pub fn run<'a>(
                         return Leave::Preempted;
                     }
                     pc = target;
+                }
+            }
+            Op::Div | Op::Idiv => {
+                let width = width_of(word);
+                let divisor = read!(a, width);
+                // The `#DE` cases are handed to the interpreter, which raises
+                // the fault at the right address: `rip` names this instruction
+                // and it did not retire, so re-interpreting it is exact.
+                if divisor == 0 {
+                    tcb.rip = trace.ip[pc - 1];
+                    flush!();
+                    return Leave::Defer { resume: pc };
+                }
+                let bits = u64::from(width.bits());
+                let low = regs[0] & width.mask(); // RAX
+                let high = regs[2] & width.mask(); // RDX
+                let dividend = (u128::from(high) << bits) | u128::from(low);
+                let (quotient, remainder, overflows) = if matches!(op, Op::Idiv) {
+                    let shift = 128 - bits * 2;
+                    let dividend = ((dividend << shift) as i128) >> shift;
+                    let divisor = width.sign_extend(divisor) as i64 as i128;
+                    match dividend.checked_div(divisor) {
+                        None => (0, 0, true), // the most negative over minus one
+                        Some(quotient) => {
+                            let bound = 1i128 << (bits - 1);
+                            let fits = quotient >= -bound && quotient < bound;
+                            (quotient as u128, (dividend % divisor) as u128, !fits)
+                        }
+                    }
+                } else {
+                    let divisor = u128::from(divisor);
+                    let quotient = dividend / divisor;
+                    (quotient, dividend % divisor, quotient > u128::from(width.mask()))
+                };
+                if overflows {
+                    tcb.rip = trace.ip[pc - 1];
+                    flush!();
+                    return Leave::Defer { resume: pc };
+                }
+                write!(0, width, width.truncate(quotient as u64)); // RAX = quotient
+                write!(2, width, width.truncate(remainder as u64)); // RDX = remainder
+                if retire {
+                    spent += 1;
                 }
             }
         }

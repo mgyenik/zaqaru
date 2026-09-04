@@ -607,3 +607,45 @@ fn a_fused_loop_counter_agrees() {
         Outcome::Syscall
     );
 }
+
+#[test]
+fn division_agrees() {
+    // Unsigned and signed div at 32 and 64 bit, quotient and remainder, plus
+    // negative signed cases — the common non-trapping path.
+    agree(|a, _| {
+        // 64-bit unsigned: rdx:rax / rcx
+        a.mov(rdx, 0u64).unwrap();
+        a.mov(rax, 1_000_003u64).unwrap();
+        a.mov(rcx, 97u64).unwrap();
+        a.div(rcx).unwrap(); // rax = quotient, rdx = remainder
+        a.mov(rsi, rax).unwrap();
+        a.mov(rdi, rdx).unwrap();
+        // 64-bit signed with a negative dividend.
+        a.mov(rax, (-1_000_003i64) as u64).unwrap();
+        a.cqo().unwrap(); // sign-extend rax into rdx
+        a.mov(rcx, 97u64).unwrap();
+        a.idiv(rcx).unwrap();
+        a.mov(r8, rax).unwrap();
+        a.mov(r9, rdx).unwrap();
+        // 32-bit unsigned.
+        a.mov(edx, 0u32).unwrap();
+        a.mov(eax, 0xffff_fffeu32).unwrap();
+        a.mov(ecx, 7u32).unwrap();
+        a.div(ecx).unwrap();
+        a.mov(r10, rax).unwrap();
+        a.syscall().unwrap();
+    });
+}
+
+#[test]
+fn division_by_zero_defers_and_faults_the_same() {
+    // A zero divisor must #DE (SIGFPE) exactly as the interpreter does — the
+    // bytecode defers it, and the interpreter raises the trap.
+    let outcome = agree(|a, _| {
+        a.mov(rdx, 0u64).unwrap();
+        a.mov(rax, 42u64).unwrap();
+        a.mov(rcx, 0u64).unwrap();
+        a.div(rcx).unwrap();
+    });
+    assert!(matches!(outcome, Outcome::Trap(Trap::DivideError { .. })));
+}

@@ -244,7 +244,9 @@ fn flag_effect(quick: &Quick, instruction: &Instruction) -> FlagEffect {
             | Mnemonic::Sar
             | Mnemonic::Rol
             | Mnemonic::Ror => FlagEffect::WriteMaybePreserve,
-            Mnemonic::Not => FlagEffect::None,
+            // `not` writes no flags; `div`/`idiv` leave them alone (the
+            // interpreter does not touch them). All preserve.
+            Mnemonic::Not | Mnemonic::Div | Mnemonic::Idiv => FlagEffect::None,
             // `adc`/`sbb`/`setcc`/`cmov` read the flags; the default (a
             // conservative reader of all of them) keeps their producer live,
             // which is exactly what they need.
@@ -711,7 +713,8 @@ impl Emitter {
                 .or_else(|| self.emit_rotate(instruction))
                 .or_else(|| self.emit_setcc(instruction))
                 .or_else(|| self.emit_cmov(instruction))
-                .or_else(|| self.emit_carrying(instruction)),
+                .or_else(|| self.emit_carrying(instruction))
+                .or_else(|| self.emit_divide(instruction)),
             // Vector ops and everything else defer.
             _ => None,
         }
@@ -1196,6 +1199,32 @@ impl Emitter {
                 Some(())
             }
         }
+    }
+
+    /// `div`/`idiv` at dword or qword width with a register divisor. The byte
+    /// and word forms (with their `AX`/`AH` shape) and a memory divisor defer.
+    fn emit_divide(&mut self, instruction: &Instruction) -> Option<()> {
+        let op = match instruction.mnemonic() {
+            Mnemonic::Div => Op::Div,
+            Mnemonic::Idiv => Op::Idiv,
+            _ => return None,
+        };
+        if instruction.has_lock_prefix()
+            || instruction.op_count() != 1
+            || instruction.op0_kind() != OpKind::Register
+        {
+            return None;
+        }
+        let divisor = Slice::of(instruction.op_register(0))?;
+        if divisor.high_byte {
+            return None;
+        }
+        let width = Width::from_bytes(instruction.op_register(0).size())?;
+        if !matches!(width, Width::Dword | Width::Qword) {
+            return None;
+        }
+        self.push(encode(op, 0, divisor.number, 0, width, false, false, true, 0, 0));
+        Some(())
     }
 
     /// The address of a memory operand when the caller holds the instruction
