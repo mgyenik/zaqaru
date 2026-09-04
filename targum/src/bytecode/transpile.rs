@@ -816,9 +816,7 @@ impl Emitter {
             // the destination register.
             (Source::Register(_), Source::Memory) => {
                 let dst = self.register(quick.destination)?;
-                let (base, disp) = self.address(quick)?;
-                let value = self.temp();
-                self.push(encode(Op::Load, value, base, 0, width, false, false, false, 0, disp as u32));
+                let value = self.emit_scratch_load(quick, width)?;
                 self.push(encode(op, dst.number, dst.number, value, width, false, no_flags, true, 0, 0));
                 Some(())
             }
@@ -940,6 +938,22 @@ impl Emitter {
         }
     }
 
+    /// Loads a memory operand into a fresh scratch register, folding an
+    /// indexed address into one `LoadX` and otherwise resolving `[base +
+    /// disp]`. Returns the scratch it loaded into.
+    fn emit_scratch_load(&mut self, quick: &Quick, width: Width) -> Option<u8> {
+        if let Some((base, index, scale, disp)) = indexed_address(quick) {
+            let scratch = self.temp();
+            self.push(encode(Op::LoadX, scratch, base, index, width, false, false, false, scale, disp as u32));
+            Some(scratch)
+        } else {
+            let (base, disp) = self.address(quick)?;
+            let scratch = self.temp();
+            self.push(encode(Op::Load, scratch, base, 0, width, false, false, false, 0, disp as u32));
+            Some(scratch)
+        }
+    }
+
     fn emit_widen(&mut self, quick: &Quick, op: Op) -> Option<()> {
         let dst = self.register(quick.destination)?;
         let source_class = quick.source_width as u8;
@@ -949,9 +963,7 @@ impl Emitter {
                 Some(())
             }
             Source::Memory => {
-                let (base, disp) = self.address(quick)?;
-                let scratch = self.temp();
-                self.push(encode(Op::Load, scratch, base, 0, quick.source_width, false, false, false, 0, disp as u32));
+                let scratch = self.emit_scratch_load(quick, quick.source_width)?;
                 self.push(encode(op, dst.number, scratch, 0, quick.width, false, false, true, source_class, 0));
                 Some(())
             }
