@@ -482,3 +482,54 @@ fn shifts_agree() {
         a.syscall().unwrap();
     });
 }
+
+#[test]
+fn rotates_agree() {
+    agree(|a, _| {
+        a.mov(rax, 0x0123_4567_89ab_cdefu64).unwrap();
+        a.rol(rax, 7u32).unwrap();
+        a.ror(rax, 3u32).unwrap();
+        a.mov(cl, 40u32).unwrap();
+        a.rol(rbx, cl).unwrap();
+        a.mov(edx, 0xdead_beefu32).unwrap();
+        a.ror(edx, 12u32).unwrap();
+        a.syscall().unwrap();
+    });
+}
+
+#[test]
+fn setcc_and_cmov_agree() {
+    agree(|a, _| {
+        a.mov(rax, 5u64).unwrap();
+        a.mov(rbx, 9u64).unwrap();
+        a.cmp(rax, rbx).unwrap();
+        a.setl(cl).unwrap(); // 5 < 9 signed -> 1
+        a.setg(dl).unwrap();
+        a.mov(rsi, 0x1111u64).unwrap();
+        a.mov(rdi, 0x2222u64).unwrap();
+        a.cmovl(rsi, rdi).unwrap(); // taken
+        a.mov(r8d, 0xffff_ffffu32).unwrap();
+        a.cmovg(r8, rax).unwrap(); // not taken: must still 32-bit write (clear top)
+        a.syscall().unwrap();
+    });
+}
+
+#[test]
+fn adc_and_sbb_agree() {
+    // A two-word add and subtract: the carry produced by the low word must
+    // reach the adc/sbb of the high word.
+    agree(|a, _| {
+        a.mov(rax, 0xffff_ffff_ffff_ffffu64).unwrap();
+        a.mov(rbx, 0u64).unwrap();
+        a.add(rax, 1i32).unwrap(); // carry out
+        a.adc(rbx, 0i32).unwrap(); // rbx += carry
+        a.mov(rcx, 0u64).unwrap();
+        a.mov(rdx, 5u64).unwrap();
+        a.sub(rcx, 1i32).unwrap(); // borrow
+        a.sbb(rdx, 0i32).unwrap(); // rdx -= borrow
+        // sbb reg, reg broadcast-carry idiom.
+        a.stc().unwrap();
+        a.sbb(rsi, rsi).unwrap();
+        a.syscall().unwrap();
+    });
+}

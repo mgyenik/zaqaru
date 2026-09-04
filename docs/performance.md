@@ -408,23 +408,38 @@ Watch one kernel cross the line as its ops get covered. The `mixed` kernel
 | + shifts                   | 1.42× |
 
 Each covered op moves it up; while any op in the loop defers it is at or below
-break-even. And `alu` — a dependent chain with a rotate (`rol`) the transpiler
-still does not cover — stays at **0.91×**, a loss, for exactly that one
-deferred op per iteration. Correctness holds throughout: the 52 engine tests
-pass through the integrated run loop, self-modifying code and faults included,
-so this is a speed question, not a safety one, as the fallback architecture
-intends.
+break-even.
 
-**Where that leaves the go/no-go.** v1 is a real but modest win on loops it
-covers end to end (1.3–2.1×) and a loss on any loop with a deferred op in it.
-The coverage bar is therefore total, not partial: a workload is only faster if
-*every* op in its hot loops is covered. Reaching the 3–6× estimate needs, in
-order: the rest of the common ALU so real loops stop deferring (`rol`/`ror`,
-`setcc`/`cmov`/`adc`, `div`), then op fusion, then tail-call threading — and a
-re-measure on a real eval-loop block, which also needs the address cache for
-the computed-goto and call/ret dispatch. None of those is built; v1 says the
-headroom is smaller, and the coverage bar higher, than the floor prototype
-implied.
+**And once a loop is covered end to end, the win depends on its op mix — and
+for compute it reaches the estimate.** With `imul`, shifts, and rotates
+covered, the two dependent-arithmetic kernels — which a native CPU cannot
+speed up by reordering, so per-op interpreter cost dominates — measure:
+
+| kernel | interp | bytecode | ratio |
+| ---    | ---    | ---      | ---   |
+| alu    | 76     | 271      | **3.59×** |
+| mixed  | 74     | 102      | 1.38× |
+
+`alu` (a pure dependent chain) lands in the middle of the 3–6× estimate; the
+component loops (1.3–2.1×) and `mixed` (a checked load and store plus an
+unpredictable branch per iteration, so memory- and branch-bound) sit lower,
+because the permission-checked access and the branch are a smaller fraction of
+what the bytecode makes cheaper. So v1 is not one number: it is ~1.4–2× on
+memory-bound loops and ~3.6× on compute-bound ones, and *zero or a loss* on
+anything with a deferred op in the loop. Correctness holds throughout — the 52
+engine tests pass through the integrated run loop, self-modifying code and
+faults included — so this is a speed question, not a safety one.
+
+**Where that leaves the go/no-go.** v1 already reaches the estimate on
+compute-bound loops it covers, and the coverage bar is total, not partial: a
+workload is faster only if *every* op in its hot loops is covered. The integer
+core now covers `mov`/`lea`, the ALU, `imul`, shifts, rotates, `setcc`/`cmov`/
+`adc`/`sbb`, loads/stores, and the fused-free branches; what still defers in
+hot code is `div`, the SSE/vector ops, and the computed-goto and call/ret
+dispatch — which needs the address cache. The next lifts toward the top of the
+range are op fusion (compare-branch, removing the lazy-flags record on the hot
+conditional) and tail-call threaded dispatch, then the address cache and a
+real eval-loop measurement.
 
 ## 7. The plan
 

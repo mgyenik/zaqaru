@@ -150,6 +150,29 @@ pub enum Op {
     /// only when `imul`'s flags are dead (else it defers), so `CF`/`OF` — the
     /// only flags `imul` defines — need not be computed.
     Mul = 30,
+
+    /// `rol`/`ror` by `regs[b]` or the immediate, count masked as x86 masks
+    /// it. Writes no flags (emitted only when the rotate's `CF`/`OF` are
+    /// dead), so the value is all it computes. `rcl`/`rcr` (through the carry)
+    /// defer.
+    Rol = 31,
+    Ror = 32,
+
+    /// `setcc`: `regs[d]`'s low byte becomes one when the condition (in the
+    /// condition field) holds, zero otherwise; the rest of the register is
+    /// preserved. Reads the live flags, writes none.
+    Setcc = 33,
+    /// `cmovcc`: `regs[d] = holds ? regs[a] : regs[d]`, written at the op
+    /// width *either way* — a 32-bit `cmov` clears the upper half whether or
+    /// not it moves, which code depends on. Reads the live flags.
+    Cmov = 34,
+
+    /// `adc`/`sbb`: `regs[a] ± rhs ± carry`, reading the carry from the live
+    /// flags and recording the carrying rule back. The right-hand side is
+    /// `regs[b]` or the immediate. These write flags (a carry chain reads
+    /// them), so they always record.
+    Adc = 35,
+    Sbb = 36,
 }
 
 impl Op {
@@ -161,7 +184,7 @@ impl Op {
         // The discriminants are contiguous 0..=29, so a range check and a
         // transmute is the whole of it — the dense dispatch the format is
         // for.
-        (byte <= Op::Mul as u8).then(|| unsafe { core::mem::transmute::<u8, Op>(byte) })
+        (byte <= Op::Sbb as u8).then(|| unsafe { core::mem::transmute::<u8, Op>(byte) })
     }
 }
 
@@ -653,6 +676,77 @@ pub fn run(trace: &Trace, start: usize, tcb: &mut Tcb, space: &mut Space, budget
                     read!(b, width)
                 };
                 write!(d, width, width.truncate(left.wrapping_mul(right)));
+                if retire {
+                    spent += 1;
+                }
+            }
+            Op::Rol | Op::Ror => {
+                let width = width_of(word);
+                let bits = u64::from(width.bits());
+                let raw = if (word >> field::IMMEDIATE) & 1 != 0 {
+                    imm as u64
+                } else {
+                    regs[b]
+                };
+                let count = raw & if width == Width::Qword { 0x3f } else { 0x1f };
+                let value = read!(a, width);
+                let turns = count % bits;
+                // The interpreter's own rotate, value only — the `(bits -
+                // turns) % bits` keeps both shifts below the width even when
+                // `turns` is zero (a masked count of zero is a no-op).
+                let result = width.truncate(match op {
+                    Op::Rol => (value << turns) | (value >> ((bits - turns) % bits)),
+                    _ => (value >> turns) | (value << ((bits - turns) % bits)),
+                });
+                write!(d, width, result);
+                if retire {
+                    spent += 1;
+                }
+            }
+            Op::Setcc => {
+                let condition = Condition::from_code(((word >> field::CONDITION) & 0xf) as u8)
+                    .expect("a four-bit condition is one of sixteen");
+                // A byte write: the low byte becomes zero or one, the rest of
+                // the register preserved.
+                write!(d, Width::Byte, u64::from(condition.holds(&tcb.flags)));
+                if retire {
+                    spent += 1;
+                }
+            }
+            Op::Cmov => {
+                let width = width_of(word);
+                let condition = Condition::from_code(((word >> field::CONDITION) & 0xf) as u8)
+                    .expect("a four-bit condition is one of sixteen");
+                // Written either way — the read of the destination for the
+                // not-taken case is what makes a 32-bit `cmov` clear the upper
+                // half whether or not it moves.
+                let value = if condition.holds(&tcb.flags) {
+                    read!(a, width)
+                } else {
+                    read!(d, width)
+                };
+                write!(d, width, value);
+                if retire {
+                    spent += 1;
+                }
+            }
+            Op::Adc | Op::Sbb => {
+                let width = width_of(word);
+                let left = read!(a, width);
+                let right = if (word >> field::IMMEDIATE) & 1 != 0 {
+                    imm as u64 & width.mask()
+                } else {
+                    read!(b, width)
+                };
+                let carry = u64::from(tcb.flags.carry());
+                let (result, rule) = match op {
+                    Op::Adc => (left.wrapping_add(right).wrapping_add(carry), Rule::AddCarry),
+                    _ => (left.wrapping_sub(right).wrapping_sub(carry), Rule::SubBorrow),
+                };
+                let result = width.truncate(result);
+                tcb.flags
+                    .record_with_carry(rule, width, left, right, result, carry == 1);
+                write!(d, width, result);
                 if retire {
                     spent += 1;
                 }

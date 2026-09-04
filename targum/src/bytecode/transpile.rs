@@ -152,10 +152,17 @@ fn flag_effect(quick: &Quick, instruction: &Instruction) -> FlagEffect {
             // whether it is transpiled or deferred.
             Mnemonic::Neg | Mnemonic::Imul | Mnemonic::Mul => FlagEffect::FullWrite,
             Mnemonic::Inc | Mnemonic::Dec => FlagEffect::WriteExceptCarry,
-            Mnemonic::Shl | Mnemonic::Sal | Mnemonic::Shr | Mnemonic::Sar => {
-                FlagEffect::WriteMaybePreserve
-            }
+            // Shifts and rotates preserve their flags on a zero count.
+            Mnemonic::Shl
+            | Mnemonic::Sal
+            | Mnemonic::Shr
+            | Mnemonic::Sar
+            | Mnemonic::Rol
+            | Mnemonic::Ror => FlagEffect::WriteMaybePreserve,
             Mnemonic::Not => FlagEffect::None,
+            // `adc`/`sbb`/`setcc`/`cmov` read the flags; the default (a
+            // conservative reader of all of them) keeps their producer live,
+            // which is exactly what they need.
             _ => FlagEffect::Unknown,
         },
         _ => FlagEffect::Unknown,
@@ -518,7 +525,11 @@ impl Emitter {
             quick::Op::General => self
                 .emit_extra(instruction)
                 .or_else(|| self.emit_mul(instruction))
-                .or_else(|| self.emit_shift(instruction)),
+                .or_else(|| self.emit_shift(instruction))
+                .or_else(|| self.emit_rotate(instruction))
+                .or_else(|| self.emit_setcc(instruction))
+                .or_else(|| self.emit_cmov(instruction))
+                .or_else(|| self.emit_carrying(instruction)),
             // Vector ops and everything else defer.
             _ => None,
         }
@@ -879,6 +890,129 @@ impl Emitter {
                 _ => None,
             },
             _ => None,
+        }
+    }
+
+    /// `rol`/`ror` on a register, by an immediate or `cl`, when the rotate's
+    /// flags (CF/OF) are dead. `rcl`/`rcr` (through the carry) and memory
+    /// destinations defer.
+    fn emit_rotate(&mut self, instruction: &Instruction) -> Option<()> {
+        let op = match instruction.mnemonic() {
+            Mnemonic::Rol => Op::Rol,
+            Mnemonic::Ror => Op::Ror,
+            _ => return None,
+        };
+        if instruction.has_lock_prefix()
+            || !self.flags_dead[self.index]
+            || instruction.op0_kind() != OpKind::Register
+        {
+            return None;
+        }
+        let dst = Slice::of(instruction.op_register(0))?;
+        if dst.high_byte {
+            return None;
+        }
+        let width = Width::from_bytes(instruction.op_register(0).size())?;
+        match instruction.op_count() {
+            1 => {
+                self.push(encode(op, dst.number, dst.number, 0, width, true, false, true, 0, 1));
+                Some(())
+            }
+            2 => match instruction.op1_kind() {
+                OpKind::Immediate8 => {
+                    let count = instruction.immediate8() as u32;
+                    self.push(encode(op, dst.number, dst.number, 0, width, true, false, true, 0, count));
+                    Some(())
+                }
+                OpKind::Register if instruction.op_register(1) == Register::CL => {
+                    self.push(encode(op, dst.number, dst.number, 1, width, false, false, true, 0, 0));
+                    Some(())
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// `setcc` into a byte register — memory destinations defer. The condition
+    /// comes from the interpreter's own mnemonic table.
+    fn emit_setcc(&mut self, instruction: &Instruction) -> Option<()> {
+        let (kind, condition) = crate::exec::conditional_of(instruction.mnemonic())?;
+        if kind != crate::exec::Conditional::Set
+            || instruction.has_lock_prefix()
+            || instruction.op0_kind() != OpKind::Register
+        {
+            return None;
+        }
+        let dst = Slice::of(instruction.op_register(0))?;
+        if dst.high_byte {
+            return None;
+        }
+        self.push(encode(Op::Setcc, dst.number, 0, 0, Width::Byte, false, false, true, condition as u8, 0));
+        Some(())
+    }
+
+    /// `cmovcc dst, src` with a register source — a memory source (which
+    /// `Quick` does not give an address for here) defers.
+    fn emit_cmov(&mut self, instruction: &Instruction) -> Option<()> {
+        let (kind, condition) = crate::exec::conditional_of(instruction.mnemonic())?;
+        if kind != crate::exec::Conditional::Move
+            || instruction.has_lock_prefix()
+            || instruction.op1_kind() != OpKind::Register
+        {
+            return None;
+        }
+        let dst = Slice::of(instruction.op_register(0))?;
+        let src = Slice::of(instruction.op_register(1))?;
+        if dst.high_byte || src.high_byte {
+            return None;
+        }
+        let width = Width::from_bytes(instruction.op_register(0).size())?;
+        self.push(encode(Op::Cmov, dst.number, src.number, 0, width, false, false, true, condition as u8, 0));
+        Some(())
+    }
+
+    /// `adc`/`sbb dst, src` with a register destination and a register or
+    /// immediate source — memory operands defer. Always records flags (a
+    /// carry chain reads them).
+    fn emit_carrying(&mut self, instruction: &Instruction) -> Option<()> {
+        let op = match instruction.mnemonic() {
+            Mnemonic::Adc => Op::Adc,
+            Mnemonic::Sbb => Op::Sbb,
+            _ => return None,
+        };
+        if instruction.has_lock_prefix()
+            || instruction.op_count() != 2
+            || instruction.op0_kind() != OpKind::Register
+        {
+            return None;
+        }
+        let dst = Slice::of(instruction.op_register(0))?;
+        if dst.high_byte {
+            return None;
+        }
+        let width = Width::from_bytes(instruction.op_register(0).size())?;
+        match instruction.op1_kind() {
+            OpKind::Register => {
+                let src = Slice::of(instruction.op_register(1))?;
+                if src.high_byte {
+                    return None;
+                }
+                self.push(encode(op, dst.number, dst.number, src.number, width, false, false, true, 0, 0));
+                Some(())
+            }
+            OpKind::Memory => None,
+            _ => {
+                let value = width.truncate(instruction.immediate(1));
+                if fits_immediate(width, value) {
+                    self.push(encode(op, dst.number, dst.number, 0, width, true, false, true, 0, value as u32));
+                } else {
+                    let scratch = self.temp();
+                    self.li(scratch, value, false);
+                    self.push(encode(op, dst.number, dst.number, scratch, width, false, false, true, 0, 0));
+                }
+                Some(())
+            }
         }
     }
 
