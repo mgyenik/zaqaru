@@ -206,7 +206,13 @@ impl Engine {
                     budget,
                     crate::bytecode::Resolver::Cache(cache),
                 );
-                budget = budget.saturating_sub(tcb.retired.wrapping_sub(before));
+                // What ran via the accelerator, counted like tier-1's share so
+                // the run's `compiled %` reports the bytecode's coverage —
+                // which says how much of a real workload it covers and how much
+                // still defers.
+                let ran = tcb.retired.wrapping_sub(before);
+                tcb.compiled = tcb.compiled.wrapping_add(ran);
+                budget = budget.saturating_sub(ran);
                 match leave {
                     crate::bytecode::Leave::Exit | crate::bytecode::Leave::Preempted => continue,
                     crate::bytecode::Leave::Fault(fault) => {
