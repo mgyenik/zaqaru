@@ -229,7 +229,13 @@ fn flag_effect(quick: &Quick, instruction: &Instruction) -> FlagEffect {
         | quick::Op::Nop
         | quick::Op::Jmp
         | quick::Op::Call
-        | quick::Op::Ret => FlagEffect::None,
+        | quick::Op::Ret
+        // The vector ops touch no status flag.
+        | quick::Op::VecMov
+        | quick::Op::VecAnd
+        | quick::Op::VecXor
+        | quick::Op::VecCmpEqB
+        | quick::Op::VecMask => FlagEffect::None,
         // The ops lowered straight from the instruction.
         quick::Op::General => match instruction.mnemonic() {
             // `imul`/`mul` overwrite the flags (only CF/OF are defined, the
@@ -704,6 +710,12 @@ impl Emitter {
             // A conditional branch in the block's middle (or a capped block's
             // last instruction): a `BrIf` whose target is resolved later.
             quick::Op::Jcc => self.emit_jcc_branch(quick),
+            // The SSE2 subset glibc's string/memory routines use.
+            quick::Op::VecMov => self.emit_vec_move(quick),
+            quick::Op::VecAnd => self.emit_vec_binary(quick, Op::VecAnd),
+            quick::Op::VecXor => self.emit_vec_binary(quick, Op::VecXor),
+            quick::Op::VecCmpEqB => self.emit_vec_binary(quick, Op::VecCmpEqB),
+            quick::Op::VecMask => self.emit_vec_mask(quick),
             // Not lowered by `Quick`, but simple enough to lower straight
             // from the instruction.
             quick::Op::General => self
@@ -1199,6 +1211,59 @@ impl Emitter {
                 Some(())
             }
         }
+    }
+
+    /// `movups`/`movaps`/`movdqu`/`movdqa`: an XMM register from another XMM
+    /// register or memory, or memory from an XMM register.
+    fn emit_vec_move(&mut self, quick: &Quick) -> Option<()> {
+        match (quick.destination, quick.source) {
+            (Source::Vector(dst), Source::Vector(src)) => {
+                self.push(encode(Op::VecMov, dst, 0, src, Width::Qword, false, false, true, 0, 0));
+                Some(())
+            }
+            (Source::Vector(dst), Source::Memory) => {
+                let (base, disp) = self.address(quick)?;
+                self.push(encode(Op::VecMov, dst, base, 0, Width::Qword, true, false, true, 0, disp as u32));
+                Some(())
+            }
+            (Source::Memory, Source::Vector(src)) => {
+                let (base, disp) = self.address(quick)?;
+                self.push(encode(Op::VecStore, 0, base, src, Width::Qword, false, false, true, 0, disp as u32));
+                Some(())
+            }
+            _ => None,
+        }
+    }
+
+    /// `pand`/`pxor`/`pcmpeqb`: an XMM destination combined with an XMM
+    /// register or memory.
+    fn emit_vec_binary(&mut self, quick: &Quick, op: Op) -> Option<()> {
+        let Source::Vector(dst) = quick.destination else {
+            return None;
+        };
+        match quick.source {
+            Source::Vector(src) => {
+                self.push(encode(op, dst, 0, src, Width::Qword, false, false, true, 0, 0));
+                Some(())
+            }
+            Source::Memory => {
+                let (base, disp) = self.address(quick)?;
+                self.push(encode(op, dst, base, 0, Width::Qword, true, false, true, 0, disp as u32));
+                Some(())
+            }
+            _ => None,
+        }
+    }
+
+    /// `pmovmskb`: the sixteen byte sign bits of an XMM register into a general
+    /// register.
+    fn emit_vec_mask(&mut self, quick: &Quick) -> Option<()> {
+        let dst = self.register(quick.destination)?;
+        let Source::Vector(src) = quick.source else {
+            return None;
+        };
+        self.push(encode(Op::VecMask, dst.number, 0, src, Width::Qword, false, false, true, 0, 0));
+        Some(())
     }
 
     /// `div`/`idiv` at dword or qword width with a register divisor. The byte

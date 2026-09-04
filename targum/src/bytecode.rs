@@ -193,6 +193,23 @@ pub enum Op {
     /// defer at transpile time.
     Div = 38,
     Idiv = 39,
+
+    /// The SSE2 subset glibc's string and memory routines lean on, operating
+    /// on the 128-bit XMM file in the control block. Everything else vector
+    /// defers to the interpreter's vector unit.
+    ///
+    /// `VecMov`: `xmm[d]` ← `xmm[b]` or the 16 bytes at `regs[a] + imm` (the
+    /// immediate modifier selects the memory source) — `movups`/`movaps`/
+    /// `movdqu`/`movdqa`. `VecStore`: the 16 bytes at `regs[a] + imm` ←
+    /// `xmm[b]`. `VecAnd`/`VecXor`/`VecCmpEqB`: `xmm[d]` combined with `xmm[b]`
+    /// or memory — `pand`/`pxor`/`pcmpeqb`. `VecMask`: `regs[d]` ← the sixteen
+    /// byte sign bits of `xmm[b]` — `pmovmskb`. A memory operand can fault.
+    VecMov = 40,
+    VecStore = 41,
+    VecAnd = 42,
+    VecXor = 43,
+    VecCmpEqB = 44,
+    VecMask = 45,
 }
 
 impl Op {
@@ -204,7 +221,7 @@ impl Op {
         // The discriminants are contiguous 0..=29, so a range check and a
         // transmute is the whole of it — the dense dispatch the format is
         // for.
-        (byte <= Op::Idiv as u8).then(|| unsafe { core::mem::transmute::<u8, Op>(byte) })
+        (byte <= Op::VecMask as u8).then(|| unsafe { core::mem::transmute::<u8, Op>(byte) })
     }
 }
 
@@ -941,6 +958,91 @@ pub fn run<'a>(
                     spent += 1;
                 }
             }
+            Op::VecMov
+            | Op::VecStore
+            | Op::VecAnd
+            | Op::VecXor
+            | Op::VecCmpEqB
+            | Op::VecMask => {
+                // The source's sixteen bytes: another XMM register, or memory
+                // at `regs[a] + imm` (the immediate modifier selects it). A
+                // memory access faults like any other.
+                let from_memory = (word >> field::IMMEDIATE) & 1 != 0;
+                let source: [u8; 16] = if from_memory && !matches!(op, Op::VecStore) {
+                    let address = regs[a].wrapping_add(imm as i32 as i64 as u64);
+                    let mut bytes = [0u8; 16];
+                    if let Err(fault) = space.read(address, &mut bytes) {
+                        tcb.rip = trace.ip[pc - 1];
+                        flush!();
+                        return Leave::Fault(fault);
+                    }
+                    bytes
+                } else if matches!(op, Op::VecStore) {
+                    // The value to store is `xmm[b]`.
+                    vector_bytes(&tcb.vectors[b])
+                } else {
+                    vector_bytes(&tcb.vectors[b])
+                };
+                match op {
+                    Op::VecStore => {
+                        let address = regs[a].wrapping_add(imm as i32 as i64 as u64);
+                        if let Err(fault) = space.write(address, &source) {
+                            tcb.rip = trace.ip[pc - 1];
+                            flush!();
+                            return Leave::Fault(fault);
+                        }
+                    }
+                    Op::VecMov => tcb.vectors[d] = vector_words(&source),
+                    Op::VecAnd => {
+                        tcb.vectors[d][0] &= vector_words(&source)[0];
+                        tcb.vectors[d][1] &= vector_words(&source)[1];
+                    }
+                    Op::VecXor => {
+                        tcb.vectors[d][0] ^= vector_words(&source)[0];
+                        tcb.vectors[d][1] ^= vector_words(&source)[1];
+                    }
+                    Op::VecCmpEqB => {
+                        let mut destination = vector_bytes(&tcb.vectors[d]);
+                        for (byte, &other) in destination.iter_mut().zip(source.iter()) {
+                            *byte = if *byte == other { 0xff } else { 0x00 };
+                        }
+                        tcb.vectors[d] = vector_words(&destination);
+                    }
+                    Op::VecMask => {
+                        // The high bit of each of the source's sixteen bytes,
+                        // packed low to high — `pmovmskb`.
+                        let mut mask = 0u64;
+                        for (index, &byte) in source.iter().enumerate() {
+                            mask |= u64::from(byte >> 7) << index;
+                        }
+                        write!(d, Width::Qword, mask);
+                    }
+                    _ => unreachable!(),
+                }
+                if retire {
+                    spent += 1;
+                }
+            }
         }
     }
+}
+
+/// The sixteen bytes of a 128-bit XMM register, little-endian — the order a
+/// `v128.load` uses, so this matches how the interpreter and the compiler
+/// read the file.
+#[inline]
+fn vector_bytes(words: &[u64; 2]) -> [u8; 16] {
+    let mut bytes = [0u8; 16];
+    bytes[..8].copy_from_slice(&words[0].to_le_bytes());
+    bytes[8..].copy_from_slice(&words[1].to_le_bytes());
+    bytes
+}
+
+/// The inverse of [`vector_bytes`].
+#[inline]
+fn vector_words(bytes: &[u8; 16]) -> [u64; 2] {
+    [
+        u64::from_le_bytes(bytes[..8].try_into().unwrap()),
+        u64::from_le_bytes(bytes[8..].try_into().unwrap()),
+    ]
 }

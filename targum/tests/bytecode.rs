@@ -649,3 +649,34 @@ fn division_by_zero_defers_and_faults_the_same() {
     });
     assert!(matches!(outcome, Outcome::Trap(Trap::DivideError { .. })));
 }
+
+#[test]
+fn sse_string_ops_agree() {
+    // The pattern glibc's memcmp/strlen use: load two 16-byte vectors, compare
+    // bytes, mask, plus pand/pxor and vector moves to/from memory.
+    agree(|a, entry| {
+        use iced_x86::code_asm::{xmm0, xmm1, xmm2};
+        let buf = entry + 0x1000;
+        a.mov(rbx, buf).unwrap();
+        // Seed two 16-byte regions via GPR stores.
+        a.mov(rdi, 0x0011_2233_4455_6677u64).unwrap();
+        a.mov(qword_ptr(rbx), rdi).unwrap();
+        a.mov(rdi, 0x8899_aabb_ccdd_eeffu64).unwrap();
+        a.mov(qword_ptr(rbx + 8), rdi).unwrap();
+        a.mov(rdi, 0x0011_2233_4455_6677u64).unwrap();
+        a.mov(qword_ptr(rbx + 16), rdi).unwrap();
+        a.mov(rdi, 0x8899_aabb_ccdd_ee00u64).unwrap(); // last byte differs
+        a.mov(qword_ptr(rbx + 24), rdi).unwrap();
+        a.movdqu(xmm0, xmmword_ptr(rbx)).unwrap();
+        a.movdqu(xmm1, xmmword_ptr(rbx + 16)).unwrap();
+        a.movdqa(xmm2, xmm0).unwrap();
+        a.pcmpeqb(xmm0, xmm1).unwrap(); // per-byte equality
+        a.pmovmskb(rax, xmm0).unwrap(); // rax = equality mask (bit 15 clear)
+        a.pxor(xmm2, xmm1).unwrap();
+        a.pand(xmm2, xmm0).unwrap();
+        a.movdqu(xmmword_ptr(rbx + 32), xmm2).unwrap(); // store result
+        a.mov(rcx, qword_ptr(rbx + 32)).unwrap();
+        a.mov(rdx, qword_ptr(rbx + 40)).unwrap();
+        a.syscall().unwrap();
+    });
+}
