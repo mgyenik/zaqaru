@@ -173,6 +173,17 @@ pub enum Op {
     /// them), so they always record.
     Adc = 35,
     Sbb = 36,
+
+    /// A fused flag-producer and conditional branch — `cmp`/`test`/`sub`/
+    /// `add`/`and`/`or`/`xor`/`inc`/`dec` immediately followed by a `jcc` that
+    /// consumes its flags, in one op. Two words: the first is the producer's
+    /// operands (`a`, `b`-or-immediate, width) and the branch's condition; the
+    /// second is `[target:32][producer op:8][flags-live-after:1]`. It computes
+    /// the result, evaluates the condition without touching the control block,
+    /// writes the result back if the producer does, updates the trace's flags
+    /// only if they are read later, and branches — and it retires *two* guest
+    /// instructions. The lazy-flags record on the hot conditional, gone.
+    FusedBranch = 37,
 }
 
 impl Op {
@@ -184,7 +195,7 @@ impl Op {
         // The discriminants are contiguous 0..=29, so a range check and a
         // transmute is the whole of it — the dense dispatch the format is
         // for.
-        (byte <= Op::Sbb as u8).then(|| unsafe { core::mem::transmute::<u8, Op>(byte) })
+        (byte <= Op::FusedBranch as u8).then(|| unsafe { core::mem::transmute::<u8, Op>(byte) })
     }
 }
 
@@ -313,6 +324,11 @@ pub fn run(trace: &Trace, start: usize, tcb: &mut Tcb, space: &mut Space, budget
     let code = &trace.code;
     let mut regs = [0u64; REGISTERS];
     regs[..crate::state::REGISTER_COUNT].copy_from_slice(&tcb.registers);
+    // The lazy-flags record, held in a local copy through the trace and
+    // flushed to the control block only at a leave — so a `cmp`/`jcc` pair, an
+    // `adc` chain, a `setcc`, touch a register-resident struct the compiler
+    // can keep in place rather than the control-block pointer on every op.
+    let mut flags = tcb.flags;
     let mut pc = start;
     let mut spent: u64 = 0;
 
@@ -352,6 +368,7 @@ pub fn run(trace: &Trace, start: usize, tcb: &mut Tcb, space: &mut Space, budget
         () => {{
             tcb.retired = tcb.retired.wrapping_add(spent);
             tcb.registers.copy_from_slice(&regs[..crate::state::REGISTER_COUNT]);
+            tcb.flags = flags;
         }};
     }
     // Self-modifying code: a store that landed on a page some cached block —
@@ -426,7 +443,7 @@ pub fn run(trace: &Trace, start: usize, tcb: &mut Tcb, space: &mut Space, budget
                 if retire {
                     spent += 1;
                 }
-                if condition.holds(&tcb.flags) {
+                if condition.holds(&flags) {
                     let target = imm as usize;
                     // A taken back-edge is a loop iteration boundary: check the
                     // budget there, in retired-instruction units.
@@ -486,7 +503,7 @@ pub fn run(trace: &Trace, start: usize, tcb: &mut Tcb, space: &mut Space, budget
                         Op::Sub | Op::Cmp => Rule::Sub,
                         _ => Rule::Logic,
                     };
-                    tcb.flags.record(rule, width, left, right, result);
+                    flags.record(rule, width, left, right, result);
                 }
                 if !matches!(op, Op::Cmp | Op::Test) {
                     write!(d, width, result);
@@ -504,7 +521,7 @@ pub fn run(trace: &Trace, start: usize, tcb: &mut Tcb, space: &mut Space, budget
                 };
                 let result = width.truncate(result);
                 if (word >> field::NO_FLAGS) & 1 == 0 {
-                    tcb.flags.record(rule, width, left, 1, result);
+                    flags.record(rule, width, left, 1, result);
                 }
                 write!(d, width, result);
                 if retire {
@@ -516,7 +533,7 @@ pub fn run(trace: &Trace, start: usize, tcb: &mut Tcb, space: &mut Space, budget
                 let value = read!(a, width);
                 let result = width.truncate(0u64.wrapping_sub(value));
                 if (word >> field::NO_FLAGS) & 1 == 0 {
-                    tcb.flags.record(Rule::Sub, width, 0, value, result);
+                    flags.record(Rule::Sub, width, 0, value, result);
                 }
                 write!(d, width, result);
                 if retire {
@@ -708,7 +725,7 @@ pub fn run(trace: &Trace, start: usize, tcb: &mut Tcb, space: &mut Space, budget
                     .expect("a four-bit condition is one of sixteen");
                 // A byte write: the low byte becomes zero or one, the rest of
                 // the register preserved.
-                write!(d, Width::Byte, u64::from(condition.holds(&tcb.flags)));
+                write!(d, Width::Byte, u64::from(condition.holds(&flags)));
                 if retire {
                     spent += 1;
                 }
@@ -720,7 +737,7 @@ pub fn run(trace: &Trace, start: usize, tcb: &mut Tcb, space: &mut Space, budget
                 // Written either way — the read of the destination for the
                 // not-taken case is what makes a 32-bit `cmov` clear the upper
                 // half whether or not it moves.
-                let value = if condition.holds(&tcb.flags) {
+                let value = if condition.holds(&flags) {
                     read!(a, width)
                 } else {
                     read!(d, width)
@@ -738,17 +755,77 @@ pub fn run(trace: &Trace, start: usize, tcb: &mut Tcb, space: &mut Space, budget
                 } else {
                     read!(b, width)
                 };
-                let carry = u64::from(tcb.flags.carry());
+                let carry = u64::from(flags.carry());
                 let (result, rule) = match op {
                     Op::Adc => (left.wrapping_add(right).wrapping_add(carry), Rule::AddCarry),
                     _ => (left.wrapping_sub(right).wrapping_sub(carry), Rule::SubBorrow),
                 };
                 let result = width.truncate(result);
-                tcb.flags
+                flags
                     .record_with_carry(rule, width, left, right, result, carry == 1);
                 write!(d, width, result);
                 if retire {
                     spent += 1;
+                }
+            }
+            Op::FusedBranch => {
+                let control = code[pc];
+                pc += 1;
+                let width = width_of(word);
+                let condition = Condition::from_code(((word >> field::CONDITION) & 0xf) as u8)
+                    .expect("a four-bit condition is one of sixteen");
+                let left = read!(a, width);
+                let right = if (word >> field::IMMEDIATE) & 1 != 0 {
+                    imm as u64 & width.mask()
+                } else {
+                    read!(b, width)
+                };
+                let producer = Op::from_byte((control >> 32) as u8)
+                    .expect("the fused producer is a real op");
+                let target = (control & 0xffff_ffff) as usize;
+                let live_after = (control >> 40) & 1 != 0;
+                // The producer decides the result, the flag rule, and whether
+                // it writes back — exactly the interpreter's own arms.
+                let (value, rule, writes_back) = match producer {
+                    Op::Add => (left.wrapping_add(right), Rule::Add, true),
+                    Op::Sub => (left.wrapping_sub(right), Rule::Sub, true),
+                    Op::Cmp => (left.wrapping_sub(right), Rule::Sub, false),
+                    Op::And => (left & right, Rule::Logic, true),
+                    Op::Test => (left & right, Rule::Logic, false),
+                    Op::Or => (left | right, Rule::Logic, true),
+                    Op::Xor => (left ^ right, Rule::Logic, true),
+                    Op::Inc => (left.wrapping_add(1), Rule::Increment, true),
+                    Op::Dec => (left.wrapping_sub(1), Rule::Decrement, true),
+                    _ => unreachable!("the fused producer is a flag-setting op"),
+                };
+                let result = width.truncate(value);
+                // `inc`/`dec` record a right-hand side of one; the rest their
+                // real one. A throwaway record seeded from the current flags —
+                // so `inc`/`dec` preserve the carry — evaluated for just this
+                // condition; the compiler drops the fields the condition does
+                // not read when the record does not escape (`live_after`).
+                let record_right = match producer {
+                    Op::Inc | Op::Dec => 1,
+                    _ => right,
+                };
+                let mut evaluated = flags;
+                evaluated.record(rule, width, left, record_right, result);
+                let holds = condition.holds(&evaluated);
+                if writes_back {
+                    write!(d, width, result);
+                }
+                if live_after {
+                    flags = evaluated;
+                }
+                // Two guest instructions — the producer and the branch.
+                spent += 2;
+                if holds {
+                    if target <= pc && spent >= budget {
+                        tcb.rip = trace.ip[target];
+                        flush!();
+                        return Leave::Preempted;
+                    }
+                    pc = target;
                 }
             }
         }

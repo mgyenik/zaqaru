@@ -434,12 +434,22 @@ faults included — so this is a speed question, not a safety one.
 compute-bound loops it covers, and the coverage bar is total, not partial: a
 workload is faster only if *every* op in its hot loops is covered. The integer
 core now covers `mov`/`lea`, the ALU, `imul`, shifts, rotates, `setcc`/`cmov`/
-`adc`/`sbb`, loads/stores, and the fused-free branches; what still defers in
-hot code is `div`, the SSE/vector ops, and the computed-goto and call/ret
-dispatch — which needs the address cache. The next lifts toward the top of the
-range are op fusion (compare-branch, removing the lazy-flags record on the hot
-conditional) and tail-call threaded dispatch, then the address cache and a
-real eval-loop measurement.
+`adc`/`sbb`, loads/stores, and the branches; what still defers in hot code is
+`div`, the SSE/vector ops, and the computed-goto and call/ret dispatch — which
+needs the address cache.
+
+**Two further lifts are now built.** The lazy flags are held in a local through
+the trace, flushed to the control block only at a leave, so a `cmp`/`jcc` pair
+or an `adc` chain touches a register-resident record rather than the
+control-block pointer per op. And a flag-producer immediately followed by a
+`jcc` that consumes its flags fuses into one `FusedBranch` — the two-op
+dispatch becomes one, and when the flags are dead past the branch (which the
+liveness pass proves, accounting for *both* the fall-through and the taken
+target) the record is skipped entirely. Together they lift the compute chain to
+**4.2×** and the arithmetic component to 2.1×; memory- and branch-bound loops
+are unmoved (their cost is elsewhere). What remains toward the top of the range
+is tail-call threaded dispatch, then the address cache and a real eval-loop
+measurement.
 
 ## 7. The plan
 

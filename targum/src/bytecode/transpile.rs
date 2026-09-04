@@ -36,17 +36,27 @@ const SCRATCH_BASE: u8 = super::SCRATCH as u8;
 /// is nothing worth running as bytecode — every instruction declined, so the
 /// trace would be a list of `Defer`s with no covered op between them.
 pub fn transpile(block: &crate::block::Block) -> Option<Trace> {
-    let mut emitter = Emitter::new(block.entry, flag_liveness(block));
     let count = block.instructions.len();
     if count == 0 {
         return None;
     }
-    for (index, (instruction, quick)) in block
+    let liveness = flag_liveness(block);
+    // The addresses a branch inside this block targets — an instruction that
+    // is one cannot be fused away, because control could enter at it.
+    let targets = internal_targets(block);
+    // Address → index, so a fused branch can find whether its taken target
+    // reads the producer's flags.
+    let index_of: std::collections::HashMap<u64, usize> = block
         .instructions
         .iter()
-        .zip(block.quick.iter())
         .enumerate()
-    {
+        .map(|(i, instruction)| (instruction.ip(), i))
+        .collect();
+    let mut emitter = Emitter::new(block.entry, liveness.dead.clone());
+    let mut index = 0;
+    while index < count {
+        let instruction = &block.instructions[index];
+        let quick = &block.quick[index];
         emitter.begin(index, instruction.ip());
         let is_last = index + 1 == count;
         // A `syscall` ends its block, and the loop — not the trace — runs it:
@@ -56,7 +66,7 @@ pub fn transpile(block: &crate::block::Block) -> Option<Trace> {
         // instead would loop, since the target is the block just run.
         if is_last && is_syscall(instruction) {
             emitter.defer(instruction);
-            continue;
+            break;
         }
         // A block otherwise ends at an *unconditional* transfer, a call, or a
         // return (a block cache invariant: a conditional branch does not end a
@@ -74,6 +84,35 @@ pub fn transpile(block: &crate::block::Block) -> Option<Trace> {
             );
         if terminates {
             emitter.terminal(quick, instruction);
+            break;
+        }
+        // Fusion: a flag-producer immediately followed by a `jcc` that
+        // consumes its flags, and whose address nothing branches to (so no
+        // control enters between them), becomes one op. The `jcc`'s flag use
+        // is what makes the producer's flags live; `live_after` says whether
+        // anything past the `jcc` still needs them.
+        if index + 1 < count
+            && block.quick[index + 1].op == quick::Op::Jcc
+            && !targets.contains(&block.instructions[index + 1].ip())
+            && emitter.try_fuse(
+                quick,
+                instruction,
+                &block.quick[index + 1],
+                &block.instructions[index + 1],
+                // The producer's flags outlive the branch if they are live on
+                // its fall-through *or* on its taken target — a static pass
+                // over one block sees only the fall-through, so the taken
+                // target is looked up (and an external one is conservatively
+                // taken as live, since the next block may read the flags).
+                fused_flags_live_after(block, &liveness, &index_of, index + 1),
+            )
+        {
+            // If the fused `jcc` was the block's last instruction (a cap that
+            // fell on it), the not-taken path still needs a fall-through exit.
+            if index + 2 == count {
+                emitter.exit_to_address(block.instructions[index + 1].next_ip(), false);
+            }
+            index += 2;
             continue;
         }
         // An ordinary instruction, including a mid-block conditional branch.
@@ -84,6 +123,7 @@ pub fn transpile(block: &crate::block::Block) -> Option<Trace> {
             // instruction already retired on its own word, so this does not.
             emitter.exit_to_address(instruction.next_ip(), false);
         }
+        index += 1;
     }
     emitter.resolve_branches();
     Some(emitter.finish())
@@ -93,6 +133,51 @@ pub fn transpile(block: &crate::block::Block) -> Option<Trace> {
 /// at that the loop, not the trace, owns.
 fn is_syscall(instruction: &Instruction) -> bool {
     matches!(instruction.mnemonic(), Mnemonic::Syscall | Mnemonic::Sysenter)
+}
+
+/// The constant addresses a branch inside the block targets. An instruction
+/// at one of these cannot be fused into its predecessor: control could enter
+/// at it, so the predecessor must not be run first.
+fn internal_targets(block: &crate::block::Block) -> std::collections::HashSet<u64> {
+    let mut targets = std::collections::HashSet::new();
+    for instruction in &block.instructions {
+        if matches!(
+            instruction.flow_control(),
+            FlowControl::ConditionalBranch | FlowControl::UnconditionalBranch
+        ) && instruction.op0_kind() == OpKind::NearBranch64
+        {
+            targets.insert(instruction.near_branch64());
+        }
+    }
+    targets
+}
+
+/// Whether a fused producer's flags are live after its `jcc` (at `jcc_index`)
+/// on *either* successor path — the fall-through, or the taken target. A taken
+/// target outside the block is taken as live, since the next block may read
+/// the flags.
+fn fused_flags_live_after(
+    block: &crate::block::Block,
+    liveness: &Liveness,
+    index_of: &std::collections::HashMap<u64, usize>,
+    jcc_index: usize,
+) -> bool {
+    if liveness.live_after[jcc_index] {
+        return true;
+    }
+    let target = block.instructions[jcc_index].near_branch64();
+    match index_of.get(&target) {
+        Some(&target_index) => liveness.live_entering[target_index],
+        None => true,
+    }
+}
+
+/// A fused producer's right-hand side.
+enum Rhs {
+    Register(u8),
+    Immediate(u64),
+    /// `inc`/`dec`: no explicit right-hand side (an implicit one).
+    None,
 }
 
 /// How an instruction affects the status flags, for the liveness pass.
@@ -191,18 +276,27 @@ fn condition_reads(condition: crate::flags::Condition) -> (bool, bool) {
 /// carry is tracked apart from the other flags because `inc`/`dec` preserve
 /// it: a carry set before a `dec` and read after it is still live across the
 /// `dec`, and the pass must not eliminate its producer.
-fn flag_liveness(block: &crate::block::Block) -> Vec<bool> {
+fn flag_liveness(block: &crate::block::Block) -> Liveness {
     let n = block.instructions.len();
     let mut dead = vec![false; n];
+    // Whether the flags are live *after* each instruction — needed by fusion,
+    // to know if a producer's flags outlive the branch that consumes them.
+    let mut live_after = vec![false; n];
     // Flags are live out of the block — the next block may read them — unless
     // it ends in a `call` or `ret`, across which the ABI makes them volatile.
     let ends_volatile = matches!(
         block.instructions.last().map(|i| i.flow_control()),
         Some(FlowControl::Call | FlowControl::IndirectCall | FlowControl::Return)
     );
+    // Whether flags are live *entering* each instruction (before it runs) —
+    // which, at a branch target, is whether the taken path reads them.
+    let mut live_entering = vec![false; n];
     let mut carry_live = !ends_volatile;
     let mut other_live = !ends_volatile;
     for index in (0..n).rev() {
+        // Before processing instruction `index`, the accumulated liveness is
+        // exactly what is live entering `index + 1` — i.e. live after `index`.
+        live_after[index] = carry_live || other_live;
         match flag_effect(&block.quick[index], &block.instructions[index]) {
             FlagEffect::FullWrite => {
                 dead[index] = !(carry_live || other_live);
@@ -232,8 +326,20 @@ fn flag_liveness(block: &crate::block::Block) -> Vec<bool> {
                 other_live = true;
             }
         }
+        // After processing, the accumulated liveness is what is live entering
+        // this instruction.
+        live_entering[index] = carry_live || other_live;
     }
-    dead
+    Liveness { dead, live_after, live_entering }
+}
+
+/// The result of [`flag_liveness`]: for each instruction, whether its written
+/// flags are dead, whether flags are live after it, and whether they are live
+/// entering it (what a branch to it inherits).
+struct Liveness {
+    dead: Vec<bool>,
+    live_after: Vec<bool>,
+    live_entering: Vec<bool>,
 }
 
 struct Emitter {
@@ -258,6 +364,10 @@ struct Emitter {
     /// external one to an exit stub. Deferred because a forward branch names a
     /// target not yet emitted.
     branches: Vec<(usize, u64, u64)>,
+    /// Fused-branch targets awaiting resolution: `(offset of the control
+    /// word, taken guest address, the branch's address)`. Like `branches`,
+    /// but the target sits in the low 32 bits of the second (control) word.
+    fused_branches: Vec<(usize, u64, u64)>,
     /// Whether each instruction's flag write is dead, from [`flag_liveness`].
     /// Indexed by instruction position; read by the ALU emissions to set the
     /// no-flags modifier.
@@ -276,31 +386,103 @@ impl Emitter {
             current: entry,
             scratch: SCRATCH_BASE,
             branches: Vec::new(),
+            fused_branches: Vec::new(),
             flags_dead,
             index: 0,
         }
+    }
+
+    /// Attempts to fuse a flag-producer and the `jcc` that follows it into one
+    /// `FusedBranch`. Returns whether it did — `false` leaves both to be
+    /// emitted separately. Only register/immediate operands with a register
+    /// destination fuse; a memory operand, a high-byte register, or an
+    /// immediate too wide for the op declines.
+    fn try_fuse(
+        &mut self,
+        producer_quick: &Quick,
+        producer: &Instruction,
+        jcc_quick: &Quick,
+        _jcc: &Instruction,
+        live_after: bool,
+    ) -> bool {
+        let target = match jcc_quick.source {
+            Source::Immediate(target) => target,
+            _ => return false,
+        };
+        let Some((producer_op, width, dest, rhs)) = fusible_producer(producer_quick, producer)
+        else {
+            return false;
+        };
+        let (immediate, b, imm) = match rhs {
+            Rhs::Register(number) => (false, number, 0u32),
+            Rhs::Immediate(value) => {
+                if !fits_immediate(width, value) {
+                    return false;
+                }
+                (true, 0, value as u32)
+            }
+            // `inc`/`dec`: no right-hand side; the op supplies its own one.
+            Rhs::None => (true, 0, 0),
+        };
+        let condition = jcc_quick.condition as u8;
+        // Word one: the producer's operands and the branch condition. `d` and
+        // `a` are both the destination, since x86's two-operand form makes the
+        // destination the left operand.
+        self.push(encode(
+            Op::FusedBranch,
+            dest,
+            dest,
+            b,
+            width,
+            immediate,
+            false,
+            true,
+            condition,
+            imm,
+        ));
+        // Word two: the target (patched later), the producer op-code, and
+        // whether the flags outlive the branch.
+        let control = ((producer_op as u64) << 32) | ((live_after as u64) << 40);
+        let control_offset = self.code.len();
+        self.push(control);
+        self.fused_branches.push((control_offset, target, self.current));
+        true
     }
 
     /// Resolves every conditional branch to a stream offset — an internal
     /// target directly, an external one through an exit stub appended after
     /// the body. Called once, after the whole block is emitted.
     fn resolve_branches(&mut self) {
+        // The same resolution serves both branch kinds — an internal target is
+        // a stream offset, an external one an exit stub — differing only in
+        // which field of which word the offset is written to.
         let branches = std::mem::take(&mut self.branches);
         for (offset, target, at) in branches {
-            let destination = match self.internal(target) {
-                Some(internal) => internal,
-                None => {
-                    // An external target: a stub that sets `rip` and leaves,
-                    // reached only when the branch is taken (it already
-                    // retired), so the stub does not retire.
-                    self.current = at;
-                    self.scratch = SCRATCH_BASE;
-                    let stub = self.code.len();
-                    self.exit_to_address(target, false);
-                    stub
-                }
-            };
+            let destination = self.resolve_target(target, at);
             self.patch_target(offset, destination);
+        }
+        let fused = std::mem::take(&mut self.fused_branches);
+        for (offset, target, at) in fused {
+            let destination = self.resolve_target(target, at);
+            // The fused target sits in the low 32 bits of the control word.
+            self.code[offset] = (self.code[offset] & !0xffff_ffffu64) | destination as u64;
+        }
+    }
+
+    /// The stream offset a branch target resolves to: an internal instruction
+    /// directly, or an exit stub (appended here) for an external one.
+    fn resolve_target(&mut self, target: u64, at: u64) -> usize {
+        match self.internal(target) {
+            Some(internal) => internal,
+            None => {
+                // Reached only when the branch is taken (it already retired),
+                // so the stub does not retire.
+                self.current = at;
+                self.scratch = SCRATCH_BASE;
+                let stub = self.code.len();
+                self.exit_to_address(target, false);
+                stub
+            }
         }
     }
 
@@ -1123,6 +1305,51 @@ impl Emitter {
         self.exit_to_register(target, true);
         Some(())
     }
+}
+
+/// Classifies a fusion candidate — the producer half of a `producer; jcc`
+/// pair — into its `FusedBranch` op-code, width, destination register, and
+/// right-hand side, or `None` when it cannot fuse (a memory operand, a
+/// high-byte register, or an op that is not a fusible flag producer).
+fn fusible_producer(quick: &Quick, instruction: &Instruction) -> Option<(Op, Width, u8, Rhs)> {
+    let op = match quick.op {
+        quick::Op::Add => Op::Add,
+        quick::Op::Sub => Op::Sub,
+        quick::Op::Cmp => Op::Cmp,
+        quick::Op::And => Op::And,
+        quick::Op::Or => Op::Or,
+        quick::Op::Xor => Op::Xor,
+        quick::Op::Test => Op::Test,
+        // `inc`/`dec` come straight from the instruction — a register operand
+        // only, no right-hand side.
+        quick::Op::General => {
+            let op = match instruction.mnemonic() {
+                Mnemonic::Inc => Op::Inc,
+                Mnemonic::Dec => Op::Dec,
+                _ => return None,
+            };
+            if instruction.op0_kind() != OpKind::Register {
+                return None;
+            }
+            let dest = Slice::of(instruction.op_register(0))?;
+            if dest.high_byte {
+                return None;
+            }
+            let width = Width::from_bytes(instruction.op_register(0).size())?;
+            return Some((op, width, dest.number, Rhs::None));
+        }
+        _ => return None,
+    };
+    let dest = match quick.destination {
+        Source::Register(slice) if !slice.high_byte => slice.number,
+        _ => return None,
+    };
+    let rhs = match quick.source {
+        Source::Register(slice) if !slice.high_byte => Rhs::Register(slice.number),
+        Source::Immediate(value) => Rhs::Immediate(value),
+        _ => return None,
+    };
+    Some((op, quick.width, dest, rhs))
 }
 
 /// A source's register when it is a full-width (qword) general register — the

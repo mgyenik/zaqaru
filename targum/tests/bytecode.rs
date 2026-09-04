@@ -533,3 +533,70 @@ fn adc_and_sbb_agree() {
         a.syscall().unwrap();
     });
 }
+
+#[test]
+fn fused_compare_branches_agree() {
+    // Every condition through a cmp/jcc, a test/jcc, and add/sub producers, so
+    // the fused op's per-producer flag computation is exercised broadly.
+    agree(|a, _| {
+        a.mov(rax, 0x8000_0000_0000_0000u64).unwrap();
+        a.mov(rbx, 1u64).unwrap();
+        a.mov(rcx, 0u64).unwrap();
+        let mut l = a.create_label();
+        // cmp + jl (signed), a large negative vs positive.
+        a.cmp(rax, rbx).unwrap();
+        a.jl(l).unwrap();
+        a.add(rcx, 0x100u32 as i32).unwrap();
+        a.set_label(&mut l).unwrap();
+        // test + jz.
+        let mut z = a.create_label();
+        a.test(rbx, rbx).unwrap();
+        a.jz(z).unwrap();
+        a.add(rcx, 0x10u32 as i32).unwrap();
+        a.set_label(&mut z).unwrap();
+        // add producing overflow + jo.
+        let mut o = a.create_label();
+        a.mov(rdx, 0x7fff_ffff_ffff_ffffu64).unwrap();
+        a.add(rdx, 1i32).unwrap();
+        a.jo(o).unwrap();
+        a.add(rcx, 0x1u32 as i32).unwrap();
+        a.set_label(&mut o).unwrap();
+        a.syscall().unwrap();
+    });
+}
+
+#[test]
+fn fused_producer_flags_live_after_agree() {
+    // The live_after case: a cmp whose flags feed both a jcc AND a later setcc,
+    // so the fused op must still update the trace flags.
+    agree(|a, _| {
+        a.mov(rax, 5u64).unwrap();
+        a.mov(rbx, 9u64).unwrap();
+        a.cmp(rax, rbx).unwrap(); // sets flags
+        let mut skip = a.create_label();
+        a.jae(skip).unwrap(); // reads CF; not taken (5 < 9 unsigned)
+        a.mov(rsi, 1u64).unwrap();
+        a.set_label(&mut skip).unwrap();
+        a.setb(cl).unwrap(); // reads CF again — same cmp's flags, after the jcc
+        a.syscall().unwrap();
+    });
+}
+
+#[test]
+fn a_fused_loop_counter_agrees() {
+    // dec + jnz, the classic loop back-edge, fused — checked over many
+    // iterations so the fused retirement (two per op) stays exact.
+    assert_eq!(
+        agree(|a, _| {
+            a.mov(rax, 0u64).unwrap();
+            a.mov(rcx, 1000u64).unwrap();
+            let mut top = a.create_label();
+            a.set_label(&mut top).unwrap();
+            a.add(rax, rcx).unwrap();
+            a.dec(rcx).unwrap();
+            a.jnz(top).unwrap();
+            a.syscall().unwrap();
+        }),
+        Outcome::Syscall
+    );
+}
