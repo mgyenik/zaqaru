@@ -2,7 +2,7 @@
 name = "x87"
 version = "0.1.0"
 edition = "2024"
-description = "Soft emulation of the x87 FPU: extended-precision softfloat, the register stack, and the helper symbols translated code calls"
+description = "Soft emulation of the x87 FPU: extended-precision softfloat and the register stack"
 
 [lib]
 # `staticlib` is what `wasm-ld` welds into the container module; `rlib` is

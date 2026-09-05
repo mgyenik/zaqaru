@@ -32,7 +32,6 @@
 //! strings   length-prefixed byte strings: names, symlink targets,
 //!           owner names, xattr names and values
 //! xattrs    per-inode blocks referencing the strings region
-//! modules   sorted (inode, prelink base) pairs, one per translated ELF
 //! command   the boot command line: NUL-separated argument strings
 //! environ   the boot environment: NUL-separated `NAME=value` strings
 //! workdir   the directory the container starts in, or nothing
@@ -53,24 +52,15 @@
 //! environment and neither with `HOME` set. A container with no environment
 //! is not a container with a smaller syscall surface; it is one with a
 //! different and larger surface than the run it will be diffed against.
-//!
-//! The modules region is small on purpose. A prelink base is a fact about
-//! the handful of files that are translated ELFs, not about every inode, so
-//! it costs eight bytes per module rather than eight bytes per inode — which
-//! on a real rootfs is the difference between a few dozen bytes and a
-//! quarter of a megabyte. The `EXEC_TRANSPILED` flag on the inode is the
-//! cheap test for whether to look here at all.
 
 /// `KISI` — kisal image.
 pub const MAGIC: u32 = u32::from_le_bytes(*b"KISI");
-pub const VERSION: u32 = 6;
+pub const VERSION: u32 = 7;
 
-pub const HEADER_SIZE: usize = 80;
+pub const HEADER_SIZE: usize = 72;
 /// Fixed and packed: `stat` is `inode_offset + index * INODE_SIZE`.
 pub const INODE_SIZE: usize = 64;
 pub const DIRENT_SIZE: usize = 12;
-/// One prelink record: the inode, and the base the bake placed it at.
-pub const MODULE_SIZE: usize = 8;
 
 /// What went wrong reading the index. Every variant names a place, because
 /// the only useful thing to say about a malformed image is where it broke.
@@ -140,8 +130,6 @@ pub mod inode_flags {
     /// with the addresses a mapping would use. Serves the zero-copy aliasing
     /// optimisation, which is designed, flagged and off — v0 copies.
     pub const MMAP_ALIGNED: u32 = 1 << 0;
-    /// An ELF the bake transpiled, with an entry in the static exec map.
-    pub const EXEC_TRANSPILED: u32 = 1 << 1;
     /// The file's contents are produced when it is read rather than stored.
     /// A synthetic mount's window onto kernel state — `/proc/self/maps` is
     /// a rendering of the VMA tree, and a snapshot taken at boot would
@@ -335,8 +323,6 @@ pub struct Header {
     /// derivable from the regions; the blob's is not, and a module that
     /// carries both as bare symbols has no other way to learn it.
     pub blob_size: u32,
-    pub module_offset: u32,
-    pub module_count: u32,
     pub command_offset: u32,
     pub command_size: u32,
     pub environment_offset: u32,
@@ -368,14 +354,12 @@ impl Header {
             xattr_size: word(header, 36),
             root_inode: word(header, 40),
             blob_size: word(header, 44),
-            module_offset: word(header, 48),
-            module_count: word(header, 52),
-            command_offset: word(header, 56),
-            command_size: word(header, 60),
-            environment_offset: word(header, 64),
-            environment_size: word(header, 68),
-            working_directory_offset: word(header, 72),
-            working_directory_size: word(header, 76),
+            command_offset: word(header, 48),
+            command_size: word(header, 52),
+            environment_offset: word(header, 56),
+            environment_size: word(header, 60),
+            working_directory_offset: word(header, 64),
+            working_directory_size: word(header, 68),
         }
     }
 
@@ -387,16 +371,15 @@ impl Header {
     /// [`index_length`] needs it to say how many bytes an index is. Those
     /// used to be two lists, and a region added to one and not the other is
     /// an image that parses at the bake and is refused inside the kernel's
-    /// own construction, where there is no kernel yet to report it. That has
-    /// now happened twice — the modules region, and the working directory —
-    /// which is twice more than a comment saying "remember to update both"
-    /// was worth.
+    /// own construction, where there is no kernel yet to report it. That
+    /// happened twice while the two lists existed, which is twice more than
+    /// a comment saying "remember to update both" was worth.
     ///
     /// Sizes are `u64` and *not* narrowed on the way: an inode count of 2^26
     /// makes the byte count 2^32, which as a `u32` is zero — a region of
     /// nothing, which validates against any index at all and then traps the
     /// first time an inode is read.
-    fn regions(&self) -> [(&'static str, u32, u64); 8] {
+    fn regions(&self) -> [(&'static str, u32, u64); 7] {
         [
             (
                 "inodes",
@@ -406,11 +389,6 @@ impl Header {
             ("dirents", self.dirent_offset, self.dirent_size as u64),
             ("strings", self.string_offset, self.string_size as u64),
             ("xattrs", self.xattr_offset, self.xattr_size as u64),
-            (
-                "modules",
-                self.module_offset,
-                (self.module_count as u64) * (MODULE_SIZE as u64),
-            ),
             ("command", self.command_offset, self.command_size as u64),
             (
                 "environment",
@@ -556,39 +534,6 @@ impl<'a> Image<'a> {
                         + self.header.working_directory_size as usize,
             )
             .unwrap_or(&[])
-    }
-
-    /// The base the bake placed a translated ELF at, if this inode is one.
-    ///
-    /// This is the run-time half of "prelink at bake". The loader asks to
-    /// map a library "anywhere"; the answer has to be the address the
-    /// translator resolved that library's operands at, or every one of them
-    /// points at nothing. The bake wrote the number here, and this is where
-    /// `mmap` reads it back.
-    ///
-    /// A `u32` because linear memory is 32-bit: a base that did not fit
-    /// would be a base nothing could be loaded at.
-    pub fn prelink_base(&self, number: u32) -> Option<u64> {
-        // Sorted by inode, so this is a binary search — though in practice
-        // the region holds a handful of entries and the loop below would do.
-        let region = self.index.get(
-            self.header.module_offset as usize
-                ..self.header.module_offset as usize
-                    + self.header.module_count as usize * MODULE_SIZE,
-        )?;
-        let mut low = 0usize;
-        let mut high = self.header.module_count as usize;
-        while low < high {
-            let middle = low + (high - low) / 2;
-            let at = middle * MODULE_SIZE;
-            let inode = word(region, at);
-            match inode.cmp(&number) {
-                core::cmp::Ordering::Less => low = middle + 1,
-                core::cmp::Ordering::Greater => high = middle,
-                core::cmp::Ordering::Equal => return Some(u64::from(word(region, at + 4))),
-            }
-        }
-        None
     }
 
     /// A length-prefixed byte string from the strings region.
@@ -823,14 +768,12 @@ pub fn write_header(into: &mut [u8; HEADER_SIZE], header: &Header) {
     into[36..40].copy_from_slice(&header.xattr_size.to_le_bytes());
     into[40..44].copy_from_slice(&header.root_inode.to_le_bytes());
     into[44..48].copy_from_slice(&header.blob_size.to_le_bytes());
-    into[48..52].copy_from_slice(&header.module_offset.to_le_bytes());
-    into[52..56].copy_from_slice(&header.module_count.to_le_bytes());
-    into[56..60].copy_from_slice(&header.command_offset.to_le_bytes());
-    into[60..64].copy_from_slice(&header.command_size.to_le_bytes());
-    into[64..68].copy_from_slice(&header.environment_offset.to_le_bytes());
-    into[68..72].copy_from_slice(&header.environment_size.to_le_bytes());
-    into[72..76].copy_from_slice(&header.working_directory_offset.to_le_bytes());
-    into[76..80].copy_from_slice(&header.working_directory_size.to_le_bytes());
+    into[48..52].copy_from_slice(&header.command_offset.to_le_bytes());
+    into[52..56].copy_from_slice(&header.command_size.to_le_bytes());
+    into[56..60].copy_from_slice(&header.environment_offset.to_le_bytes());
+    into[60..64].copy_from_slice(&header.environment_size.to_le_bytes());
+    into[64..68].copy_from_slice(&header.working_directory_offset.to_le_bytes());
+    into[68..72].copy_from_slice(&header.working_directory_size.to_le_bytes());
 }
 
 /// The total length of an index whose header is `header`.

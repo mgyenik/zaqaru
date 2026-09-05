@@ -1,23 +1,12 @@
 //! SSE: the vector register file, and what the packed and scalar
 //! instructions do to it.
 //!
-//! The semantics are the translator's, transcribed. `translate/vector.rs`
-//! is the source of truth for what each of these means on this machine, and
-//! the surface here is deliberately the same surface: a container that runs
-//! through the transpiler and a container that runs interpreted have to
-//! agree instruction for instruction, and the cheapest way to keep two
-//! engines agreeing is for the second to be a transcription of the first
-//! rather than a fresh reading of the manual.
-//!
-//! What changes in the move is that a vector is a number again. Under the
-//! transpiler an XMM register is two `i64` globals, because LLD cannot link
-//! an object that declares a `v128` one, and every operation is written
-//! twice around that seam. Here it is a `u128`, lanes are shifts, and the
-//! whole packed family is one loop taking a closure.
+//! A vector here is a number: an XMM register is a `u128`, lanes are
+//! shifts, and the whole packed family is one loop taking a closure.
 //!
 //! The machine is a baseline x86-64 with SSE2 and a little of SSE3/SSE4
-//! where the translator already reached for it — the same machine `cpuid`
-//! reports, deliberately, so that a libc cannot select a path nothing here
+//! where a libc reaches for it — the same machine `cpuid` reports,
+//! deliberately, so that a libc cannot select a path nothing here
 //! implements.
 
 use iced_x86::{Instruction, Mnemonic, OpKind, Register};

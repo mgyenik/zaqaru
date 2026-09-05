@@ -125,20 +125,6 @@ impl<'a> Filesystem<'a> {
         }
     }
 
-    /// The address the bake placed a translated ELF at.
-    ///
-    /// Only a baked image can answer: an overlay's upper layer holds files
-    /// that arrived at run time, and nothing translated those. That is not a
-    /// gap but the boundary the design draws — code that was not baked
-    /// cannot run, and the honest answer for a file the bake never saw is
-    /// that it has no base.
-    pub fn prelink_base(&self, number: u32) -> Option<u64> {
-        match self {
-            Self::Image(image) => image.prelink_base(number),
-            Self::Overlay(overlay) => overlay.prelink_base(number),
-        }
-    }
-
     pub fn xattr_count(&self, inode: &Inode, number: u32) -> Result<u32, Errno> {
         match self {
             Self::Image(image) => image.xattr_count(inode).map_err(|_| Errno::Io),

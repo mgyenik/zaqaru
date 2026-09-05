@@ -1,25 +1,17 @@
 //! The run loop: a scheduler with an interpreter under it.
 //!
-//! This is the whole of what replaces the ahead-of-time seam. There, a
-//! `syscall` is a rewritten call through a generated thunk that marshals six
-//! argument registers out of wasm globals, hands the kernel a stack that
-//! must dodge the guest's red zone, receives either a result or a leave
-//! sentinel, and turns the sentinel into a wasm throw that a catch above
-//! reinterprets. Here the loop reaches a `syscall`, reads six fields, calls
-//! a Rust function, and writes one field back.
+//! The loop runs a thread until the engine stops it. At a `syscall` it
+//! reads six fields of the control block, calls a Rust function, and writes
+//! one field back. The shape a junior developer should recognise from any
+//! virtual machine — run a thread until something stops it, decide what the
+//! something was, go round again — and deliberately so, because the shape
+//! *is* the scheduler: more threads add a choice of which control block to
+//! advance, and nothing about the loop changes.
 //!
-//! The shape a junior developer should recognise from any virtual machine —
-//! run a thread until something stops it, decide what the something was,
-//! go round again — and deliberately so, because the shape *is* the
-//! scheduler. What more threads will add is a choice of which control block
-//! to advance; nothing about the loop changes.
-//!
-//! Two things the interpreter's world gets for free and the seam's cannot:
-//! **`%rcx` and `%r11` are faithful** at a syscall, holding the return
-//! address and the flags word as hardware leaves them rather than the
-//! conformant zeros the transpiler invents; and a fault is a *fault*, with
-//! the program counter left on the faulting instruction so that a handler
-//! could retry it.
+//! Two things come free of this arrangement: **`%rcx` and `%r11` are
+//! faithful** at a syscall, holding the return address and the flags word
+//! as hardware leaves them; and a fault is a *fault*, with the program
+//! counter left on the faulting instruction so that a handler can retry it.
 
 use targum::block::BlockCache;
 use targum::exec::Trap;
@@ -669,11 +661,10 @@ impl<'a, S: Store> Process<'a, S> {
     fn serve(&mut self) -> Served {
         // Whatever the host placed in guest memory for the previous call is
         // dead now. The arena's lifetime is one call, and that is what stops
-        // the boundary leaking — the ahead-of-time seam does this at the top
-        // of its dispatch and so must this one. Without it a container runs
-        // perfectly well until the arena fills, which for a Python process
-        // is about thirty-eight seconds in and looks like the host refusing
-        // a forty-four byte read.
+        // the boundary leaking. Without it a container runs perfectly well
+        // until the arena fills, which for a Python process is about
+        // thirty-eight seconds in and looks like the host refusing a
+        // forty-four byte read.
         crate::abi::reset_transfer_arena();
         let thread = self.kernel.machine.thread();
         let number = thread.registers[NUMBER] as i64;
@@ -704,11 +695,11 @@ impl<'a, S: Store> Process<'a, S> {
 
     /// Writes one line of syscall trace, if a trace was asked for.
     ///
-    /// The same renderer the ahead-of-time seam uses, and deliberately the
-    /// same: the acceptance test for a booted container is a diff against a
-    /// real `strace`, and a second format would have to be translated before
-    /// it could be compared — which is how two traces come to disagree in
-    /// ways nobody can attribute.
+    /// In `strace`'s own format, deliberately: the fidelity check for a
+    /// booted container is a diff against a real `strace`, and a second
+    /// format would have to be converted before it could be compared —
+    /// which is how two traces come to disagree in ways nobody can
+    /// attribute.
     fn record(&mut self, number: i64, arguments: &[i64; 6], answer: &Outcome) {
         if !self.kernel.tracing() {
             return;

@@ -51,13 +51,6 @@ pub struct Meta {
     pub uname: Vec<u8>,
     pub gname: Vec<u8>,
     pub xattrs: Vec<(Vec<u8>, Vec<u8>)>,
-    /// For an ELF the bake translated, the address it was placed at.
-    ///
-    /// `Some(0)` is a real answer and not a missing one: a fixed-address
-    /// executable is translated at the addresses it states, so its base is
-    /// zero and it is still a translated file. `None` means the bake did
-    /// not translate this file at all.
-    pub prelink_base: Option<u32>,
 }
 
 /// What a node holds.
@@ -383,8 +376,5 @@ fn read_meta(path: &Path, metadata: &std::fs::Metadata) -> Result<Meta> {
         gname: Vec::new(),
         xattrs: xattr::read(path)
             .with_context(|| format!("reading extended attributes of {}", path.display()))?,
-        // Nothing on disk or in a tar archive is a translated ELF; the
-        // bake sets this on the files it translates and places itself.
-        prelink_base: None,
     })
 }

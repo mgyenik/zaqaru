@@ -10,3 +10,6 @@ wasmtime = "48.0.1"
 # container's own `SIGTERM`, and a signal handler is the only way a process
 # is told about one.
 libc = "0.2"
+
+[dev-dependencies]
+anyhow = "1.0.104"

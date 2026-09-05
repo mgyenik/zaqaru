@@ -14,9 +14,8 @@
 //! nothing writes it.
 
 use anyhow::Result;
-use zaqaru::emitter::WasmObject;
-use zaqaru::emitter::data::DataSegment;
-use zaqaru::emitter::linking::{DataSymbolLocation, Symbol, SymbolTarget, symbol_flags};
+
+use crate::wasm::{DataObject, DataSegment, DataSymbol, symbol_flags};
 
 /// The symbols kisal resolves the image through.
 pub const BLOB_SYMBOL: &str = "__image_blob";
@@ -48,29 +47,26 @@ pub fn refuse_unaddressable(name: &str, length: usize) -> Result<()> {
 
 /// Builds the object carrying an image.
 pub fn emit(image: &super::Image) -> Result<Vec<u8>> {
-    let mut wasm = WasmObject::new();
+    let mut wasm = DataObject::new();
 
     for (name, bytes, alignment) in [
         (BLOB_SYMBOL, &image.blob, BLOB_ALIGNMENT_LOG2),
         (INDEX_SYMBOL, &image.index, INDEX_ALIGNMENT_LOG2),
     ] {
         refuse_unaddressable(name, bytes.len())?;
-        let segment_index = wasm.data_segments.len() as u32;
-        wasm.data_segments.push(DataSegment {
+        let segment_index = wasm.segments.len() as u32;
+        wasm.segments.push(DataSegment {
             // Not `.bss`: these bytes are the image, and a zero-filled
             // segment would be an empty filesystem.
             name: format!(".rodata.{name}"),
             alignment_log2: alignment,
             bytes: bytes.to_vec(),
-            relocations: Vec::new(),
         });
-        wasm.add_symbol(Symbol {
+        wasm.symbols.push(DataSymbol {
             name: name.to_string(),
-            target: SymbolTarget::Data(Some(DataSymbolLocation {
-                segment_index,
-                offset: 0,
-                size: bytes.len() as u32,
-            })),
+            segment_index,
+            offset: 0,
+            size: bytes.len() as u32,
             // Visible to the kernel across the link, and hidden from the
             // module's public face: the image is an implementation detail of
             // the container, not something a host reaches into.

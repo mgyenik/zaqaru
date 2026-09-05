@@ -144,8 +144,9 @@ pub struct Program {
 struct Loaded {
     file: Vec<u8>,
     program: Program,
-    /// Whether *this* kernel chose the base, rather than the bake or the
-    /// file itself. Only an unplaced file has to fit in a reserved region.
+    /// Whether the kernel chose the base, rather than the file stating its
+    /// own addresses. Only a file that states them has to fit in the region
+    /// the bake reserved below the module's data.
     placed: bool,
 }
 
@@ -156,8 +157,8 @@ pub enum Kind {
     /// bias it can be read at is zero.
     Fixed,
     /// `ET_DYN`: a shared object or position-independent executable, whose
-    /// addresses are relative to a base someone else chooses. Here that
-    /// someone is the bake — see the prelink design in `container-plan.md`.
+    /// addresses are relative to a base the kernel chooses when it loads
+    /// the file.
     PositionIndependent,
 }
 
@@ -183,13 +184,8 @@ impl Program {
         Self::parse_at(bytes, 0)
     }
 
-    /// Reads a file as though a loader had placed it at `bias`.
-    ///
-    /// The mirror of `zaqaru::reader::ObjectFile::parse_at`, and it has to
-    /// be: the translator resolved this file's operands at a base, and the
-    /// loader has to put the bytes at the same one or every one of those
-    /// operands points at nothing. Both halves take the same number from
-    /// the bake, and this is the half that copies the bytes.
+    /// Reads a file as though a loader had placed it at `bias`: every
+    /// address in the parsed program is the file's plus the bias.
     pub fn parse_at(bytes: &[u8], bias: u64) -> Result<Self, Error> {
         if bytes.len() < 64 {
             return Err(Error::Truncated("header"));
@@ -213,8 +209,8 @@ impl Program {
             }
         };
         // A file that states its own addresses cannot be moved: its operands
-        // were translated as the addresses they hold, so a bias would move
-        // the program out from under its own code.
+        // hold those addresses, so a bias would move the program out from
+        // under its own code.
         if kind == Kind::Fixed && bias != 0 {
             return Err(Error::NotLoadable(
                 "it is a fixed-address executable, which cannot be placed \
@@ -675,8 +671,8 @@ mod tests {
     }
 
     /// A fixed-address executable cannot be moved, and asking is an error
-    /// rather than a silent relocation: its operands were translated as the
-    /// addresses they hold.
+    /// rather than a silent relocation: its operands hold the addresses it
+    /// states.
     #[test]
     fn a_fixed_executable_refuses_a_bias() {
         assert!(matches!(
@@ -878,25 +874,6 @@ pub fn module_data_base() -> u64 {
     u64::MAX
 }
 
-/// Refuses a position-independent file the bake never placed.
-///
-/// A base of zero is a real answer for a fixed-address executable and a
-/// meaningless one for a shared object: its code was resolved at some
-/// address by the translator, and if the image carries no record of which,
-/// then this file was never translated. Loading it anyway would put bytes at
-/// address zero that no exec-map entry describes, and the first indirect
-/// call through them would report a miss for an address that was never the
-/// question. Saying so here names the file instead.
-fn untranslated(program: &Program, base: u64) -> Result<(), Error> {
-    match program.kind == Kind::PositionIndependent && base == 0 {
-        true => Err(Error::NotLoadable(
-            "it is a shared object the bake did not translate, so there is no \
-             address its code was resolved at",
-        )),
-        false => Ok(()),
-    }
-}
-
 /// A slice with leading and trailing spaces and tabs removed.
 fn trimmed(bytes: &[u8]) -> &[u8] {
     let blank = |byte: &u8| *byte == b' ' || *byte == b'\t' || *byte == b'\r';
@@ -985,7 +962,7 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
         let mut rebuilt: Vec<Vec<u8>> = argv.iter().map(|held| held.to_vec()).collect();
         let mut followed = 0;
         loop {
-            let (file, _) = self.read_whole(&program)?;
+            let file = self.read_whole(&program)?;
             if !file.starts_with(b"#!") {
                 return Ok(match followed {
                     0 => None,
@@ -1041,10 +1018,10 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
         // A dynamic program is not entered directly. `PT_INTERP` names the
         // loader that must run first — it maps the libraries, applies the
         // relocations, and only then jumps to the program's own entry — and
-        // the loader is an ordinary translated module like any other, placed
-        // by the same bake at its own base. So both files are loaded, the
-        // auxiliary vector says where each of them went, and control goes to
-        // the loader.
+        // the loader is an ordinary shared object like any other, placed
+        // wherever there is room. So both files are loaded, the auxiliary
+        // vector says where each of them went, and control goes to the
+        // loader.
         let interpreter = match program.interpreter_path(&file) {
             Some(interpreter) => {
                 let loader = self.load(interpreter).map_err(|_| {
@@ -1057,8 +1034,8 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
             None => None,
         };
 
-        // The region check applies to whatever the *bake* had to reserve
-        // room for, which is only a file that states its own addresses. A
+        // The region check applies to whatever the bake had to reserve room
+        // for, which is only a file that states its own addresses. A
         // position-independent one was placed a moment ago by
         // `reserve_object`, out of the address space above the module's own
         // data — so checking it against the module's data base would be
@@ -1094,14 +1071,10 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
         // project had until now, and every clock call falls back to the
         // syscall that has always answered them.
         //
-        // Only where the guest's code is *executed* rather than translated.
-        // The vDSO is guest text that arrives at runtime, like an unplaced
-        // shared object above: under `Flat` the bake decided what code
-        // exists, no translated function covers these bytes, and a program
-        // that took `AT_SYSINFO_EHDR` at its word would call into an address
-        // that is not the address of any function. So that world is told
-        // there is no vDSO, and glibc reads the clock by syscall — which is
-        // what it did here until now.
+        // Only where guest code is executed at all. Under `Flat` — the
+        // native tests' world, which has no engine — mapping guest text
+        // would be writing bytes nothing runs, so that world is told there
+        // is no vDSO and glibc would read the clock by syscall.
         let vdso = match self.enforcement {
             crate::syscall::Enforcement::Mapped => self.map_vdso().ok().map(|placed| placed.image),
             crate::syscall::Enforcement::Flat => None,
@@ -1216,34 +1189,19 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
 
     /// Reads a file and decides where it goes.
     ///
-    /// Two worlds meet here. In the ahead-of-time world a
-    /// position-independent file has one possible address — the one the bake
-    /// resolved its code at — so the base comes out of the image and a file
-    /// without one cannot be loaded at all: its operands point at nothing.
-    ///
-    /// Under the interpreter there is nothing to resolve. Code is data, so a
-    /// shared object goes wherever there is room, which is what a real
-    /// kernel does and what the prelink design existed to avoid having to
-    /// do. **This is where prelink disappears**: the bake stops assigning
-    /// bases, the image stops carrying them, and the address space answers
-    /// the question at load time instead.
+    /// A file that states its own addresses goes there. A
+    /// position-independent one goes wherever there is room, which is what a
+    /// real kernel does: code is data to the interpreter, so nothing about
+    /// where a shared object lands has to be known before it is loaded.
     fn load(&mut self, path: &[u8]) -> Result<Loaded, Error> {
-        let (file, recorded) = self.read_whole(path)?;
-        let program = Program::parse_at(&file, recorded)?;
-        if recorded != 0 || program.kind != Kind::PositionIndependent {
-            // Either the bake placed it, or it states its own addresses.
-            untranslated(&program, recorded)?;
+        let file = self.read_whole(path)?;
+        let program = Program::parse_at(&file, 0)?;
+        if program.kind != Kind::PositionIndependent {
             return Ok(Loaded {
                 file,
                 program,
                 placed: false,
             });
-        }
-        if self.enforcement != crate::syscall::Enforcement::Mapped {
-            // The ahead-of-time world, where an unplaced shared object has
-            // no address its code was resolved at.
-            untranslated(&program, recorded)?;
-            unreachable!("`untranslated` refuses exactly this case");
         }
         let base = self.reserve_object(&program)?;
         let program = Program::parse_at(&file, base)?;
@@ -1290,7 +1248,7 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
     }
 
     /// The whole of a file, as bytes, and the base the bake placed it at.
-    fn read_whole(&self, path: &[u8]) -> Result<(Vec<u8>, u64), Error> {
+    fn read_whole(&self, path: &[u8]) -> Result<Vec<u8>, Error> {
         let root = self.vfs.root();
         let vnode = self
             .vfs
@@ -1322,14 +1280,7 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
         let contents = filesystem
             .contents(&inode, vnode.inode)
             .map_err(|_| Error::NotLoadable("its contents cannot be read"))?;
-        // A file the bake did not translate has no base, and a
-        // position-independent one then has nowhere it can go — its code was
-        // never resolved at any address. A fixed-address executable is the
-        // other case and needs no base, which is why zero is the answer
-        // rather than a refusal here: `Program::parse_at` is what refuses a
-        // shared object it cannot place.
-        let base = filesystem.prelink_base(vnode.inode).unwrap_or(0);
-        Ok((contents.to_vec(), base))
+        Ok(contents.to_vec())
     }
 
     /// The initial stack's region, as an ordinary anonymous mapping.

@@ -2,20 +2,13 @@
 //!
 //! A process is an address space, a kernel, and the threads running in it.
 //! Two live processes cannot share one address space — a guest address is a
-//! linear-memory offset and the child needs the parent's addresses — which
-//! is the same structural fact `container-plan.md` records for the
-//! ahead-of-time world, and it is why a process is an instance there and an
-//! address space here.
+//! linear-memory offset and the child needs the parent's addresses — so a
+//! process here is an address space, and a switch is what moves one aside
+//! for another (see [`crate::resident`]).
 //!
-//! **What the interpreter deletes is the expensive half.** A fork on the
-//! other path is a snapshot *plus a way back into the frames it was taken
-//! from*: resume IDs threaded through the guest stack, a resume body for
-//! every function, a driver that walks the chain re-entering each frame at
-//! its post-call block — the machinery `tests/fork_resume.rs` exists to
-//! prove, and the doubled code section that is its bill. Here the child's
-//! machine state is a control block and its address space is bytes. The
-//! child resumes by *being interpreted*, which is the only thing the loop
-//! ever does.
+//! A fork is cheap because the machine is data: the child's state is a
+//! control block and its address space is bytes, and the child resumes by
+//! *being interpreted*, which is the only thing the loop ever does.
 //!
 //! So a fork is three steps and none of them is subtle:
 //!

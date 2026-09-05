@@ -274,11 +274,11 @@ fn assemble(index: &mut Vec<u8>, inodes: &[Inode], dirents: &[u8], strings: &[u8
             string_size: strings.len() as u32,
             xattr_offset: xattr_offset as u32,
             root_inode: 0,
-            // A synthetic mount holds no file contents, no ELF to prelink,
-            // and is not what a container boots — so no blob, no modules,
-            // no command line and no environment. Named fields rather than
-            // a run of zeroes, because a run of zeroes says which regions
-            // are empty only to whoever counts them.
+            // A synthetic mount holds no file contents and is not what a
+            // container boots — so no blob, no command line and no
+            // environment. Named fields rather than a run of zeroes,
+            // because a run of zeroes says which regions are empty only to
+            // whoever counts them.
             ..crate::image::Header::default()
         },
     );

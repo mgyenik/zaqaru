@@ -1,14 +1,10 @@
 //! Soft emulation of the x87 FPU.
 //!
-//! Translated x87 instructions become typed calls into this crate — the
-//! design's "fourth body", beside the translator, kisal and the baker. The
-//! helpers are intrinsics with respect to every translator discipline: they
-//! never touch the register-file globals, never block, never throw, and
-//! report flag effects as return values for the translator to store.
-//!
-//! All emulated FPU state lives in one static in this crate's data segment
-//! ([`state::X87State`] behind [`ffi`]): zero new wasm globals, which is
-//! what makes fork and snapshot free — the state rides linear memory.
+//! The interpreter's x87 and MMX instructions are computed here, against a
+//! [`state::X87State`] that lives in each thread's control block: the
+//! register stack, the control and status words, and extended-precision
+//! arithmetic that matches the hardware bit for bit where the table below
+//! says it does.
 //!
 //! # Tier table
 //!
@@ -61,9 +57,6 @@ pub mod f80;
 pub mod ops;
 pub mod state;
 pub mod transcendental;
-
-#[cfg(target_arch = "wasm32")]
-pub mod ffi;
 
 /// FSW bit assignments, used both for sticky state and as the flag word
 /// operations return. Matching the hardware layout is what lets the oracle

@@ -1,12 +1,9 @@
 //! Threads: what a process has more than one of.
 //!
 //! The design's claim about threads is that they are cheap here, and this
-//! module is where that gets tested. Under the ahead-of-time seam a new
-//! thread means a fabricated resume chain on a fresh stack, a first genuine
-//! unwind, and a dispatcher that has to be entered at the right body — the
-//! subtlest machinery in the tree. Under the loop a thread is a
-//! [`targum::state::Tcb`] with `rip` and `rsp` set, and a context switch is
-//! choosing a different index.
+//! module is where that gets tested. A thread is a [`targum::state::Tcb`]
+//! with `rip` and `rsp` set, and a context switch is choosing a different
+//! index.
 //!
 //! What is *not* cheap and is not skipped: the kernel half. Which thread is
 //! runnable, what a futex wait parks on and what a wake releases, what
@@ -122,11 +119,11 @@ pub struct Accepting {
 
 /// The kernel's own per-thread cells.
 ///
-/// Separate from [`Thread`] because both worlds have them and only one has a
-/// [`Tcb`]: the ahead-of-time machine keeps its registers in wasm globals
-/// and has exactly one thread, and it still has a signal mask and a
+/// Separate from [`Thread`] because every machine has them and only the
+/// interpreter's has a [`Tcb`]: the native tests' bare register file has
+/// exactly one thread, and it still has a signal mask and a
 /// `clear_child_tid`. So this is what [`crate::machine::Machine`] hands out,
-/// and the two worlds differ only in where it is stored.
+/// and the machines differ only in where it is stored.
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 pub struct Owned {
     /// Where to write a zero when this thread ends, from

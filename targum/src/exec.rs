@@ -1032,11 +1032,10 @@ impl<'a> Cpu<'a> {
 
             // ---- the machine ----
             Mnemonic::Syscall => {
-                // Faithful, where the transpiler's seam had to invent
-                // zeros: the hardware puts the return address in `%rcx` and
-                // the flags word in `%r11`, and so does this. It costs
-                // nothing and it removes a documented divergence from the
-                // syscall-trace diff, so it must not be "simplified" back.
+                // Faithful: the hardware puts the return address in `%rcx`
+                // and the flags word in `%r11`, and so does this. It costs
+                // nothing and a guest can observe it, so it must not be
+                // "simplified" to zeros.
                 self.tcb.registers[number::RCX] = instruction.next_ip();
                 self.tcb.registers[number::R11] = self.tcb.flags.materialized();
                 Ok(Step::Syscall)

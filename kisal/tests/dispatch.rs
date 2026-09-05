@@ -935,7 +935,7 @@ fn fadvise_checks_what_it_cannot_act_on() {
         Outcome::Done(Errno::Invalid.as_result())
     );
     // And a pipe has no position to advise about.
-    let mut ends = GuestBytes::<8>::new();
+    let ends = GuestBytes::<8>::new();
     assert_eq!(
         kernel.dispatch(number::PIPE, Arguments::new([ends.address(), 0, 0, 0, 0, 0])),
         Outcome::Done(0)

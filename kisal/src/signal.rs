@@ -1,17 +1,11 @@
 //! Signal delivery: the frame Linux builds and the frame this builds.
 //!
-//! Under the ahead-of-time seam this was M10's hardest problem. A handler
-//! has to run *on top of* whatever the guest was doing, and the guest's
-//! frames are wasm frames — so delivery meant a reserved table slot, a
-//! resume-body signature, a splice-versus-call rule and surgery on the
-//! chain of resume IDs threaded through the guest stack.
-//!
-//! Here a handler is a program counter. The loop stops between blocks, the
-//! frame is a block of bytes written to the guest stack through the same
-//! address space every other store goes through, `%rip` is set to the
-//! handler, and interpretation continues. `sigreturn` reads the block back.
-//! What is left of the design is its *dispositions table* and its routing
-//! rules — the parts that were Linux semantics rather than machinery.
+//! A handler is a program counter. The loop stops between blocks, the frame
+//! is a block of bytes written to the guest stack through the same address
+//! space every other store goes through, `%rip` is set to the handler, and
+//! interpretation continues. `sigreturn` reads the block back. The rest of
+//! this module is the *dispositions table* and the routing rules — Linux
+//! semantics rather than machinery.
 //!
 //! # The frame
 //!

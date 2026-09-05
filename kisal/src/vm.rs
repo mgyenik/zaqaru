@@ -1,13 +1,10 @@
-//! Booting the interpreted world, from inside the module.
+//! Booting the container, from inside the module.
 //!
-//! The counterpart of [`crate::kisal_boot`], and the shorter one. That entry
-//! resolves the program's entry point to a *table slot* — because the bake
-//! translated the program into wasm functions and the only way to reach one
-//! is through the table — and then drives a run loop whose only job is to
-//! catch what the seam throws. This one sets a program counter.
-//!
-//! Everything else about the container is the same: the same image, the same
-//! kernel, the same two host imports. What changes is the machine underneath.
+//! The one export the host calls. It reads the command line and environment
+//! the bake recorded in the image, boots a kernel on the interpreter's
+//! machine, loads the program, and runs the process table until the first
+//! process exits — reporting how the run went, and what it cost, through
+//! the store.
 
 #![cfg(target_arch = "wasm32")]
 

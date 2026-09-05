@@ -418,7 +418,7 @@ pub(crate) fn grow_memory<M: Machine>(
 /// space would undo every `mprotect` the guest has made, because the rows
 /// narrow the table and this would widen it back. What is being said here
 /// is "memory that nothing has had a chance to map yet is reachable", which
-/// is exactly the ahead-of-time world's arrangement and nothing more.
+/// is exactly what a native test's buffer is and nothing more.
 fn flatten(pages: &mut targum::space::Space, enforcement: Enforcement, from: u64) {
     if enforcement != Enforcement::Flat {
         return;
@@ -444,30 +444,24 @@ pub enum Enforcement {
     /// interpreter's world, and the one that makes a null dereference a real
     /// `SIGSEGV`.
     Mapped,
-    /// Everything below the limit is reachable. The ahead-of-time world,
-    /// where the guest's code and data are placed into linear memory by the
-    /// bake rather than by any `mmap` the kernel saw — so there is no row
-    /// that could have mapped them, and enforcing the table there would
-    /// refuse the program's own text.
+    /// Everything below the limit is reachable. The native tests' world,
+    /// where a test hands the kernel a buffer it allocated and pointers into
+    /// it — so there is no row that could have mapped them, and enforcing
+    /// the table there would refuse every argument a test passes.
     Flat,
 }
 
 /// How a syscall ended.
-///
-/// Three of the four variants are unreachable at M1 and exist anyway,
-/// because the shape of the protocol is what the generated seam is compiled
-/// against: adding a variant later would be an ABI change, and adding a
-/// *use* of one is not.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Outcome {
     /// The value to put in `rax`, negative errno included.
     Done(i64),
     /// The thread cannot proceed. Its control block is already parked on the
-    /// wait object with a completion recipe; the seam turns this into the
-    /// throw that discards its redundant wasm frames.
+    /// wait object with a completion recipe; the run loop picks another
+    /// thread.
     Blocked,
-    /// The process is finished. The seam unwinds to the run loop, which
-    /// reports the status through `/iso/shutdown/complete`.
+    /// The process is finished. The run loop reports the status through
+    /// `/iso/shutdown/complete`.
     Exit(i32),
     /// Something the kernel does not implement, named. Never an errno: a
     /// silent `ENOSYS` here is a hang somewhere else later.
@@ -510,8 +504,7 @@ pub struct Fault {
     pub name: Option<&'static str>,
     /// What the call was given. A worklist entry saying only "mmap" sends
     /// someone to read the trace again; one carrying the arguments is the
-    /// trace. It is also the only place the seam's register marshalling is
-    /// observable from outside — six values in, six values named.
+    /// trace.
     pub arguments: [i64; 6],
     /// Which *part* of the syscall is missing, when the syscall itself is
     /// implemented and one of its operations is not — an `arch_prctl`
@@ -688,16 +681,6 @@ pub struct Kernel<'a, S: Store, M: Machine> {
     /// a mounted filesystem and this is recorded while one is being built.
     /// Empty when the image did not say, which is most images.
     pub image_working_directory: Vec<u8>,
-    /// Where the thread should resume, when something left in order to go
-    /// somewhere else rather than to stop.
-    ///
-    /// `longjmp` is the first writer and M7's scheduler is the second: both
-    /// are "this thread is runnable, and here is the continuation to enter
-    /// it at". Read by the boot path after the unwind, in the same breath as
-    /// `status` and distinguished from it — a thread that exited has a
-    /// status, a thread that jumped has a continuation, and one that has
-    /// neither left for a reason nothing recorded.
-    pub continuation: Option<i64>,
     /// The guest's address space: the arenas, and the tree of what is
     /// mapped where.
     pub space: crate::space::Space,
@@ -738,8 +721,8 @@ pub enum Delivery {
     /// not there. Which is the stack overflow `sigaltstack` exists for, when
     /// no alternate stack was given.
     NoStack { at: u64 },
-    /// This machine keeps its registers somewhere a frame cannot be built
-    /// from — the ahead-of-time world.
+    /// This machine has no control block to build a frame from — the native
+    /// tests' bare register file.
     NoControlBlock,
 }
 
@@ -893,6 +876,10 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
     /// which is what mounting means: `mount` on a missing mount point fails
     /// on Linux as well, and inventing the directory would be inventing a
     /// filesystem the image did not ask for.
+    ///
+    /// This is the native tests' constructor: the address space is whatever
+    /// the test hands over, unmapped and reachable. The container's own boot
+    /// uses [`Kernel::with_enforcement`] with [`Enforcement::Mapped`].
     pub fn new(store: S, machine: M, image: crate::image::Image<'a>) -> Self {
         Self::with_enforcement(store, machine, image, Enforcement::Flat)
     }
@@ -942,7 +929,6 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             enforcement,
             tracing: None,
             image_working_directory,
-            continuation: None,
             dispositions: [Disposition::DEFAULT; 64],
             space,
         };
@@ -1360,7 +1346,6 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             clock: self.clock,
             // The child has not finished and is not going anywhere.
             status: None,
-            continuation: None,
             // The mappings, and the page table under them. Copied rather
             // than shared: the bytes were copied, so the description of them
             // has to be too.
@@ -1480,7 +1465,6 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             epolls: crate::poll::Held::new(self.epolls.borrow().clone()),
             clock: self.clock,
             status: None,
-            continuation: None,
             // Emphatically *not* inherited. A new program gets a new address
             // space, and both of these describe the old one — carrying
             // either across would leave the loader placing segments around
@@ -3522,13 +3506,10 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
 
     /// `arch_prctl(2)`: the only way the thread pointer moves.
     ///
-    /// Every writer of `%fs` arrives at a flush boundary by construction —
-    /// this one because a syscall is a call, a new thread's because the base
-    /// lands in its control block before it runs, and a context switch's
-    /// because it happens between threads. So the register can be promoted
-    /// into a local inside function bodies with no new discipline: the
-    /// translated call reloads it afterwards, and nothing else can have
-    /// changed it.
+    /// Every writer of `%fs` arrives between instructions by construction —
+    /// this one because a syscall ends a block, a new thread's because the
+    /// base lands in its control block before it runs, and a context
+    /// switch's because it happens between threads.
     fn arch_prctl(&mut self, arguments: Arguments) -> Outcome {
         const ARCH_SET_GS: i64 = 0x1001;
         const ARCH_SET_FS: i64 = 0x1002;
@@ -3877,11 +3858,9 @@ const SIGSTOP: i64 = 19;
 /// wrapper before the call.
 ///
 /// Thirty-two bytes: handler, flags, restorer, mask. The restorer is the
-/// return trampoline glibc supplies with `SA_RESTORER`, and it is recorded
-/// rather than used — `rt_sigreturn` never runs here, because a delivered
-/// handler returns through the resume chain kisal builds rather than through
-/// a stack frame it has to unwind itself (see `container-plan.md`'s signal
-/// design). Recording it anyway costs eight bytes and keeps `oldact` honest.
+/// return trampoline glibc supplies with `SA_RESTORER`; the frame
+/// [`crate::signal`] builds has it as the handler's return address, so a
+/// handler that returns lands in `rt_sigreturn`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Disposition {
     handler: u64,

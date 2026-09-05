@@ -294,9 +294,6 @@ fn meta_of(entry: &Entry) -> Meta {
         uname: entry.uname.clone(),
         gname: entry.gname.clone(),
         xattrs: entry.xattrs.clone(),
-        // Nothing on disk or in a tar archive is a translated ELF; the
-        // bake sets this on the files it translates and places itself.
-        prelink_base: None,
     }
 }
 

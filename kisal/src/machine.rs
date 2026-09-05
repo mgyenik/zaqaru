@@ -2,8 +2,9 @@
 //!
 //! The store ([`crate::abi`]) is how the kernel reaches the world; this is how
 //! it reaches the guest's own state. Both are traits for the same reason —
-//! the kernel's logic is ordinary Rust that gets unit-tested natively, and a
-//! wasm global is not something Rust can name.
+//! the kernel's logic is ordinary Rust that gets unit-tested natively, on a
+//! machine that is nothing but a register file ([`Registers`]), and runs
+//! for real on the interpreter's thread control blocks ([`Interpreted`]).
 //!
 //! Only cells the kernel touches *individually* live here. Moving the whole
 //! register file at a context switch is `x86_save_machine`/`x86_load_machine`,
@@ -49,12 +50,12 @@ pub trait Machine {
 
     /// This thread's identifier.
     ///
-    /// The defaults below are a *world with one thread*, which is exactly
-    /// what the ahead-of-time machine is: its registers are wasm globals and
-    /// there is nowhere to put a second set. Every answer here is true of
-    /// such a world rather than a stand-in for a better one — one thread has
-    /// the first identifier, cannot create a second, cannot park (nothing
-    /// could wake it), and wakes nobody.
+    /// The defaults below are a *world with one thread*, which is what the
+    /// native tests' register file is: one set of registers and nowhere to
+    /// put a second. Every answer here is true of such a world rather than
+    /// a stand-in for a better one — one thread has the first identifier,
+    /// cannot create a second, cannot park (nothing could wake it), and
+    /// wakes nobody.
     fn current_tid(&self) -> i32 {
         crate::thread::FIRST
     }
@@ -207,122 +208,6 @@ pub trait Machine {
     fn grow(&mut self, to: u64) -> bool;
 }
 
-/// The real machine: the generated accessors the seam object defines.
-///
-/// Declared as plain undefined symbols rather than as host imports, because
-/// they are neither — the seam defines them inside the same link, and
-/// `wasm-ld` resolves them there.
-#[derive(Default)]
-pub struct GuestMachine {
-    /// See [`Machine::owned`]. One, because this world has one thread.
-    owned: crate::thread::Owned,
-}
-
-#[cfg(target_arch = "wasm32")]
-unsafe extern "C" {
-    #[link_name = "x86_get_fs_base"]
-    fn get_segment_base() -> i64;
-    #[link_name = "x86_set_fs_base"]
-    fn set_segment_base(value: i64);
-    #[link_name = "x86_get_rsp"]
-    fn get_stack_pointer() -> i64;
-    #[link_name = "x86_set_rsp"]
-    fn set_stack_pointer(value: i64);
-    // Defined by the `x87` crate, which is in every container's link for
-    // the same reason kisal is.
-    #[link_name = "x87_reset"]
-    fn reset_floating_point();
-}
-
-#[cfg(target_arch = "wasm32")]
-impl Machine for GuestMachine {
-    fn owned(&mut self) -> &mut crate::thread::Owned {
-        &mut self.owned
-    }
-
-    fn segment_base(&self) -> i64 {
-        unsafe { get_segment_base() }
-    }
-
-    fn set_segment_base(&mut self, value: i64) {
-        unsafe { set_segment_base(value) }
-    }
-
-    fn stack_pointer(&self) -> i64 {
-        unsafe { get_stack_pointer() }
-    }
-
-    fn set_stack_pointer(&mut self, value: i64) {
-        unsafe { set_stack_pointer(value) }
-    }
-
-    fn reset_floating_point(&mut self) {
-        unsafe { reset_floating_point() }
-    }
-
-    fn memory_limit(&self) -> u64 {
-        // Memory only ever grows, so this is read per syscall rather than
-        // cached: a `memory.grow` between two syscalls must widen what the
-        // second one accepts.
-        core::arch::wasm32::memory_size(0) as u64 * 65536
-    }
-
-    fn grow(&mut self, to: u64) -> bool {
-        const WASM_PAGE: u64 = 65536;
-        let current = self.memory_limit();
-        if to <= current {
-            return true;
-        }
-        // In amortised chunks: growth is a host `mmap` under wasmtime, and
-        // one per 4 KiB reservation would be one syscall per page.
-        let wanted = to
-            .max(current + crate::space::GROW_CHUNK)
-            .next_multiple_of(WASM_PAGE);
-        let pages = ((wanted - current) / WASM_PAGE) as usize;
-        // `memory.grow` answers −1 when it cannot, which is `ENOMEM` at the
-        // row above rather than a trap here.
-        core::arch::wasm32::memory_grow(0, pages) != usize::MAX
-    }
-}
-
-/// Off wasm there are no globals to reach. The type exists so that the rest
-/// of the kernel compiles unchanged for its native tests, which supply a
-/// double of their own.
-#[cfg(not(target_arch = "wasm32"))]
-impl Machine for GuestMachine {
-    fn owned(&mut self) -> &mut crate::thread::Owned {
-        &mut self.owned
-    }
-
-    fn segment_base(&self) -> i64 {
-        unreachable!("the guest machine exists only inside the wasm module")
-    }
-
-    fn set_segment_base(&mut self, _value: i64) {
-        unreachable!("the guest machine exists only inside the wasm module")
-    }
-
-    fn stack_pointer(&self) -> i64 {
-        unreachable!("the guest machine exists only inside the wasm module")
-    }
-
-    fn set_stack_pointer(&mut self, _value: i64) {
-        unreachable!("the guest machine exists only inside the wasm module")
-    }
-
-    fn reset_floating_point(&mut self) {
-        unreachable!("the guest machine exists only inside the wasm module")
-    }
-
-    fn memory_limit(&self) -> u64 {
-        unreachable!("the guest machine exists only inside the wasm module")
-    }
-
-    fn grow(&mut self, _to: u64) -> bool {
-        unreachable!("the guest machine exists only inside the wasm module")
-    }
-}
-
 /// A machine that is only its registers: the native tests' stand-in, and the
 /// shape a thread control block's saved register file will have.
 pub struct Registers {
@@ -438,7 +323,20 @@ fn top_of_memory() -> u64 {
 /// Grows the guest's memory to reach `to`, and answers whether it did.
 #[cfg(target_arch = "wasm32")]
 fn grow_memory(to: u64) -> bool {
-    GuestMachine::default().grow(to)
+    const WASM_PAGE: u64 = 65536;
+    let current = top_of_memory();
+    if to <= current {
+        return true;
+    }
+    // In amortised chunks: growth is a host `mmap` under wasmtime, and one
+    // per 4 KiB reservation would be one syscall per page.
+    let wanted = to
+        .max(current + crate::space::GROW_CHUNK)
+        .next_multiple_of(WASM_PAGE);
+    let pages = ((wanted - current) / WASM_PAGE) as usize;
+    // `memory.grow` answers −1 when it cannot, which is `ENOMEM` at the row
+    // above rather than a trap here.
+    core::arch::wasm32::memory_grow(0, pages) != usize::MAX
 }
 
 #[cfg(not(target_arch = "wasm32"))]
