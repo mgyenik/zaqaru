@@ -2,7 +2,7 @@
 
 Status: design, 2026-09-05. Nothing below is built yet; each part says what
 it is, what it changes, and how it is checked. Code comments should name
-the mechanisms described here, not this document's numbering.
+the mechanisms described here, not this document's headings.
 
 ## What it is
 
@@ -16,8 +16,40 @@ machine rewound to the instruction that made it.
 
 It is possible because a run is a pure function of its tape, and because
 the whole machine is linear memory. Neither is true of Docker, and
-neither is true of an ordinary emulator, which is why this has not been
-built before.
+neither is true of an ordinary emulator.
+
+## The interface it uses, and why
+
+A container module is an isotope Block. The spec (`structfs/isotope/spec`)
+gives a Block two faces, and this design uses both as written rather than
+adding a third:
+
+- **Inside, the Block is a StructFS client.** Everything it needs from the
+  host it reads or writes under `/iso/`, through the two imports the
+  module already has. This is how the kernel gets time, entropy, the
+  console and the network today, and it is the boundary the tape
+  records.
+- **Outside, the Block is a StructFS store.** Anyone who wants something
+  *from* the Block reads or writes its store. The runtime turns that into
+  a Request the Block reads from `/iso/server/requests` (or, without
+  blocking, from `/iso/server/requests/pending`), and the Block answers by
+  writing a Response to the Request's `respond_to` path. The spec calls
+  this the Server Protocol, and it is the spec's answer to "how does the
+  outside ask a Block a question".
+
+So the debugger's questions — what processes exist, what is thread 3's
+`rip`, what is mapped at this address — are reads of the container's
+public store, served by the kernel. No new import, no new export, and no
+path invented under `/iso/`. The same client code drives the wasmtime
+host and a browser, because both are just StructFS clients of the same
+store.
+
+What the spec leaves to the runtime is how a Block is *driven*: its
+non-goals are scheduling and the execution engine, and its lifecycle
+chapter lists preemption and checkpointing as open questions. Stopping
+the machine at an exact instruction and snapshotting it are therefore
+runtime-level mechanisms, below the Block interface, and they are the
+only additions this design makes at the wasm level.
 
 ## What is already true
 
@@ -28,14 +60,16 @@ built before.
   against the recording, so a divergence is found at its first step.
 - **The schedule is a function of retired instructions.** The quantum is
   100,000 retired instructions per thread, a slice is sixteen quanta per
-  process, and `rdtsc` answers from the same counter. Two runs of the same
-  tape interleave identically, across threads and processes.
+  process, and `rdtsc` answers from the same counter.
 - **No guest state lives on the wasm stack.** A thread is a control block
-  in linear memory; a context switch is a pointer swap. The kernel's state
-  is a graph of `Rc` and `RefCell` in the same memory. Between two
-  instructions, memory is the machine.
-- **The module has one mutable global**, the shadow stack pointer, and it
-  is at its base whenever no export is executing.
+  in linear memory; the kernel's state is a graph of `Rc` and `RefCell` in
+  the same memory. Between two instructions, memory is the machine.
+- **The module has one mutable global**, the shadow stack pointer, at its
+  base whenever no export is executing. The module exports `memory`,
+  `zaqaru_boot` and `cabi_realloc`, and nothing else.
+- **The kernel already polls the host at a deterministic point.** Once a
+  slice it reads `/iso/net/events`, refreshes its timebase and checks for
+  shutdown. That is where it will read `/iso/server/requests/pending`.
 - **The kernel can already describe itself**: `/proc/self/maps` is a
   rendering of the VMA tree, and the stall report walks every process and
   thread and says what each is parked on.
@@ -46,180 +80,166 @@ built before.
   there is never a moment when the host holds the wasm stack empty and can
   copy memory.
 - The bytecode accelerator checks its budget only at back-edges, so a
-  quantum can overshoot by a block. The interpreter stops at any count; the
-  accelerator stops at the next back-edge after it. "Instruction N" is
-  reachable today only if N is a stopping point of the recorded run.
+  quantum can overshoot by a block. "Instruction N" is reachable today
+  only if N is a stopping point of the recorded run.
+- The container serves no store. It is a StructFS client only.
 - Nothing snapshots or restores.
-- There is no browser harness: the two imports exist only in the wasmtime
-  host.
+- There is no browser harness.
 
 ## The parts, in dependency order
 
-### A re-entrant guest
+### The container as a store
 
-The boot export splits in two:
+The kernel gains a server: once a slice, at the same point it pumps the
+edge, it reads `/iso/server/requests/pending` and answers every Request
+in the batch by writing a Response to its `respond_to` path. It also
+answers at every return to the host (below), so a stopped machine can be
+asked about the instant it stopped at. Values are JSON; the module's
+`manifest()` export declares `application/json` and the paths below, and
+the kernel writes the same declaration to `/iso/self/interface` at boot,
+both as the spec asks.
+
+The paths the store serves, all read-only:
+
+| path | value |
+| --- | --- |
+| `statistics` | retired, accelerated, decoded, current pid; the line `/iso/log/statistics` carries at exit, as a value, at any time |
+| `processes` | every process: pid, parent, state, exit status if unreaped, and each thread's tid and state, with what it is parked on. The stall report, structured |
+| `processes/{pid}/threads/{tid}/registers` | the sixteen general registers, `rip`, the segment base, the flags as materialised, and `flags_stale` (see below) |
+| `processes/{pid}/maps` | the VMA tree, the fields `/proc/self/maps` shows |
+| `processes/{pid}/descriptors` | each fd: what backs it, offset, flags |
+| `cache` | blocks decoded, blocks live, bytes of bytecode, flushes |
+| `meta/...` | the spec's meta lens: which paths are readable |
+
+Optionally `processes/{pid}/threads/{tid}/disassembly`, the block at
+`rip`, which needs iced's formatter compiled in behind a feature since the
+engine deliberately leaves it out of the shipped module.
+
+**The one rule that keeps replay honest.** Serving a Request reads kernel
+state and writes a Response; it never changes anything the guest can
+observe. That rule is what lets the tape exclude `/iso/server/*`: the
+answers to `requests/pending` are not inputs to the run, so the recording
+store does not record them and the replay store does not check them, and
+a debugger can ask questions during a replay without the run diverging.
+The rule is checked, not assumed: the acceptance test below asks
+questions at every step of one replay and none of another and requires
+identical memory at the end.
+
+The syscall trace stays where it is (`/iso/config/trace` on,
+`/iso/log/debug` out), and each line gains the retired count at which the
+call was made, so the trace is a time axis the page can seek by.
+
+Changes: a `server` module in `crates/kernel` with the renderers, the poll
+in `System`'s slice boundary, the `manifest` export and the interface
+write in `crates/guest`, the tape exclusion in `crates/host/src/store.rs`.
+
+Check: native kernel tests read each path through an in-memory server
+store and assert against the same programs the dispatch tests already
+run; the container test reads `processes` and `statistics` from a running
+module under wasmtime.
+
+### A re-entrant guest, and an exact stop
+
+The one addition at the wasm level. The boot export becomes a step:
 
 ```
-zaqaru_boot() -> i32            load the program; 0, or a status if it could not
-zaqaru_step() -> i32            one scheduler turn; answers a Turn
+zaqaru_step(until: i64) -> i32
 ```
 
-`Turn` is `Running`, `Idle` (nothing runnable; the host may wait on the
-tape or the world and call again), or `Finished` with the exit status in
-the high bits. The `System` moves into a static so that between calls the
-wasm stack is empty. The host-side run loop that `zaqaru run` uses today
-becomes a loop over `zaqaru_step`, and the idle path's blocking store
-read stays where it is, inside the kernel, because a step that idles
-makes it and returns.
+The first call boots. Each call runs the scheduler until the global
+retired count reaches `until`, or the container finishes, or nothing is
+runnable; it answers `Running`, `Idle`, or `Finished` with the status in
+the high bits. A negative `until` means to completion, which is what
+`zaqaru run` uses. A call with `until` equal to the current count runs no
+instruction, serves pending Requests, and returns: that is how the
+debugger asks about the instant the machine is stopped at. The `System`
+moves into a static so that between calls the wasm stack is empty.
 
-Changes: `crates/guest/src/boot.rs`, a `System::step` beside `System::run`
-in `crates/kernel/src/system.rs` that performs exactly one iteration of
-the existing loop, and the host's `Container::boot` becoming the loop.
+The last block before `until` runs **interpreted** rather than as a
+bytecode trace, so the stop lands on the instruction exactly. That is a
+flag on the engine's run loop, the same path a deferred instruction
+already takes, and it changes nothing about the state at `until`. What
+it must never do is continue past `until` in that mode, because the
+accelerated run would have preempted at a different point and the
+recorded schedule would diverge; seeking always resumes from a
+checkpoint, so it never does. A recorded schedule depends on whether the
+bytecode was on, so the tape gains a header saying so and replay matches
+it.
 
-Check: the container test runs the module through `zaqaru_step` and
-through the old single call, and the console output and the retired count
-are identical.
+If featherweight's `run` export turns out to have a fixed nullary
+signature, the module exports that too, as `zaqaru_step(-1)`, and the
+stepping export stays the runtime extension it is.
 
-### Two counters the host can read
-
-```
-zaqaru_retired() -> i64         instructions retired by every process, living or gone
-zaqaru_current() -> i32         the pid whose turn it is, or -1
-```
-
-The first is the debugger's time axis. It is the number the statistics
-already report at exit, exposed as a query.
-
-### An exact stop
-
-```
-zaqaru_step_to(n: i64) -> i32   run until zaqaru_retired() == n, or a Turn ends the run first
-```
-
-The system gives the current thread a budget of `n - retired` instead of
-a full quantum, and the engine runs that budget **interpreted**, skipping
-the block's bytecode trace, so the stop lands on the instruction exactly.
-That is a one-flag change in `Engine::run` — the same path a deferred
-instruction already takes — and it changes nothing about the machine's
-state at `n`: interpreting and running the trace compute the same
-instructions to the same results. What it must never do is *continue*
-past `n` in that mode, because the accelerated run would have preempted
-at a different point and the recorded schedule would diverge. Seeking
-always resumes from a checkpoint, so it never does.
-
-A recorded schedule depends on whether the bytecode was on. The tape
-gains a header recording it, and the debugger replays in the same mode.
-
-Check: for random `n` within a recorded run, restore the initial
-snapshot, `zaqaru_step_to(n)`, then run to the end, and compare console
-output and the final retired count with a straight replay. Then stop at
-`n`, snapshot, restore, and continue to the end: same comparison.
+Check: the container test runs a module to completion in one call and in
+steps of one quantum, and the output and retired count are identical.
+For random `n` within a recorded run, stopping at `n` and continuing to
+the end matches a straight replay.
 
 ### Snapshot and restore
 
-A snapshot is:
+A snapshot is linear memory (minus the image's data segment, which is
+constant and comes back with instantiation), the shadow stack pointer,
+and the host's own state: the tape cursor, the console and log buffers,
+the config mounts, and the server store's queue, which is empty between
+steps. Restore is a fresh instance of the compiled module sized to the
+snapshot, memory copied back, the global set. A fresh instance rather
+than the old one because wasm memory only grows, and an older snapshot in
+a grown memory would report a larger limit to the kernel than the run had.
 
-1. **linear memory**, minus the image's data segment, which is constant
-   and is restored by instantiation;
-2. **the shadow stack pointer**, which will always be its initial value
-   between calls and is recorded anyway so that the check below can
-   notice if that stops being true;
-3. **host state**: the tape cursor, the console and log buffers, and the
-   config mounts. Under replay there is no network and no clock to
-   reconstruct.
+Nothing in the module knows a snapshot happened. This is entirely the
+host's, built first under wasmtime as `Container::snapshot` and
+`Container::restore` and tested in `crates/bake/tests`.
 
-Restore is a fresh instance of the same compiled module, sized to the
-snapshot, a copy of memory back into it, and the global set. A fresh
-instance rather than writing into the old one because wasm memory only
-grows: an older snapshot restored into a memory that has since grown
-would report a larger limit to the kernel than the run had at that
-instant.
-
-Built first under wasmtime, in `crates/host`, as `Container::snapshot()`
-and `Container::restore(&snapshot)`, and tested in `crates/bake/tests`
-before any browser exists.
-
-Check: this is the acceptance test for the whole design. Run to `N`,
-snapshot, continue to `M`, and record memory and output. Then restore the
-snapshot and continue to `M`: memory, output, and the retired count are
-byte-identical. Do it at several `N`, including one that falls inside a
-`fork` and one during a signal delivery.
-
-### Introspection
-
-```
-zaqaru_describe(kind: i32, buffer: i32, capacity: i32) -> i32   bytes written, or the size needed
-```
-
-`kind` selects a rendering, written as JSON so the page needs no parser
-of its own:
-
-- `processes`: every process, its pid, parent, state, and each thread's
-  tid, state, and what it is parked on. The stall report, structured.
-- `registers` for a pid and tid: the sixteen general registers, `rip`,
-  the segment base, the flags as materialised, and whether the flags at
-  this instant may be stale (see below).
-- `maps` for a pid: the VMA tree, as `/proc/self/maps` renders it.
-- `descriptors` for a pid: each fd, what backs it, its offset and flags.
-- `cache`: blocks decoded, blocks live, bytes of bytecode.
-
-The syscall trace already exists (`/iso/config/trace` on, lines to
-`/iso/log/debug`). Each line gains the retired count at which the call
-was made, so the trace is a time axis the page can seek by. Optionally a
-`disassembly` kind for the block at `rip`, which needs iced's formatter
-compiled in behind a feature, since the engine deliberately leaves it out
-of the shipped module.
+Check, and this is the acceptance test for the whole design: run to `N`,
+snapshot, continue to `M`, and record memory and output. Restore and
+continue to `M` again: memory, output and retired count are
+byte-identical. Do it at several `N`, including one inside a `fork` and
+one during a signal delivery, and once with the debugger reading
+`processes` at every step of one leg and never on the other.
 
 ### The browser harness
 
-The two imports in JavaScript, in a Worker:
+The two imports in JavaScript, in a Worker: a mount table over `/iso`
+with the console, the log, the config, the random seed, the clock, the
+shutdown switch, the **replay store** answering from the tape and
+checking paths as the host's does, and the **server store**: the runtime
+half of the Server Protocol, queueing Requests the page makes and
+correlating Responses. The canonical-ABI lowering is in
+`crates/guest/src/wire.rs`. Under replay nothing blocks, because the one
+waiting read is on the tape, so the first harness needs neither JSPI nor
+`Atomics.wait`.
 
-- a mount table over `/iso` with the console, the log, the config, the
-  random seed, the clock, and the shutdown switch, each a small object;
-- a **replay store** that answers from the tape and checks the path of
-  each question, exactly as the host's does;
-- the canonical-ABI lowering: paths as `(pointer, length)` pairs, results
-  through the return area, bytes placed by calling the module's
-  `cabi_realloc`. The layouts are in `crates/guest/src/wire.rs`.
+The page is then a StructFS client of the container. It reads
+`processes`; the harness enqueues the Request, calls `zaqaru_step` with
+the current count, and returns the Response. That is the same client
+code that will drive the wasmtime host.
 
-Under replay nothing ever blocks, because the one waiting read is
-answered from the tape, so the first harness needs neither JSPI nor
-`Atomics.wait`. The stepping loop calls `zaqaru_step` in batches and posts
-progress to the page. A live mode with a JavaScript clock and entropy
-that records as it runs, and a JavaScript edge that turns the page's own
-`fetch` into `/iso/net` events so the page can request the container's own
-Django page, are natural follow-ons and are not needed for the demo.
-
-Check: the recorded Django run replays in the browser to the same
-console output and retired count as under wasmtime.
+Check: the recorded Django run replays in the browser to the same console
+output and retired count as under wasmtime, and `statistics` read at the
+end agrees.
 
 ### Checkpoints and seeking
 
 While playing, take a snapshot every `K` retired instructions. Seeking
-to `n` restores the last checkpoint at or before `n` and calls
-`zaqaru_step_to(n)`. Deterministic re-execution means `K` can be large:
-at 100 MIPS a gap of 200 M instructions is a two-second seek worst case,
-and re-execution is the cheap direction.
+to `n` restores the last checkpoint at or before `n` and steps to `n`.
+Deterministic re-execution means `K` can be large: at 100 MIPS a gap of
+200 M instructions is a two-second seek worst case.
 
 Memory is the constraint. A Django module's memory is several hundred
-megabytes, and ten full snapshots would not fit a tab. So: the first
-checkpoint is full, and every later one is a delta against the previous,
-computed by comparing pages in a small wasm helper and storing the pages
-that differ. The kernel's page ownership means most of memory does not
-change between checkpoints while a server idles, and the image segment
-never does. Restoring a delta chain is a copy per link, which bounds the
-useful chain length; a full snapshot every few dozen deltas keeps it
-short.
+megabytes, so the first checkpoint is full and every later one is a delta
+against the previous, computed by comparing pages in a small wasm helper.
+Page ownership means most of memory is still while a server idles, and
+the image segment never changes. A full snapshot every few dozen deltas
+bounds the restore chain.
 
 ### The page
 
-- A timeline over retired instructions with checkpoint marks, play,
-  pause, step forward by one instruction, and step back, which is a seek.
-- Lanes per process showing who holds the quantum when, from
-  `zaqaru_current` sampled at each step.
-- The syscall log as a clickable time axis; click to seek.
-- Panels for the selected process and thread: registers, memory map,
-  descriptors, and the block at `rip`.
+A timeline over retired instructions with checkpoint marks; play, pause,
+step forward by one instruction, step back as a seek. Lanes per process
+from `statistics` sampled at each step. The syscall log as a clickable
+time axis. Panels for the selected process and thread: registers, maps,
+descriptors, and the block at `rip`, each a read of the container's
+store.
 
 ## Two things the page must say
 
@@ -227,29 +247,34 @@ short.
 overwritten before anything reads them does not record them (dead-flag
 elimination in the interpreter; liveness in the transpiler). At an
 instant inside such a span, the flags word is the last *recorded*
-writer's. The `registers` description carries a `flags_stale` field, and
-the page shows the flags greyed with a note rather than as truth.
-`docs/fidelity.md` records the same divergence for signal frames.
+writer's. The `registers` value carries `flags_stale`, and the page shows
+the flags greyed with a note rather than as truth. `docs/fidelity.md`
+records the same divergence for signal frames.
 
-**Speed.** The interpreter runs at 30–100 MIPS, and a browser engine may
-be slower than wasmtime. A Django boot is 3.29 G instructions. The demo
+**Speed.** The interpreter runs at 30–100 MIPS and a browser engine may be
+slower than wasmtime. A Django boot is 3.29 G instructions. The demo
 should start from a checkpoint taken after boot rather than boot live,
-which is the same snapshot the performance plan wants for start-up
-anyway.
+which is the same snapshot the performance plan wants for start-up.
+
+## Out of scope, and noted
+
+The kernel reads its configuration at `/iso/config/{trace,bytecode}`.
+The spec puts configuration at `/config/`, wired by the assembly, and
+reserves `/iso/` for runtime services. That is a pre-existing divergence
+this design does not fix and does not extend; it is recorded here so it
+is decided deliberately.
 
 ## Order of work and size
 
 | Part | Size | Where |
 | --- | --- | --- |
-| Re-entrant guest | small | guest, kernel, host |
-| Counters | small | guest, kernel |
-| Exact stop | small | cpu, kernel, guest; tape header in host |
+| The container as a store | medium | kernel, guest, host |
+| Re-entrant guest and exact stop | small | guest, kernel, cpu, host |
 | Snapshot and restore | medium; the acceptance test | host, bake tests |
-| Introspection | small to medium | kernel, guest |
 | Browser harness | medium | new: `web/` |
 | Checkpoints and seeking | medium | `web/` |
 | The page | large | `web/` |
 
-Everything through introspection is testable under wasmtime with the
-existing test infrastructure. The browser work starts only once the
+Everything through snapshot and restore is testable under wasmtime with
+the existing test infrastructure. The browser work starts only once the
 snapshot test passes.
