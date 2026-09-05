@@ -13,17 +13,21 @@ name = "cpu"
 # Off by default because it runs once per retired instruction, which is the
 # one place this engine cannot afford anything.
 histogram = []
+# Instructions as text, for the debugger's disassembly panel: iced's fast
+# formatter, which the engine itself never needs. See `disassembly`.
+disassembly = ["iced-x86/fast_fmt"]
 # The same bargain for addresses: which guest code a run spends itself in,
 # counted exactly, at the cost of running several times slower while it is
 # being counted.
 profile = []
 
 [dependencies]
-# Decoding and the RFLAGS-effect tables, and nothing else: no encoder, no
-# formatters. The engine names an instruction it cannot execute by its
-# mnemonic and its bytes, which needs neither, and every feature left out is
-# module bytes a browser does not download. `instr_info` earns its place
-# twice — it is what the lockstep oracle masks undefined flag bits with.
+# Decoding and the RFLAGS-effect tables, and nothing else: no encoder, and
+# a formatter only behind the `disassembly` feature. The engine names an
+# instruction it cannot execute by its mnemonic and its bytes, which needs
+# neither, and every feature left out is module bytes a browser does not
+# download. `instr_info` earns its place twice — it is what the lockstep
+# oracle masks undefined flag bits with.
 iced-x86 = { version = "1.21.0", default-features = false, features = [
     "std",
     "decoder",

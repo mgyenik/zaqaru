@@ -10,6 +10,10 @@ description = "The container module's guest side: the kernel, the interpreter an
 name = "guest"
 crate-type = ["staticlib"]
 
+[features]
+# The disassembly panel's path in the container's store.
+disassembly = ["kernel/disassembly"]
+
 [dependencies]
 cpu = { package = "zaqaru-cpu", path = "../cpu" }
 kernel = { package = "zaqaru-kernel", path = "../kernel" }

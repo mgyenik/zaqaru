@@ -111,12 +111,19 @@ The paths the store serves, all read-only:
 | `processes/{pid}/threads/{tid}/registers` | the sixteen general registers, `rip`, the segment base, the flags as materialised, and `flags_stale` (see below) |
 | `processes/{pid}/maps` | the VMA tree, the fields `/proc/self/maps` shows |
 | `processes/{pid}/descriptors` | each fd: what backs it, offset, flags |
+| `processes/{pid}/threads/{tid}/disassembly` | up to forty instructions from `rip`: address, bytes, text |
+| `processes/{pid}/memory/{address}/{length}` | up to 4096 bytes of the process's memory, hex, as far as they are readable |
 | `cache` | blocks decoded, blocks live, bytes of bytecode, flushes |
 | `meta/...` | the spec's meta lens: which paths are readable |
 
-Optionally `processes/{pid}/threads/{tid}/disassembly`, the block at
-`rip`, which needs iced's formatter compiled in behind a feature since the
-engine deliberately leaves it out of the shipped module.
+The disassembly is iced's fast formatter, behind the `disassembly` cargo
+feature on the cpu, kernel and guest crates; the engine itself never
+prints an instruction. Measured at 54 KB on a module that is 2.6 MB before
+its image, so the guest the tool embeds carries it, and the manifest
+declares the path only when it is compiled in. The two memory paths are
+served for the running process only: every process maps the same range and
+only the running one's bytes are in place (`resident`), so a dormant
+process's memory is refused with `unavailable` rather than misread.
 
 **The one rule that keeps replay honest.** Serving a Request reads kernel
 state and writes a Response; it never changes anything the guest can
@@ -235,15 +242,53 @@ the way; the slider views anything behind it.
 **The edge.** `Edge` in `web/zaqaru.js` speaks the `/iso/net` protocol the
 wasmtime host speaks to real TCP — `listen`, `events`, `conn/{j}/rx/{room}`,
 `conn/{j}/tx`, `conn/{j}/ctl` — to requests made by the page. A request is
-one connection whose whole request is already in, followed by end of
-file; it resolves with everything the guest sent when the guest ends the
-connection. A request to a published port the guest has not listened on
+one connection whose whole request is already in; it resolves with
+everything the guest sent when the guest ends the connection, and the
+client's side stays open until then, as curl's would. It has to: nginx
+treats a client that half-closes while its request is being proxied as one
+that went away, and answers nothing — which is how the first Django
+request through the edge came back empty. A request to a published port the guest has not listened on
 yet waits, as a client retrying would, and connects the moment the
 listener registers. The one wait the kernel makes, `wait/{ms}`, cannot
 block in a browser and answers what there is; the worker sleeps briefly on
 an idle turn instead of spinning. So the page is `curl` to a server inside
 the container: `fixture.sh` bakes one that answers "pong", and the
 browser test sends it "ping".
+
+### Starting from a file
+
+A booted container, written to a file and continued from: `web/snapshot.js`
+is the format and `web/preboot.mjs` the tool. The tool runs a module live
+under Node, with the demo's ports published on an edge nobody sends to,
+until it is *quiet* — for three seconds of wall time it retires fewer than
+two million instructions, which is a server whose processes are all parked
+on timeouts. It then writes the pages of memory that differ from a fresh
+instance's (found with the checkpoint diff against the fresh memory), the
+stack pointer, the retired count, and every store's state as JSON
+(`MountTable.save`): the console so far, the clock's monotonic reading so
+the guest's clock continues rather than runs backwards, the entropy, the
+config, and which ports the guest listens on. The boot's own syscall log
+is dropped, since nothing can seek into the time before the file. The file
+is gzip as a whole; the browser inflates it with `DecompressionStream`.
+
+Continuing is `MountTable.load` of that state — with this run's edge, and
+recording — and `Container.continueFrom`, which is the restore with two
+differences from a checkpoint's: the pages are relative to a fresh
+instance, so what the file lacks is left as instantiated rather than put
+to zero; and the table is used as built rather than copied, because a copy
+of a recording table is a replay over its recording, which for a run that
+is only beginning is a tape that has run out at the first clock read. (It
+was: the container's first idle check found no clock and called itself
+deadlocked.) History begins at the file's instant: the first checkpoint
+is taken there, and the slider does not go below it.
+
+For Django (`web/demo.sh`): the boot is 3.29 G instructions, 32 s under
+Node — the same rate as wasmtime; 71,900 pages of the 887 MB memory
+differ from a fresh instance, 281 MB, 75 MB compressed, beside a 74 MB
+module. Headless Chrome loads both and stands the container up listening
+on port 80 in 1.0 s; a `GET /` through the edge is answered by nginx,
+gunicorn and Django in 0.3 s and 3.9 M instructions; a seek into the
+middle of the request restores and re-executes in 0.3 s.
 
 Check: the recorded Django run replays in the browser to the same console
 output and retired count as under wasmtime, and `statistics` read at the
@@ -281,12 +326,18 @@ point, and a container restored from one runs to the same end.
 
 ### The page
 
-A timeline over retired instructions with checkpoint marks; play, pause,
-step forward by one instruction, step back as a seek. Lanes per process
-from `statistics` sampled at each step. The syscall log as a clickable
-time axis. Panels for the selected process and thread: registers, maps,
-descriptors, and the block at `rip`, each a read of the container's
-store.
+A timeline over retired instructions; play, pause, step forward by one
+instruction, step back as a seek, and previous and next syscall. The
+syscall log as a clickable time axis, holding rows only for a window of
+three hundred around the present — a run is a million syscalls long before
+it is interesting — and rebuilt when the present leaves the window. Panels
+for the running process and thread, each a read of the container's store:
+processes, registers, the disassembly from `rip`, 256 bytes of stack under
+`rsp` as quadwords, the memory map, descriptors, the console, and the
+edge, where a request is typed and its answer shown with the instants it
+was sent and answered, the latter a link that seeks there. Live, "play"
+advances the frontier four million instructions a tick and renders each
+one, so the panels move while the container runs.
 
 ## Two things the page must say
 
@@ -298,10 +349,14 @@ writer's. The `registers` value carries `flags_stale`, and the page shows
 the flags greyed with a note rather than as truth. `docs/fidelity.md`
 records the same divergence for signal frames.
 
-**Speed.** The interpreter runs at 30–100 MIPS and a browser engine may be
-slower than wasmtime. A Django boot is 3.29 G instructions. The demo
-should start from a checkpoint taken after boot rather than boot live,
-which is the same snapshot the performance plan wants for start-up.
+**Speed.** The interpreter runs at 30–100 MIPS; V8 turned out to run the
+module at wasmtime's rate. A Django boot is 3.29 G instructions, half a
+minute either way, so the demo starts from the file `preboot.mjs` writes
+rather than boot live — the same booted snapshot the performance notes
+want for start-up. Checkpoints of an 887 MB memory cost about a hundred
+milliseconds each, so a live run of that size checkpoints every twenty
+million instructions (the `every` parameter; the page picks that default
+when given a snapshot) and a seek re-executes at most that far.
 
 ## Out of scope, and noted
 
@@ -326,13 +381,15 @@ harness under Node, against the wasmtime host's own run) and
 - the browser harness, the worker with delta checkpoints and seeking, and
   the page with the timeline, the syscall log, and the panels;
 - live mode, with the recording that makes its past seekable, and the
-  edge through which the page is the client of a server in the container.
+  edge through which the page is the client of a server in the container;
+- the disassembly and memory paths, and the panels that read them;
+- the snapshot file, the tool that writes one from a quiet container, and
+  the page continuing from it — and the demo: `web/demo.sh` makes the
+  Django module and its snapshot, and the browser test drives the page
+  through a request and a seek into it when they are present.
 
 Not built:
 
-- **The disassembly panel**, which needs iced's formatter compiled into
-  the guest behind a feature.
-- **A pre-booted Django snapshot** to start the demo from.
 - **A real wait in live mode.** The kernel's `wait/{ms}` read cannot block
   in a browser Worker without JSPI or `Atomics.wait` on shared memory; the
   worker sleeps between idle turns instead, which costs nothing here but
@@ -348,6 +405,8 @@ Not built:
 | Browser harness | medium | new: `web/` |
 | Checkpoints and seeking | medium | `web/` |
 | The page | large | `web/` |
+| Disassembly and memory paths | small | cpu, kernel, `web/` |
+| The snapshot file and the demo | medium | `web/` |
 
 Everything through snapshot and restore is testable under wasmtime with
 the existing test infrastructure. The browser work starts only once the

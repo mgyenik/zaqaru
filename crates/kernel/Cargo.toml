@@ -7,6 +7,10 @@ description = "The in-guest Linux-personality kernel: syscalls handled inside th
 [lib]
 name = "kernel"
 
+[features]
+# The store's `processes/{pid}/threads/{tid}/disassembly` path.
+disassembly = ["cpu/disassembly"]
+
 [dependencies]
 # The address space. `cpu/src/space.rs` is the page table — one bit per page
 # per permission, plus the bitmap that says which pages a decoded block came

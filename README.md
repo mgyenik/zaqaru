@@ -59,12 +59,16 @@ same tape are the same run.
 ## The debugger
 
 `web/` is a time-travel debugger for a container, in a browser: load a
-module and a tape of one of its runs, drag a slider through the run, and
-stand the machine on any instruction — the processes, a thread's
-registers, the memory map, the descriptors and the console as of that
-instant, with the syscall log as a clickable time axis. It rests on two
-facts about a container: every run is a pure function of its tape, and
-between two instructions linear memory is the whole machine. See
+module and a tape of one of its runs — or run it live, sending it requests
+from the page, or continue a booted one from a snapshot — drag a slider
+through the run, and stand the machine on any instruction: the processes,
+a thread's registers, the instructions at `rip`, the stack, the memory
+map, the descriptors and the console as of that instant, with the syscall
+log as a clickable time axis. `web/demo.sh` makes the demo: nginx,
+gunicorn and Django, booted, answering the page's own `GET /` and seekable
+into the middle of it. It rests on two facts about a container: every run
+is a pure function of its tape, and between two instructions linear memory
+is the whole machine. See
 [web/README.md](web/README.md) and
 [docs/time-travel-debugger.md](docs/time-travel-debugger.md).
 

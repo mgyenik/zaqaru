@@ -9,3 +9,4 @@
 
 # The debugger page's fixture: a module and a tape, made by web/fixture.sh.
 /web/fixture
+/web/demo

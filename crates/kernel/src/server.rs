@@ -29,8 +29,26 @@ use crate::paths;
 use super::System;
 
 /// What the container's store serves, as the manifest and
-/// `/iso/self/interface` declare it.
-pub const INTERFACE: &str = r#"{"name":"zaqaru-container","version":"0.1.0","serialization":"application/json","paths":{"statistics":{"read":"instructions retired and accelerated, blocks decoded, the current pid"},"processes":{"read":"every process and its threads, with what each is parked on"},"processes/{pid}/threads/{tid}/registers":{"read":"the general registers, rip, the segment base and the flags of one thread"},"processes/{pid}/maps":{"read":"the process's memory map, as /proc/self/maps renders it"},"processes/{pid}/descriptors":{"read":"the process's open descriptors"},"cache":{"read":"the running process's block cache"},"meta/":{"read":"which paths are readable"}}}"#;
+/// `/iso/self/interface` declare it. The disassembly path is declared only
+/// when it is compiled in.
+macro_rules! interface {
+    ($disassembly:literal) => {
+        concat!(
+            r#"{"name":"zaqaru-container","version":"0.1.0","serialization":"application/json","paths":{"statistics":{"read":"instructions retired and accelerated, blocks decoded, the current pid"},"processes":{"read":"every process and its threads, with what each is parked on"},"processes/{pid}/threads/{tid}/registers":{"read":"the general registers, rip, the segment base and the flags of one thread"},"processes/{pid}/maps":{"read":"the process's memory map, as /proc/self/maps renders it"},"processes/{pid}/descriptors":{"read":"the process's open descriptors"},"processes/{pid}/memory/{address}/{length}":{"read":"up to 4096 bytes of the running process's memory, hex"},"cache":{"read":"the running process's block cache"},"meta/":{"read":"which paths are readable"}"#,
+            $disassembly,
+            "}}"
+        )
+    };
+}
+#[cfg(feature = "disassembly")]
+pub const INTERFACE: &str = interface!(
+    r#","processes/{pid}/threads/{tid}/disassembly":{"read":"the instructions from the thread's rip, as text"}"#
+);
+#[cfg(not(feature = "disassembly"))]
+pub const INTERFACE: &str = interface!("");
+
+/// The most memory one read hands back.
+const MEMORY_READ_CAP: u64 = 4096;
 
 /// One Request, as the runtime queued it.
 struct Request {
@@ -66,8 +84,9 @@ impl<'a, S: Store + Clone> System<'a, S> {
         for request in requests {
             let response = match request.op.as_str() {
                 "read" => match self.read(&request.path) {
-                    Some(value) => format!(r#"{{"result":"ok","value":{value}}}"#),
-                    None => error("not_found", &format!("the container serves no {}", request.path)),
+                    Ok(value) => format!(r#"{{"result":"ok","value":{value}}}"#),
+                    Err(Refusal::NotFound) => error("not_found", &format!("the container serves no {}", request.path)),
+                    Err(Refusal::Unavailable(why)) => error("unavailable", &why),
                 },
                 "write" => error("not_writable", "the container's store is read-only"),
                 other => error("invalid_path", &format!("unknown operation {other}")),
@@ -78,38 +97,41 @@ impl<'a, S: Store + Clone> System<'a, S> {
         }
     }
 
-    /// The value at a path of the container's store, as JSON, or `None`.
-    fn read(&mut self, path: &str) -> Option<String> {
+    /// The value at a path of the container's store, as JSON.
+    fn read(&mut self, path: &str) -> Result<String, Refusal> {
         let parts: Vec<&str> = path.trim_matches('/').split('/').collect();
         match parts.as_slice() {
-            ["statistics"] => Some(self.statistics()),
-            ["processes"] => Some(self.processes()),
+            ["statistics"] => Ok(self.statistics()),
+            ["processes"] => Ok(self.processes()),
             ["processes", pid, "maps"] => {
-                let index = self.container_index(pid.parse().ok()?)?;
+                let index = self.container_index(pid.parse().ok().ok_or(Refusal::NotFound)?).ok_or(Refusal::NotFound)?;
                 let maps = self.containers[index].process.kernel.render_maps();
-                Some(quoted(&maps))
+                Ok(quoted(&maps))
             }
             ["processes", pid, "descriptors"] => {
-                let index = self.container_index(pid.parse().ok()?)?;
-                Some(self.descriptors(index))
+                let index = self.container_index(pid.parse().ok().ok_or(Refusal::NotFound)?).ok_or(Refusal::NotFound)?;
+                Ok(self.descriptors(index))
             }
             ["processes", pid, "threads", tid, "registers"] => {
-                let index = self.container_index(pid.parse().ok()?)?;
-                let tid: i32 = tid.parse().ok()?;
-                let container = &self.containers[index];
-                let thread = container
-                    .process
-                    .kernel
-                    .machine
-                    .threads
-                    .all()
-                    .iter()
-                    .find(|thread| thread.tid == tid)?;
-                Some(registers(&thread.tcb))
+                let (index, position) = self.thread_index(pid, tid)?;
+                Ok(registers(&self.containers[index].process.kernel.machine.threads.all()[position].tcb))
+            }
+            ["processes", pid, "threads", tid, "disassembly"] => {
+                let (index, position) = self.thread_index(pid, tid)?;
+                self.in_place(index)?;
+                let rip = self.containers[index].process.kernel.machine.threads.all()[position].tcb.rip;
+                Ok(disassembly(&self.containers[index].process.kernel.pages, rip))
+            }
+            ["processes", pid, "memory", address, length] => {
+                let index = self.container_index(pid.parse().ok().ok_or(Refusal::NotFound)?).ok_or(Refusal::NotFound)?;
+                self.in_place(index)?;
+                let address = number(address).ok_or(Refusal::NotFound)?;
+                let length = number(length).ok_or(Refusal::NotFound)?.min(MEMORY_READ_CAP);
+                Ok(memory(&self.containers[index].process.kernel.pages, address, length))
             }
             ["cache"] => {
                 let cache = &self.current().cache;
-                Some(format!(
+                Ok(format!(
                     r#"{{"decoded":{},"flushes":{},"live":{},"accelerates":{}}}"#,
                     cache.decoded,
                     cache.flushes,
@@ -117,10 +139,42 @@ impl<'a, S: Store + Clone> System<'a, S> {
                     cache.accelerates()
                 ))
             }
-            ["meta"] | ["meta", ..] => Some(String::from(
-                r#"{"paths":{"statistics":{"readable":true,"writable":false},"processes":{"readable":true,"writable":false},"processes/{pid}/threads/{tid}/registers":{"readable":true,"writable":false},"processes/{pid}/maps":{"readable":true,"writable":false},"processes/{pid}/descriptors":{"readable":true,"writable":false},"cache":{"readable":true,"writable":false}}}"#,
+            ["meta"] | ["meta", ..] => Ok(String::from(
+                r#"{"paths":{"statistics":{"readable":true,"writable":false},"processes":{"readable":true,"writable":false},"processes/{pid}/threads/{tid}/registers":{"readable":true,"writable":false},"processes/{pid}/threads/{tid}/disassembly":{"readable":true,"writable":false},"processes/{pid}/maps":{"readable":true,"writable":false},"processes/{pid}/descriptors":{"readable":true,"writable":false},"processes/{pid}/memory/{address}/{length}":{"readable":true,"writable":false},"cache":{"readable":true,"writable":false}}}"#,
             )),
-            _ => None,
+            _ => Err(Refusal::NotFound),
+        }
+    }
+
+    /// Which container and which of its threads a path names.
+    fn thread_index(&self, pid: &str, tid: &str) -> Result<(usize, usize), Refusal> {
+        let index = self.container_index(pid.parse().ok().ok_or(Refusal::NotFound)?).ok_or(Refusal::NotFound)?;
+        let tid: i32 = tid.parse().ok().ok_or(Refusal::NotFound)?;
+        let position = self.containers[index]
+            .process
+            .kernel
+            .machine
+            .threads
+            .all()
+            .iter()
+            .position(|thread| thread.tid == tid)
+            .ok_or(Refusal::NotFound)?;
+        Ok((index, position))
+    }
+
+    /// Whether a process's memory is the memory in place. Every process
+    /// maps the same range, and only the running one's bytes are at those
+    /// addresses — see `resident` — so the store reads memory only for the
+    /// process whose turn it is, and says so otherwise.
+    fn in_place(&self, index: usize) -> Result<(), Refusal> {
+        if self.containers[index].pid == self.current_pid() {
+            Ok(())
+        } else {
+            Err(Refusal::Unavailable(format!(
+                "pid {} is not running; only the running process's memory ({}) is in place",
+                self.containers[index].pid,
+                self.current_pid()
+            )))
         }
     }
 
@@ -223,6 +277,74 @@ fn registers(tcb: &cpu::state::Tcb) -> String {
         },
         tcb.retired
     );
+    out
+}
+
+/// Why a read was not answered with a value.
+enum Refusal {
+    /// The store serves nothing at the path.
+    NotFound,
+    /// The path exists, but not now, and this is why.
+    Unavailable(String),
+}
+
+/// A number in a path: hex with `0x`, or decimal.
+fn number(text: &str) -> Option<u64> {
+    match text.strip_prefix("0x") {
+        Some(hex) => u64::from_str_radix(hex, 16).ok(),
+        None => text.parse().ok(),
+    }
+}
+
+/// The instructions from `rip`, as the disassembly feature renders them:
+/// an array of `{address, bytes, text}`; empty when the feature is not
+/// compiled in, which the manifest also says.
+fn disassembly(pages: &cpu::space::Space, rip: u64) -> String {
+    #[cfg(feature = "disassembly")]
+    {
+        let mut out = String::from("[");
+        for (position, line) in cpu::disassembly::disassemble(pages, rip, 40).iter().enumerate() {
+            if position > 0 {
+                out.push(',');
+            }
+            let _ = write!(out, r#"{{"address":"{:#x}","bytes":"{}","text":{}}}"#, line.address, hex(&line.bytes), quoted(&line.text));
+        }
+        out.push(']');
+        out
+    }
+    #[cfg(not(feature = "disassembly"))]
+    {
+        let _ = (pages, rip);
+        String::from("[]")
+    }
+}
+
+/// `length` bytes at `address` in the running process's memory, as far as
+/// they are readable: `{address, bytes}` with the bytes in hex, stopping at
+/// the first page the process may not read.
+fn memory(pages: &cpu::space::Space, address: u64, length: u64) -> String {
+    const PAGE: u64 = 4096;
+    let mut held = Vec::with_capacity(length as usize);
+    let mut at = address;
+    let end = address.saturating_add(length);
+    while at < end {
+        let page_end = ((at / PAGE) + 1) * PAGE;
+        let take = page_end.min(end) - at;
+        let mut chunk = vec![0u8; take as usize];
+        if pages.read(at, &mut chunk).is_err() {
+            break;
+        }
+        held.extend_from_slice(&chunk);
+        at += take;
+    }
+    format!(r#"{{"address":"{address:#x}","bytes":"{}"}}"#, hex(&held))
+}
+
+fn hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(out, "{byte:02x}");
+    }
     out
 }
 

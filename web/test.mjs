@@ -7,8 +7,9 @@
 // The fixture is made by `web/fixture.sh`.
 
 import { readFileSync } from "node:fs";
-import { Container, Edge, KIND, parseTape, standardMounts, text } from "./zaqaru.js";
+import { Container, Edge, KIND, MountTable, parseTape, standardMounts, text } from "./zaqaru.js";
 import { Checkpoints, apply, dense, diff } from "./checkpoints.js";
+import { changedSince, decode, encode, gunzip, gzip } from "./snapshot.js";
 
 const [modulePath, tapePath, stdoutPath, serverPath] = process.argv.slice(2);
 if (!stdoutPath) {
@@ -230,6 +231,73 @@ if (serverPath) {
   check("the guest answered the request", answered === "pong\n", JSON.stringify(answered));
   check("the guest read the request", text(container.readback(["iso", "console", "stdout"]) ?? new Uint8Array()) === "listening on 8080\nread 5: ping\n", JSON.stringify(text(container.readback(["iso", "console", "stdout"]) ?? new Uint8Array())));
   check("the server exited", status === 0, String(status));
+}
+
+// 8. The container read as a store, beyond the registers: the disassembly
+//    at rip and the memory under rsp agree with each other.
+{
+  const container = await Container.instantiate(module, replayMounts());
+  container.stopAt(500000);
+  const processes = container.value("processes");
+  const pid = processes.current;
+  const other = processes.processes.find((p) => p.pid !== pid);
+  const tid = processes.processes.find((p) => p.pid === pid).threads[0].tid;
+  const registers = container.value(`processes/${pid}/threads/${tid}/registers`);
+  const disassembly = container.value(`processes/${pid}/threads/${tid}/disassembly`);
+  check("the disassembly begins at rip", disassembly.length > 1 && disassembly[0].address === registers.rip, JSON.stringify(disassembly[0]));
+  check("every line has text and bytes", disassembly.every((line) => line.text.length > 0 && /^[0-9a-f]+$/.test(line.bytes)));
+  const code = container.value(`processes/${pid}/memory/${registers.rip}/16`);
+  check("the memory at rip holds the instruction's bytes", code.bytes.startsWith(disassembly[0].bytes), JSON.stringify({ code, first: disassembly[0] }));
+  const stack = container.value(`processes/${pid}/memory/${registers.rsp}/256`);
+  check("the stack reads as 256 bytes", stack.bytes.length === 512, `${stack.bytes.length} hex digits`);
+  const nothing = container.value(`processes/${pid}/memory/0x10/16`);
+  check("unmapped memory reads as nothing", nothing.bytes === "");
+  // Every process maps the same range and only the running one's bytes are
+  // in place, so another process's memory is refused, not misread.
+  let refused = null;
+  try {
+    container.value(`processes/${other.pid}/memory/0x400000/16`);
+  } catch (why) {
+    refused = String(why);
+  }
+  check("a dormant process's memory is refused", other && /unavailable/.test(refused ?? ""), String(refused));
+  const manifest = JSON.parse(container.manifest());
+  check("the manifest declares the disassembly path", "processes/{pid}/threads/{tid}/disassembly" in manifest.paths);
+}
+
+// 9. A container written to a file and started from it: the file holds
+//    only what booting changed, and the continued run ends as the original.
+{
+  const fresh = await Container.instantiate(module, standardMounts());
+  const freshMemory = new Uint8Array(fresh.memory.buffer).slice();
+  const mounts = standardMounts({ seed: null, config: { trace: 1 } });
+  const original = await Container.instantiate(module, mounts);
+  original.step(0);
+  for (let step = 1; step <= 4; step++) original.step(step * 200000);
+  const at = original.value("statistics").retired;
+  const memory = new Uint8Array(original.memory.buffer);
+  const pages = changedSince(freshMemory, memory);
+  const all = diff(null, memory).changed;
+  check("a snapshot file holds fewer pages than the memory has", pages.size > 0 && pages.size < all.size, `${pages.size} of ${all.size}`);
+  const file = encode({ at, stackPointer: original.stackPointer, length: memory.length, pages, mounts: mounts.save({ drop: ["iso/log"] }) });
+  const compressed = await gzip(file);
+  check("the file compresses", compressed.length < file.length / 2, `${compressed.length} of ${file.length}`);
+  const read = decode(await gunzip(compressed));
+  check("the file reads back", read.at === at && read.pages.size === pages.size && read.stackPointer === original.stackPointer);
+  const table = MountTable.load(read.mounts);
+  check("the console came through the file", text(table.readback(["iso", "console", "stdout"]) ?? new Uint8Array()) === text(original.readback(["iso", "console", "stdout"]) ?? new Uint8Array()));
+  check("the logs were dropped", (table.readback(["iso", "log", "debug"]) ?? new Uint8Array()).length === 0);
+  // Recording, as the worker's live run does: a run that continues from a
+  // file records from the file's instant on.
+  const recording = table.record();
+  const continued = await Container.continueFrom(module, read, table);
+  check("the continued container stands at the file's instant", continued.value("statistics").retired === at);
+  const status = original.boot();
+  const continuedStatus = continued.boot();
+  check("the continued run exits the same", continuedStatus === status && status === 0);
+  check("and prints the same", text(continued.readback(["iso", "console", "stdout"])) === text(original.readback(["iso", "console", "stdout"])));
+  check("the continued run was recorded", recording.length > 0, `${recording.length} answers`);
+  console.log(`     ${pages.size} pages, ${(file.length / 1024).toFixed(0)} KB, ${(compressed.length / 1024).toFixed(0)} KB compressed`);
 }
 
 console.log(failures ? `${failures} failure(s)` : "all passed");

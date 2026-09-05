@@ -4,48 +4,59 @@
 <meta charset="utf-8">
 <title>zaqaru — a container, in time</title>
 <style>
-  :root { color-scheme: light dark; font: 13px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; }
-  body { margin: 0; display: grid; grid-template-rows: auto auto auto 1fr; height: 100vh; }
-  header { padding: 8px 12px; border-bottom: 1px solid #8884; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
-  header input[type=file] { max-width: 220px; }
-  #timeline { padding: 8px 12px; border-bottom: 1px solid #8884; display: flex; gap: 8px; align-items: center; }
-  #edge { padding: 6px 12px; border-bottom: 1px solid #8884; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-  #responses { flex-basis: 100%; max-height: 6em; overflow: auto; }
-  #responses pre { margin: 0; opacity: .85; }
+  :root { color-scheme: light dark; font: 13px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; --accent: #58a6ff; --line: #8884; }
+  body { margin: 0; display: grid; grid-template-rows: auto auto 1fr; height: 100vh; }
+  header { padding: 6px 12px; border-bottom: 1px solid var(--line); display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+  header input[type=file] { max-width: 200px; }
+  header input[type=text], header input[type=number] { font: inherit; }
+  #controls { display: contents; }
+  #controls.hidden { display: none; }
+  #status { opacity: .8; }
+  #timeline { padding: 6px 12px; border-bottom: 1px solid var(--line); display: flex; gap: 8px; align-items: center; }
   #slider { flex: 1; }
-  main { display: grid; grid-template-columns: 1fr 1fr 1fr; grid-template-rows: 1fr 1fr; gap: 1px; background: #8884; min-height: 0; }
-  section { background: Canvas; padding: 8px 12px; overflow: auto; min-height: 0; }
-  section h2 { margin: 0 0 6px; font-size: 12px; font-weight: 600; opacity: .7; text-transform: uppercase; letter-spacing: .04em; }
+  #at { min-width: 16em; text-align: right; }
+  main { display: grid; grid-template-columns: 1.2fr 1fr 1fr 1.3fr; grid-template-rows: 1fr 1fr; gap: 1px; background: var(--line); min-height: 0; }
+  section { background: Canvas; padding: 6px 10px; overflow: auto; min-height: 0; }
+  section h2 { margin: 0 0 4px; font-size: 11px; font-weight: 600; opacity: .7; text-transform: uppercase; letter-spacing: .04em; position: sticky; top: 0; background: Canvas; }
   pre { margin: 0; white-space: pre-wrap; word-break: break-all; }
   .syscall { cursor: pointer; white-space: pre; opacity: .45; padding: 0 4px; }
   .syscall.past { opacity: 1; }
   .syscall.now { background: #58a6ff33; }
-  .syscall:hover { background: #8884; }
-  .process { margin-bottom: 6px; padding: 4px 6px; border-left: 3px solid #8888; }
-  .process.current { border-left-color: #58a6ff; }
+  .syscall:hover { background: var(--line); }
+  .elided { opacity: .5; padding: 2px 4px; font-style: italic; }
+  .process { margin-bottom: 6px; padding: 3px 6px; border-left: 3px solid #8888; }
+  .process.current { border-left-color: var(--accent); }
   .thread { padding-left: 12px; opacity: .8; }
   #registers div { display: flex; gap: 8px; }
   #registers .name { width: 64px; opacity: .7; }
   .stale { color: #d29922; }
-  button { font: inherit; }
+  .line { display: grid; grid-template-columns: 9em 16em 1fr; gap: 8px; white-space: pre; }
+  .line.rip { background: #58a6ff33; }
+  .line .bytes { opacity: .6; }
+  .word { white-space: pre; }
+  .word .address { opacity: .6; }
+  #edge form { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; margin-bottom: 6px; }
+  #edge input[type=text] { flex: 1; min-width: 12em; font: inherit; }
+  .exchange { border-top: 1px solid var(--line); padding: 4px 0; }
+  .exchange .meta { opacity: .7; }
+  .exchange a { color: var(--accent); cursor: pointer; }
+  .exchange pre { max-height: 14em; overflow: auto; }
+  button, select { font: inherit; }
 </style>
 </head>
 <body>
 <header>
   <strong>zaqaru</strong>
-  <label>module <input id="module" type="file" accept=".wasm"></label>
-  <label>tape <input id="tape" type="file"></label>
-  <label>or live, publishing ports <input id="publish" type="text" value="8080" style="width:7em"></label>
-  <label>checkpoint every <input id="every" type="number" value="2000000" step="500000" style="width:9em"></label>
-  <button id="load">load</button>
-  <span id="status">choose a module and a tape, or a module alone to run live; or pass ?module=…&amp;tape=… / ?module=…&amp;live=8080</span>
+  <span id="controls">
+    <label>module <input id="module" type="file" accept=".wasm"></label>
+    <label>tape <input id="tape" type="file"></label>
+    <label>snapshot <input id="snapshot" type="file"></label>
+    <label>live ports <input id="publish" type="text" value="8080" style="width:6em"></label>
+    <label>checkpoint every <input id="every" type="number" value="2000000" step="1000000" style="width:9em"></label>
+    <button id="load">load</button>
+  </span>
+  <span id="status">choose a module and a tape to replay, a module alone to run live, or a module and a snapshot to continue a booted one; or pass ?module=…&amp;tape=…, ?module=…&amp;live=8080, ?module=…&amp;snapshot=…&amp;live=80</span>
 </header>
-<div id="edge" hidden>
-  <label>edge: port <input id="port" type="number" value="8080" style="width:6em"></label>
-  <input id="request" type="text" value="GET / HTTP/1.0\r\n\r\n" style="flex:1">
-  <button id="send">send</button>
-  <div id="responses"></div>
-</div>
 <div id="timeline">
   <button id="prev" title="previous syscall">⇤</button>
   <button id="back" title="one instruction back">−1</button>
@@ -54,15 +65,25 @@
   <button id="next" title="next syscall">⇥</button>
   <input id="slider" type="range" min="0" max="0" value="0">
   <span id="at">0</span>
-  <label>step <select id="speed"><option value="10000">10k</option><option value="100000" selected>100k</option><option value="1000000">1M</option></select></label>
+  <span id="took" style="opacity:.6;min-width:12em"></span>
+  <label>step <select id="speed"><option value="10000">10k</option><option value="100000" selected>100k</option><option value="1000000">1M</option><option value="10000000">10M</option></select></label>
 </div>
 <main>
   <section><h2>syscalls</h2><div id="syscalls"></div></section>
   <section><h2>processes</h2><pre id="statistics"></pre><div id="processes"></div></section>
   <section><h2>registers</h2><div id="registers"></div></section>
-  <section><h2>memory map</h2><pre id="maps"></pre></section>
-  <section><h2>descriptors</h2><pre id="descriptors"></pre></section>
+  <section><h2>disassembly</h2><div id="disassembly"></div></section>
+  <section id="edge"><h2>edge</h2>
+    <form id="send-form">
+      <label>port <input id="port" type="number" value="8080" style="width:6em"></label>
+      <input id="request" type="text" value="GET / HTTP/1.0\r\n\r\n">
+      <button id="send" type="submit">send</button>
+    </form>
+    <div id="responses"></div>
+  </section>
   <section><h2>console</h2><pre id="stdout"></pre><pre id="stderr" style="opacity:.7"></pre></section>
+  <section><h2>stack</h2><div id="stack"></div></section>
+  <section><h2>memory map · descriptors</h2><pre id="descriptors"></pre><pre id="maps" style="opacity:.85"></pre></section>
 </main>
 <script type="module" src="./app.js"></script>
 </body>

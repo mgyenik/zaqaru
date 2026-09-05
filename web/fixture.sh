@@ -78,4 +78,7 @@ cargo build --release --quiet -p zaqaru --manifest-path "$repo/Cargo.toml"
 "$repo/target/release/zaqaru" bake "$out/root" -o "$out/module.wasm" -- /init a b
 "$repo/target/release/zaqaru" run --trace "$out/trace.txt" --record "$out/tape.bin" --seed 51 \
     "$out/module.wasm" > "$out/stdout.txt" 2> "$out/stderr.txt" || true
-echo "fixture in $out: module.wasm, tape.bin, trace.txt, stdout.txt, server.wasm"
+# The server, booted and written to a file once it is listening, for the
+# page's start-from-a-snapshot mode.
+node "$repo/web/preboot.mjs" "$out/server.wasm" "$out/server.snapshot" --publish 8080 --quiet-ms 1000 2>/dev/null
+echo "fixture in $out: module.wasm, tape.bin, trace.txt, stdout.txt, server.wasm, server.snapshot"

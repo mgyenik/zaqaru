@@ -2731,7 +2731,10 @@ int main(void) {
             {"op":"read","path":"processes/1/maps","data":null,"respond_to":"/iso/server/responses/4"},
             {"op":"read","path":"processes/1/descriptors","data":null,"respond_to":"/iso/server/responses/5"},
             {"op":"write","path":"processes","data":{"x":1},"respond_to":"/iso/server/responses/6"},
-            {"op":"read","path":"nothing","data":null,"respond_to":"/iso/server/responses/7"}]"#
+            {"op":"read","path":"nothing","data":null,"respond_to":"/iso/server/responses/7"},
+            {"op":"read","path":"processes/1/threads/1/disassembly","data":null,"respond_to":"/iso/server/responses/8"},
+            {"op":"read","path":"processes/1/memory/0x400000/16","data":null,"respond_to":"/iso/server/responses/9"},
+            {"op":"read","path":"processes/1/memory/0x10/16","data":null,"respond_to":"/iso/server/responses/10"}]"#
             .to_vec(),
     );
     system.serve();
@@ -2756,6 +2759,19 @@ int main(void) {
     assert!(descriptors.contains(r#""fd":1"#), "{descriptors}");
     assert!(response("6").contains(r#""type":"not_writable""#));
     assert!(response("7").contains(r#""type":"not_found""#));
+    // The disassembly begins at rip, and its first bytes are the bytes the
+    // memory path reads there; below the first mapping there is nothing.
+    let rip = registers.split(r#""rip":""#).nth(1).and_then(|rest| rest.split('"').next()).expect("rip in the registers");
+    let disassembly = response("8");
+    if cfg!(feature = "disassembly") {
+        assert!(disassembly.starts_with(&format!(r#"{{"result":"ok","value":[{{"address":"{rip}","bytes":""#)), "{disassembly}");
+        assert!(disassembly.contains(r#""text":""#), "{disassembly}");
+    } else {
+        assert!(disassembly.starts_with(r#"{"result":"ok","value":[]"#), "{disassembly}");
+    }
+    let memory = response("9");
+    assert!(memory.starts_with(r#"{"result":"ok","value":{"address":"0x400000","bytes":"7f454c46"#), "an ELF header: {memory}");
+    assert!(response("10").contains(r#""bytes":"""#), "{}", response("10"));
     // And the guest saw none of it: the run finishes as it always does.
     assert_eq!(system.run(), Exit::Status(0));
 }

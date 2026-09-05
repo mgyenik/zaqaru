@@ -36,6 +36,8 @@
 
 pub mod block;
 pub mod bytecode;
+#[cfg(feature = "disassembly")]
+pub mod disassembly;
 pub mod exec;
 pub mod flags;
 pub mod histogram;

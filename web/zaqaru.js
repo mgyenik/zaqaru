@@ -3,6 +3,10 @@
 // snapshot and restore. An ES module with no dependencies, so the same code
 // runs a container in a browser Worker and under Node for the smoke test.
 //
+// Every store can also `save()` its state as plain JSON and be rebuilt from
+// it, which is how a booted container is written to a file and started from
+// later (see `snapshot.js` and `preboot.mjs`).
+//
 // The wire shapes are the canonical ABI's, as `crates/guest/src/wire.rs`
 // states them and `crates/host/src/lib.rs` writes them: a `list<u8>` is a
 // `(pointer, length)` pair of u32s; `ll_read`'s return area is sixteen bytes
@@ -42,6 +46,20 @@ function samePath(a, b) {
   return a.length === b.length && a.every((segment, i) => sameBytes(segment, b[i]));
 }
 
+/// Bytes as base64 and back, for state saved as JSON.
+export function toBase64(data) {
+  let binary = "";
+  for (let i = 0; i < data.length; i += 0x8000) binary += String.fromCharCode.apply(null, data.subarray(i, i + 0x8000));
+  return btoa(binary);
+}
+
+export function fromBase64(string) {
+  const binary = atob(string);
+  const data = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) data[i] = binary.charCodeAt(i);
+  return data;
+}
+
 // ---- stores -----------------------------------------------------------------
 //
 // A store answers `read(path) -> Uint8Array | null` (null: nothing at that
@@ -75,6 +93,12 @@ export class Sink {
   snapshot() {
     return new Sink(new Map([...this.entries].map(([k, v]) => [k, v.slice()])), this.echo);
   }
+  save() {
+    return { kind: "sink", entries: [...this.entries].map(([k, v]) => [k, toBase64(v)]) };
+  }
+  static load(saved, echo = null) {
+    return new Sink(new Map(saved.entries.map(([k, v]) => [k, fromBase64(v)])), echo);
+  }
 }
 
 /// The host's clocks, as nanoseconds in decimal text.
@@ -93,6 +117,14 @@ export class Clock {
   }
   snapshot() {
     return new Clock(this.started);
+  }
+  /// The monotonic reading, so a container started from a file sees its
+  /// clock continue from where it was rather than run backwards.
+  save() {
+    return { kind: "clock", monotonicMs: performance.now() - this.started };
+  }
+  static load(saved) {
+    return new Clock(performance.now() - saved.monotonicMs);
   }
 }
 
@@ -114,6 +146,14 @@ export class Shutdown {
     const copy = new Shutdown(this.requested);
     copy.complete = this.complete;
     return copy;
+  }
+  save() {
+    return { kind: "shutdown", requested: this.requested, complete: this.complete };
+  }
+  static load(saved) {
+    const shutdown = new Shutdown(saved.requested);
+    shutdown.complete = saved.complete;
+    return shutdown;
   }
 }
 
@@ -162,6 +202,9 @@ export class Server {
   snapshot() {
     return this;
   }
+  save() {
+    return { kind: "server" };
+  }
 }
 
 /// `/iso/net`, with the page as the only peer: the protocol the wasmtime
@@ -173,11 +216,15 @@ export class Server {
 /// lines `open {conn} {port} {peer}`, `data {conn}`, `eof {conn}`; it pulls
 /// bytes with `conn/{j}/rx/{room}`, pushes them with `conn/{j}/tx`, and
 /// ends with `conn/{j}/ctl` holding `shutdown` or `close`. A request from
-/// the page is one connection whose whole request is already in, followed
-/// by end of file; its promise resolves with everything the guest sent
-/// when the guest ends the connection. A request to a published port the
-/// guest has not listened on yet waits, as a client retrying a connection
-/// would, and connects the moment the guest registers the listener.
+/// the page is one connection whose whole request is already in; its
+/// promise resolves with everything the guest sent when the guest ends the
+/// connection. The client's side stays open until then, as a browser's or
+/// curl's would: nginx treats a client that half-closes while its request
+/// is being proxied as one that went away, and answers nothing. (A test
+/// may ask for the half-close with `halfClose`.) A request to a published
+/// port the guest has not listened on yet waits, as a client retrying a
+/// connection would, and connects the moment the guest registers the
+/// listener.
 ///
 /// Shared, not copied, by a snapshot: the edge is the world, and a
 /// container restored from a checkpoint replays the world's answers from
@@ -189,6 +236,7 @@ export class Edge {
     this.events = [];
     this.connections = [];
     this.waiting = []; // requests to ports not yet listened on
+    this.first = 0; // the id of connections[0]: ids continue across a save
   }
   publish(port) {
     this.published.add(port);
@@ -200,17 +248,18 @@ export class Edge {
   /// Sends `request` to a guest listener on `port`, as one connection that
   /// then half-closes. Resolves with the guest's response when it ends the
   /// connection, or rejects if the port is not reachable.
-  request(port, request) {
+  request(port, request, { halfClose = false } = {}) {
     return new Promise((resolve, reject) => {
       if (!this.published.has(port)) return reject(`port ${port} is not published`);
-      if (this.listening.has(port)) this.connect(port, request, resolve);
-      else this.waiting.push({ port, request, resolve });
+      if (this.listening.has(port)) this.connect(port, request, resolve, halfClose);
+      else this.waiting.push({ port, request, resolve, halfClose });
     });
   }
-  connect(port, request, resolve) {
-    const id = this.connections.length;
-    this.connections.push({ incoming: request.slice(), outgoing: [], finished: true, resolve, closed: false });
-    this.events.push(`open ${id} ${port} 127.0.0.1:${40000 + id}`, `data ${id}`, `eof ${id}`);
+  connect(port, request, resolve, halfClose) {
+    const id = this.first + this.connections.length;
+    this.connections.push({ incoming: request.slice(), outgoing: [], resolve, closed: false });
+    this.events.push(`open ${id} ${port} 127.0.0.1:${40000 + id}`, `data ${id}`);
+    if (halfClose) this.events.push(`eof ${id}`);
   }
   drain() {
     if (!this.events.length) return null;
@@ -222,7 +271,7 @@ export class Edge {
     const [, , what, which, leaf, room] = path.map((s) => text(s));
     if (what === "events" || what === "wait") return this.drain();
     if (what === "conn" && leaf === "rx") {
-      const connection = this.connections[Number(which)];
+      const connection = this.connections[Number(which) - this.first];
       if (!connection) return null;
       const taken = Math.min(Number(room) || 0, connection.incoming.length);
       const given = connection.incoming.slice(0, taken);
@@ -240,12 +289,12 @@ export class Edge {
         this.listening.add(port);
         const arrived = this.waiting.filter((w) => w.port === port);
         this.waiting = this.waiting.filter((w) => w.port !== port);
-        for (const { request, resolve } of arrived) this.connect(port, request, resolve);
+        for (const { request, resolve, halfClose } of arrived) this.connect(port, request, resolve, halfClose);
       }
       return segmentsOf(["iso", "net", published ? "listener" : "loopback", String(port)]);
     }
     if (what === "conn") {
-      const connection = this.connections[Number(which)];
+      const connection = this.connections[Number(which) - this.first];
       if (!connection) throw "a connection that is not open";
       if (leaf === "tx") connection.outgoing.push(data.slice());
       else if (leaf === "ctl") {
@@ -266,6 +315,19 @@ export class Edge {
     throw `${key(path)} is not writable`;
   }
   snapshot() {
+    return this;
+  }
+  /// What the guest knows of the edge: which ports it listens on, and how
+  /// many connections it has been handed. Open connections are not saved —
+  /// a container is written to a file when it is quiet.
+  save() {
+    return { kind: "edge", published: [...this.published], listening: [...this.listening], next: this.first + this.connections.length };
+  }
+  /// Applies a saved edge's guest-visible state to this one.
+  load(saved) {
+    for (const port of saved.published) this.published.add(port);
+    for (const port of saved.listening) this.listening.add(port);
+    this.first = saved.next;
     return this;
   }
 }
@@ -396,6 +458,39 @@ export class MountTable {
     copy.server = this.server;
     return copy;
   }
+  /// Every store's state as JSON: what a container written to a file keeps
+  /// of the host's side. Sinks named in `drop` are saved empty — the logs of
+  /// a boot nobody can seek into.
+  save({ drop = [] } = {}) {
+    return {
+      mounts: this.mounts.map(({ prefix, store }) => {
+        const name = key(prefix);
+        const saved = store.save();
+        if (saved.kind === "sink" && drop.includes(name)) saved.entries = [];
+        return { prefix: name, state: saved };
+      }),
+    };
+  }
+  /// A table rebuilt from `save()`'s output. The edge is the caller's — the
+  /// world is not in the file — and takes the saved guest-visible state.
+  static load(saved, { echo = null, edge = null } = {}) {
+    const table = new MountTable();
+    for (const { prefix, state } of saved.mounts) {
+      const path = prefix.split("/");
+      let store;
+      if (state.kind === "sink") store = Sink.load(state, prefix === "iso/console" ? echo : null);
+      else if (state.kind === "clock") store = Clock.load(state);
+      else if (state.kind === "shutdown") store = Shutdown.load(state);
+      else if (state.kind === "edge") {
+        if (!edge) continue;
+        store = edge.load(state);
+      } else if (state.kind === "server") continue;
+      else throw `a saved store of kind ${state.kind}`;
+      table.mount(path, store);
+    }
+    table.serve();
+    return table;
+  }
 }
 
 /// The mounts a plain run needs: a console, a log, entropy, a clock, the
@@ -422,6 +517,27 @@ export function standardMounts({ seed = 0x5a, echo = null, config = {}, edge = n
 }
 
 // ---- the container ----------------------------------------------------------
+
+/// Per module, the pages a fresh instance's memory has that are not zero:
+/// the image and the guest's data. A sparse snapshot holds only pages that
+/// are not zero, so restoring one has to put back to zero any of these the
+/// snapshot does not have.
+const basePages = new WeakMap();
+
+function nonZeroPages(memory) {
+  const words = new Uint32Array(memory.buffer, memory.byteOffset, memory.byteLength >>> 2);
+  const pages = new Set();
+  for (let page = 0; page * 1024 < words.length; page++) {
+    const end = Math.min((page + 1) * 1024, words.length);
+    for (let i = page * 1024; i < end; i++) {
+      if (words[i] !== 0) {
+        pages.add(page);
+        break;
+      }
+    }
+  }
+  return pages;
+}
 
 export class Container {
   constructor(module, instance, mounts) {
@@ -608,16 +724,45 @@ export class Container {
   /// as a checkpoint store keeps. A fresh memory is zero, so sparse pages
   /// are written straight in.
   async restore(snapshot) {
-    const mounts = snapshot.mounts.snapshot();
-    const container = new Container(this.module, null, mounts);
-    container.instance = await WebAssembly.instantiate(this.module, { env: container.imports() });
+    return Container.fromSnapshot(this.module, snapshot);
+  }
+
+  /// A container standing where a snapshot was taken, from a module. The
+  /// snapshot's mount table is copied, so the snapshot stays good for the
+  /// next restore: a restored container moves its own table's tape cursor.
+  static fromSnapshot(module, snapshot) {
+    return Container.build(module, snapshot, snapshot.mounts.snapshot());
+  }
+
+  /// A container continuing from a file (`snapshot.js`), against a mount
+  /// table built for it — `MountTable.load` of the file's saved state, with
+  /// this run's edge, recording if this run records. Not copied: a copy of
+  /// a recording table is a replay over its recording, which is right for
+  /// a checkpoint and wrong for a run that is only beginning.
+  static continueFrom(module, file, mounts) {
+    return Container.build(module, file, mounts);
+  }
+
+  /// Sparse pages mean one of two things. A checkpoint's map holds every
+  /// page that is not zero, so a page absent from it is zero — including
+  /// one the fresh module has data in. A file's map (`relative`) holds the
+  /// pages that differ from a fresh instance, so a page absent from it is
+  /// the fresh instance's.
+  static async build(module, snapshot, mounts) {
+    const container = new Container(module, null, mounts);
+    container.instance = await WebAssembly.instantiate(module, { env: container.imports() });
+    const fresh = new Uint8Array(container.memory.buffer);
+    if (!basePages.has(module)) basePages.set(module, nonZeroPages(fresh));
     const have = container.memory.buffer.byteLength;
     const want = snapshot.memory ? snapshot.memory.length : snapshot.length;
     if (want < have) throw "the snapshot's memory is smaller than a fresh instance's";
     if (want > have) container.memory.grow(Math.ceil((want - have) / 65536));
     const target = new Uint8Array(container.memory.buffer);
     if (snapshot.memory) target.set(snapshot.memory);
-    else for (const [page, bytes] of snapshot.pages) target.set(bytes.subarray(0, Math.min(bytes.length, want - page * 4096)), page * 4096);
+    else {
+      if (!snapshot.relative) for (const page of basePages.get(module)) if (!snapshot.pages.has(page)) target.fill(0, page * 4096, (page + 1) * 4096);
+      for (const [page, bytes] of snapshot.pages) target.set(bytes.subarray(0, Math.min(bytes.length, want - page * 4096)), page * 4096);
+    }
     if (container.stackPointer !== snapshot.stackPointer) throw "the guest left state on its stack";
     return container;
   }
