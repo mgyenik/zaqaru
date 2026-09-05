@@ -5,7 +5,7 @@
 //! `ptrace`. Running the same bytes both ways and comparing the *entire*
 //! register file after every instruction — flags included — is the
 //! maximal-resolution differential this project can run, and it is
-//! structurally impossible for the transpiler, whose observable granularity
+//! structurally impossible for a compiled translation, whose observable granularity
 //! is a whole run. It changes what a breadth failure costs: instead of
 //! "implement, run the corpus, debug a divergence three layers downstream",
 //! it is "implement, and the oracle names the first wrong instruction".

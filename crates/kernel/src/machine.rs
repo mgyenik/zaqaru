@@ -78,10 +78,8 @@ pub trait Machine {
 
     /// Parks this thread part-way through a pipe transfer.
     ///
-    /// Nothing to park on a machine with one thread and no scheduler, and
-    /// that is why a pipe read on the ahead-of-time path would hang rather
-    /// than wait — which is a thing to know about that path, not a gap in
-    /// this one.
+    /// Nothing to park on a machine with one thread and no scheduler: a pipe
+    /// read on the native tests' register file cannot wait, and says so.
     fn park_on_transfer(&mut self, _transfer: crate::ring::Transfer) -> bool {
         false
     }
@@ -132,7 +130,7 @@ pub trait Machine {
     ///
     /// The top of memory by default, which is right whenever a process's
     /// bytes live somewhere of their own — natively they are a file per
-    /// process, and on the ahead-of-time path there is one process. It is
+    /// process. It is
     /// wrong inside the module, where they share the one linear memory, and
     /// [`Interpreted`] overrides it there. See `GUEST_BASE`.
     fn guest_base(&mut self) -> u64 {
@@ -142,10 +140,8 @@ pub trait Machine {
     /// Puts this process's address space at the guest's addresses, and
     /// takes it down again.
     ///
-    /// Nothing to do by default, and that is the honest answer for the
-    /// ahead-of-time machine rather than a gap in it: there the address
-    /// space is the module instance's own memory and a second process is a
-    /// second instance, so no machine ever holds two. It is the interpreter
+    /// Nothing to do by default, which is the honest answer for a machine
+    /// with one process and nothing to displace it. It is the interpreter
     /// that runs every process in one engine and therefore has to say which
     /// one the bytes belong to.
     fn activate(&mut self, pages: &cpu::space::Space) {
@@ -189,10 +185,9 @@ pub trait Machine {
     /// This thread's registers, where the world keeps them in a control
     /// block it can hand out.
     ///
-    /// `None` for the ahead-of-time machine, whose registers are wasm
-    /// globals: there is no block, and building a signal frame out of them
-    /// is the chain surgery that world's design calls M10. The rows that
-    /// need one say so loudly rather than pretending.
+    /// `None` for a machine that has no control block — the native tests'
+    /// bare register file. The rows that need one say so loudly rather than
+    /// pretending.
     fn tcb(&mut self) -> Option<&mut cpu::state::Tcb> {
         None
     }
@@ -252,10 +247,8 @@ impl Default for Registers {
 ///
 /// **The thread control block lives here, and here is inside the kernel** —
 /// `Kernel` owns its `machine`, so owning the control block through it is
-/// the ownership `docs/vm.md` section 3 asks for ("the TCB, owned by the kernel
-/// as M7 always intended") with no second path to the same state. The six
-/// places the kernel reaches for machine state do not change shape at all;
-/// they simply land on a control block instead of on a wasm global.
+/// one owner with no second path to the same state. The six places the
+/// kernel reaches for machine state all land on a control block.
 ///
 /// What is *not* here is the address space, which is the kernel's own field
 /// because the mapping rows write it, and the block cache, which is the

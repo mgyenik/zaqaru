@@ -1,6 +1,6 @@
-# N5 — the same stack traced both ways, and every difference accounted for
+# The same stack traced both ways, and every difference accounted for
 #
-# `strace -f` over the native container against kisal's own trace of the
+# `strace -f` over the native container against the kernel's own trace of the
 # interpreted one, on the same scenario: boot, two `curl` requests, a
 # `SIGTERM` shutdown. Regenerate with `demo/hello-django/trace.sh` for the
 # native side, `trace-interpreted.sh` for the other, and `diff.py` for the
@@ -10,12 +10,12 @@
 #
 # The clock used to be the whole story — 6,455 extra calls, because there was
 # no vDSO and glibc took the syscall path it keeps for exactly that case.
-# `kisal/src/vdso.rs` closed it: the kernel publishes a timebase against the
+# `crates/kernel/src/vdso.rs` closed it: the kernel publishes a timebase against the
 # retired-instruction counter and glibc computes the time itself, so a
 # container that reads the clock two thousand times issues no clock syscall
 # at all. The count went from 15,986 to 9,532 against a native 9,365.
 #
-# 1. `kill` is the two shutdowns differing. N0's was signalled from *inside*
+# 1. `kill` is the two shutdowns differing. The native one was signalled from *inside*
 #    the container, by a shell run with `docker exec`, because `docker stop`
 #    signals pid 1 which under tracing is `strace` itself. The interpreted
 #    run's arrives from the host at pid 1 directly, so no guest process

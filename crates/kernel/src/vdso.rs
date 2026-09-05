@@ -41,9 +41,8 @@
 //!
 //! Two consecutive samples give elapsed nanoseconds and elapsed ticks, and
 //! their ratio is the rate. It therefore tracks whatever the machine
-//! actually does — a slow host, a fast one, a future tier that compiles hot
-//! blocks and retires instructions at a different rate — without anything
-//! being told.
+//! actually does — a slow host, a fast one, an accelerator that retires
+//! instructions at a different rate — without anything being told.
 
 use crate::errno::Errno;
 

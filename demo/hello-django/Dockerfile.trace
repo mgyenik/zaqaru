@@ -1,4 +1,4 @@
-# The demo image plus `strace`, for gate N0 of `docs/network-plan.md`.
+# The demo image plus `strace`, for tracing the stack natively.
 #
 # Separate from the demo image on purpose: what gets baked into a `.wasm`
 # should be the stack and nothing else, and a tracing tool in the image

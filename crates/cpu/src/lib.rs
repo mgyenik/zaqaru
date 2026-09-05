@@ -5,8 +5,8 @@
 //! into the same module; the bet *this* crate makes is that the code on the
 //! other side of the program counter can be data rather than something a
 //! bake had to understand ahead of time. An interpreter decodes at the
-//! actual program counter at run time: ground truth, no inference, no
-//! witnesses, no recognizer — and every instruction the guest can reach is
+//! actual program counter at run time: ground truth, no static analysis —
+//! and every instruction the guest can reach is
 //! reachable, including bytes it wrote a microsecond ago.
 //!
 //! The pieces, in the order they matter:
@@ -82,8 +82,7 @@ pub enum Outcome {
 /// an omission. The thread control block, the address space and the block
 /// cache belong to the kernel: the kernel is what schedules threads, what
 /// maps and unmaps pages, and what will one day fork a process — so the
-/// kernel is what has to own them, and section 3 of `docs/vm.md` says as
-/// much ("the TCB, owned by the kernel as M7 always intended").
+/// kernel is what has to own them.
 ///
 /// What that buys is not tidiness. The `mmap` rows have to reach the page
 /// bitmaps, and the kernel's guest-memory writes have to reach the
@@ -509,8 +508,8 @@ mod tests {
         );
     }
 
-    /// The capability the ahead-of-time design has to refuse outright: a
-    /// guest writes a function into memory, calls it, rewrites it, and calls
+    /// Self-modifying code: a guest writes a function into memory, calls
+    /// it, rewrites it, and calls
     /// it again. Both calls must run the bytes that were there at the time.
     ///
     /// The second half is the whole test. With page invalidation removed,

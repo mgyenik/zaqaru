@@ -215,8 +215,8 @@ static uint64_t kernel_float(uint64_t rounds) {
     return bits;
 }
 
-/* The kernel seam: a round trip through a pipe, which under the container is
- * a syscall into kisal and back. Nothing about the engine's speed at
+/* The kernel boundary: a round trip through a pipe, which under the container
+ * is a syscall into the kernel and back. Nothing about the engine's speed at
  * instructions — this is the cost of leaving the guest. */
 static uint64_t kernel_syscalls(uint64_t rounds) {
     int ends[2];

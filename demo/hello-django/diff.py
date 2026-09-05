@@ -1,7 +1,6 @@
-"""Diff an interpreted syscall trace against N0's native baseline.
+"""Diff an interpreted syscall trace against the native baseline.
 
-N5's acceptance, and V2's long-outstanding one: *the same stack, traced
-both ways, and the difference accounted for.*
+*The same stack, traced both ways, and the difference accounted for.*
 
 Not a line-by-line diff, which would be noise — addresses differ, orders
 differ, and two correct kernels interleave five processes differently on

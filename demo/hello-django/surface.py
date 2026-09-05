@@ -1,4 +1,4 @@
-"""Turn an `strace -f` of the demo stack into the N0 surface and worklist.
+"""Turn an `strace -f` of the demo stack into the traced syscall surface and worklist.
 
 Split out of `trace.sh` so the extraction can be re-run over a trace that
 already exists — which is most of the time, because tracing costs a docker
@@ -34,15 +34,15 @@ def main(trace_path: str, repo: str) -> None:
     missing = sorted(set(counts) - named, key=lambda name: (-counts[name], name))
 
     lines = [
-        "# N0 — the traced syscall surface of nginx + gunicorn + django",
+        "# The traced syscall surface of nginx + gunicorn + django",
         "#",
-        "# Gate N0 of `docs/network-plan.md`. The image is `demo/hello-django`;",
+        "# The image is `demo/hello-django`;",
         "# the trace is `strace -f -yy` over the whole process tree from boot,",
         "# through two `curl` requests, to a `SIGTERM` shutdown every process",
         "# exits 0 from. Regenerate with `demo/hello-django/trace.sh`.",
         "#",
-        "# This is the worklist, and it is the baseline N5 diffs the interpreted",
-        "# run against.",
+        "# This is the worklist, and it is the baseline the interpreted run is",
+        "# diffed against.",
         "#",
         f"# processes: {len(processes)}   distinct syscalls: {len(counts)}"
         f"   calls: {sum(counts.values())}",
@@ -59,7 +59,7 @@ def main(trace_path: str, repo: str) -> None:
     lines += ["", f"[missing]  {len(missing)} rows the stack calls and the kernel has none for", ""]
     lines += [f"{counts[name]:8d}  {name}" for name in missing]
 
-    out = pathlib.Path(repo, "demo/hello-django/baseline/n0-surface.txt")
+    out = pathlib.Path(repo, "demo/hello-django/baseline/native-surface.txt")
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text("\n".join(lines) + "\n")
     print(

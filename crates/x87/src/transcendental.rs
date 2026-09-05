@@ -4,7 +4,7 @@
 //! bits and round per RC — verified against the host FPU in all four
 //! modes (measured 2026-08-28).
 //!
-//! `f2xm1`/`fyl2x`/`fyl2xp1`/`fpatan` are the f64-backed tier: exact
+//! `f2xm1`/`fyl2x`/`fyl2xp1`/`fpatan` are the f64-backed operations: exact
 //! special cases per the architecture's tables, cores computed in double
 //! via `libm`, with the divergence from hardware measured in ulps by the
 //! oracle rather than assumed. Bit-matching is not the target here —

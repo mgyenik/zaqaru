@@ -1,12 +1,12 @@
-# N0 — the traced syscall surface of nginx + gunicorn + django
+# The traced syscall surface of nginx + gunicorn + django
 #
-# Gate N0 of `docs/network-plan.md`. The image is `demo/hello-django`;
+# The image is `demo/hello-django`;
 # the trace is `strace -f -yy` over the whole process tree from boot,
 # through two `curl` requests, to a `SIGTERM` shutdown every process
 # exits 0 from. Regenerate with `demo/hello-django/trace.sh`.
 #
-# This is the worklist, and it is the baseline N5 diffs the interpreted
-# run against.
+# This is the worklist, and it is the baseline the interpreted run is
+# diffed against.
 #
 # processes: 5   distinct syscalls: 88   calls: 9365
 # signals delivered: SIGCHLD×2, SIGTERM×4
@@ -102,5 +102,5 @@
        1  kill                 row
        1  getpeername          row
 
-[missing]  0 rows the stack calls and kisal has none for
+[missing]  0 rows the stack calls and the kernel has none for
 

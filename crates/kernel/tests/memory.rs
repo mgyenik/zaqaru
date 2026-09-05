@@ -811,9 +811,9 @@ fn a_mapping_past_the_end_of_a_file_is_zeros() {
 /// `MAP_FIXED` each segment over it at its own file offset.
 ///
 /// This is the shape from the trace this design was built from, tested as
-/// pure address-space surgery several milestones before a loader exists to
-/// run it — so that the tier which needs it inherits a substrate that has
-/// been checked rather than one that looks plausible.
+/// pure address-space surgery with no loader involved — so that the loader
+/// inherits a substrate that has been checked rather than one that looks
+/// plausible.
 #[test]
 fn the_loader_carving_sequence_lands_the_right_bytes() {
     let mut fixture = fixture("carving");
@@ -832,17 +832,8 @@ fn the_loader_carving_sequence_lands_the_right_bytes() {
     // Then each segment over it, at its own file offset — the second page
     // as text, the third as read-only data.
     //
-    // The middle segment is carved writable rather than executable, and
-    // that is the half of ld.so's sequence this fixture can honestly
-    // represent: an executable mapping of a file the bake did not translate
-    // is a named refusal — see
-    // `an_executable_mapping_of_an_untranslated_file_is_refused`, which owns
-    // that rule — while the writable data segment is the one a real loader
-    // genuinely re-copies, and the one whose protection differs from its
-    // neighbours' so that the shape below can tell them apart. A real
-    // loader carving a real module maps text executable and is answered,
-    // because the module *was* translated; `tests/dynamic_boot.rs` runs
-    // exactly that.
+    // The middle segment is carved writable rather than executable, so the
+    // shape below can tell the segments apart by protection.
     let text = fixture.call(
         number::MMAP,
         [
@@ -1126,10 +1117,8 @@ fn proc_self_maps_renders_the_tree_as_it_stands() {
         [0, PAGE, prot::READ as i64, map::PRIVATE as i64, fd, PAGE],
     );
     assert!(file > 0);
-    // Executable *afterwards*, which is the only way this kernel reaches an
-    // `r-xp` file line for a file the bake did not translate: `mmap` refuses
-    // that protection on such a file by name, and `mprotect` records
-    // whatever it is asked for and enforces nothing, exactly as the design
+    // Executable *afterwards*, through `mprotect`, which records whatever
+    // it is asked for and enforces nothing, exactly as the design
     // says. So the state is reachable, and the rendering has to describe it.
     assert_eq!(
         fixture.call(

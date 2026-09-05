@@ -1,7 +1,6 @@
 //! Execution: what each instruction means, in Rust.
 //!
-//! The semantics here are not new. They are the same facts the translator
-//! encodes — which flags an operation writes and by what rule, `dec`
+//! Which flags an operation writes and by what rule, `dec`
 //! preserving the carry, `xchg` reading both operands before writing either,
 //! a 32-bit write clearing the upper half, the segment override on `lea`
 //! being ineffectual, `cmov` writing its destination whether or not it
@@ -90,9 +89,8 @@ impl std::fmt::Display for Unsupported {
 /// Why execution stopped short of retiring an instruction.
 ///
 /// Everything except [`Trap::Unsupported`] is a condition the guest can
-/// observe and, given a handler, survive — which is the fidelity class the
-/// ahead-of-time design documents as impossible, arriving because there is a
-/// fetch and a load and a store to hang the check on.
+/// observe and, given a handler, survive, because there is a fetch and a
+/// load and a store to hang the check on.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Trap {
     /// An access the address space refused: `SIGSEGV`, with `si_addr`.
@@ -236,8 +234,8 @@ impl<'a> Cpu<'a> {
     /// land on an `endbr64`, is *encoded* as a `%ds` prefix, so every switch
     /// in a control-flow-protected binary carries one.
     ///
-    /// `%gs` stays a loud error, and now at one site rather than at every
-    /// translation site: it genuinely has a base, nothing on this path uses
+    /// `%gs` is a loud error, at one site: it genuinely has a base, nothing
+    /// on this path uses
     /// one, and a libc that reached for it would be a libc nothing here has
     /// been tested against.
     fn address(&self, instruction: &Instruction) -> Result<u64, Trap> {
@@ -1115,7 +1113,7 @@ impl<'a> Cpu<'a> {
             }),
 
             // Then the vector surface, then the x87, then the loud error.
-            // The order is the translator's: an integer arm first, then
+            // An integer arm first, then
             // SSE, then the FPU, then a report naming the instruction —
             // never a silent approximation.
             _ => match self.vector_step(instruction)? {

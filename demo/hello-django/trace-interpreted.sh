@@ -1,11 +1,11 @@
 #!/bin/bash
-# The interpreted half of N5's acceptance: the same scenario `trace.sh`
+# The interpreted half of the trace comparison: the same scenario `trace.sh`
 # traced natively — boot, two `curl` requests, a `SIGTERM` shutdown — run
 # under the interpreter with its own trace on.
 #
 # Then:
 #   python3 demo/hello-django/diff.py \
-#       $ZAQARU_DEMO_OUT/n0/native.txt $ZAQARU_DEMO_OUT/n0/interpreted.txt
+#       $ZAQARU_DEMO_OUT/traces/native.txt $ZAQARU_DEMO_OUT/traces/interpreted.txt
 #
 # Waits for gunicorn's control socket before stopping, because five of the
 # native trace's calls live in that thread and a comparison that stops
@@ -14,7 +14,7 @@ set -u
 trap 'kill -9 $(jobs -p) 2>/dev/null' EXIT INT TERM
 REPO=${ZAQARU_REPO:-$(cd "$(dirname "$0")/../.." && pwd)}
 PORT=8104
-OUT=${ZAQARU_DEMO_OUT:-/tmp/zaqaru-demo}/n0/interpreted.txt
+OUT=${ZAQARU_DEMO_OUT:-/tmp/zaqaru-demo}/traces/interpreted.txt
 rm -f "$OUT"
 "$REPO/target/release/zaqaru" emulate --trace -p "$PORT:80" \
     ${ZAQARU_DEMO_OUT:-/tmp/zaqaru-demo}/hello-django.tar > "$OUT" 2>&1 &

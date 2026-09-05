@@ -34,7 +34,7 @@ use crate::errno::Errno;
 
 /// What a refused access means to a syscall row.
 ///
-/// The same [`Fault`] serves two consumers, and this is the seam between
+/// The same [`Fault`] serves two consumers, and this is the boundary between
 /// them: at a syscall row a refused access is `EFAULT`, one call failing;
 /// at the interpreter's loop the same fault is a `SIGSEGV` delivered to the
 /// guest. One check, two meanings, decided by who asked.

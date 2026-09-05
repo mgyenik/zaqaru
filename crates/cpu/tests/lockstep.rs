@@ -12,7 +12,7 @@
 //! See `support::lockstep` for how the two machines are brought into the
 //! same state to begin with.
 //!
-//! # Two tiers, and why
+//! # Two suites, and why
 //!
 //! Every comparison costs a `fork`, an `exec` and one `ptrace` stop per
 //! instruction, so the full sweep — three corpora, three optimisation
@@ -22,14 +22,14 @@
 //! stop running, and the whole value of this instrument is that it is the
 //! thing you run *first*.
 //!
-//! So the default tier is one optimisation level and three argument pairs,
+//! So the default suite is one optimisation level and three argument pairs,
 //! which is the same instrument at a tenth of the cost and catches the
 //! overwhelming majority of what it would catch anyway. The full sweep and
 //! the coverage assertions are `#[ignore]`d and run deliberately:
 //!
 //! ```text
-//! cargo test -p the engine                          # the fast tier, well under a second
-//! cargo test -p the engine -- --ignored             # the whole sweep, seconds
+//! cargo test -p zaqaru-cpu --test lockstep             # the quick suite, well under a second
+//! cargo test -p zaqaru-cpu --test lockstep -- --ignored  # the whole sweep, seconds
 //! ```
 
 #![cfg(target_os = "linux")]
@@ -60,7 +60,7 @@ const ARGUMENTS: [(u64, u64); 12] = [
     (0x1234_5678_9abc_def0, 0x0fed_cba9_8765_4321),
 ];
 
-/// The fast tier's slice of them: zero, the sign boundary against minus one,
+/// The quick suite's slice of them: zero, the sign boundary against minus one,
 /// and a dense pattern. Between them they exercise both carry directions,
 /// both overflow directions, a NaN and a denormal in the floating-point
 /// corpora, and the divide that traps.
@@ -80,7 +80,7 @@ const FAST_ARGUMENTS: [(u64, u64); 3] = [
 /// given.
 const LEVELS: [&str; 3] = ["-O0", "-O2", "-Os"];
 
-/// The fast tier's level. `-O2` because it is what a real binary is built
+/// The quick suite's level. `-O2` because it is what a real binary is built
 /// at, and because it is the level that reaches for the conditional moves
 /// and the folded flag consumers.
 const FAST_LEVEL: &str = "-O2";
@@ -163,7 +163,7 @@ fn one(program: &Path, name: &str, left: u64, right: u64) -> BTreeSet<&'static s
 /// rather than the instruction. The other two corpora want them on.
 const INTEGER_ONLY: &[&str] = &["-mgeneral-regs-only"];
 
-// ---- the fast tier ------------------------------------------------------
+// ---- the quick suite ----------------------------------------------------
 
 #[test]
 fn the_integer_core_matches_hardware() {
@@ -209,7 +209,7 @@ fn the_oracle_fails_when_the_machines_disagree() {
     );
 }
 
-// ---- the comprehensive tier ---------------------------------------------
+// ---- the whole sweep ----------------------------------------------------
 
 /// The whole sweep: three optimisation levels, twelve argument pairs, and
 /// the coverage each corpus was written to reach.

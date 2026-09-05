@@ -1,18 +1,16 @@
 //! The thread control block: the whole machine, as a struct.
 //!
 //! This is the design's load-bearing simplification. Under the transpiler a
-//! guest register is a wasm global, a context switch is a marshalling
-//! exercise through a 412-byte image, and a suspended thread is a chain of
-//! resume IDs threaded through the guest stack. Here a register is a field,
-//! a context switch is a pointer swap, and a suspended thread is a `Tcb`
-//! nobody is advancing.
+//! guest register would be a wasm global and a context switch a marshalling
+//! exercise. Here a register is a field, a context switch is a pointer
+//! swap, and a suspended thread is a `Tcb` nobody is advancing.
 //!
 //! The register file is an array indexed by the x86 encoding number rather
 //! than sixteen named fields, because an interpreter's operand access is
 //! indexed: `instruction.op_register(0)` produces a number and the read has
 //! to be a subscript. On wasm32 a Rust array *is* linear memory, so the
-//! indexing cost is the same load a global would have been, and the spike's
-//! measurements already include it.
+//! indexing cost is the same load a global would have been, and the
+//! throughput measurements already include it.
 
 use iced_x86::Register;
 
@@ -157,7 +155,7 @@ impl Slice {
 /// One thread's machine state, in full.
 ///
 /// Everything a context switch has to move is here and nothing else is: no
-/// wasm globals, no shadow stack, no resume chain. A snapshot is a copy of
+/// wasm globals, no shadow stack. A snapshot is a copy of
 /// this struct plus the pages of linear memory the thread can reach.
 #[derive(Clone)]
 pub struct Tcb {

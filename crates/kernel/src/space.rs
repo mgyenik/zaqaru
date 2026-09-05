@@ -377,8 +377,8 @@ impl Space {
             //
             // Found by the interpreter's page table, which enforces what the
             // tree records and therefore noticed the tree recording two
-            // overlapping mappings; on the ahead-of-time path nothing
-            // enforced protections, so the overlap was invisible.
+            // overlapping mappings, which nothing enforcing protections could
+            // have let stand.
             self.take(start, length);
             start
         } else {

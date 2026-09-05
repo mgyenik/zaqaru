@@ -1,8 +1,8 @@
 //! The kernel's logic, falsified natively in milliseconds.
 //!
-//! This is the innermost tier of the testing discipline: anything that can be
-//! decided without emulation is decided here, so that the emulated tiers are
-//! spent on what only they can check. Every row the kernel grows gets its routing
+//! This is the innermost level of the testing discipline: anything that can
+//! be decided without emulation is decided here, so that the emulated tests
+//! are spent on what only they can check. Every row the kernel grows gets its routing
 //! and its errno tested at this level first.
 
 use kernel::machine::{GuestBuffer, GuestBytes};
@@ -307,7 +307,7 @@ fn getting_the_fs_base_into_nothing_is_efault() {
     );
 }
 
-/// `%gs` is a loud error here as well as in the translator, and the fault
+/// `%gs` is a loud error here as well as in the engine, and the fault
 /// names the sub-function rather than the syscall — `arch_prctl` mostly
 /// works, and a worklist entry saying otherwise would send someone to the
 /// wrong place.
@@ -362,8 +362,8 @@ fn a_real_but_unimplemented_arch_prctl_request_is_a_named_fault() {
 use kernel::memory::GuestReader;
 use cpu::space::{PAGE_SIZE, Protection, Space};
 
-/// An address space of `limit` bytes with everything in it reachable — the
-/// ahead-of-time world's arrangement, which is what these cases are about.
+/// An address space of `limit` bytes with everything in it reachable, which
+/// is what these cases are about.
 /// What they check is the arithmetic that decides whether a range is inside
 /// the space at all, so they say the limit explicitly rather than taking
 /// whatever a particular module's memory happens to be.

@@ -6,13 +6,13 @@
 //! arithmetic that matches the hardware bit for bit where the table below
 //! says it does.
 //!
-//! # Tier table
+//! # Fidelity table
 //!
-//! Every operation carries its fidelity tier. The differential harness picks
+//! Every operation carries its fidelity level. The differential harness picks
 //! bit-exact versus tolerance comparison from this table, and "full
 //! emulation" is this table driven to done.
 //!
-//! | Operation | Tier |
+//! | Operation | Fidelity |
 //! | --- | --- |
 //! | `fadd`/`fsub`/`fmul`/`fdiv` (all forms) | bit-exact (host-FPU oracle) |
 //! | `fsqrt`, `frndint`, `fprem`, `fprem1` | bit-exact (host-FPU oracle) |
@@ -60,7 +60,7 @@ pub mod transcendental;
 
 /// FSW bit assignments, used both for sticky state and as the flag word
 /// operations return. Matching the hardware layout is what lets the oracle
-/// compare flag words with a mask and no translation.
+/// compare flag words with a mask and no conversion.
 pub mod flags {
     pub const INVALID: u16 = 0x0001;
     pub const DENORMAL: u16 = 0x0002;

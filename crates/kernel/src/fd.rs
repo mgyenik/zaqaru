@@ -16,7 +16,7 @@ use crate::errno::Errno;
 use crate::mount::Vnode;
 
 /// Linux's default `RLIMIT_NOFILE` soft limit. A guest that wants more asks
-/// through `prlimit64`, which arrives with M6.
+/// through `prlimit64`.
 pub const MAX_DESCRIPTORS: usize = 1024;
 
 /// Which console stream a descriptor names.

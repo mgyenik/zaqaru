@@ -1,6 +1,6 @@
 //! The edge: real TCP, terminated by the host.
 //!
-//! `docs/network-plan.md` §5 is the design. The split it rests on: a
+//! The split this rests on: a
 //! connection with both ends in the guest never comes here — that is kernel
 //! state, rings in an arena — and a connection with one end outside is a
 //! *stream* the host terminates and hands across as bytes. Neither is a
@@ -162,8 +162,8 @@ impl NetStore {
 
     /// Blocks for up to `milliseconds` waiting for something to report.
     ///
-    /// The one store read allowed to take time, and the whole of
-    /// `docs/network-plan.md` §6: nothing in the container is runnable, so
+    /// The one store read allowed to take time: nothing in the container is
+    /// runnable, so
     /// the alternative is a spin. A blocking read is observationally a slow
     /// store — nothing about the ABI changes, the host function simply does
     /// not return yet.

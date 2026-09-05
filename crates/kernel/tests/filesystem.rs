@@ -80,8 +80,8 @@ fn tree(label: &str) -> Tree {
 
     // A directory, a symlink and a fifo inside a directory that gets listed,
     // so `getdents64` reports more than one `d_type`. With only regular files
-    // in view, a translation that hardcoded `DT_REG` would be indistinguish-
-    // able from one that read the image.
+    // in view, a kernel that hardcoded `DT_REG` would be indistinguishable
+    // from one that read the image.
     std::fs::create_dir_all(root.join("etc/conf.d")).expect("mkdir");
     std::os::unix::fs::symlink("hosts", root.join("etc/hosts-alias")).expect("symlink");
     let fifo = std::ffi::CString::new(root.join("etc/pipe").as_os_str().as_bytes()).expect("path");
@@ -1674,7 +1674,7 @@ fn faccessat2_honours_symlink_nofollow() {
 
 /// A device node baked into the image has no driver behind it. `EINVAL`
 /// would be a plausible answer to a perfectly valid call, so it is refused by
-/// name instead — `/dev` becomes a synthetic mount at M4.
+/// name instead — `/dev` is a synthetic mount.
 #[test]
 fn reading_a_device_node_is_refused_by_name() {
     let mut fixture = fixture("device");
@@ -3720,7 +3720,7 @@ fn flock_is_held_by_the_description() {
     );
 }
 
-// ---- what the M4 review found ---------------------------------------------
+// ---- symlinks at the end of a path ----------------------------------------
 
 /// Every path-based change acts on what a trailing symlink *points at*, not
 /// on the link.
@@ -3785,8 +3785,8 @@ fn a_change_through_a_symlink_reaches_the_file_it_names() {
         "the link's own mode is untouched"
     );
 
-    // `utimensat` sets the target's time — the row M4 calls load-bearing
-    // for `.pyc` staleness, and source trees are full of symlinks.
+    // `utimensat` sets the target's time — the row `.pyc` staleness rests
+    // on, and source trees are full of symlinks.
     let times = fixture.arena.place(&{
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&0i64.to_le_bytes());

@@ -1,6 +1,6 @@
 #!/bin/bash
-# N5's last acceptance: a served HTTP session, recorded and replayed
-# bit-identically with no network at all.
+# A served HTTP session, recorded and replayed bit-identically with no
+# network at all.
 #
 #   usage: replay.sh [host-port]
 #

@@ -39,9 +39,9 @@ pub const PAGE_SHIFT: u32 = 12;
 ///
 /// The wasm32 ceiling, and so a property of the machine rather than of any
 /// particular host: linear memory is indexed by an `i32`, so four gigabytes
-/// is the whole address space. `docs/vm.md` states it as a boundary of the
-/// design — "v1 of this design is a 4 GiB machine" — and the bitmaps below
-/// are sized against it, so a limit beyond it is a mistake rather than an
+/// is the whole address space. This is a 4 GiB machine, and the bitmaps
+/// below are sized against that, so a limit beyond it is a mistake rather
+/// than an
 /// expensive request.
 pub const CEILING: u64 = 1 << 32;
 
@@ -667,8 +667,7 @@ impl Space {
     }
 
     /// Fetches instruction bytes, which is a read with the *execute*
-    /// permission — the check no ahead-of-time design can make, because it
-    /// has no fetch to hang it on.
+    /// permission.
     ///
     /// The slice runs to the end of the contiguous executable run containing
     /// `address`, capped, so a decoder can work through it without asking

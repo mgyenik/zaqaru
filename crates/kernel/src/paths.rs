@@ -50,7 +50,7 @@ pub const TIME_MONOTONIC: &[&[u8]] = &[b"iso", b"time", b"monotonic_ns"];
 
 /// The network edge. A container with nothing mounted here has `lo` and
 /// nothing else, which is exactly a Linux network namespace with no
-/// interfaces attached — see `docs/network-plan.md` §11, amendment 1.
+/// interfaces attached.
 pub const NET_LISTEN: &[&[u8]] = &[b"iso", b"net", b"listen"];
 pub const NET_EVENTS: &[&[u8]] = &[b"iso", b"net", b"events"];
 

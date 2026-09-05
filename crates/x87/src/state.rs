@@ -4,8 +4,8 @@
 //!
 //! Everything behaves as-if-masked: faults record their flags (including
 //! the stack fault and ES) and execution continues with the masked
-//! response. Delivery of unmasked exceptions is a later milestone; keeping
-//! ES scrupulous now is what makes it a bolt-on then.
+//! response. Delivery of unmasked exceptions is not built; keeping ES
+//! scrupulous now is what makes it a bolt-on then.
 
 use crate::f80::{Class, F80};
 use crate::flags::{C1, CONDITIONS, ERROR_SUMMARY, EXCEPTIONS, INVALID, STACK_FAULT};

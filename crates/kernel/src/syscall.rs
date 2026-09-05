@@ -579,8 +579,7 @@ fn push_decimal(into: &mut String, value: i64) {
 
 /// The kernel's state, and its two downward faces: the store it reaches the
 /// world through, and the machine cells it reads and writes one at a time.
-/// The fd table, the VFS, the VMA tree and the scheduler all land here in
-/// their own milestones.
+/// The fd table, the VFS, the VMA tree and the scheduler all land here.
 pub struct Kernel<'a, S: Store, M: Machine> {
     pub store: S,
     pub machine: M,
@@ -588,11 +587,11 @@ pub struct Kernel<'a, S: Store, M: Machine> {
     /// [`crate::random`] for why the seed crosses the boundary exactly once.
     pub random: crate::random::Random,
     /// What `/proc/self/exe` points at. Empty until something sets it —
-    /// M6's `execve` is what knows the answer — and reading the link before
+    /// `execve` is what knows the answer — and reading the link before
     /// then is a named fault rather than a plausible path.
     pub executable: String,
-    /// Resolution, and the mount table it walks. One filesystem is attached
-    /// until M4's overlay; what a path *means* is decided here either way.
+    /// Resolution, and the mount table it walks: what a path *means* is
+    /// decided here.
     pub vfs: crate::vfs::Vfs<'a>,
     /// Which process this kernel is, and whose child it is.
     ///
@@ -607,9 +606,9 @@ pub struct Kernel<'a, S: Store, M: Machine> {
     /// Who this process is running as, and what mask it creates files with.
     ///
     /// A constant zero until the traced nginx dropped privileges — see
-    /// `demo/hello-django/baseline/n0-surface.txt`. `container-plan.md`
-    /// answers `getuid` with zero on the grounds that "a container has one
-    /// user and it is the one that started it", which was true until a
+    /// `demo/hello-django/baseline/native-surface.txt`. The first answer to
+    /// `getuid` was zero, on the grounds that a container has one user and
+    /// it is the one that started it — which was true until a
     /// program *in* the container changed users.
     pub identity: Identity,
     /// The descriptor table, and the open file descriptions under it.
@@ -643,12 +642,11 @@ pub struct Kernel<'a, S: Store, M: Machine> {
     /// The one piece of kernel state a fork must not duplicate, and the
     /// sharing is in the type rather than in a rule somebody has to
     /// remember: a pipe whose buffer was copied into the child is a pipe
-    /// nobody is reading. See [`crate::pipe`], which is where the whole of
-    /// `container-plan.md`'s fd hoisting lands once the shared thing lives
+    /// nobody is reading. See [`crate::pipe`]: the shared thing lives
     /// somewhere both processes can reach.
     pub rings: crate::ring::Shared,
     /// Every socket in the container, shared for the same reason the rings
-    /// are — and this is where `container-plan.md`'s port table lives,
+    /// are — and this is where the port table lives,
     /// because a port table is network-namespace state and a namespace
     /// spans processes. See [`crate::socket`].
     pub sockets: crate::socket::Shared,
@@ -691,13 +689,11 @@ pub struct Kernel<'a, S: Store, M: Machine> {
     /// `signal(2)` is about the program and `sigprocmask(2)` is about the
     /// caller.
     ///
-    /// Recorded from M6 and delivered at M10, which is the build plan's own
-    /// sequencing and not a deferral invented here: CPython installs its
-    /// handlers before it runs a line, so refusing `rt_sigaction` stops the
-    /// interpreter at startup, while *running* a handler needs the chain
-    /// surgery M10 builds. What is recorded is enough to answer the two
-    /// questions a program can ask before then — what is this signal set to,
-    /// and what happens when I raise it at myself.
+    /// Recorded here, delivered by [`crate::signal`]. CPython installs its
+    /// handlers before it runs a line, so refusing `rt_sigaction` would stop
+    /// the interpreter at startup; what is recorded answers the two questions
+    /// a program asks — what is this signal set to, and what happens when I
+    /// raise it at myself.
     dispositions: [Disposition; 64],
 }
 
@@ -1088,7 +1084,7 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
     /// Sets what `/proc/self/exe` points at, and rebuilds `/proc` so that it
     /// does.
     ///
-    /// M6's `execve` is what calls this: the path is a fact about the
+    /// `execve` is what calls this: the path is a fact about the
     /// program that was started, and nothing before that knows one.
     pub fn set_executable(&mut self, path: &str) {
         self.executable = String::from(path);
@@ -1234,13 +1230,11 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
     /// it is not this crate's operation: it is a duplicate of the whole
     /// linear memory and the world decides how.
     ///
-    /// What this does *not* yet do is `container-plan.md`'s fd hoisting.
     /// The fd table is copied, which is right for everything whose state is
     /// genuinely private — a regular file's content, the cwd, the flags —
     /// and wrong for the things POSIX shares across a fork. Those live in
     /// the ring arena instead, which the child shares rather than copies:
-    /// see [`crate::ring::Shared`]. That is `container-plan.md`'s fd
-    /// hoisting, made structural, and its ordering rule — hoist, *then*
+    /// see [`crate::ring::Shared`]. The ordering rule — share, *then*
     /// copy — is satisfied by there being nothing to copy, because the
     /// bytes were never in either address space. What remains uncopied and
     /// unshared is a file's offset cell, which two processes reading one
@@ -1259,9 +1253,9 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
                 rings.acquire(ring, end);
             }
             // A socket descriptor is a reference on the socket *and* one on
-            // each ring it is still able to move bytes through — which is
-            // pitfall 1 of `docs/network-plan.md`: the shutdown bits are not
-            // references, so a direction already given up raises nothing.
+            // each ring it is still able to move bytes through. The shutdown
+            // bits are not references, so a direction already given up raises
+            // nothing.
             let mut sockets = self.sockets.borrow_mut();
             for id in self.files.socket_ids() {
                 sockets.acquire(id);
@@ -1497,8 +1491,7 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
     ///
     /// `clone` reaches here too, when its flags say a process rather than a
     /// thread — which is what the flags mean and what it used to be refused
-    /// for. `container-plan.md` specifies this in detail and treats it as
-    /// critical; the earlier refusal was reading a milestone boundary as a
+    /// for; the earlier refusal was a sequencing choice mistaken for a
     /// policy.
     ///
     /// `vfork` is `fork` here, deliberately and conservatively: its promise
@@ -1518,8 +1511,7 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
     /// `fork` on its own covers a daemon that splits off a copy of itself,
     /// and `fork` plus `exec` is every subprocess anything actually
     /// launches — `subprocess.run`, a shell's `$(...)`, a build system's
-    /// compiler. `container-plan.md` treats the pair together for that
-    /// reason.
+    /// compiler. The pair is treated together for that reason.
     ///
     /// The arguments are read *here*, out of the address space that is about
     /// to stop existing, and carried across as owned bytes. That is not a
@@ -1742,9 +1734,9 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
     ///
     /// **It spins**, and so does every other deadline in this kernel, for
     /// the reason `crate::poll`'s header gives: the host boundary is two
-    /// imports and neither of them waits. `docs/network-plan.md`'s N4 is
-    /// where that stops being true, and it retires the spin everywhere at
-    /// once rather than here.
+    /// imports and neither of them waits. The blocking store read the
+    /// system's idle path makes is where that stops being true, and it
+    /// retires the spin everywhere at once rather than here.
     fn sleep(&mut self, number: i64, arguments: Arguments) -> Outcome {
         /// `TIMER_ABSTIME`.
         const ABSOLUTE: i64 = 1;
@@ -2635,8 +2627,8 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
     /// The kernel clears that word and futex-wakes anything waiting on it,
     /// which is how `pthread_join` learns a thread is gone. Recorded rather
     /// than acted on: there is one thread, nothing can be waiting for it,
-    /// and by the time it ends the process has. M7 is where the recorded
-    /// address starts being used.
+    /// and by the time it ends the process has. With more threads the
+    /// recorded address is used.
     ///
     /// It never fails, and it answers with the caller's thread id.
     fn set_tid_address(&mut self, arguments: Arguments) -> Outcome {
@@ -2939,7 +2931,7 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
     /// `futex(2)`, for the half of it that has a true answer today.
     ///
     /// **`WAKE` wakes nobody, and that is exact rather than approximate.**
-    /// There is one thread — M7 is the milestone that makes more — so no
+    /// There is one thread on this machine, so no
     /// thread can be parked on any address, and the number of waiters woken
     /// is zero. Answering zero is not a stub standing in for the real thing;
     /// it is the real thing, for a process that cannot have a waiter.
@@ -2953,8 +2945,8 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
     /// **`WAIT` stays a named fault**, and for the mirror reason: a wait
     /// that would block has nothing to wake it and no scheduler to switch
     /// to, so the honest answer is to stop with the operation named rather
-    /// than to return a value the caller will act on. When M7 builds the
-    /// wait queues, both halves get their real implementation together —
+    /// than to return a value the caller will act on. With wait queues,
+    /// both halves get their real implementation together —
     /// and the loud half is what makes sure the quiet half is revisited then
     /// rather than inherited.
     fn futex(&mut self, arguments: Arguments) -> Outcome {
@@ -3065,12 +3057,10 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
 
     /// `rt_sigaction(2)`: what a signal is set to do.
     ///
-    /// Recorded, not delivered, and that split is the build plan's — M6
-    /// records dispositions and M10 makes them live. CPython installs its
-    /// handlers before it evaluates a line, so a refusal here stops the
-    /// interpreter at startup; running one needs the chain surgery M10
-    /// builds. What recording buys immediately is that the two questions a
-    /// program can ask *before* delivery exists are answered truthfully:
+    /// Recorded here; [`crate::signal`] delivers. CPython installs its
+    /// handlers before it evaluates a line, so a refusal here would stop the
+    /// interpreter at startup. What recording buys is that the two questions
+    /// a program can ask are answered truthfully:
     /// what is this signal currently set to, and what happens if I raise it
     /// at myself — see [`Self::tgkill`], which now consults this rather than
     /// assuming every signal is at its default.
@@ -3209,8 +3199,9 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
     ///
     /// What the disposition decides, now that `rt_sigaction` records one:
     /// `SIG_IGN` is ignored, `SIG_DFL` does the default action, and a real
-    /// handler is a **named fault**. Running the handler is M10's chain
-    /// surgery; terminating instead would be a plausible wrong answer to a
+    /// handler is a **named fault** on a machine with no control block to
+    /// build a frame on; terminating instead would be a plausible wrong
+    /// answer to a
     /// program that installed one precisely so that it would not die, and
     /// silently skipping it would be worse.
     fn tgkill(&mut self, arguments: Arguments) -> Outcome {
@@ -3533,7 +3524,7 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
                     Err(errno) => Outcome::Done(errno.as_result()),
                 }
             }
-            // `%gs` is a loud error in the translator too. A libc that
+            // `%gs` is a loud error in the engine too. A libc that
             // reaches for it is a libc this has never been tested against,
             // and answering plausibly would hide that.
             ARCH_SET_GS | ARCH_GET_GS => Outcome::Fault(Fault::detailed(
@@ -3541,15 +3532,15 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
                 arguments,
                 "the `%gs` base, which nothing on this path uses",
             )),
-            // CPUID is a control knob the design cares about — the dynamic
-            // tier curates its answer so ifunc resolvers pick the SSE2 paths
-            // the translation covers — so a guest asking to turn its faulting
-            // behaviour on or off is exactly the thing that must not get a
-            // plausible answer.
+            // CPUID is a control knob the design cares about — the engine
+            // curates its answer so ifunc resolvers pick the SSE2 paths it
+            // implements — so a guest asking to turn its faulting behaviour
+            // on or off is exactly the thing that must not get a plausible
+            // answer.
             ARCH_GET_CPUID | ARCH_SET_CPUID => Outcome::Fault(Fault::detailed(
                 number::ARCH_PRCTL,
                 arguments,
-                "CPUID faulting, which the translation curates rather than emulates",
+                "CPUID faulting, which the engine curates rather than emulates",
             )),
             // Everything else really is unknown to Linux too, and `EINVAL` is
             // what Linux answers. A deliberate row, not a shrug.
@@ -3695,8 +3686,8 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
     /// exactly what they mean — the gather and scatter are about saving
     /// syscalls, not about doing anything a sequence of them could not.
     /// Linux additionally makes the whole thing atomic against other writers
-    /// on the same description; with one thread there is no other writer,
-    /// and M7 is where that stops being true for free.
+    /// on the same description; a context switch happens only between
+    /// syscalls, so there is never another writer mid-call.
     ///
     /// The return value is the total moved. A vector that fails after
     /// something has already moved reports what moved rather than the

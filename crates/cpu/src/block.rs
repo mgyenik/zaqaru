@@ -4,8 +4,8 @@
 //! A block is a decoded run from a guest program counter to the first
 //! control transfer, capped so that pathological straight-line code cannot
 //! make one unbounded entry. The cache is what makes interpretation fast
-//! enough to be a floor at all — the spike measured decode-every-time at
-//! 61 MIPS in wasm against 125 for the cached variant — and the map probe it
+//! enough to be a floor at all — decode-every-time measured 61 MIPS in wasm
+//! against 125 for the cached variant — and the map probe it
 //! costs is paid once per *block*, never per instruction.
 //!
 //! Two properties are worth stating because getting either wrong is silent:

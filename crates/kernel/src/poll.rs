@@ -110,9 +110,9 @@ pub struct EpollSet {
 /// which is not a subtle wrongness, it is a `poll` that never wakes.
 ///
 /// Linux does share an `epoll` instance across a `fork`, at the description
-/// level, and it is famous as a footgun. `container-plan.md` decided that
-/// case explicitly: "using an inherited epoll fd from the child after plain
-/// fork is a loud, documented error, revisited if something real trips it".
+/// level, and it is famous as a footgun. The decision here is explicit:
+/// using an inherited epoll fd from the child after a plain fork is a loud,
+/// documented error, revisited if something real trips it.
 /// So a fork copies the sets and marks them, and the child is told rather
 /// than quietly given a private one.
 #[derive(Clone, Default, Debug)]
@@ -335,8 +335,8 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
     /// Linux shares the interest list across a fork at the description
     /// level. Here a description is a per-process index, so sharing the
     /// list would mean one process's `close` cancelling another's
-    /// registration. `container-plan.md` chose the loud error over the
-    /// complexity knot, and this is it: a divergence stated on the box
+    /// registration. The loud error was chosen over the complexity knot, and
+    /// this is it: a divergence stated on the box
     /// rather than a `poll` that mysteriously never wakes.
     fn refuse_inherited(&mut self, number: i64, arguments: Arguments) -> Option<Outcome> {
         let id = self.epoll_of(arguments.get(0) as i32)?;
@@ -347,9 +347,9 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
             number,
             arguments,
             "an `epoll` descriptor inherited across a `fork`, whose interest \
-             list Linux shares between the two processes — a shape \
-             `container-plan.md` refuses by name rather than approximate, \
-             because the alternative is a registration one process can \
+             list Linux shares between the two processes — refused by name \
+             rather than approximated, because the alternative is a \
+             registration one process can \
              cancel out from under the other",
         )))
     }
@@ -380,8 +380,8 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
     /// on, while the request it was proxying timed out.
     ///
     /// The edge is derived from the readiness this kernel computes rather
-    /// than from anything the host said, which is `container-plan.md`'s
-    /// discipline: an edge is a *transition of our own state*, so it cannot
+    /// than from anything the host said: an edge is a *transition of our own
+    /// state*, so it cannot
     /// report one that did not happen or miss one that did.
     fn epoll_ready(&self, id: u32) -> Vec<(u64, u32)> {
         self.epoll_edges(id)
@@ -454,10 +454,10 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
     /// `select(2)` and `pselect6(2)`.
     ///
     /// A `poll` in older clothes: three bitmaps of descriptors instead of an
-    /// array of records, and the same question. So it is translated into a
+    /// array of records, and the same question. So it is turned into a
     /// `poll` set and answered by the same scan — three frontends over one
-    /// scan, which is what `container-build-plan.md`'s M8 asks for, because
-    /// a divergence between them would mean the scan lied to somebody.
+    /// scan, because a divergence between them would mean the scan lied to
+    /// somebody.
     ///
     /// It is `pselect6` that the traced stack calls, not `select`: gunicorn's
     /// arbiter waits in it with a fifteen-second timeout.

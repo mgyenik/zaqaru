@@ -3,7 +3,7 @@
 Deliberately minimal: no database, no sessions, no static files. What the
 demo exercises is the *stack* — nginx in front, gunicorn's prefork worker
 behind, Django rendering — and every setting that would add a subsystem
-would add syscalls that are not what N0 is measuring.
+would add syscalls that are not what the trace is measuring.
 """
 
 SECRET_KEY = "not-a-secret-this-container-serves-one-page"

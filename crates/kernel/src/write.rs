@@ -923,8 +923,8 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
     ///   has no way back to a name. Linux allows `fchmod` and `futimens`
     ///   there and this cannot, so it says so by name. Storing the name in
     ///   every open file description would make it work and would put an
-    ///   allocation on every `open`; the milestone that needs it can make
-    ///   that trade with a caller to justify it.
+    ///   allocation on every `open`; whatever needs it can make that trade
+    ///   with a caller to justify it.
     fn copy_up_for_change(
         &mut self,
         dirfd: i64,
@@ -1267,7 +1267,7 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
     ///
     /// One second past the epoch is not a real time, and it is not pretending
     /// to be: a container with no clock mount has no clock, `clock_gettime`
-    /// is what will answer that question when M6 asks it, and a timestamp
+    /// is what answers that question, and a timestamp
     /// that claimed to be now would be a plausible wrong answer. What
     /// matters for the one caller that depends on timestamps — a `.pyc`
     /// against its source — is that a file written after another compares

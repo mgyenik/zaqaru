@@ -1,15 +1,16 @@
 //! A register-machine bytecode, and a switch-loop interpreter for it, that
 //! runs x86-64 faster than interpreting x86 directly on the loops it covers.
 //!
-//! The idea is in `docs/bytecode-plan.md` and `tools/bytecode-floor/`: a flat
-//! register-machine bytecode a block transpiles into, run by a dense
-//! switch-loop, because the stream is flat (a direct branch is `pc = offset`,
-//! not a re-entry of the run loop), the dispatch is dense (a `br_table` over a
-//! `u8`, not a seventeen-hundred-way match), and the operands are already
-//! resolved (no `iced` re-derivation per execution). The floor prototype put
+//! The idea, and the measurement that justified it, are in
+//! `docs/performance.md`: a flat register-machine bytecode a block transpiles
+//! into, run by a dense switch-loop, because the stream is flat (a direct
+//! branch is `pc = offset`, not a re-entry of the run loop), the dispatch is
+//! dense (a `br_table` over a `u8`, not a seventeen-hundred-way match), and
+//! the operands are already resolved (no `iced` re-derivation per
+//! execution). The floor prototype put
 //! that at 7.7× idealised; the faithful transpiler here, carrying x86's
 //! widths, flags, and the engine's `Space`, measures **1.3–2.1×** under
-//! wasmtime on fully-covered hot loops (`docs/performance.md` §6c) — and a
+//! wasmtime on fully-covered hot loops (`docs/performance.md`) — and a
 //! *loss* on any loop it does not cover end to end, since a [`Op::Defer`]
 //! costs more than interpreting. So the win is real, modest, and entirely a
 //! function of coverage; the staged optimisations (op fusion, tail-call

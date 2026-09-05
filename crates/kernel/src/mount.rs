@@ -23,7 +23,7 @@ use crate::overlay::{Dirent, Overlay};
 
 /// How many filesystems can be attached at once. Small on purpose — a
 /// container's namespace is the image, an overlay over it, and the handful
-/// of synthetic mounts (`/proc`, `/sys`, `/dev`) M4 and M5 bring.
+/// of synthetic mounts (`/proc`, `/sys`, `/dev`).
 pub const MAX_MOUNTS: usize = 8;
 
 /// A file, named the way the kernel has to name one: which filesystem, and

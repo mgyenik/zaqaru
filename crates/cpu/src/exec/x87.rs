@@ -10,10 +10,7 @@
 //!
 //! So this module is decode, not semantics. What lives here is the mapping
 //! from an x86 encoding to a call — which `ST(i)` an operand names, which
-//! width a memory operand is, which forms pop — and that mapping is
-//! `translate/x87.rs`'s, transcribed for the same reason the vector
-//! semantics were: two engines that must agree are cheapest to keep
-//! agreeing when the second is a transcription of the first.
+//! width a memory operand is, which forms pop.
 //!
 //! One thing genuinely changes, and it is the change the thread design
 //! asked for: **the state is per thread**. The crate's wasm arrangement is
@@ -475,10 +472,8 @@ impl Cpu<'_> {
             // Reached by every dynamically linked program that binds lazily:
             // `_dl_runtime_resolve` saves the vector registers around a
             // symbol lookup, because the resolver is ordinary C and would
-            // otherwise clobber arguments passing through them. The
-            // ahead-of-time world cannot translate this instruction and so
-            // arranges never to reach it, by binding eagerly; the
-            // interpreter has no such problem — every byte this writes is a
+            // otherwise clobber arguments passing through them. Every byte
+            // this writes is a
             // field of the control block.
             //
             // The area is split between two owners and assembled here: the

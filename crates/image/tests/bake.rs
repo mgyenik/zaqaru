@@ -1,6 +1,6 @@
 //! Baking a tree and reading it back, natively, in milliseconds.
 //!
-//! This is the cheapest tier: no emulation, no linking, no wasm. Everything
+//! This is the cheapest level: no emulation, no linking, no wasm. Everything
 //! the index format claims — that a miss costs what a hit costs, that a
 //! hardlink is one record with two names, that metadata survives verbatim —
 //! is decidable here, so it is decided here.

@@ -305,7 +305,7 @@ mod tests {
                 // does not suppress — the kernel runs a pipe handler
                 // regardless, so that crash reporters always see a crash.
                 // `PR_SET_DUMPABLE` does suppress it, and the difference is
-                // a second of the fast tier for a test whose whole content
+                // a second of the quick suite for a test whose whole content
                 // is "the read faults".
                 libc::prctl(libc::PR_SET_DUMPABLE, 0);
                 let value = (beyond as usize as *const u8).read_volatile();

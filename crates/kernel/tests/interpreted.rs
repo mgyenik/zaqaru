@@ -6,8 +6,7 @@
 //! linked, a thousand functions, hand-written assembly, `ifunc` resolvers —
 //! and *runs* it, one instruction at a time, until it exits.
 //!
-//! Nothing translates it and nothing analysed it. The interpreter decodes at
-//! the program counter, which is the whole claim `docs/vm.md` makes: the
+//! Nothing analysed it. The interpreter decodes at the program counter: the
 //! guest's instructions are data.
 //!
 //! Native, and deliberately so — the same engine, the same kernel, the same
@@ -451,7 +450,7 @@ fn interpreted_output(label: &str, baked: &'static image::Image) -> String {
     .expect("utf-8")
 }
 
-/// The floor, demonstrated: a program nobody translated, running.
+/// The simplest case: a static program, running.
 #[test]
 fn a_static_program_writes_and_exits() {
     agrees_with_native(
@@ -585,8 +584,7 @@ int main(void) {
     );
 }
 
-/// The rung the ahead-of-time design cannot climb without a bake that
-/// assigned every base in advance: an ordinary dynamic executable.
+/// An ordinary dynamic executable.
 ///
 /// Nothing here was placed by anybody. `PT_INTERP` names a loader, the
 /// loader is a position-independent object the address space finds room
@@ -614,10 +612,8 @@ int main(void) {
 ///
 /// A Python extension module, a codec plugin, a wheel installed at run time
 /// — all of them are this: a shared object nobody named at link time, opened
-/// by path, relocated into a fresh mapping, and called. The ahead-of-time
-/// design has to refuse it outright, because a bake can only translate code
-/// that existed at bake time and there is no such thing here. The
-/// interpreter needs nothing from anyone: the pages get their permission
+/// by path, relocated into a fresh mapping, and called. The interpreter
+/// needs nothing from anyone: the pages get their permission
 /// bits and the first fetch decodes them.
 #[test]
 fn a_dlopened_object_is_loaded_and_called() {
@@ -677,8 +673,7 @@ int answer(int value) { return value * 7; }
     assert_eq!(out, expected);
 }
 
-/// Threads, which the ahead-of-time path defers and the loop gets by
-/// scheduling a different control block.
+/// Threads, which the loop gets by scheduling a different control block.
 ///
 /// Four of them, each doing arithmetic and returning a value the joiner
 /// collects — so the test fails if a thread never ran, if two threads shared
@@ -767,9 +762,9 @@ int main(void) {
 
 /// Two compute-bound threads making progress against each other.
 ///
-/// The capability the ahead-of-time path defers: it switches only at
-/// syscalls, so a thread that spins without making one holds the processor
-/// for ever. Here the quantum is denominated in retired instructions and the
+/// A scheduler that switched only at syscalls would let a thread that
+/// spins without making one hold the processor for ever. Here the quantum
+/// is denominated in retired instructions and the
 /// loop takes the thread off at the count, whatever it was doing.
 ///
 /// Written so that *nothing but preemption* can finish it. Each side spins
@@ -933,8 +928,7 @@ int main(void) {
     );
 }
 
-/// **A `SIGSEGV` a handler catches** — the fidelity class the ahead-of-time
-/// design documents as impossible.
+/// **A `SIGSEGV` a handler catches.**
 ///
 /// There a null dereference reads whatever happens to be at address zero and
 /// carries on. Here the address space refused the access, the loop turned
@@ -1042,10 +1036,10 @@ int main(void) {
 
 /// **`fork`.**
 ///
-/// `container-plan.md` specifies this and treats it as critical; an earlier
-/// version of this engine refused it by name, which was reading a milestone
-/// boundary as a policy. What the interpreter changes is the *price*: on the
-/// other path a fork is a snapshot plus a resume-chain walk to rebuild the
+/// An earlier version of this engine refused it by name, which was a
+/// sequencing choice mistaken for a policy. The interpreter makes it cheap:
+/// a fork is a copy of the control block and the address space, where a
+/// machine holding guest state on the wasm stack would need to rebuild the
 /// parent's frames, and the resume bodies that walk needs are the doubled
 /// code section. Here the child's machine state is a control block and its
 /// address space is bytes — the child returns from `fork` by being
@@ -1133,8 +1127,7 @@ int main(void) {
 ///
 /// A `fork` on its own covers a daemon that splits off a copy of itself. The
 /// pair is every subprocess anything actually launches — `subprocess.run`, a
-/// shell's `$(...)`, a build system's compiler — and it is the pair that
-/// `container-plan.md` treats as critical.
+/// shell's `$(...)`, a build system's compiler.
 ///
 /// The child replaces its address space with a second program in the image,
 /// that program reads the arguments it was given and picks its own status,
@@ -1896,8 +1889,8 @@ int main(void) {
 /// Interest is registered on the open file *description*, not on the
 /// descriptor — which is Linux's rule and the reason a registered
 /// descriptor closed while a `dup` of it survives goes on firing. It is
-/// famous as a bug source, real software depends on it, and
-/// `container-plan.md` asks for it by name. So it is built, and the test
+/// famous as a bug source, and real software depends on it. So it is built,
+/// and the test
 /// says so both ways: the registration survives the close that leaves a
 /// dup, and it is gone after the close that leaves none.
 ///
@@ -2073,7 +2066,7 @@ int main(void) {
 /// **A loopback server and client in one process tree**, which is the shape
 /// the demo stack is made of: nginx binds a port, gunicorn connects to it.
 ///
-/// Every piece of N1 at once — `socket`, `bind`, `listen`, `connect`,
+/// Every piece of loopback networking at once — `socket`, `bind`, `listen`, `connect`,
 /// `accept4`, `getsockname`, and a parked `accept` woken by a connection
 /// that arrives from another *process*. No host is involved: both ends are
 /// in the guest, so a connection is two rings in an arena the process tree

@@ -180,7 +180,7 @@ const CONSOLE_INODE_BASE: u64 = 0xffff_ff00;
 /// Measured cost of getting it wrong: every *relative* path through the
 /// `…at` family answered `EBADF`. Absolute ones did not, because an absolute
 /// path never looks at the descriptor at all — which is why the whole
-/// dynamic tier, `ld.so` and all, ran for a day without noticing. CPython
+/// dynamic loader, `ld.so` and all, ran for a day without noticing. CPython
 /// noticed on the first thing it looks for that is not absolute:
 /// `openat(AT_FDCWD, "pyvenv.cfg")`, three lines into `getpath`.
 ///
@@ -412,8 +412,8 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
         }
     }
 
-    /// `ioctl`, which at this milestone answers exactly one family of
-    /// requests and answers it "no".
+    /// `ioctl`, which answers exactly one family of requests and answers it
+    /// "no".
     ///
     /// Stdio is not a terminal. That is a decision rather than a limitation:
     /// a container writing to a pipe is the ordinary case, and a kernel that
@@ -459,7 +459,7 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
             // `O_NONBLOCK` under another name. nginx sets it this way and
             // CPython sets it with `fcntl`, and they are one bit — a check
             // that consults only one spelling makes one of the two block
-            // where Linux would not. (`docs/network-plan.md`, pitfall 6.)
+            // where Linux would not.
             ioctl_request::FIONBIO => {
                 let at = arguments.get(2) as u64;
                 let mut bytes = [0u8; 4];
@@ -494,7 +494,7 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
             // evidence — and here there is some: nginx's master sets it on
             // its own end of the worker channel and then waits in
             // `rt_sigsuspend` for `SIGTERM`, while the *worker* learns
-            // everything through `epoll_wait`. The N0 trace shows the
+            // everything through `epoll_wait`. The native trace shows the
             // shutdown command arriving that way, so nothing in this stack
             // reads the signal this flag asks for.
             //
@@ -1555,7 +1555,7 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
                 number::READLINK,
                 Arguments::new([dirfd, path, buffer, capacity, 0, 0]),
                 "the path of the running executable, which nothing has set — \
-                 M6's `execve` is what knows it",
+                 `execve` is what knows it",
             ));
         }
         // Truncated rather than refused, and no terminator: `readlink` is the

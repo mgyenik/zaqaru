@@ -190,8 +190,7 @@ impl<'a, S: Store + Clone> System<'a, S> {
         child.kernel.pid = pid;
         child.kernel.parent = parent;
         // `fork` returns zero in the child. `%rip` is already past the
-        // `syscall`, which is the whole of what the other path needed a
-        // resume driver for.
+        // `syscall`, so the child simply continues.
         child.kernel.machine.thread_mut().registers[0] = 0;
         self.containers.push(Container {
             process: child,
@@ -578,8 +577,8 @@ impl<'a, S: Store + Clone> System<'a, S> {
     /// So deadlines are collected here, at the one moment they matter, and
     /// the container's whole processor goes to whoever *can* run.
     ///
-    /// **And this is where the wait goes.** `docs/network-plan.md`'s N4 puts
-    /// a blocking store read at exactly this point — nothing is runnable and
+    /// **And this is where the wait goes.** A blocking store read belongs at
+    /// exactly this point — nothing is runnable and
     /// the earliest deadline is known, so "wait for a host event or that
     /// long" is the one call that turns this spin into a sleep. Until then
     /// it spins, which costs a core and is correct.
@@ -603,15 +602,14 @@ impl<'a, S: Store + Clone> System<'a, S> {
             .min();
         // Something outside may still change things. A container with a
         // listener the host answers for is *at rest*, not deadlocked, and
-        // this is where `docs/network-plan.md` §6 says the difference is
-        // decided.
+        // this is where the difference is decided.
         let listening = self.containers.iter().any(|container| {
             container.status.is_none() && container.process.kernel.has_edge()
         });
         let Some(deadline) = deadline else {
             if listening {
-                // Wait for the host rather than spin, which is the whole of
-                // N4: nothing here is runnable and there is no deadline, so
+                // Wait for the host rather than spin: nothing here is runnable
+                // and there is no deadline, so
                 // "wait for an event or a good long while" *is* a sleep.
                 self.current().kernel.pump(Some(PATIENCE));
                 self.take_shutdown();

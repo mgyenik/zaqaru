@@ -6,8 +6,8 @@
 //! eagerly at the `cmp` means five stores and five loads that nothing
 //! consumes. So the record here stores what the operation *was* — its rule,
 //! its width, its two inputs and its result — and each consumer derives
-//! exactly the bit it needs. This is not a new idea and not a new design:
-//! it is the model the translator already validated, ported.
+//! exactly the bit it needs. This is not a new idea: it is the lazy-flags
+//! model every fast x86 emulator uses.
 //!
 //! The tail is handled by materialization rather than by more rules.
 //! Shifts, rotates, multiplies, bit tests and the flag-writing instructions
@@ -26,10 +26,9 @@
 ///
 /// The positions are the architecture's, not a convention of ours, because
 /// `pushf` and `popf` and the signal frame's `eflags` word all have to agree
-/// with what a guest already believes. Adjust is here — unlike in the
-/// translator's eager model, which left it out — because an interpreter can
-/// answer it for free from the same three values every other flag comes
-/// from, and because a faithful `pushf` needs it.
+/// with what a guest already believes. Adjust is here because an
+/// interpreter can answer it for free from the same three values every
+/// other flag comes from, and because a faithful `pushf` needs it.
 pub mod bit {
     pub const CARRY: u64 = 1 << 0;
     /// Architecturally reserved and architecturally *one*. A `pushf` that

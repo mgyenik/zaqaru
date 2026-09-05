@@ -1,8 +1,7 @@
 //! Sockets, which are rings with addressing.
 //!
-//! `docs/network-plan.md` is the plan and `container-plan.md`'s "Sockets and
-//! epoll" is the authority for semantics. The sentence both rest on: **a
-//! connected socket is two rings crossed.** What one endpoint writes into,
+//! The sentence everything here rests on: **a connected socket is two rings
+//! crossed.** What one endpoint writes into,
 //! the other reads out of, in both directions at once — so everything a
 //! stream does is already in [`crate::ring`], and what is here is the part
 //! that is *not* a ring: which address a socket answers to, who is allowed
@@ -25,8 +24,8 @@
 //! network-namespace state and a namespace spans processes; under a shared
 //! arena that is a sentence rather than a subsystem.
 //!
-//! It is also where `container-plan.md`'s "multi-process honesty clause"
-//! gets repealed. That clause priced sockets as the subsystem where fd
+//! It is also where the early worry about multi-process sockets went away.
+//! That worry priced sockets as the subsystem where fd
 //! hoisting costs most — a prefork server's hot `accept` path running
 //! through a host-side router. There is no router: workers inherit a
 //! listener the way forked processes inherit a pipe, the accept queue is
@@ -229,7 +228,7 @@ pub struct Options {
     pub send_buffer: u32,
     /// `SO_ERROR`: read once and cleared, which is how a non-blocking
     /// `connect` reports what happened. nginx reads it after *every*
-    /// connect, completed or not — see the N0 baseline.
+    /// connect, completed or not — see the traced baseline.
     pub error: i32,
 }
 
@@ -1050,7 +1049,7 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
     /// the reason it insists the asymmetry with the edge be stated.
     ///
     /// `SO_ERROR` *does* arise here, though, because nginx reads it after
-    /// every connect whether or not one was needed. See the N0 baseline.
+    /// every connect whether or not one was needed. See the traced baseline.
     pub(crate) fn connect(&mut self, arguments: crate::syscall::Arguments) -> crate::syscall::Outcome {
         use crate::syscall::Outcome;
         let fd = arguments.get(0) as i32;
@@ -1348,7 +1347,7 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
             (option::SOL_SOCKET, option::RCVBUF) => socket.options.receive_buffer = value as u32,
             (option::SOL_SOCKET, option::SNDBUF) => socket.options.send_buffer = value as u32,
             (option::SOL_TCP, option::TCP_NODELAY) => socket.options.no_delay = value != 0,
-            // Timeouts, which need the deadline machinery N4 builds. Named
+            // Timeouts, which need a parked transfer racing a deadline. Named
             // rather than accepted: a program that sets a receive timeout
             // and is told it worked will wait forever when it fires.
             (option::SOL_SOCKET, option::RCVTIMEO | option::SNDTIMEO) => {
@@ -1356,8 +1355,7 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
                     crate::syscall::number::SETSOCKOPT,
                     arguments,
                     "`SO_RCVTIMEO`/`SO_SNDTIMEO`, which are a parked transfer \
-                     racing a deadline — and a deadline needs the waiting \
-                     machinery of `docs/network-plan.md`'s N4",
+                     racing a deadline, and nothing here races one",
                 ));
             }
             // Everything else is recorded as accepted, which is what Linux
@@ -1523,8 +1521,8 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
     ///
     /// Control data is refused **by name**, because the only thing that
     /// arrives in it here is `SCM_RIGHTS` — descriptor passing, which nginx
-    /// reaches the moment `worker_processes` exceeds one, and which
-    /// `docs/network-plan.md` §9 designs and defers. Accepting the message
+    /// reaches the moment `worker_processes` exceeds one, and which is not
+    /// built. Accepting the message
     /// and dropping the descriptors would be a worker that thinks it was
     /// handed a listener and was not.
     pub(crate) fn send_receive_message(
@@ -1547,7 +1545,7 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
         };
         // A *sender* with ancillary data is refused by name: the only thing
         // that arrives in it here is `SCM_RIGHTS` — descriptor passing,
-        // designed in `docs/network-plan.md` §9 and not built — and a worker
+        // which is not built — and a worker
         // that thinks it was handed a listener and was not is worse than one
         // told it could not be.
         //
@@ -1562,9 +1560,8 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
                 number,
                 arguments,
                 "ancillary data on a sent message, which here means \
-                 `SCM_RIGHTS` — descriptor passing, designed in \
-                 `docs/network-plan.md` §9 and not built, and worse to \
-                 accept and drop than to refuse",
+                 `SCM_RIGHTS` — descriptor passing, which is not built, and \
+                 worse to accept and drop than to refuse",
             ));
         }
         let vectors = word(16);
@@ -1708,8 +1705,7 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
         // quantum, from the run loop.
         let mut moved = self.flush_edges();
         // Then in. A wait is the same read with a deadline on it, which is
-        // the one store read allowed to take time — see
-        // `docs/network-plan.md` §6.
+        // the one store read allowed to take time.
         let mut batch = Vec::new();
         let present = match waiting {
             Some(milliseconds) => {
@@ -1855,7 +1851,7 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
     /// A connection the host accepted, materialized as one the guest can.
     ///
     /// From here it is indistinguishable from a loopback connection, which
-    /// is the seam the whole design turns on: **everything above the rings
+    /// is the boundary the whole design turns on: **everything above the rings
     /// is one code path**.
     fn accept_edge(&mut self, conn: u32, port: u16, peer: Address) -> bool {
         let wanted = Address::Inet {

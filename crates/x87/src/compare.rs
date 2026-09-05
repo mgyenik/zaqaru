@@ -97,7 +97,7 @@ impl Relation {
         }
     }
 
-    /// Packed EFLAGS for the translator: CF bit 0, PF bit 2, ZF bit 6.
+    /// Packed EFLAGS, as `fcomi` writes them: CF bit 0, PF bit 2, ZF bit 6.
     pub fn eflags(self) -> u32 {
         match self {
             Relation::Greater => 0,

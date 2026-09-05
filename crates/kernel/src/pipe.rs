@@ -7,8 +7,8 @@
 //! `pipe(2)` row that makes one ring and hands back a descriptor on each
 //! end.
 //!
-//! Why the ring arena is shared across the process tree, which is the whole
-//! of `container-plan.md`'s fd hoisting made structural, is in
+//! Why the ring arena is shared across the process tree — the state POSIX
+//! shares across a fork, kept where both processes can reach it — is in
 //! [`crate::ring`]'s comment on [`crate::ring::Shared`].
 
 use crate::errno::Errno;

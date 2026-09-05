@@ -3,7 +3,7 @@
 //! against hardware, across random operands, all four rounding modes and
 //! all three precision-control settings.
 //!
-//! The f64-backed transcendental tier compares in ulps instead — Intel and
+//! The f64-backed transcendentals compare in ulps instead — Intel and
 //! AMD hardware disagree in those ops' low bits, so bit-matching is not a
 //! coherent target there; the divergence is measured, not assumed.
 //!
@@ -732,7 +732,7 @@ fn constants_are_bit_exact_in_every_mode() {
     }
 }
 
-// --- the f64-backed tier: measured in ulps, not assumed ---
+// --- the f64-backed operations: measured in ulps, not assumed ---
 
 /// Distance in units of the last place between two finite extendeds of the
 /// same sign, treating (exponent, significand) as one ordered integer.

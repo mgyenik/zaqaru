@@ -136,7 +136,7 @@ pub struct Program {
     /// that absence is the whole of how the two are told apart at boot.
     pub interpreter: Option<(u64, u64)>,
     /// `PT_DYNAMIC`'s address and size, already at the bias. What holds
-    /// `DT_NEEDED`, which is how a bake finds the libraries to translate.
+    /// `DT_NEEDED`.
     pub dynamic: Option<(u64, u64)>,
 }
 

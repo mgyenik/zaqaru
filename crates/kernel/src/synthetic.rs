@@ -129,7 +129,7 @@ pub fn dev() -> Vec<u8> {
     ])
 }
 
-/// `/proc`, which at this milestone is `self/exe` and nothing else.
+/// `/proc`: `self/exe`, `self/maps`, and nothing else.
 ///
 /// `self/exe` and `self/maps`, and nothing else yet. What is absent is
 /// absent: `stat("/proc/self/status")` is `ENOENT`, which is what a

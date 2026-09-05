@@ -177,18 +177,12 @@ impl<'a, S: Store> Process<'a, S> {
             })?;
         }
 
-        // The environment is the caller's, unchanged.
-        //
-        // Worth saying because the ahead-of-time boot prepends
-        // `LD_BIND_NOW=1` here and this deliberately does not. That world
-        // has a reason: lazy binding calls `_dl_runtime_resolve`, which
-        // saves the vector register file with `fxsave`, and a bake cannot
-        // translate that instruction — so binding eagerly is how the
-        // function is never reached. None of that is true here. `fxsave` is
-        // an instruction like any other, it writes state the control block
-        // already holds, and the interpreter executes it. Injecting a
-        // variable the guest can read, to avoid an instruction the engine
-        // can execute, would be a divergence bought for nothing.
+        // The environment is the caller's, unchanged. Nothing is injected:
+        // lazy binding calls `_dl_runtime_resolve`, which saves the vector
+        // register file with `fxsave`, and `fxsave` is an instruction like
+        // any other here. A variable the guest can read, added to avoid an
+        // instruction the engine can execute, would be a divergence bought
+        // for nothing.
         Self::enter(kernel, path, argv, envp, cache)
     }
 
@@ -269,8 +263,8 @@ impl<'a, S: Store> Process<'a, S> {
     /// [`crate::system::System`], because a `fork` needs the table of every
     /// process and a process is not that. There is deliberately no
     /// `Process::run` — one would be a loop that turns every fork into an
-    /// error, which is the shape of refusal this engine spent a section of
-    /// `docs/vm.md` getting rid of.
+    /// error.
+    ///
     /// The same, saying what it needs when it needs something.
     pub fn step(&mut self, quantum: u64) -> Progress {
         // Before anything runs, and therefore *between blocks*: the control
@@ -756,10 +750,10 @@ impl<'a, S: Store> Process<'a, S> {
 
     /// Turns a trap into what the guest sees.
     ///
-    /// **A fault is a signal now, and a handler can catch it.** That is the
-    /// fidelity class the ahead-of-time design documents as impossible: a
-    /// null dereference there reads whatever is at address zero and carries
-    /// on, guard pages cannot be enforced, and a stack overflow corrupts
+    /// **A fault is a signal, and a handler can catch it.** Without a fetch,
+    /// a load and a store to hang the check on, a null dereference would
+    /// read whatever is at address zero and carry on, guard pages could not
+    /// be enforced, and a stack overflow would corrupt
     /// silently. Here the address space refused the access, the loop turns
     /// the refusal into `SIGSEGV` with a faithful `si_addr`, and a guest
     /// that installed a handler runs it — on its alternate stack, if the

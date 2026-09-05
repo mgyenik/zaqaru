@@ -1,6 +1,6 @@
-//! Instruction-level semantics: what each translated x87 instruction asks
-//! the state to do. These methods are what the [`crate::ffi`] helpers call,
-//! and what native tests drive on plain instances.
+//! Instruction-level semantics: what each x87 instruction asks the state to
+//! do. These methods are what the interpreter calls, and what native tests
+//! drive on plain instances.
 //!
 //! The fault model runs through [`X87State::read`]/[`X87State::push`]: an
 //! empty or full register records its stack fault and substitutes the
@@ -314,8 +314,8 @@ impl X87State {
         self.rotate(true);
     }
 
-    /// `fcmovcc`: the predicate was already decided translator-side from
-    /// the promoted flags; both registers are still checked, matching the
+    /// `fcmovcc`: the predicate was already decided by the caller from the
+    /// integer flags; both registers are still checked, matching the
     /// hardware's stack-fault behavior for the untaken case.
     pub fn fcmov(&mut self, index: u32, take: bool) {
         let source = self.read(index);
@@ -364,8 +364,8 @@ impl X87State {
         self.compared(F80::ZERO, NanPolicy::Signalling, 0);
     }
 
-    /// `fcomi`/`fucomi`: the relation goes to EFLAGS — returned packed for
-    /// the translator (CF bit 0, PF bit 2, ZF bit 6) — and only C1 is
+    /// `fcomi`/`fucomi`: the relation goes to EFLAGS — returned packed (CF
+    /// bit 0, PF bit 2, ZF bit 6) — and only C1 is
     /// touched in the status word.
     pub fn fcomi(&mut self, index: u32, policy: NanPolicy, pop: bool) -> u32 {
         let a = self.read(0);
