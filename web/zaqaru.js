@@ -164,6 +164,112 @@ export class Server {
   }
 }
 
+/// `/iso/net`, with the page as the only peer: the protocol the wasmtime
+/// host speaks to real TCP, spoken instead to requests made by JavaScript.
+///
+/// The guest registers a listener by writing its port to `listen`, and is
+/// told by the result path whether the port is published; it reads `events`
+/// (or `wait/{ms}`, which here cannot wait and answers what there is) for
+/// lines `open {conn} {port} {peer}`, `data {conn}`, `eof {conn}`; it pulls
+/// bytes with `conn/{j}/rx/{room}`, pushes them with `conn/{j}/tx`, and
+/// ends with `conn/{j}/ctl` holding `shutdown` or `close`. A request from
+/// the page is one connection whose whole request is already in, followed
+/// by end of file; its promise resolves with everything the guest sent
+/// when the guest ends the connection. A request to a published port the
+/// guest has not listened on yet waits, as a client retrying a connection
+/// would, and connects the moment the guest registers the listener.
+///
+/// Shared, not copied, by a snapshot: the edge is the world, and a
+/// container restored from a checkpoint replays the world's answers from
+/// the recording rather than asking the edge again.
+export class Edge {
+  constructor(published = []) {
+    this.published = new Set(published);
+    this.listening = new Set();
+    this.events = [];
+    this.connections = [];
+    this.waiting = []; // requests to ports not yet listened on
+  }
+  publish(port) {
+    this.published.add(port);
+  }
+  /// Whether the guest has registered a listener on a published port.
+  reachable(port) {
+    return this.listening.has(port);
+  }
+  /// Sends `request` to a guest listener on `port`, as one connection that
+  /// then half-closes. Resolves with the guest's response when it ends the
+  /// connection, or rejects if the port is not reachable.
+  request(port, request) {
+    return new Promise((resolve, reject) => {
+      if (!this.published.has(port)) return reject(`port ${port} is not published`);
+      if (this.listening.has(port)) this.connect(port, request, resolve);
+      else this.waiting.push({ port, request, resolve });
+    });
+  }
+  connect(port, request, resolve) {
+    const id = this.connections.length;
+    this.connections.push({ incoming: request.slice(), outgoing: [], finished: true, resolve, closed: false });
+    this.events.push(`open ${id} ${port} 127.0.0.1:${40000 + id}`, `data ${id}`, `eof ${id}`);
+  }
+  drain() {
+    if (!this.events.length) return null;
+    const batch = this.events.join("\n") + "\n";
+    this.events = [];
+    return bytes(batch);
+  }
+  read(path) {
+    const [, , what, which, leaf, room] = path.map((s) => text(s));
+    if (what === "events" || what === "wait") return this.drain();
+    if (what === "conn" && leaf === "rx") {
+      const connection = this.connections[Number(which)];
+      if (!connection) return null;
+      const taken = Math.min(Number(room) || 0, connection.incoming.length);
+      const given = connection.incoming.slice(0, taken);
+      connection.incoming = connection.incoming.slice(taken);
+      return given;
+    }
+    return null;
+  }
+  write(path, data) {
+    const [, , what, which, leaf] = path.map((s) => text(s));
+    if (what === "listen") {
+      const port = Number(text(data).trim());
+      const published = this.published.has(port);
+      if (published) {
+        this.listening.add(port);
+        const arrived = this.waiting.filter((w) => w.port === port);
+        this.waiting = this.waiting.filter((w) => w.port !== port);
+        for (const { request, resolve } of arrived) this.connect(port, request, resolve);
+      }
+      return segmentsOf(["iso", "net", published ? "listener" : "loopback", String(port)]);
+    }
+    if (what === "conn") {
+      const connection = this.connections[Number(which)];
+      if (!connection) throw "a connection that is not open";
+      if (leaf === "tx") connection.outgoing.push(data.slice());
+      else if (leaf === "ctl") {
+        if (!connection.closed) {
+          connection.closed = true;
+          const total = connection.outgoing.reduce((n, part) => n + part.length, 0);
+          const response = new Uint8Array(total);
+          let at = 0;
+          for (const part of connection.outgoing) {
+            response.set(part, at);
+            at += part.length;
+          }
+          connection.resolve(response);
+        }
+      } else throw "a connection operation with no name";
+      return path;
+    }
+    throw `${key(path)} is not writable`;
+  }
+  snapshot() {
+    return this;
+  }
+}
+
 // ---- the tape ---------------------------------------------------------------
 
 /// Parses a tape `zaqaru run --record` wrote: `ZQT1`, a mode byte, a count,
@@ -222,6 +328,15 @@ export class MountTable {
   replay(tape) {
     this.tape = { entries: tape.entries, at: 0 };
   }
+  /// Starts keeping every answer given, in one shared array. A snapshot of
+  /// a recording table is a *replay* over that same array from the cursor
+  /// at the snapshot — so a container restored from a checkpoint of a live
+  /// run re-executes against the answers the live run was actually given,
+  /// which the array goes on accumulating as the live run continues.
+  record() {
+    this.recording = [];
+    return this.recording;
+  }
   resolve(path) {
     return this.mounts.find(({ prefix }) => prefix.length <= path.length && samePath(prefix, path.slice(0, prefix.length)));
   }
@@ -276,8 +391,8 @@ export class MountTable {
       if (!held) throw `the store at ${key(prefix)} holds state a snapshot cannot copy`;
       copy.mounts.push({ prefix, store: held });
     }
-    copy.tape = this.tape ? { entries: this.tape.entries, at: this.tape.at } : null;
-    copy.recording = this.recording ? this.recording.slice() : null;
+    if (this.recording) copy.tape = { entries: this.recording, at: this.recording.length };
+    else copy.tape = this.tape ? { entries: this.tape.entries, at: this.tape.at } : null;
     copy.server = this.server;
     return copy;
   }
@@ -285,13 +400,17 @@ export class MountTable {
 
 /// The mounts a plain run needs: a console, a log, entropy, a clock, the
 /// shutdown switch, the self store and the server. `seed` fixes the entropy.
-export function standardMounts({ seed = 0x5a, echo = null, config = {} } = {}) {
+export function standardMounts({ seed = 0x5a, echo = null, config = {}, edge = null } = {}) {
   const mounts = new MountTable();
   mounts.mount(["iso", "console"], new Sink(new Map(), echo));
   mounts.mount(["iso", "log"], new Sink());
   mounts.mount(["iso", "self"], new Sink());
   const random = new Sink();
-  random.place(["iso", "random", "bytes", "32"], new Uint8Array(32).fill(seed));
+  const entropy = new Uint8Array(32);
+  if (seed === null) crypto.getRandomValues(entropy);
+  else entropy.fill(seed);
+  random.place(["iso", "random", "bytes", "32"], entropy);
+  if (edge) mounts.mount(["iso", "net"], edge);
   mounts.mount(["iso", "random"], random);
   mounts.mount(["iso", "time"], new Clock());
   mounts.mount(["iso", "shutdown"], new Shutdown());

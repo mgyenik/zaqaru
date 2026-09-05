@@ -128,6 +128,25 @@ try {
   await until(`!window.zaqaruDebug.busy && window.zaqaruDebug.current === 1`);
   const early = await evaluate(`document.getElementById("stdout").textContent`);
   check("seeking back empties the console", early === "", JSON.stringify(early));
+
+  // Live: the server module, run against the page's own clock, with a
+  // request sent through the edge box.
+  await send("Page.navigate", { url: `http://127.0.0.1:${port}/web/?module=fixture/server.wasm&live=8080` }, sessionId);
+  await until(`document.readyState === "complete" && !!window.zaqaruDebug && window.zaqaruDebug.live === true`);
+  await until(`!window.zaqaruDebug.busy && document.getElementById("status").textContent.includes("press play")`);
+  await evaluate(`document.getElementById("speed").value = "1000000"; document.getElementById("request").value = "ping\\n"; document.getElementById("send").click()`);
+  const response = await until(`(() => { const r = document.getElementById("responses").textContent; return r.includes("← pong") ? r : (r.includes("nothing in the container listens") ? r : ""); })()`, 120000);
+  check("a request through the edge is answered by the server in the container", /← pong/.test(response), response.slice(0, 200));
+  await until(`document.getElementById("status").textContent.includes("exited 0")`, 60000);
+  const liveStatus = await evaluate(`document.getElementById("status").textContent`);
+  check("the live run finishes", /exited 0/.test(liveStatus), liveStatus);
+  console.log("     " + liveStatus);
+  await until(`!window.zaqaruDebug.busy`);
+  const frontier = await evaluate("window.zaqaruDebug.frontier");
+  await evaluate("window.zaqaruDebug.seek(Math.floor(window.zaqaruDebug.frontier / 2))");
+  await until(`!window.zaqaruDebug.busy && window.zaqaruDebug.current === Math.floor(${frontier} / 2)`);
+  const midway = await evaluate(`document.getElementById("stdout").textContent`);
+  check("seeking into the live run's past re-executes against the recording", midway === "listening on 8080\n" || midway === "", JSON.stringify(midway));
   if (consoleLines.length) console.log("console:\n  " + consoleLines.join("\n  "));
 } catch (why) {
   console.log("FAIL " + why);

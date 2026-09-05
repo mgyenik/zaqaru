@@ -7,10 +7,10 @@
 // The fixture is made by `web/fixture.sh`.
 
 import { readFileSync } from "node:fs";
-import { Container, KIND, parseTape, standardMounts, text } from "./zaqaru.js";
+import { Container, Edge, KIND, parseTape, standardMounts, text } from "./zaqaru.js";
 import { Checkpoints, apply, dense, diff } from "./checkpoints.js";
 
-const [modulePath, tapePath, stdoutPath] = process.argv.slice(2);
+const [modulePath, tapePath, stdoutPath, serverPath] = process.argv.slice(2);
 if (!stdoutPath) {
   console.error("usage: node web/test.mjs <module.wasm> <tape.bin> <stdout.txt>");
   process.exit(2);
@@ -163,6 +163,73 @@ function replayMounts() {
   const finished = restored.boot();
   check("and runs to the same end", finished === 0 && text(restored.readback(["iso", "console", "stdout"])) === expected);
   console.log(`     ${store.length} checkpoints hold ${(store.held / 1048576).toFixed(1)} MB; ${(store.naive / 1048576).toFixed(0)} MB as full copies`);
+}
+
+// 6. Live: no tape. The container runs against this process's clock and
+//    entropy, everything the host answers is recorded, and a checkpoint of
+//    the live run restores into a replay of that recording.
+{
+  const mounts = standardMounts({ seed: null, config: { trace: 1 } });
+  const recording = mounts.record();
+  const container = await Container.instantiate(module, mounts);
+  container.step(0);
+  const store = new Checkpoints({ fullEvery: 4 });
+  store.add(0, container);
+  let at = 0;
+  let status = null;
+  for (let i = 1; ; i++) {
+    at += 400000;
+    const turn = container.step(at);
+    if (turn.kind === KIND.FINISHED) {
+      status = turn.status;
+      break;
+    }
+    if (turn.kind === KIND.IDLE) continue;
+    store.add(container.value("statistics").retired, container);
+  }
+  const out = text(container.readback(["iso", "console", "stdout"]));
+  check("a live run finishes", status === 0);
+  check("a live run prints what the recorded run printed", out === expected, JSON.stringify(out));
+  check("a live run was recorded", recording.length > 10, `${recording.length} answers`);
+  const timeline = text(container.readback(["iso", "log", "timeline"]) ?? new Uint8Array());
+  check("a live run has a timeline", timeline.split("\n").length > 10);
+  // Back into the past of the live run: a checkpoint's mounts replay the
+  // recording from where the checkpoint was taken.
+  const index = Math.min(3, store.length - 1);
+  const past = await container.restore(store.snapshot(index));
+  check("a checkpoint of a live run restores", past.value("statistics").retired === store.at(index));
+  const again = past.boot();
+  check("and re-executes against the recording to the same end", again === 0 && text(past.readback(["iso", "console", "stdout"])) === out);
+}
+
+// 7. The edge: a server inside the container, and this process as its
+//    client through /iso/net.
+if (serverPath) {
+  const server = await WebAssembly.compile(readFileSync(serverPath));
+  const edge = new Edge([8080]);
+  const mounts = standardMounts({ seed: null, config: { trace: 1 }, edge });
+  mounts.record();
+  const container = await Container.instantiate(server, mounts);
+  let at = 0;
+  let answered = null;
+  let status = null;
+  // Asked before the guest has even booted, as a client that connects
+  // before the server is up: the edge holds it until the listener exists.
+  edge.request(8080, new TextEncoder().encode("ping\n")).then((response) => (answered = text(response)));
+  let refused = null;
+  edge.request(9999, new Uint8Array()).catch((why) => (refused = why));
+  for (let i = 0; i < 400 && status === null; i++) {
+    at += 200000;
+    const turn = container.step(at);
+    if (turn.kind === KIND.FINISHED) status = turn.status;
+    if (turn.kind === KIND.IDLE) at = container.value("statistics").retired;
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  check("a request to an unpublished port is refused", /not published/.test(refused ?? ""), String(refused));
+  check("the guest published its listener", edge.reachable(8080));
+  check("the guest answered the request", answered === "pong\n", JSON.stringify(answered));
+  check("the guest read the request", text(container.readback(["iso", "console", "stdout"]) ?? new Uint8Array()) === "listening on 8080\nread 5: ping\n", JSON.stringify(text(container.readback(["iso", "console", "stdout"]) ?? new Uint8Array())));
+  check("the server exited", status === 0, String(status));
 }
 
 console.log(failures ? `${failures} failure(s)` : "all passed");
