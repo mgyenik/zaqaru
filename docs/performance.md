@@ -1,10 +1,10 @@
 # Performance: what it costs, where it goes, and what has been tried
 
-Status: **reference** — current as of 2026-09-02, and every number in it
-was measured on one machine (Ryzen AI 9 HX PRO 370, 24 threads, 5.16 GHz
-boost, a laptop with a scaling governor) on the commit named beside it.
-Where this disagrees with a plan document, this is right and the plan is
-stale.
+Status: reference. Every number in it was measured on one machine (Ryzen AI
+9 HX PRO 370, 24 threads, 5.16 GHz boost, a laptop with a scaling governor)
+on the date or commit named beside it. Commands are given for the current
+tool; the older measurements were taken with earlier entry points that did
+the same work.
 
 Read the ratios to two significant figures and no further. The section on
 how they are measured is not preamble: two of the numbers this document
@@ -15,13 +15,13 @@ because anything checked.
 ## 1. What a container costs
 
 `demo/hello-django` — an ordinary Dockerfile, `python:3.12-slim` plus
-nginx, gunicorn and Django — run by `docker run` and by `zaqaru-run`, same
-image, same client. Measured 2026-09-02, after step 1 of the plan in
-section 7, with readiness read off the process's CPU use rather than
-asked for with requests, which section 3 explains changed every number
-below.
+nginx, gunicorn and Django — run by `docker run` and by `zaqaru run`, same
+image, same client. Measured 2026-09-02, after the process switch stopped
+copying whole address spaces (section 5), with readiness read off the
+process's CPU use rather than asked for with requests, which section 3
+explains changed every number below.
 
-| | native | wasm | ratio | before step 1 |
+| | native | wasm | ratio | before |
 | --- | --- | --- | --- | --- |
 | boot, until the process goes quiet | 0.26 s | **29–30 s** | ~110× | 32–35 s |
 | first request after that | 2.0 ms | 33–90 ms | — | 106–162 ms |
@@ -44,10 +44,9 @@ about four requests deep), and overlap the host round trips that a single
 client waits on, which is why they get more throughput.
 
 The "before" column is the same day, before the process switch stopped
-copying whole address spaces — step 1, which took the thirty milliseconds
-a warm request was spending outside the interpreter down to about nine —
-and before the rootfs was compressed, which is gate T0 of
-[tier1-plan.md](tier1-plan.md) and costs nothing measurable at boot.
+copying whole address spaces — which took the thirty milliseconds a warm
+request was spending outside the interpreter down to about nine — and
+before the rootfs was compressed, which costs nothing measurable at boot.
 
 Compiling the 170 MB module costs 0.23 s and is not in those figures — it
 is paid once, it parallelises, and it scales with *code* rather than image
@@ -55,10 +54,10 @@ size, because a container's filesystem is data the compiler walks past.
 
 ### 1a. The bytecode accelerator on the stack (2026-09-04)
 
-The same `demo/hello-django` image, baked twice — the default interpreter
-and `ZAQARU_ENGINE_FEATURES=targum/bytecode` — and both run through
-`tools/microbench/latency.py` in the same session, so the ratio is clean
-even though the session measured ~1.2–1.3× slower than §1's (its
+The same `demo/hello-django` module, run with `--no-bytecode` and with
+the accelerator, both through `tools/microbench/latency.py` in the same
+session, so the ratio is clean
+even though the session measured ~1.2–1.3× slower than section 1's (its
 interpreter reads 38 rather than 46 req/s; the microbenchmarks read ~75 vs
 ~100 MIPS, a throttle that hits both engines).
 
@@ -75,7 +74,7 @@ interpreter reads 38 rather than 46 req/s; the microbenchmarks read ~75 vs
 
 Three things the shape says. **Boot is eval-loop-bound** — pure Python
 import, no host round trips — so it gets the whole ~1.5× the bytecode buys
-on the interpretation it covers. **A single warm request does not**: §1's
+on the interpretation it covers. **A single warm request does not**: section 1's
 own decomposition put ~11 ms of a 20 ms request in the interpreter and the
 rest in host round trips and the edge pump, which the bytecode does not
 touch, so sequential moves only 1.16× at the median. **Concurrency is
@@ -88,13 +87,11 @@ feels.
 The one regression is the **cold request**, 27 → 40 ms: the first hit
 through new code pays the transpile-on-first-execution cost, the
 transpiler running as a block is first executed. It is one-time per block
-and amortised immediately — every warm number is faster — and §7's
-bake-time pre-translation (transpiling hot traces at bake, byte-keyed like
-tier 1, storing only the bytecode's size rather than a slower execution
-path) is what removes it. It is the clear next lever if cold-start latency
-matters.
+and amortised immediately — every warm number is faster. Transpiling at
+bake time, keyed by the block's bytes, would remove it, and is the clear
+next lever if cold-start latency matters (section 7).
 
-Everything else in this document about the bytecode is §6c: it covers
+Everything else in this document about the bytecode is section 6c: it covers
 93–96 % of a real workload's instructions, is correct and deterministic
 (byte-identical retirement under a fixed seed), and reaches 3.6× on a
 compute chain but 1.3–1.5× on the memory- and host-bound eval loop — which
@@ -140,7 +137,7 @@ rows where the *native* leg measured quicker this time. It is the reason
 this table carries absolute times rather than only ratios.
 
 - **3× on syscalls**, because a syscall here is a Rust function call
-  rather than a mode switch. kisal is genuinely cheaper than Linux at
+  rather than a mode switch. the kernel is genuinely cheaper than Linux at
   this, and it very nearly cancels the cost of interpreting.
 - **4× on pointer chasing**, because native is stalled on memory rather
   than executing, and the interpreter hides behind the same stalls.
@@ -206,8 +203,8 @@ process going quiet, not the first 200.
 
 ### What not to report
 
-`kisal/examples/interpret` runs the same engine compiled to x86-64 instead
-of to wasm. It is two to three times faster and correspondingly quicker to
+`zaqaru emulate` runs the same engine compiled to x86-64 instead of to
+wasm. It is two to three times faster and correspondingly quicker to
 iterate on, and it is a **development instrument, not a result**. Nobody
 runs an x86 interpreter on x86; the number that means anything is the
 container. Its output belongs in a decision about what to optimise and
@@ -218,10 +215,10 @@ never in a report about what this costs.
 Three instruments, each answering a different question, each off unless
 asked for because each runs once per retired instruction.
 
-### Which instructions — `--features targum/histogram`
+### Which instructions — `--features zaqaru-cpu/histogram`
 
-    cargo run --release -p kisal --example interpret \
-        --features targum/histogram -- <image.tar> [argv...]
+    cargo run --release -p zaqaru --features zaqaru-cpu/histogram -- \
+        emulate <image.tar> [-- argv...]
 
 Counts retired instructions per mnemonic, and separately how many took the
 fast path. The gap in a partly-lowered row is an operand shape
@@ -233,10 +230,10 @@ Django's import graph, 731 M instructions, **94.5% on the fast path**:
 which is what makes a basic block about five instructions long and is the
 measurement that motivated extending them.
 
-### Which guest code — `--features targum/profile`
+### Which guest code — `--features zaqaru-cpu/profile`
 
-    TARGUM_PROFILE_OUT=/tmp/profile.tsv cargo run --release -p kisal \
-        --example interpret --features targum/profile -- <image.tar> [argv...]
+    cargo run --release -p zaqaru --features zaqaru-cpu/profile -- \
+        emulate --profile-out /tmp/profile.tsv <image.tar> [-- argv...]
 
 Counts retired instructions per guest address and attributes them against
 the guest's own memory map. Django's import: **90.9% `libpython3.12.so`**,
@@ -251,18 +248,18 @@ executed.
 
 There is no hot spot, and that kills the obvious idea: intercepting
 glibc's `memcpy` and `strlen` to run them on the host has a **4.3%
-ceiling** on this workload, however good the interception is. What it also
-says is that tier 1 is well targeted — 90% coverage is about four thousand
-blocks, a working set a translator holds comfortably.
+ceiling** on this workload, however good the interception is. It also
+says what any block-level accelerator has to cover: 90% of the run is
+about four thousand blocks.
 
 ### Which engine code — `perf` with wasmtime's map
 
-    ZAQARU_PERFMAP=1 perf record -F 999 -o /tmp/p.data \
-        ./target/release/zaqaru-run <module.wasm>
+    perf record -F 999 -o /tmp/p.data \
+        ./target/release/zaqaru run --perfmap <module.wasm>
     perf report -i /tmp/p.data --stdio --no-children
 
-`ZAQARU_PERFMAP` makes wasmtime write the map that names JIT frames;
-without it the whole engine is one unresolved address. **This is the
+`--perfmap` makes wasmtime write the map that names JIT frames; without it
+the whole engine is one unresolved address. **This is the
 instrument that mattered**, and section 6 is about why.
 
 Django's import at `ba24d46`: `Cpu::quick` 53%, `Engine::run` 16%,
@@ -284,10 +281,10 @@ process into the kernel's heap and zeroed it, then `restore` copied the
 incoming one's back — for a 60 MB CPython worker against a 4 MB nginx, a
 few hundred megabytes of memory traffic per request round trip.
 
-After step 1 (`kisal/src/resident.rs`), four clients at once: `quick`
+After page ownership (`crates/kernel/src/resident.rs`), four clients at once: `quick`
 68%, `Engine::run` 14%, `step` 6%, `note_code_write` 4%,
 `BlockCache::entry` 3%. No `memmove` above the 1.5% line. The first
-version of step 1 — ownership without placement — still had `memmove` at
+version of page ownership — without placement — still had `memmove` at
 21%, all of it under `activate`: every program bump-allocated from the
 same base, so nginx's binary, libraries and heap sat exactly where the
 worker's did and a few thousand pages moved on every switch. Placing each
@@ -308,13 +305,13 @@ attach** while `kernel.yama.ptrace_scope` is 1. `perf` needs
 
 ## 5. What is built
 
-Since `280f607`, in the engine:
+In the engine, since the first throughput measurements:
 
 - **Instructions are pre-decoded.** The block cache decoded bytes once and
   then re-derived the decode on every execution — operand kinds four
   times, registers three times, each through an `Option` and an error
   closure, all dispatched through a match over 1,700 mnemonics.
-  `targum/src/quick.rs` lowers what it understands into a compact form
+  `crates/cpu/src/quick.rs` lowers what it understands into a compact form
   with a dense opcode and resolved operands. **What cannot be lowered is
   not lowered**: `Op::General` falls through to the untouched `step`, so
   a bug in the lowering can make the engine slower and cannot make it
@@ -329,7 +326,14 @@ Since `280f607`, in the engine:
   believed only after the block it names is confirmed still entered at the
   address asked for, so nothing has to remember to invalidate it.
 - **The edge is flushed every quantum**, while the inbound read stays on
-  the slice — see `network-plan.md`.
+  the slice.
+- **The process switch moves only the pages two processes both map.**
+  Linear memory keeps every process's pages in place and an owner table
+  (`crates/kernel/src/resident.rs`) says whose bytes are resident at each;
+  a fork child collides with its parent everywhere by construction and
+  stays a copy, paid once per fork, and an `execve`'d program is placed in
+  the emptiest quarter of the 512 MB guest block so unrelated programs do
+  not collide at all. A warm request went from 41 to 20 ms.
 
 ## 6. What was tried and rejected
 
@@ -398,8 +402,8 @@ paying its tax*, matches or beats Blink's **native** interpreter
 (1.05–1.45×); native to native we are 1.5–2.6× ahead. So the floor, defined
 as the best interpreter anyone has built, is below us, not above. The
 ceiling above is a JIT (Blink's own, and qemu): 3–8× faster, but runtime
-native codegen the wasm sandbox forbids — the reason tier 1 is bake-time,
-and tier 1 lost on CPython (`tier1-plan.md`).
+native codegen the wasm sandbox forbids. Compiling blocks to wasm at bake
+time was built and measured instead, and lost (section 6e).
 
 **CPython is the exception that stays at the floor.** Both changes are
 within noise on it. Its blocks are short, so its arithmetic flags are live
@@ -411,20 +415,37 @@ already built to run. For the container, the interpreter *is* near its
 floor; the levers left are startup and, for compute-bound guests, these
 per-op wins.
 
-## 6c. The bytecode transpiler, v1 measured (2026-09-03)
+## 6c. The bytecode floor, and the transpiler measured against it (2026-09-03)
 
-§6b's floor prototype (`tools/bytecode-floor`) suggested a register-machine
-bytecode could be 7.7× the x86 interpreter. That prototype was *idealised* —
-no faithful widths, no lazy flags, a `Vec<u8>` for memory, a local
-retirement counter. The real transpiler (`targum::bytecode`, `targum/bytecode`
-feature) carries x86's weight: width masking on every op, the engine's
-`Space` and its permission check, retirement and flags into the control
-block. So the honest number is lower, and the design doc estimated 3–6×.
+**The floor prototype.** How much of the interpreter's per-instruction cost
+is x86's, and how much is the block-structured design? A minimal
+register-machine bytecode interpreter — a flat `Vec<u64>` stream, sixteen
+registers, a switch-loop dispatch, and faithful permission-checked memory —
+ran the same `mixed` computation as the engine, both under wasmtime:
 
-**Measured lower still.** Component kernels, baked both ways and run under
-wasmtime (`ZAQARU_ENGINE_FEATURES=targum/bytecode` bakes the accelerator in;
-each is one fully-covered block whose back-edge stays inside the bytecode),
-MIPS interpreter → bytecode:
+| interpreter | ns/iter | ops/iter |
+| --- | --- | --- |
+| engine, x86 over the pre-decoded form | 230 | 17 |
+| the bytecode prototype | 30 | 14.5 |
+
+**7.7×**, holding per op class — arithmetic ~9×, checked load/store 5–6×,
+branches ~12×. Most of the per-instruction cost was the design, not x86:
+the flat stream keeps branches in the loop where the engine exits and
+re-enters per block, and the fixed encoding skips the operand decode and
+the per-instruction budget and `rip` machinery. The write-up is
+[archive/bytecode-floor.md](archive/bytecode-floor.md); the prototype
+itself lived in `tools/bytecode-floor` until 2026-09-05.
+
+That prototype was *idealised* — no faithful widths, no lazy flags, a
+`Vec<u8>` for memory, a local retirement counter. The real transpiler
+(`crates/cpu/src/bytecode.rs`) carries x86's weight: width masking on
+every op, the engine's page table and its permission check, retirement
+and flags into the control block. So the honest number is lower, and the
+design estimated 3–6×.
+
+**Measured lower still.** Component kernels, run with and without the
+accelerator under wasmtime (each is one fully-covered block whose
+back-edge stays inside the bytecode), MIPS interpreter → bytecode:
 
 | kernel  | interp | bytecode | ratio |
 | ---     | ---    | ---      | ---   |
@@ -527,14 +548,11 @@ owns). More coverage past this has bounded upside (`div` and the common SSE2
 were added and moved the number by ~5% on the workloads that use them); the
 1.3–1.6× on real code is the covered path's *per-op* cost, not coverage.
 
-**And the per-op cost has no cheaper-dispatch lever.** Tail-call threaded
-dispatch, the planned v2, is a measured regression under wasmtime — ~5.2×
-slower on an identical bytecode loop, root-caused in `tools/thread-dispatch/`
-to the sandbox's checked indirect tail call (~3.0 ns) against a `br_table`'s
-in-function jump. The switch-loop is already the fastest dispatch wasm offers.
-What is left is **fewer** dispatches and cheaper per-op work — and revisiting
-the memory-themed benchmark that scoped this (§6b's checked-memory 5-6×) found
-both. The `Load`/`Store` ops addressed only `[base + disp]`; an indexed access,
+**And the per-op cost has no cheaper-dispatch lever** (section 6d). The
+switch-loop is already the fastest dispatch wasm offers. What is left is
+**fewer** dispatches and cheaper per-op work — and revisiting the
+memory-themed benchmark that scoped this (section 6b's checked-memory
+5-6×) found both. The `Load`/`Store` ops addressed only `[base + disp]`; an indexed access,
 `[base + index*scale + disp]` — the array and object addressing x86 folds into
 every memory instruction — materialised the address with a `Li`, an `Add` and a
 `Lea` first, four dispatches for one guest load. `LoadX`/`StoreX` fold it into
@@ -549,47 +567,73 @@ themselves. Superinstructions that do not touch a shared cost (memory-RMW,
 `MemRmw`) stay neutral on the memory-bound eval loop; the ones that remove
 dispatches (indexed folding) or lean a shared cost (the page cache) move it.
 
-## 7. The plan
+## 6d. Dispatch: the switch loop is the floor (2026-09-03)
 
-Three steps, decided 2026-09-02, in the order they pay. Step 1 is being
-built; steps 2 and 3 wait on a design discussion and are not to be
-started before it.
+The interpreter literature (wasmi, Deegen and LuaJIT-remake) reports
+1.3–1.5× for tail-call threaded dispatch — each op handler ending in a
+tail call to the next — over a central `br_table`. That literature is
+about native interpreters, where a threaded tail call compiles to a raw
+`jmp`. Under wasmtime it does not hold. Two hand-written wasm
+interpreters running the identical bytecode loop, 2 billion dispatched
+ops, pinned to a core:
 
-1. **Page ownership for the process switch — built, 2026-09-02.**
-   Linear memory keeps every process's pages in place. An owner table
-   (`kisal/src/resident.rs`) says whose bytes are resident at each page; a
-   switch walks only the pages the incoming process has had taken from
-   it, and a page moves only when two processes map the same address and
-   one of them is running. A fork child collides with its parent
-   everywhere by construction and stays a copy, paid once per fork; an
-   `execve`'d program is placed in the emptiest quarter of the 512 MB
-   guest block, so unrelated programs do not collide at all. The same
-   code runs natively — the per-process memory files are gone — so the
-   kernel suite tests what the module does. Expected 15 ms a request;
-   measured 20–22 ms, with the interpreter now the whole of the profile.
-2. **Tier 1: hot blocks compiled to wasm at bake time — waiting.** The
-   only lever that reaches boot and request latency both, and it needs
-   nothing from the host and no run of the user's image: a wasm module
-   cannot create code, so the compile happens in the bake, and the
-   result is linked in beside the interpreter and keyed by its bytes — a
-   block that never runs or has been overwritten is a function nobody
-   enters, so the bake may guess. It draws on three sources: a corpus of
-   runtime profiles matched by content, a ranked and budgeted static
-   sweep of the image's own ELFs, and an optional profile of one's own
-   workload. The ceiling is measured, not guessed: the AOT transpiler
-   with register promotion reached parity with clang's own wasm backend
-   on the integer and memory kernels, about a hundred times above the
-   interpreter. A block compiler lands short of that; five to twenty
-   times is the band this shape sits in, which is a boot of a few
-   seconds and requests of a few milliseconds. Size: the runtime's text
-   is 5 MB of the image's 39, and the rootfs, 124 MB uncompressed,
-   compresses to 37 — so the plan's first gate compresses it, and a
-   module with tier 1 comes out smaller than one without it is now.
-   [tier1-plan.md](tier1-plan.md) is the design.
-3. **Snapshot a booted container — waiting.** The alternative for boot
-   that does not depend on engine speed. The interpreter holds no guest
-   state on the wasm stack and kisal's state is a graph in linear memory,
-   so a memory image taken at a quantum boundary, with the run loop
+| interpreter | time |
+| --- | --- |
+| `br_table` switch loop | **1.65 s** |
+| threaded, state in globals | 8.77 s |
+| threaded, state passed as arguments | 8.53 s |
+
+Threaded is **~5.2× slower**, and keeping the state in arguments does not
+help, so it is not memory traffic. The decomposition: a bare `loop` costs
+~0.2 ns per iteration, a direct `return_call` ~1.4 ns, a
+`return_call_indirect` ~3.0 ns. Two additive costs, both the sandbox's —
+the tail call is a real call ABI even in tail position, and the indirect
+dispatch adds a table bounds check, a funcref load and a signature check.
+A `br_table` is an in-function jump with none of that, and lets Cranelift
+keep the interpreter's state in registers across it. The write-up is
+[archive/thread-dispatch.md](archive/thread-dispatch.md); the `.wat`
+sources lived in `tools/thread-dispatch` until 2026-09-05.
+
+## 6e. Compiling blocks to wasm at bake time: built, and a loss (2026-09-03)
+
+Before the bytecode, hot blocks were compiled to wasm *at bake time* —
+a wasm module cannot create code, so the compile has to happen before the
+run — keyed by the block's bytes so that a wrong guess is a function
+nobody enters, and drawing on a static sweep of the image's ELFs with an
+optional profile of a representative workload. It was built, it was
+correct against the interpreter under a verifying run loop, and it lost:
+
+- **compiled x86-in-wasm is ~1.85× slower per instruction than the
+  interpreter on CPython.** Each compiled block still enters and leaves
+  through the control block, still checks every access against the page
+  table, and still hands anything it declined back to the interpreter;
+  CPython's blocks are short and its flags live at the computed goto, so
+  the region a compiler can keep in wasm locals is small.
+- **on long straight compute loops it paid 3–11×**, which is the shape
+  the bytecode now covers at 1.3–4× with no bake-time work and no guess
+  about what will run.
+- **a corpus of profiled hot blocks made serving 4.4× slower**: the hot
+  set of one workload is cold code for another, and a compiled block that
+  runs once costs more than interpreting it.
+
+The compiler was removed on 2026-09-05 (the last commit carrying it is
+tagged `before-aot-removal`); the design and the settled result are in
+[archive/tier1-plan.md](archive/tier1-plan.md).
+
+## 7. What is next
+
+In the order it pays.
+
+1. **Transpile at bake time.** The bytecode's one regression is the cold
+   request (section 1a): the first execution of new code pays the
+   transpile. Transpiling the hot blocks at bake, keyed by their bytes as
+   the wasm compiler was, and storing the bytecode beside the image would
+   remove it. Unlike compiled wasm, a stored bytecode block costs its size
+   and nothing else if it never runs.
+2. **Snapshot a booted container.** The alternative for boot that does
+   not depend on engine speed. The interpreter holds no guest state on
+   the wasm stack and the kernel's state is a graph in linear memory, so
+   a memory image taken at a quantum boundary, with the run loop
    re-entered rather than restarted, is a booted container in well under a
    second. The host-side state to reconstruct is the mount table and the
    listeners; open connections are the reason to snapshot before the
@@ -601,33 +645,31 @@ started before it.
   worker map the same 20 MB at the same addresses, so the arbiter's
   once-a-second wake-up moves those pages out and back: a few
   milliseconds a second, invisible in the request path, and the one
-  shape step 1 leaves as a copy. Copy-on-write at page granularity —
+  shape page ownership leaves as a copy. Copy-on-write at page granularity —
   skip a page whose bytes the two still agree on — is the refinement if
   a workload ever forks and keeps both sides busy.
 - **The nine milliseconds a request spends outside the interpreter** are
   host round trips: the edge pump's reads and writes, and the slice
   boundary the inbound read waits for. Not profiled yet.
-- **Boot dominates and is untouched.** 32–35 s, all of it interpretation
-  of 3.29 G instructions, most of them Python's import graph — re-executed
-  identically on every start. Halving the engine again gets 16 s.
-  Snapshotting a booted container gets under a second, and it is the only
-  idea on the table at the right order of magnitude. The determinism the
-  design already has is what makes it plausible; kisal's state being an
-  `Rc`/`RefCell` graph in linear memory, and the interpreter holding no
-  guest state on the wasm stack, is what makes it work.
+- **Boot dominates.** 28 s with the bytecode, all of it interpretation of
+  3.29 G instructions, most of them Python's import graph — re-executed
+  identically on every start. Snapshotting a booted container gets under a
+  second, and it is the only idea on the table at the right order of
+  magnitude. The determinism the design already has is what makes it
+  plausible; the kernel's state being an `Rc`/`RefCell` graph in linear
+  memory, and the interpreter holding no guest state on the wasm stack,
+  is what makes it work.
 - **`string` at 882×.** glibc's SSE routines, unlowered, 32 MIPS against
   41–115 everywhere else. About 2.4% of the import, and the request-path
   histogram says it is no larger there.
-- **`Cpu::quick` at 53% and `Engine::run` at 16%.** The dispatch and the
-  loop. Fusing `cmp`/`test` with the `jcc` that follows is the shaped idea
-  here — the histogram puts those at 14.4% and 16.4% of the stream — and
-  it removes a dispatch, a flag record and a flag read per pair. Worth
-  perhaps 1.3× on the engine; not the order of magnitude.
-- **Tier 1 is the step change**, and section 4 is the argument that it
-  would work rather than thrash. The ceiling is known: the AOT transpiler
-  with register promotion reached parity with clang's own wasm backend on
-  the integer and memory kernels (`docs/archive/promotion-plan.md`), about
-  a hundred times where the interpreter sits. A trace compiler will not
-  get all of that, but five to twenty is the band the literature puts
-  this shape in, and it is the only lever that reaches boot and request
-  latency both.
+- **`Cpu::quick` at 53% and `Engine::run` at 16%** in the plain
+  interpreter. The bytecode is what answers this: its fused
+  compare-branch removes a dispatch, a flag record and a flag read per
+  pair, and it is on by default.
+- **The ceiling is known and unreached.** The removed ahead-of-time
+  translator, with register promotion, reached parity with clang's own
+  wasm backend on the integer and memory kernels
+  (`archive/promotion-plan.md`) — about a hundred times where the
+  interpreter sits. Every attempt to get there for arbitrary code has
+  lost to the cost of guessing what will run; the bytecode gets 1.3–4× by
+  not guessing.

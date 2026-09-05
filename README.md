@@ -1,196 +1,101 @@
 # zaqaru
 
-Lifts machine code out of x86-64 ELF object files and lowers it to
-WebAssembly.
+Run x86-64 OCI containers in WebAssembly.
 
-The input is a relocatable object (`gcc -c`); the output is a **relocatable
-wasm object** in the LLVM tool-conventions linking format, so stock `wasm-ld`
-links one or more of them into a finished module. Two objects transpiled
-independently can call each other and share one emulated register file, which
-is the point of emitting relocatable objects rather than finished modules.
+`zaqaru bake` turns a container image — a `docker save` tarball, or any
+root directory — into one `.wasm` module. `zaqaru run` runs it. Inside the
+module an x86-64 interpreter executes the image's programs exactly as they
+shipped, and a Linux-personality kernel serves their syscalls without
+leaving the module. The host supplies two functions: a store to read from
+and write to. Everything else — files, memory, processes, threads, sockets
+between them — is inside.
 
-```sh
-gcc -O1 -c add.c -o add.o
-zaqaru add.o -o add.wasm.o
-wasm-ld --no-entry add.wasm.o -o add.wasm     # `add` is exported
-```
-
-## How it works
-
-```text
-ELF .o ──(reader)────► sections + symbols + relocations
-       ──(lifter)────► per-function instructions, operands resolved to
-                        symbol + addend — never to an address
-       ──(cfg)───────► basic blocks, dominators, loop structure
-       ──(structurer)► wasm structured control flow
-       ──(translate)─► x86 semantics against an emulated machine model
-       ──(emitter)───► relocatable wasm object
-```
-
-The emulated machine is the load-bearing idea: the sixteen general-purpose
-registers are `i64` wasm globals, the flags are `i32` globals, and the guest
-stack lives in linear memory with `x86_rsp` pointing into it. Translated
-functions therefore assume *nothing* about calling conventions — the binary is
-self-consistent with itself, and faithful register emulation inherits that.
-Host-callable wrappers marshal arguments at the export boundary.
-
-The globals are the *convention*, not where the work happens: inside each
-function body, every register, XMM half and flag the function touches is
-promoted to a wasm local, copied in at entry and flushed back at calls and
-exits — which is what lets the engine build SSA and register-allocate the
-guest's registers. On the benchmark kernels this puts integer and
-memory-bound code at parity with clang's own wasm backend.
-`--no-promote` turns it off for A/B debugging.
-
-The sixteen XMM registers are *pairs* of `i64` globals rather than `v128`
-ones, which is not a preference: stock `wasm-ld` cannot link an object that
-defines a `v128` global, because LLD's object reader has no case for a
-`v128.const` initializer. SIMD instructions and `v128` locals inside function
-bodies are fine — LLD copies code opaquely — so packed operations assemble a
-vector from the pair, work on it, and take it apart again. The pair turns out
-to fit SSE's grain anyway: a scalar operation writes the low 64 bits and
-preserves the high 64, which here means touching one global and leaving the
-other alone.
-
-Control flow is translated two ways. The dominator-based structured
-translation produces the `block`/`loop`/`if` nesting a reader expects; a
-`br_table` dispatcher handles anything it cannot express (an irreducible
-graph) and doubles as the oracle the structured mode is tested against.
-
-Function pointers become slots in the indirect function table, and indirect
-calls become `call_indirect` — made easy by the emulated convention, since
-every translated function has the same wasm type and so signatures can never
-disagree. A `switch` compiled to a jump table is the one thing that cannot be
-translated at all, because its entries are code addresses; those dispatches
-are recognised and rewritten into a `br_table`.
-
-A transpiled module is not an island: given a signature, a guest function's
-wrapper becomes an ordinary wasm function that any module can call, and a
-call *out* to a function nobody transpiled becomes a generated thunk that
-marshals the emulated registers into a typed wasm call. Signatures are
-recovered from the machine code rather than read out of debug information,
-because the binaries this is for are stripped.
+The name is Akkadian, *zaqāru*: to build high, as a tower is built.
 
 ```sh
-zaqaru add.o -o add.wasm.o --infer                        # typed exports
-zaqaru --thunks add.o foreign.wasm.o -o interop.wasm.o    # calls out
-wasm-ld --fatal-warnings add.wasm.o interop.wasm.o foreign.wasm.o -o out.wasm
+docker build -t hello-django demo/hello-django
+docker save hello-django -o hello-django.tar
+zaqaru bake hello-django.tar -o hello-django.wasm
+zaqaru run hello-django.wasm -p 8080:80
+curl http://localhost:8080/
 ```
 
-The thunk generator is given the wasm objects too, because that is where a
-foreign signature is *stated* rather than guessed — and an argument passed
-straight through leaves no trace in the native object at all. A wrong
-signature at a seam is caught by the linker rather than run: `wasm-ld` type-
-checks across objects and warns on a mismatch; `--fatal-warnings` is what
-turns the warning into a refusal, which is why every recipe here passes it.
+That is nginx, gunicorn and Django — five processes, an ordinary Debian
+image, nothing rebuilt — served from a wasm module by wasmtime.
 
-`--resume` adds checkpoint-resume: every call site records where its frame
-would continue, every function gets a second body that can be entered
-there, and a generated `x86_resume` driver rebuilds a process from a copy
-of its memory and globals — the mechanics of `fork`, exercised end to end
-by `tests/fork_resume.rs`. It rests on a property the ordinary translation
-already has: at any call boundary the complete machine state is in the
-shared globals and linear memory, never on the wasm stack.
+## The tool
 
-`--seam` emits the kernel seam: `x86_syscall`, which the translator turns a
-`syscall` instruction into, reading the Linux syscall ABI out of the register
-globals and making it an ordinary typed call to `kisal_syscall`. That is the
-bet the container work rests on — a syscall costs a wasm call rather than a
-trap, and the kernel is just more code linked into the module.
-
-```sh
-zaqaru --seam -o seam.wasm.o
-wasm-ld --no-entry --export=cabi_realloc --export-table --growable-table \
-    guest.wasm.o seam.wasm.o libkisal.a -o container.wasm
+```
+zaqaru bake    <image.tar | rootfs/> [-o out.wasm] [--env NAME=value]... [-- command...]
+zaqaru run     <module.wasm> [-p HOST:GUEST]... [--trace FILE] [--record TAPE | --replay TAPE]
+               [--no-bytecode] [--seed BYTE] [--perfmap]
+zaqaru emulate <image.tar | rootfs/> [-p HOST:GUEST]... [--env NAME=value]... [--trace]
+               [--no-bytecode] [--profile-out FILE] [-- command...]
+zaqaru image inspect <image.tar | rootfs/> [--list]
 ```
 
-The seam object also carries what a scheduler needs: the `x86_yield` tag with
-its throw and the `try_table` that catches it, and helpers that move the whole
-register file between the globals and linear memory. A blocking thread throws
-its wasm frames away, because the flush discipline already put everything of
-value in the globals and the guest stack.
+- **bake** reads the image's layers, entrypoint, command, environment and
+  working directory, flattens the filesystem into a packed index and a
+  blob, and links them with the guest archive — the kernel, the
+  interpreter and the FPU, compiled once for wasm32 and embedded in the
+  binary. It needs `wasm-ld` and nothing else. Arguments after `--`
+  replace the image's command, as `docker run image cmd...` does.
+- **run** instantiates the module under wasmtime with a console, a clock,
+  entropy, a shutdown switch, and — with `-p` — a network edge that
+  publishes guest ports. `--record` keeps every answer the host gave;
+  `--replay` runs the same container again from that tape, with no network
+  at all, byte for byte. Ctrl-C is the container's `SIGTERM`.
+- **emulate** runs the same kernel and interpreter natively, without a
+  module: two to three times faster, and where a native profiler sees the
+  engine's own frames. A development instrument; its numbers are not the
+  container's.
+- **image inspect** says what an image would boot as.
 
-`kisal/` is the in-guest kernel — Rust compiled to `wasm32-unknown-unknown`,
-with a Linux syscall face upward and a two-function `ll-store` boundary
-downward, so a container's filesystem traffic never crosses to the host at
-all. `runner/` is the wasmtime host: those two imports, a mount table, and
-nothing else.
-
-`docs/design.md` has the rationale, the decision log, the current status —
-what is built and what a real binary would hit next — and what is
-deliberately out of scope. `docs/container-plan.md` and
-`docs/container-build-plan.md` are the container design and its milestones.
-
-## Building and testing
-
-```sh
-cargo build
-cargo test
-```
-
-The test suite needs `gcc`, `clang` and `wasm-ld` on the path, and the
-`wasm32-unknown-unknown` rustc target for the kernel; wasmtime comes in as a
-crate. The backbone is differential execution: every corpus function
-is compiled natively into a shared library *and* transpiled, linked and
-instantiated, then both are called with the same inputs and must agree
-exactly. Each corpus is built forty ways — both compilers, position-independent
-and absolute code, at `-O0` through `-O3` and `-Os`, through both control-flow
-translations — because a transpiler meant for binaries it did not compile has
-to cope with what it is handed, not with flags of its own choosing. Floating
-point is compared as raw bits, with NaNs compared as a class in the one place
-where the bits are the engine's choice rather than the translation's.
-
-Compiler output covers whichever members of an instruction family that day's
-compiler happened to want, which is not the same as covering the family. So
-the corpus also carries hand-written assembly for what compilers rarely emit:
-an irreducible control-flow graph, every write mask of the SSE move family,
-the parity flag consumed after integer arithmetic, and every lane width of
-every packed operation.
-
-Everything else — an optimisation sweep over every source at every
-configuration, snapshot rendering, linker acceptance, structural checks on
-what was recovered, and a diff of our linking metadata against clang's —
-exists to make a failure legible before it reaches that comparison.
-
-Snapshots are refreshed with `ZAQARU_UPDATE_SNAPSHOTS=1 cargo test`, and the
-resulting diff is meant to be read.
-
-`cargo bench` runs the four-kernel performance benchmark — register-bound,
-memory-bound, scalar-float and call-heavy — against clang's own wasm
-backend as the ceiling, under wasmtime. It checks every build's results
-against the native build before timing anything.
+A container is deterministic: the scheduler switches on a count of retired
+instructions, `rdtsc` answers from the same count, and everything else —
+time, entropy, the network — arrives as a store read. Two runs with the
+same tape are the same run.
 
 ## Layout
 
-```text
-src/
-  main.rs        CLI: zaqaru input.o -o output.wasm.o [--dump] [--print]
-  reader.rs      ELF sections, symbols, relocations
-  lifter.rs      decoding, symbolic operand resolution
-  jump_table.rs  recovering `switch` dispatches from indirect jumps
-  cfg.rs         basic blocks, dominators, loop structure
-  structurer.rs  dispatcher and structured control flow
-  machine.rs     the emulated register file, flags and stack
-  translate.rs   x86 instruction semantics
-  translate/
-    vector.rs    the XMM register file and everything that moves through it
-  abi/           signatures at the boundary with ordinary wasm
-    effects.rs   what each instruction reads and overwrites
-    infer.rs     recovering signatures from machine code
-    marshal.rs   moving values in and out of the register file
-  thunks.rs      generated entry points for functions we did not translate
-  seam.rs        the kernel seam: `syscall` as a typed call, plus the tag,
-                 the scheduler's catch, and the register-file helpers
-  wasm_reader.rs the types a wasm object states for what it defines
-  transpile.rs   what symbols an output object has
-  emitter/       the relocatable wasm object format
-  dump.rs        human-readable rendering of the front end
-tests/
-  corpus/        C and hand-written .s sources for differential testing
-  specimens/     C compiled by clang's wasm backend, as known-good metadata
-  snapshots/     .wat expectations
-benches/
-  kernels.rs     the promotion benchmark: transpiled vs clang-native wasm
-kisal/           the in-guest kernel: syscalls handled inside the module
-runner/          the wasmtime host: two ll-store imports and a mount table
 ```
+crates/cpu      the x86-64 machine: interpreter, block cache, lazy flags, page table,
+                and the bytecode accelerator hot blocks are transpiled into
+crates/kernel   the Linux-personality kernel: syscalls, VFS and overlay, processes,
+                threads, signals, sockets, the packed image format
+crates/x87      the soft x87 FPU: extended precision and the register stack
+crates/guest    the container module's guest side, as one wasm32 staticlib:
+                the boot export and the two host imports over the kernel
+crates/image    the packager: OCI layers or a directory, into the image the kernel reads
+crates/bake     the link: an image and the guest archive become a module
+crates/host     the wasmtime host: the two imports, the mount table, the network edge
+crates/cli      the zaqaru binary
+demo/           the nginx + gunicorn + Django image, and the scripts that trace and replay it
+tools/          the microbenchmarks
+docs/           architecture, fidelity, performance
+```
+
+## Building
+
+Rust with the `wasm32-unknown-unknown` target, and `wasm-ld` (from LLVM)
+on the path. The tests also want `gcc`, `clang` and `ldd`.
+
+```sh
+rustup target add wasm32-unknown-unknown
+cargo build --release -p zaqaru
+target/release/zaqaru --help
+```
+
+The build compiles the guest archive for wasm32 and embeds it; the first
+build takes a minute for that.
+
+## Documentation
+
+- [docs/architecture.md](docs/architecture.md) — how it works: the
+  machine, the kernel, the host boundary, the bake, determinism.
+- [docs/fidelity.md](docs/fidelity.md) — where the kernel differs from
+  Linux, and what a program would have to do to notice.
+- [docs/performance.md](docs/performance.md) — what a container costs,
+  where the time goes, how it is measured, and what was tried.
+- [docs/archive/](docs/archive/) — the design and planning documents the
+  project was built from, kept as dated records.

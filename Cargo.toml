@@ -10,9 +10,6 @@ members = [
     "crates/x87",
 ]
 resolver = "3"
-# The interpreter-throughput spike is a standalone instrument, not a member:
-# it must not add its dependencies or build time to the workspace.
-exclude = ["tools/interp-spike"]
 
 # Dependencies are built optimized even for tests.
 #
