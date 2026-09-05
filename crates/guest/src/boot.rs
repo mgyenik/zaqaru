@@ -59,10 +59,14 @@ pub const KIND_STOPPED: i32 = 3;
 pub unsafe extern "C" fn zaqaru_run(until: i64) -> i32 {
     // SAFETY: one instance, one thread of execution, and the host makes one
     // call at a time.
+    let slot = unsafe { &mut *(&raw mut SYSTEM) };
     if let Some(status) = unsafe { FINISHED } {
+        // A finished container still describes itself.
+        if let Some(system) = slot {
+            system.serve();
+        }
         return finished(status);
     }
-    let slot = unsafe { &mut *(&raw mut SYSTEM) };
     let system = match slot {
         Some(system) => system,
         None => match boot() {
@@ -130,10 +134,13 @@ pub unsafe extern "C" fn zaqaru_run(until: i64) -> i32 {
 /// As [`zaqaru_run`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn zaqaru_stop_at(target: i64) -> i32 {
+    let slot = unsafe { &mut *(&raw mut SYSTEM) };
     if let Some(status) = unsafe { FINISHED } {
+        if let Some(system) = slot {
+            system.serve();
+        }
         return finished(status);
     }
-    let slot = unsafe { &mut *(&raw mut SYSTEM) };
     let system = match slot {
         Some(system) => system,
         None => match boot() {

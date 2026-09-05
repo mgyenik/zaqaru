@@ -24,6 +24,8 @@ const WRITE_IMPORT: &str = "ll_write";
 /// The export the host reaches back through to place returned bytes in guest
 /// memory, exactly as the component canonical ABI does.
 const REALLOC_EXPORT: &str = "cabi_realloc";
+/// Rust's shadow stack pointer, the module's one mutable global.
+const STACK_POINTER_EXPORT: &str = "__stack_pointer";
 const MEMORY_EXPORT: &str = "memory";
 
 /// The one thing the host calls to run a container.
@@ -70,6 +72,29 @@ const LIST_ALIGNMENT: u32 = 4;
 pub struct Container {
     store: wasmtime::Store<MountTable>,
     instance: wasmtime::Instance,
+    /// The compiled module, kept so that a restore is a fresh instance of
+    /// it rather than a second compile.
+    module: wasmtime::Module,
+}
+
+/// The whole of a stopped container: its linear memory, its one mutable
+/// global, and the host's side of the boundary.
+///
+/// Taken between turns, when nothing is on the guest's stack, so memory is
+/// the machine. Restoring one gives a container that continues exactly as
+/// the original would have — see [`Container::restore`] — which is what a
+/// debugger seeks with and what an acceptance test checks byte for byte.
+pub struct Snapshot {
+    memory: Vec<u8>,
+    stack_pointer: i32,
+    mounts: MountTable,
+}
+
+impl Snapshot {
+    /// The guest's linear memory as it was.
+    pub fn memory(&self) -> &[u8] {
+        &self.memory
+    }
 }
 
 /// How to set the engine up.
@@ -112,7 +137,87 @@ impl Container {
         let instance = linker
             .instantiate(&mut store, &module)
             .context("instantiating the container module")?;
-        Ok(Self { store, instance })
+        Ok(Self { store, instance, module })
+    }
+
+    /// The container as it stands: to be called between turns.
+    pub fn snapshot(&mut self) -> Result<Snapshot> {
+        let memory = self.memory()?;
+        let bytes = memory.data(&self.store).to_vec();
+        let stack_pointer = self.stack_pointer()?;
+        let mounts = self.store.data().snapshot().map_err(|why| wasmtime::Error::msg(why))?;
+        Ok(Snapshot {
+            memory: bytes,
+            stack_pointer,
+            mounts,
+        })
+    }
+
+    /// A container standing where the snapshot was taken: a fresh instance
+    /// of the same module, its memory grown to the snapshot's size and
+    /// copied back, the host's mounts as they were.
+    ///
+    /// A fresh instance rather than this one because wasm memory only
+    /// grows: an older snapshot written into a memory that has since grown
+    /// would show the kernel a larger limit than the run had at that
+    /// instant.
+    pub fn restore(&self, snapshot: &Snapshot) -> Result<Container> {
+        let engine = self.module.engine();
+        let mounts = snapshot.mounts.snapshot().map_err(|why| wasmtime::Error::msg(why))?;
+        let mut store = wasmtime::Store::new(engine, mounts);
+        let mut linker = wasmtime::Linker::new(engine);
+        define_store_imports(&mut linker)?;
+        let instance = linker
+            .instantiate(&mut store, &self.module)
+            .context("instantiating the container module for a restore")?;
+        let mut restored = Container {
+            store,
+            instance,
+            module: self.module.clone(),
+        };
+        let memory = restored.memory()?;
+        let have = memory.data_size(&restored.store);
+        let want = snapshot.memory.len();
+        if want < have {
+            bail!("the snapshot's memory is smaller than a fresh instance's, which cannot be");
+        }
+        if want > have {
+            let pages = ((want - have) as u64).div_ceil(65536);
+            memory
+                .grow(&mut restored.store, pages)
+                .context("growing memory to the snapshot's size")?;
+        }
+        memory
+            .write(&mut restored.store, 0, &snapshot.memory)
+            .context("copying the snapshot's memory")?;
+        let live = restored.stack_pointer()?;
+        if live != snapshot.stack_pointer {
+            bail!(
+                "the shadow stack pointer is {live:#x} in a fresh instance and was \
+                 {:#x} in the snapshot; the guest left state on its stack",
+                snapshot.stack_pointer
+            );
+        }
+        Ok(restored)
+    }
+
+    fn memory(&mut self) -> Result<wasmtime::Memory> {
+        match self.instance.get_export(&mut self.store, MEMORY_EXPORT) {
+            Some(wasmtime::Extern::Memory(memory)) => Ok(memory),
+            _ => bail!("the container module does not export its linear memory as `{MEMORY_EXPORT}`"),
+        }
+    }
+
+    /// The guest's shadow stack pointer, which is at its base whenever no
+    /// export is executing; read to check that this is still so.
+    fn stack_pointer(&mut self) -> Result<i32> {
+        match self.instance.get_export(&mut self.store, STACK_POINTER_EXPORT) {
+            Some(wasmtime::Extern::Global(global)) => match global.get(&mut self.store) {
+                wasmtime::Val::I32(value) => Ok(value),
+                other => bail!("the stack pointer global is not an i32: {other:?}"),
+            },
+            _ => bail!("the container module does not export `{STACK_POINTER_EXPORT}`"),
+        }
     }
 
     /// Calls any export by name and type.

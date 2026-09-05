@@ -23,6 +23,9 @@ pub const GUEST_ARCHIVE: &str = "libguest.a";
 pub const RUN_EXPORT: &str = "zaqaru_run";
 pub const STOP_EXPORT: &str = "zaqaru_stop_at";
 pub const MANIFEST_EXPORT: &str = "manifest";
+/// The module's one mutable global, exported so a snapshot can check it is
+/// at its base between turns.
+pub const STACK_POINTER_EXPORT: &str = "__stack_pointer";
 pub const REALLOC_EXPORT: &str = "cabi_realloc";
 
 /// The guest archive: everything in the module that is not the image.
@@ -121,6 +124,7 @@ pub fn link(image: &image::Image, guest: &Guest, output: &Path) -> Result<()> {
         .arg(format!("--export={RUN_EXPORT}"))
         .arg(format!("--export={STOP_EXPORT}"))
         .arg(format!("--export={MANIFEST_EXPORT}"))
+        .arg(format!("--export={STACK_POINTER_EXPORT}"))
         .arg(format!("--export={REALLOC_EXPORT}"))
         // Room below the module's own data for a program that states its
         // own addresses. A position-independent one is placed above it and

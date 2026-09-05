@@ -20,11 +20,18 @@ pub trait Store: Send {
     /// The result path a write settles at, which for an append-only sink is
     /// the path written.
     fn write(&mut self, path: &[Vec<u8>], data: &[u8]) -> Result<Vec<Vec<u8>>, String>;
+
+    /// A copy of this store's state, for a snapshot of the container it
+    /// serves — or `None` for a store whose state is the world's rather
+    /// than its own, which a snapshot cannot hold: a live network edge.
+    fn snapshot(&self) -> Option<Box<dyn Store>> {
+        None
+    }
 }
 
 /// A store that keeps every write and hands it back on read: the console and
 /// the kernel log, and the thing a test reads to find out what happened.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct Sink {
     entries: Vec<(Vec<Vec<u8>>, Vec<u8>)>,
     /// Where to echo writes as they arrive, if anywhere.
@@ -116,6 +123,10 @@ impl Store for Sink {
         self.slot(path).extend_from_slice(data);
         Ok(path.to_vec())
     }
+
+    fn snapshot(&self) -> Option<Box<dyn Store>> {
+        Some(Box::new(self.clone()))
+    }
 }
 
 /// `/iso/shutdown`: the container asking how it ended, and the host asking
@@ -132,7 +143,7 @@ impl Store for Sink {
 /// asking the host things — which also makes the moment a shutdown is
 /// noticed a function of the guest's own execution rather than of when a
 /// signal happened to land.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct Shutdown {
     recorded: Sink,
 }
@@ -185,6 +196,10 @@ impl Store for Shutdown {
 
     fn write(&mut self, path: &[Vec<u8>], data: &[u8]) -> Result<Vec<Vec<u8>>, String> {
         self.recorded.write(path, data)
+    }
+
+    fn snapshot(&self) -> Option<Box<dyn Store>> {
+        Some(Box::new(self.clone()))
     }
 }
 
@@ -409,6 +424,12 @@ impl Store for Server {
         state.responses.insert(id, data.to_vec());
         Ok(path.to_vec())
     }
+
+    /// The same queue: between turns it is empty, and a Response written
+    /// after a restore is one the restored container was asked for.
+    fn snapshot(&self) -> Option<Box<dyn Store>> {
+        Some(Box::new(self.clone()))
+    }
 }
 
 /// The prefix the tape leaves alone.
@@ -443,6 +464,7 @@ fn is_server_path(path: &[Vec<u8>]) -> bool {
 /// recorded one did, the determinism claim is false and this is where that
 /// is found — loudly, at the first divergence, rather than as a run that
 /// quietly goes somewhere else.
+#[derive(Clone)]
 pub enum Tape {
     Recording {
         entries: Vec<Answer>,
@@ -482,6 +504,28 @@ impl MountTable {
         self.mounts
             .iter()
             .any(|(prefix, _)| path.starts_with(prefix))
+    }
+
+    /// A copy of every mount and of the tape, for a snapshot of the
+    /// container. Fails naming the mount whose state cannot be copied.
+    pub fn snapshot(&self) -> Result<MountTable, String> {
+        let mut mounts = Vec::with_capacity(self.mounts.len());
+        for (prefix, store) in &self.mounts {
+            match store.snapshot() {
+                Some(copy) => mounts.push((prefix.clone(), copy)),
+                None => {
+                    return Err(format!(
+                        "the store at {} holds state a snapshot cannot copy",
+                        render(prefix)
+                    ));
+                }
+            }
+        }
+        Ok(MountTable {
+            mounts,
+            tape: self.tape.clone(),
+            server: self.server.clone(),
+        })
     }
 
     /// Mounts the container's own store's other end at `/iso/server`, and
@@ -600,6 +644,7 @@ impl MountTable {
 /// measures from its own boot and the difference is invisible to any
 /// correct program: monotonic time promises an origin that does not move
 /// during a run, never a particular origin.
+#[derive(Clone)]
 pub struct Clock {
     started: std::time::Instant,
 }
@@ -642,6 +687,10 @@ impl Store for Clock {
              is not something this store does",
             render(path)
         ))
+    }
+
+    fn snapshot(&self) -> Option<Box<dyn Store>> {
+        Some(Box::new(self.clone()))
     }
 }
 

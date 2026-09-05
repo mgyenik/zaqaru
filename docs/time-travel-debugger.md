@@ -123,7 +123,9 @@ store does not record them and the replay store does not check them, and
 a debugger can ask questions during a replay without the run diverging.
 The rule is checked, not assumed: the acceptance test below asks
 questions at every step of one replay and none of another and requires
-identical memory at the end.
+the same output, the same retired count, and the same description of the
+machine at the end. (Not the same memory: a question's answer is built on
+the kernel's heap, whose layout the guest cannot see.)
 
 The syscall trace stays where it is (`/iso/config/trace` on,
 `/iso/log/debug` out), and each line gains the retired count at which the
@@ -193,9 +195,13 @@ host's, built first under wasmtime as `Container::snapshot` and
 Check, and this is the acceptance test for the whole design: run to `N`,
 snapshot, continue to `M`, and record memory and output. Restore and
 continue to `M` again: memory, output and retired count are
-byte-identical. Do it at several `N`, including one inside a `fork` and
-one during a signal delivery, and once with the debugger reading
-`processes` at every step of one leg and never on the other.
+byte-identical. Then restore once more and continue to `M` with the
+debugger reading `processes` at every step: output, retired count and the
+machine's own description of itself are identical, though memory is not
+compared on this leg — answering a question allocates on the kernel's
+heap, and the heap's layout is the one thing in memory a question
+changes. That is the exact statement of "serving a Request changes
+nothing the guest can observe".
 
 ### The browser harness
 

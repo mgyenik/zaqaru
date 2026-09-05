@@ -235,6 +235,117 @@ int main(void) {
     drop(workspace);
 }
 
+/// **A restored container is the container.** Run to a count, snapshot,
+/// continue to the end; restore the snapshot and continue to the end
+/// again: memory, output and the retired count are byte for byte the
+/// same. A third leg is questioned through the store at every step and
+/// must reach the same output, count and final description — the rule
+/// that keeps the store outside the tape, checked. Its memory is *not*
+/// compared: answering a question allocates on the kernel's heap, and the
+/// heap's layout is the one thing in memory a question changes.
+///
+/// The program forks, pipes and waits, so the snapshot falls inside a
+/// process switch's territory; a second snapshot is taken from an exact
+/// stop, which is the debugger's own case.
+#[test]
+fn a_restored_container_continues_byte_for_byte() {
+    let (workspace, module) = module_for(
+        "restored",
+        r#"
+#include <stdio.h>
+#include <unistd.h>
+#include <sys/wait.h>
+int main(void) {
+    int fd[2];
+    pipe(fd);
+    pid_t child = fork();
+    if (child == 0) {
+        long sum = 0;
+        for (long i = 0; i < 1500000; i++) sum += i * 3;
+        char text[32];
+        int length = snprintf(text, sizeof text, "%ld", sum);
+        write(fd[1], text, length);
+        _exit(5);
+    }
+    close(fd[1]);
+    char text[64];
+    int length = read(fd[0], text, sizeof text - 1);
+    text[length] = 0;
+    int status;
+    waitpid(child, &status, 0);
+    printf("child said %s and exited %d\n", text, WEXITSTATUS(status));
+    return 0;
+}
+"#,
+        &["-static", "-no-pie"],
+    );
+    let bytes = std::fs::read(&module).expect("read the container");
+    let finish = |container: &mut host::Container| -> i32 {
+        loop {
+            if let host::Turn::Finished(status) = container.step(-1).expect("step") {
+                return status;
+            }
+        }
+    };
+
+    // The first leg: to a point, a snapshot, and on to the end.
+    let mut original = host::Container::instantiate(&bytes, support::mounts_seeded(&[0x33; 32])).expect("instantiate");
+    for step in 1..=7 {
+        match original.step(step * 100_000).expect("step") {
+            host::Turn::Finished(_) => panic!("finished before the snapshot point"),
+            host::Turn::Running | host::Turn::Idle => {}
+            host::Turn::Stopped => unreachable!(),
+        }
+    }
+    let snapshot = original.snapshot().expect("snapshot");
+    let original_status = finish(&mut original);
+    let original_out = readback(&mut original, &[b"iso", b"console", b"stdout"]);
+    let original_stats = readback(&mut original, &[b"iso", b"log", b"statistics"]);
+    let original_memory = original.snapshot().expect("snapshot").memory().to_vec();
+    let original_description = original.ask("processes").expect("ask");
+    assert_eq!(original_status, 0);
+    assert_eq!(original_out, "child said 3374997750000 and exited 5\n");
+
+    // The second leg, from the snapshot, asked nothing: byte for byte.
+    let mut restored = original.restore(&snapshot).expect("restore");
+    assert_eq!(finish(&mut restored), original_status);
+    assert_eq!(readback(&mut restored, &[b"iso", b"console", b"stdout"]), original_out);
+    assert_eq!(readback(&mut restored, &[b"iso", b"log", b"statistics"]), original_stats);
+    let restored_memory = restored.snapshot().expect("snapshot").memory().to_vec();
+    assert_eq!(restored_memory.len(), original_memory.len(), "memory sizes differ");
+    let first_difference = original_memory.iter().zip(&restored_memory).position(|(a, b)| a != b);
+    assert_eq!(first_difference, None, "memory differs at byte {first_difference:?}");
+    assert_eq!(restored.ask("processes").expect("ask"), original_description);
+
+    // The third leg, questioned at every step: the same run, as far as the
+    // guest and the host can tell.
+    let mut questioned = original.restore(&snapshot).expect("restore");
+    let mut step = 7;
+    let questioned_status = loop {
+        step += 1;
+        questioned.ask("processes").expect("ask");
+        questioned.ask("processes/1/maps").expect("ask");
+        if let host::Turn::Finished(status) = questioned.step(step * 100_000).expect("step") {
+            break status;
+        }
+    };
+    assert_eq!(questioned_status, original_status);
+    assert_eq!(readback(&mut questioned, &[b"iso", b"console", b"stdout"]), original_out);
+    assert_eq!(readback(&mut questioned, &[b"iso", b"log", b"statistics"]), original_stats);
+    assert_eq!(questioned.ask("processes").expect("ask"), original_description);
+
+    // And from an exact stop: a container held on an instruction is
+    // snapshotted, restored, and read; it stands in the same place.
+    let mut stopped = host::Container::instantiate(&bytes, support::mounts_seeded(&[0x33; 32])).expect("instantiate");
+    assert_eq!(stopped.stop_at(654_321).expect("stop"), host::Turn::Stopped);
+    let registers = stopped.ask("processes/1/threads/1/registers").expect("ask");
+    let held = stopped.snapshot().expect("snapshot");
+    let mut again = stopped.restore(&held).expect("restore");
+    assert_eq!(again.ask("processes/1/threads/1/registers").expect("ask"), registers);
+    assert_eq!(again.ask("statistics").expect("ask"), stopped.ask("statistics").expect("ask"));
+    drop(workspace);
+}
+
 /// **The machine stops on an instruction.** For several targets, a fresh
 /// container run to exactly that count reports exactly that count, says
 /// whether its flags are the last instruction's, and — run twice — stands
