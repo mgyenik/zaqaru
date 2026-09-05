@@ -56,6 +56,18 @@ instructions, `rdtsc` answers from the same count, and everything else —
 time, entropy, the network — arrives as a store read. Two runs with the
 same tape are the same run.
 
+## The debugger
+
+`web/` is a time-travel debugger for a container, in a browser: load a
+module and a tape of one of its runs, drag a slider through the run, and
+stand the machine on any instruction — the processes, a thread's
+registers, the memory map, the descriptors and the console as of that
+instant, with the syscall log as a clickable time axis. It rests on two
+facts about a container: every run is a pure function of its tape, and
+between two instructions linear memory is the whole machine. See
+[web/README.md](web/README.md) and
+[docs/time-travel-debugger.md](docs/time-travel-debugger.md).
+
 ## Layout
 
 ```
@@ -70,6 +82,7 @@ crates/image    the packager: OCI layers or a directory, into the image the kern
 crates/bake     the link: an image and the guest archive become a module
 crates/host     the wasmtime host: the two imports, the mount table, the network edge
 crates/cli      the zaqaru binary
+web/            the time-travel debugger: the host in JavaScript, and the page
 demo/           the nginx + gunicorn + Django image, and the scripts that trace and replay it
 tools/          the microbenchmarks
 docs/           architecture, fidelity, performance

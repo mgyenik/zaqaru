@@ -1,8 +1,9 @@
 # A time-travel debugger for a container
 
-Status: design, 2026-09-05. Nothing below is built yet; each part says what
-it is, what it changes, and how it is checked. Code comments should name
-the mechanisms described here, not this document's headings.
+Status: built, 2026-09-05, through the page in `web/`; see "Where it
+stands" at the end for what is not. Each part says what it is, what it
+changes, and how it is checked. Code comments should name the mechanisms
+described here, not this document's headings.
 
 ## What it is
 
@@ -74,17 +75,19 @@ only additions this design makes at the wasm level.
   rendering of the VMA tree, and the stall report walks every process and
   thread and says what each is parked on.
 
-## What is not yet true
+## What was not true when this was written
 
-- The boot export runs the container to completion inside one call, so
-  there is never a moment when the host holds the wasm stack empty and can
-  copy memory.
+Each of these is now built; the parts below say how.
+
+- The boot export ran the container to completion inside one call, so
+  there was never a moment when the host held the wasm stack empty and
+  could copy memory.
 - The bytecode accelerator checks its budget only at back-edges, so a
-  quantum can overshoot by a block. "Instruction N" is reachable today
-  only if N is a stopping point of the recorded run.
-- The container serves no store. It is a StructFS client only.
-- Nothing snapshots or restores.
-- There is no browser harness.
+  quantum can overshoot by a block, and "instruction N" was reachable only
+  if N was a stopping point of the recorded run.
+- The container served no store. It was a StructFS client only.
+- Nothing snapshotted or restored.
+- There was no browser harness.
 
 ## The parts, in dependency order
 
@@ -269,6 +272,34 @@ The spec puts configuration at `/config/`, wired by the assembly, and
 reserves `/iso/` for runtime services. That is a pre-existing divergence
 this design does not fix and does not extend; it is recorded here so it
 is decided deliberately.
+
+## Where it stands
+
+Built, and checked by the tests named above plus `web/test.mjs` (the
+harness under Node, against the wasmtime host's own run) and
+`web/browser-test.mjs` (the page in headless Chrome):
+
+- the container as a store, served once a slice and at every return;
+- `zaqaru_run(until)` and `zaqaru_stop_at(target)`, with the flags'
+  staleness recorded at an exact stop;
+- snapshot and restore, on the wasmtime host and in the browser, with the
+  byte-identical acceptance test;
+- the tape's engine-mode header;
+- the browser harness, the worker with checkpoints and seeking, and the
+  page with the timeline, the syscall log, and the panels.
+
+Not built:
+
+- **Delta checkpoints.** Every checkpoint is a full copy of memory. The
+  fixture's module is a few megabytes; a Django module's is hundreds, and
+  a run of any length would exhaust a tab. Page-diff deltas against the
+  previous checkpoint are the next piece of work.
+- **The disassembly panel**, which needs iced's formatter compiled into
+  the guest behind a feature.
+- **A live mode** in the browser: a JavaScript clock and entropy, and an
+  edge that turns the page's own `fetch` into `/iso/net` events. The
+  harness has the stores; nothing wires a live run yet.
+- **A pre-booted Django snapshot** to start the demo from.
 
 ## Order of work and size
 

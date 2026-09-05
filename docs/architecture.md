@@ -15,11 +15,19 @@ A container module is two things linked by `wasm-ld`:
   the FPU compiled for `wasm32-unknown-unknown`. It is the same in every
   container and is embedded in the `zaqaru` binary.
 
-The module imports two functions and exports two. It imports `ll_read` and
-`ll_write` — the store, the whole host interface. It exports `zaqaru_boot`,
-which the host calls once and which returns the container's exit status,
-and `cabi_realloc`, which the host calls to place the bytes a read
-returns. Nothing about the module says what programs are inside it.
+The module imports two functions: `ll_read` and `ll_write`, the store,
+the whole host interface. It exports `zaqaru_run(until)`, which boots on
+its first call and runs the container until it has retired `until`
+instructions, finished, or idled once (a negative target runs to
+completion); `zaqaru_stop_at(target)`, which runs to exactly that
+instruction and holds the machine there for reading; `cabi_realloc`,
+which the host calls to place the bytes a read returns; `manifest`, the
+isotope Block's declaration of the store it serves; and its one mutable
+global, the shadow stack pointer, so a host can check it is at its base
+between calls. Between calls nothing is on the wasm stack, so linear
+memory is the whole machine: a snapshot is a copy of it, and a restore is
+a fresh instance with the copy written back. Nothing about the module
+says what programs are inside it.
 
 The bake never reads the program. There is no analysis, no translation, no
 guess about where code is: the program's bytes go into the image as data,
@@ -178,7 +186,19 @@ store answer, and every store answer arrives at a point that is a pure
 function of execution and earlier answers. Recording the answers records
 the run; replaying them from a tape, with nothing mounted, reproduces it
 byte for byte — the schedule, the clock the guest saw, a served HTTP
-session.
+session. The tape's header names the engine that made the run, because
+the interpreter and the accelerator end quanta at different points and a
+replay has to use the same one.
+
+**The container is a store.** A Block has an outside face too: the
+kernel reads `/iso/server/requests/pending` once a slice and whenever a
+run returns to the host, and answers each Request — `statistics`,
+`processes`, a thread's `registers`, a process's `maps` and
+`descriptors`, the block `cache`, the `meta` lens — by writing a JSON
+Response to its `respond_to` path. Serving a Request never changes
+anything the guest can observe, which is why `/iso/server` sits outside
+the tape and a debugger can question a replayed run. The host's
+`Container::ask` is the other end; `web/` is a debugger built on it.
 
 ## The bake (`crates/image`, `crates/bake`)
 
