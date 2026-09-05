@@ -74,13 +74,20 @@ pub unsafe extern "C" fn zaqaru_run(until: i64) -> i32 {
     };
     loop {
         if until >= 0 && system.retired() >= until as u64 {
+            // Whatever the host asked of the container's store, answered at
+            // the instant it is stopped at.
+            system.serve();
             return KIND_RUNNING;
         }
         match system.turn() {
             Turn::Ran => {}
             Turn::Idle if until < 0 => {}
-            Turn::Idle => return KIND_IDLE,
+            Turn::Idle => {
+                system.serve();
+                return KIND_IDLE;
+            }
             Turn::Finished(outcome) => {
+                system.serve();
                 // What the run cost, before anything is said about how it
                 // ended. A module has no clock of its own worth trusting and
                 // no way to time itself, so the host measures the seconds
@@ -154,7 +161,37 @@ fn boot() -> Result<System<'static, HostStore>, i32> {
     // The process table, which is what makes a `fork` inside the module a
     // second address space rather than an error. One process is the common
     // case and costs a vector of one.
-    Ok(System::new(process))
+    let mut system = System::new(process);
+    // The Block's interface, declared at start-up as the isotope spec asks:
+    // the same paths the manifest names, through the store.
+    let _ = Store::write(
+        &mut system.current().kernel.store,
+        paths::SELF_INTERFACE,
+        kernel::system::server::INTERFACE.as_bytes(),
+    );
+    Ok(system)
+}
+
+/// The Block's static manifest, per the isotope spec: what the container's
+/// store serves, as JSON, before it runs.
+///
+/// Answers the address of a NUL-terminated string in linear memory. The
+/// wasm-level shape of this export is provisional until featherweight's is
+/// known; the content is the spec's.
+///
+/// # Safety
+/// Called by the host on an instance; reads nothing.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn manifest() -> i32 {
+    // The interface text with a terminator, built once and kept: one
+    // instance, one thread of execution.
+    static mut TEXT: Option<Vec<u8>> = None;
+    let text = unsafe { &mut *(&raw mut TEXT) }.get_or_insert_with(|| {
+        let mut bytes = kernel::system::server::INTERFACE.as_bytes().to_vec();
+        bytes.push(0);
+        bytes
+    });
+    text.as_ptr() as usize as i32
 }
 
 /// Whether the host asked for a run without the bytecode accelerator.

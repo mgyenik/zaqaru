@@ -133,6 +133,8 @@ pub fn console_mounts() -> host::store::MountTable {
     let mut mounts = host::store::MountTable::new();
     mounts.mount(&[b"iso", b"console"], Box::new(host::store::Sink::new()));
     mounts.mount(&[b"iso", b"log"], Box::new(host::store::Sink::new()));
+    mounts.serve();
+    mounts.mount(&[b"iso", b"self"], Box::new(host::store::Sink::new()));
     mounts
 }
 

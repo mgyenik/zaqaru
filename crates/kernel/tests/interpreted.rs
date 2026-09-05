@@ -25,7 +25,7 @@ use kernel::image::Image;
 use kernel::machine::Interpreted;
 use kernel::run::{Exit, Process};
 use kernel::syscall::{Enforcement, Kernel};
-use kernel::system::System;
+use kernel::system::{System, Turn};
 
 /// A directory that removes itself.
 struct Tree {
@@ -45,6 +45,9 @@ struct Console {
     /// Whether the container should trace its syscalls, which is how a test
     /// counts them.
     tracing: bool,
+    /// A batch of Server Protocol Requests for the kernel's next read of
+    /// `/iso/server/requests/pending`, as the host would queue them.
+    pending: Option<Vec<u8>>,
     /// Whether this container has been asked to stop.
     ///
     /// The host's half of a shutdown, which is a *read* the guest makes
@@ -75,6 +78,15 @@ impl Store for Console {
         if self.tracing && path == kernel::paths::CONFIG_TRACE {
             into.push(b'1');
             return StoreOutcome::Present;
+        }
+        if path == kernel::paths::SERVER_PENDING {
+            return match self.pending.take() {
+                Some(batch) => {
+                    into.extend_from_slice(&batch);
+                    StoreOutcome::Present
+                }
+                None => StoreOutcome::Absent,
+            };
         }
         // A *fixed* clock, which is a clock: the container gets a usable
         // timebase — so the vDSO is exercised rather than skipped — and two
@@ -2685,4 +2697,65 @@ int main(void) {
         clock_calls.len(),
         clock_calls.join("\n")
     );
+}
+
+/// **The container is a store.** The isotope Server Protocol from the
+/// kernel's side: a batch of Requests read from `/iso/server/requests/pending`,
+/// each answered by a Response written to its `respond_to` path — the
+/// processes, a thread's registers, the run's cost — and a path the store
+/// does not serve answered as `not_found`.
+#[test]
+fn the_container_serves_its_own_store() {
+    let (_tree, baked) = image_of(
+        "served",
+        r#"
+#include <unistd.h>
+int main(void) {
+    volatile long sum = 0;
+    for (long i = 0; i < 2000000; i++) sum += i;
+    write(1, "done\n", 5);
+    return 0;
+}
+"#,
+        Linkage::Static,
+    );
+    let image = Image::parse(&baked.index, &baked.blob).expect("parse the image");
+    let mut system = boot("served", image);
+    for _ in 0..3 {
+        assert_ne!(system.turn(), Turn::Finished(Exit::Status(0)), "finished before it was asked anything");
+    }
+    system.current().kernel.store.borrow_mut().pending = Some(
+        br#"[{"op":"read","path":"statistics","data":null,"respond_to":"/iso/server/responses/1"},
+            {"op":"read","path":"processes","data":null,"respond_to":"/iso/server/responses/2"},
+            {"op":"read","path":"processes/1/threads/1/registers","data":null,"respond_to":"/iso/server/responses/3"},
+            {"op":"read","path":"processes/1/maps","data":null,"respond_to":"/iso/server/responses/4"},
+            {"op":"read","path":"processes/1/descriptors","data":null,"respond_to":"/iso/server/responses/5"},
+            {"op":"write","path":"processes","data":{"x":1},"respond_to":"/iso/server/responses/6"},
+            {"op":"read","path":"nothing","data":null,"respond_to":"/iso/server/responses/7"}]"#
+            .to_vec(),
+    );
+    system.serve();
+    let mut response = |id: &str| -> String {
+        let path = vec![b"iso".to_vec(), b"server".to_vec(), b"responses".to_vec(), id.as_bytes().to_vec()];
+        let store = system.current().kernel.store.clone();
+        let store = store.borrow();
+        let (_, bytes) = store.written.iter().find(|(at, _)| *at == path).unwrap_or_else(|| panic!("no response {id}"));
+        String::from_utf8(bytes.clone()).expect("utf-8")
+    };
+    let statistics = response("1");
+    assert!(statistics.starts_with(r#"{"result":"ok","value":{"retired":"#), "{statistics}");
+    assert!(statistics.contains(r#""current":1"#), "{statistics}");
+    let processes = response("2");
+    assert!(processes.contains(r#""pid":1,"parent":0,"state":"live""#), "{processes}");
+    assert!(processes.contains(r#""tid":1,"rip":"0x"#), "{processes}");
+    let registers = response("3");
+    assert!(registers.contains(r#""rsp":"0x"#) && registers.contains(r#""flags_stale":null"#), "{registers}");
+    let maps = response("4");
+    assert!(maps.contains("r-xp") || maps.contains("rw-p"), "{maps}");
+    let descriptors = response("5");
+    assert!(descriptors.contains(r#""fd":1"#), "{descriptors}");
+    assert!(response("6").contains(r#""type":"not_writable""#));
+    assert!(response("7").contains(r#""type":"not_found""#));
+    // And the guest saw none of it: the run finishes as it always does.
+    assert_eq!(system.run(), Exit::Status(0));
 }

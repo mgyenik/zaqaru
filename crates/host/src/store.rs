@@ -288,6 +288,117 @@ fn decode(bytes: &[u8]) -> Result<Entries, String> {
 pub struct MountTable {
     mounts: Vec<(Vec<Vec<u8>>, Box<dyn Store>)>,
     tape: Option<Tape>,
+    /// The container's own store's other end, when one is mounted — see
+    /// [`Server`].
+    server: Option<Server>,
+}
+
+/// The runtime half of the isotope Server Protocol: the queue a caller's
+/// reads of the container's store wait in, and the responses the kernel
+/// writes back.
+///
+/// Mounted at `/iso/server`. The kernel reads `requests/pending` for the
+/// batch of Requests since it last looked and writes each Response to the
+/// `respond_to` path the Request named. The host enqueues with
+/// [`MountTable::ask`] and collects with [`MountTable::answer`].
+///
+/// **Outside the tape**, both ways. Serving a Request reads kernel state and
+/// writes a Response and changes nothing the guest can observe, so its
+/// answers are not inputs to the run: a recording does not keep them and a
+/// replay does not check them. That is what lets a debugger ask questions
+/// of a replayed run without the run diverging.
+#[derive(Clone, Default)]
+pub struct Server {
+    state: std::sync::Arc<std::sync::Mutex<ServerState>>,
+}
+
+#[derive(Default)]
+struct ServerState {
+    next: u64,
+    pending: Vec<(u64, String)>,
+    responses: std::collections::HashMap<u64, Vec<u8>>,
+}
+
+impl Server {
+    /// Queues a read of `path` in the container's store; the id names the
+    /// response.
+    pub fn ask(&self, path: &str) -> u64 {
+        let mut state = self.state.lock().unwrap_or_else(|poison| poison.into_inner());
+        let id = state.next;
+        state.next += 1;
+        state.pending.push((id, path.to_string()));
+        id
+    }
+
+    /// The Response to a queued read, once the kernel has written it.
+    pub fn answer(&self, id: u64) -> Option<Vec<u8>> {
+        let mut state = self.state.lock().unwrap_or_else(|poison| poison.into_inner());
+        state.responses.remove(&id)
+    }
+}
+
+fn json_string(text: &str) -> String {
+    let mut out = String::from("\"");
+    for c in text.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+impl Store for Server {
+    fn read(&mut self, path: &[Vec<u8>]) -> Result<Option<Vec<u8>>, String> {
+        let mut state = self.state.lock().unwrap_or_else(|poison| poison.into_inner());
+        match path.get(2).map(Vec::as_slice) {
+            // The batch since the kernel last looked, as the spec's array
+            // of Requests; drained, so a Request is delivered once.
+            Some(b"requests") if path.get(3).map(Vec::as_slice) == Some(b"pending") => {
+                let batch: Vec<String> = state
+                    .pending
+                    .drain(..)
+                    .map(|(id, asked)| {
+                        format!(
+                            r#"{{"op":"read","path":{},"data":null,"respond_to":"/iso/server/responses/{id}"}}"#,
+                            json_string(&asked)
+                        )
+                    })
+                    .collect();
+                Ok(Some(format!("[{}]", batch.join(",")).into_bytes()))
+            }
+            Some(b"responses") => {
+                let id: u64 = path
+                    .get(3)
+                    .and_then(|held| std::str::from_utf8(held).ok())
+                    .and_then(|text| text.parse().ok())
+                    .ok_or_else(|| format!("{} does not name a response", render(path)))?;
+                Ok(state.responses.get(&id).cloned())
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn write(&mut self, path: &[Vec<u8>], data: &[u8]) -> Result<Vec<Vec<u8>>, String> {
+        let id: u64 = match (path.get(2).map(Vec::as_slice), path.get(3)) {
+            (Some(b"responses"), Some(held)) => std::str::from_utf8(held)
+                .ok()
+                .and_then(|text| text.parse().ok())
+                .ok_or_else(|| format!("{} does not name a response", render(path)))?,
+            _ => return Err(format!("{} is not writable", render(path))),
+        };
+        let mut state = self.state.lock().unwrap_or_else(|poison| poison.into_inner());
+        state.responses.insert(id, data.to_vec());
+        Ok(path.to_vec())
+    }
+}
+
+/// The prefix the tape leaves alone.
+fn is_server_path(path: &[Vec<u8>]) -> bool {
+    path.len() >= 2 && path[0] == b"iso" && path[1] == b"server"
 }
 
 /// A record of every answer the host gave, or a replay of one.
@@ -355,7 +466,37 @@ impl MountTable {
             .any(|(prefix, _)| path.starts_with(prefix))
     }
 
+    /// Mounts the container's own store's other end at `/iso/server`, and
+    /// hands back the handle the host asks through.
+    pub fn serve(&mut self) -> Server {
+        let server = Server::default();
+        self.server = Some(server.clone());
+        self.mount(&[b"iso", b"server"], Box::new(server.clone()));
+        server
+    }
+
+    /// Queues a read of the container's store. The kernel answers it the
+    /// next time it looks: once a slice, and whenever a run returns to the
+    /// host. Nothing is mounted to answer if [`MountTable::serve`] was not
+    /// called, and the id then never resolves.
+    pub fn ask(&mut self, path: &str) -> Option<u64> {
+        self.server.as_ref().map(|server| server.ask(path))
+    }
+
+    /// The Response to an [`MountTable::ask`], once written.
+    pub fn answer(&mut self, id: u64) -> Option<Vec<u8>> {
+        self.server.as_ref().and_then(|server| server.answer(id))
+    }
+
     pub fn read(&mut self, path: &[Vec<u8>]) -> Result<Option<Vec<u8>>, String> {
+        // The container's own store is served live under a replay and left
+        // out of a recording: its answers are not inputs to the run.
+        if is_server_path(path) {
+            return match self.resolve(path) {
+                Some(store) => store.read(path),
+                None => Err(format!("nothing is mounted at {}", render(path))),
+            };
+        }
         // A replay never reaches a store at all: the tape *is* the host.
         if let Some(Tape::Replaying { entries }) = &mut self.tape {
             let Some((asked, answer)) = entries.pop_front() else {

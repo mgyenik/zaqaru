@@ -148,6 +148,27 @@ impl Container {
         Turn::decode(self.call::<i64, i32>(RUN_EXPORT, until)?)
     }
 
+    /// Reads a path of the container's own store — the isotope Server
+    /// Protocol from the outside — and answers the Response as the kernel
+    /// wrote it, JSON of the shape `{"result":"ok","value":...}` or
+    /// `{"result":"error","error":{...}}`.
+    ///
+    /// The kernel serves at the instant the machine is stopped at: the
+    /// Request is queued, the container is asked to run to the count it has
+    /// already reached, which runs nothing and serves, and the Response is
+    /// collected. Needs the mount table to have called
+    /// [`MountTable::serve`].
+    pub fn ask(&mut self, path: &str) -> Result<String> {
+        let Some(id) = self.mounts().ask(path) else {
+            bail!("nothing is mounted at /iso/server, so the container's store cannot be asked");
+        };
+        self.step(0)?;
+        match self.mounts().answer(id) {
+            Some(bytes) => Ok(String::from_utf8_lossy(&bytes).into_owned()),
+            None => bail!("the container did not answer the read of `{path}`"),
+        }
+    }
+
     /// The mount table. A host that cannot see what the guest wrote cannot
     /// diagnose anything, so this is the diagnostic face of the boundary as
     /// well as the way a test reads back a run.

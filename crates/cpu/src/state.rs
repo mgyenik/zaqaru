@@ -193,6 +193,21 @@ pub struct Tcb {
     /// of the workload the transpiler covers and how much still defers to
     /// the interpreter.
     pub accelerated: u64,
+    /// Whether the flags record is the last instruction's, as far as the
+    /// engine can say. An arithmetic instruction whose flags are overwritten
+    /// before anything reads them skips the record (dead-flag elimination),
+    /// so at an instant inside such a span the record is an earlier
+    /// writer's. The run loop knows this only where it stopped a block on
+    /// purpose, one instruction at a time; everywhere else it is unknown.
+    pub flags_staleness: Staleness,
+}
+
+/// What the engine can say about the flags record at a stop.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Staleness {
+    Unknown,
+    Fresh,
+    Stale,
 }
 
 impl Default for Tcb {
@@ -239,6 +254,7 @@ impl Tcb {
             x87: x87::state::X87State::new(),
             retired: 0,
             accelerated: 0,
+            flags_staleness: Staleness::Unknown,
         }
     }
 

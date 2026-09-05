@@ -79,6 +79,9 @@ pub struct Container<'a, S: Store> {
 }
 
 /// Every process, and which one is running.
+#[path = "server.rs"]
+pub mod server;
+
 pub struct System<'a, S: Store> {
     containers: Vec<Container<'a, S>>,
     current: usize,
@@ -458,6 +461,9 @@ impl<'a, S: Store + Clone> System<'a, S> {
             self.current().kernel.pump(None);
             self.current().kernel.refresh_timebase();
             self.take_shutdown();
+            // And the container's own store: whatever the outside asked
+            // since the last slice. Kernel state only, like the pump.
+            self.serve();
         }
         if !self.schedule(why) {
             // Nothing runnable anywhere, which is three different things
@@ -495,72 +501,7 @@ impl<'a, S: Store + Clone> System<'a, S> {
             into.push('\n');
             for thread in container.process.kernel.machine.threads.all() {
                 let _ = write!(&mut into, "    thread {} ", thread.tid);
-                match thread.state {
-                    crate::thread::State::Runnable => into.push_str("runnable"),
-                    crate::thread::State::Waiting {
-                        word,
-                        bitset,
-                        deadline,
-                    } => {
-                        let _ = write!(&mut into, "parked on futex {word:#x} bitset {bitset:#x}");
-                        if let Some(deadline) = deadline {
-                            let _ = write!(&mut into, " until {deadline} ns");
-                        }
-                    }
-                    crate::thread::State::WaitingForChild { wanted, .. } => {
-                        let _ = write!(&mut into, "waiting for child {wanted}");
-                    }
-                    crate::thread::State::Transferring(transfer) => {
-                        let rings = container.process.kernel.rings.borrow();
-                        let _ = write!(
-                            &mut into,
-                            "{:?} on pipe {} ({} of {} bytes; {} queued, {} readers, {} writers)",
-                            transfer.end,
-                            transfer.ring,
-                            transfer.done,
-                            transfer.length,
-                            rings.queued(transfer.ring),
-                            rings.readers(transfer.ring),
-                            rings.writers(transfer.ring),
-                        );
-                    }
-                    crate::thread::State::Watching(watching) => {
-                        let _ = write!(&mut into, "in {:?}", watching.watch);
-                        if watching.deadline.is_some() {
-                            into.push_str(" with a deadline");
-                        }
-                    }
-                    crate::thread::State::Accepting(waiting) => {
-                        let sockets = container.process.kernel.sockets.borrow();
-                        let _ = write!(
-                            &mut into,
-                            "in `accept` on listener {} ({} queued)",
-                            waiting.listener,
-                            sockets.queued(waiting.listener),
-                        );
-                    }
-                    crate::thread::State::Eventing(waiting) => {
-                        let _ = write!(
-                            &mut into,
-                            "on eventfd {} ({}), counter {}",
-                            waiting.event,
-                            match waiting.writing {
-                                true => "writing",
-                                false => "reading",
-                            },
-                            container.process.kernel.events.borrow().count(waiting.event),
-                        );
-                    }
-                    crate::thread::State::Sleeping { deadline } => {
-                        let _ = write!(&mut into, "asleep until {deadline} ns");
-                    }
-                    crate::thread::State::Paused => {
-                        into.push_str("in `pause`, waiting for a signal");
-                    }
-                    crate::thread::State::Exited { status } => {
-                        let _ = write!(&mut into, "exited {status}");
-                    }
-                }
+                into.push_str(&self.describe_state(container, thread));
                 into.push('\n');
             }
             let open: Vec<String> = container
@@ -575,6 +516,80 @@ impl<'a, S: Store + Clone> System<'a, S> {
             }
         }
         into
+    }
+
+    /// What a thread is doing, in words: runnable, or parked on what.
+    pub(crate) fn describe_state(&self, container: &Container<'a, S>, thread: &crate::thread::Thread) -> String {
+        use core::fmt::Write;
+        let mut text = String::new();
+        let into = &mut text;
+        match thread.state {
+            crate::thread::State::Runnable => into.push_str("runnable"),
+            crate::thread::State::Waiting {
+                word,
+                bitset,
+                deadline,
+            } => {
+                let _ = write!(into, "parked on futex {word:#x} bitset {bitset:#x}");
+                if let Some(deadline) = deadline {
+                    let _ = write!(into, " until {deadline} ns");
+                }
+            }
+            crate::thread::State::WaitingForChild { wanted, .. } => {
+                let _ = write!(into, "waiting for child {wanted}");
+            }
+            crate::thread::State::Transferring(transfer) => {
+                let rings = container.process.kernel.rings.borrow();
+                let _ = write!(
+                    into,
+                    "{:?} on pipe {} ({} of {} bytes; {} queued, {} readers, {} writers)",
+                    transfer.end,
+                    transfer.ring,
+                    transfer.done,
+                    transfer.length,
+                    rings.queued(transfer.ring),
+                    rings.readers(transfer.ring),
+                    rings.writers(transfer.ring),
+                );
+            }
+            crate::thread::State::Watching(watching) => {
+                let _ = write!(into, "in {:?}", watching.watch);
+                if watching.deadline.is_some() {
+                    into.push_str(" with a deadline");
+                }
+            }
+            crate::thread::State::Accepting(waiting) => {
+                let sockets = container.process.kernel.sockets.borrow();
+                let _ = write!(
+                    into,
+                    "in `accept` on listener {} ({} queued)",
+                    waiting.listener,
+                    sockets.queued(waiting.listener),
+                );
+            }
+            crate::thread::State::Eventing(waiting) => {
+                let _ = write!(
+                    into,
+                    "on eventfd {} ({}), counter {}",
+                    waiting.event,
+                    match waiting.writing {
+                        true => "writing",
+                        false => "reading",
+                    },
+                    container.process.kernel.events.borrow().count(waiting.event),
+                );
+            }
+            crate::thread::State::Sleeping { deadline } => {
+                let _ = write!(into, "asleep until {deadline} ns");
+            }
+            crate::thread::State::Paused => {
+                into.push_str("in `pause`, waiting for a signal");
+            }
+            crate::thread::State::Exited { status } => {
+                let _ = write!(into, "exited {status}");
+            }
+        }
+        text
     }
 
     /// Nothing can run. Answers whether anything might, later.

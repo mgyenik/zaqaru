@@ -86,6 +86,11 @@ pub const LOG_STATISTICS: &[&[u8]] = &[b"iso", b"log", b"statistics"];
 /// path the host mounts. A container whose embedder mounts nothing here
 /// traces nothing and pays one failed read for the privilege.
 pub const CONFIG_TRACE: &[&[u8]] = &[b"iso", b"config", b"trace"];
+/// The isotope Server Protocol's non-blocking request batch: what the
+/// outside wants from the container's own store. See `crate::server`.
+pub const SERVER_PENDING: &[&[u8]] = &[b"iso", b"server", b"requests", b"pending"];
+/// Where a Block declares its interface at start-up, per the isotope spec.
+pub const SELF_INTERFACE: &[&[u8]] = &[b"iso", b"self", b"interface"];
 /// `0` to run without the bytecode accelerator; anything else, or nothing,
 /// runs with it.
 pub const CONFIG_BYTECODE: &[&[u8]] = &[b"iso", b"config", b"bytecode"];

@@ -200,17 +200,37 @@ int main(void) {
     let mut stepped = host::Container::instantiate(&bytes, support::mounts_seeded(&[0x33; 32]))
         .expect("instantiate");
     let mut steps = 0u64;
+    let mut asked_while_running = false;
     let stepped_status = loop {
         steps += 1;
         match stepped.step((steps * 100_000) as i64).expect("step") {
             host::Turn::Finished(status) => break status,
             host::Turn::Running | host::Turn::Idle => {}
         }
+        // The container's own store, read while the machine is stopped
+        // between turns: the isotope Server Protocol from the outside.
+        if steps == 10 {
+            let processes = stepped.ask("processes").expect("ask");
+            assert!(processes.contains(r#""result":"ok""#), "{processes}");
+            assert!(processes.contains(r#""pid":1"#), "{processes}");
+            let statistics = stepped.ask("statistics").expect("ask");
+            assert!(statistics.contains(r#""retired":"#), "{statistics}");
+            let registers = stepped.ask("processes/1/threads/1/registers").expect("ask");
+            assert!(registers.contains(r#""rip":"0x"#), "{registers}");
+            let missing = stepped.ask("nothing/here").expect("ask");
+            assert!(missing.contains(r#""type":"not_found""#), "{missing}");
+            asked_while_running = true;
+        }
     };
     assert!(steps > 20, "the run took only {steps} steps, so stepping was not exercised");
+    assert!(asked_while_running);
     assert_eq!(stepped_status, status);
     assert_eq!(readback(&mut stepped, &[b"iso", b"console", b"stdout"]), out);
     assert_eq!(readback(&mut stepped, &[b"iso", b"log", b"statistics"]), stats);
+    // Asking changed nothing the guest could see: the interface the
+    // container declared at boot is there too.
+    let interface = readback(&mut stepped, &[b"iso", b"self", b"interface"]);
+    assert!(interface.contains(r#""name":"zaqaru-container""#), "{interface}");
     drop(workspace);
 }
 

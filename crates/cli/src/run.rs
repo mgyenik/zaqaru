@@ -167,6 +167,11 @@ fn mounts(seed: Option<u8>) -> host::store::MountTable {
         Box::new(host::store::Shutdown::listening()),
     );
     mounts.mount(&[b"iso", b"time"], Box::new(host::store::Clock::new()));
+    // The container's own store, so anything holding this host can ask it
+    // questions between turns; and `/iso/self`, where it declares what that
+    // store serves.
+    mounts.serve();
+    mounts.mount(&[b"iso", b"self"], Box::new(host::store::Sink::new()));
 
     // Exactly as many bytes as the seed holds. `/dev/urandom` is a
     // character device and never reports end of file, so a read that stops
