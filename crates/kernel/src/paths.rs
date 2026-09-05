@@ -65,6 +65,12 @@ pub const LOG_ERROR: &[&[u8]] = &[b"iso", b"log", b"error"];
 /// error log carries what went wrong, and this carries what happened. A run
 /// that succeeds writes nothing to the first and everything to the second.
 pub const LOG_DEBUG: &[&[u8]] = &[b"iso", b"log", b"debug"];
+/// Beside the trace, when tracing: one line per syscall, `retired pid tid
+/// name`, with the container-wide retired count at which the call was
+/// made. The trace is for reading; this is the time axis a debugger seeks
+/// by, kept apart so that the trace's format — which tools diff against a
+/// native `strace` — does not change.
+pub const LOG_TIMELINE: &[&[u8]] = &[b"iso", b"log", b"timeline"];
 
 /// What the run cost, written once as the container exits.
 ///

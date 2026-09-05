@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>zaqaru — a container, in time</title>
+<style>
+  :root { color-scheme: light dark; font: 13px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; }
+  body { margin: 0; display: grid; grid-template-rows: auto auto 1fr; height: 100vh; }
+  header { padding: 8px 12px; border-bottom: 1px solid #8884; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+  header input[type=file] { max-width: 220px; }
+  #timeline { padding: 8px 12px; border-bottom: 1px solid #8884; display: flex; gap: 8px; align-items: center; }
+  #slider { flex: 1; }
+  main { display: grid; grid-template-columns: 1fr 1fr 1fr; grid-template-rows: 1fr 1fr; gap: 1px; background: #8884; min-height: 0; }
+  section { background: Canvas; padding: 8px 12px; overflow: auto; min-height: 0; }
+  section h2 { margin: 0 0 6px; font-size: 12px; font-weight: 600; opacity: .7; text-transform: uppercase; letter-spacing: .04em; }
+  pre { margin: 0; white-space: pre-wrap; word-break: break-all; }
+  .syscall { cursor: pointer; white-space: pre; opacity: .45; padding: 0 4px; }
+  .syscall.past { opacity: 1; }
+  .syscall.now { background: #58a6ff33; }
+  .syscall:hover { background: #8884; }
+  .process { margin-bottom: 6px; padding: 4px 6px; border-left: 3px solid #8888; }
+  .process.current { border-left-color: #58a6ff; }
+  .thread { padding-left: 12px; opacity: .8; }
+  #registers div { display: flex; gap: 8px; }
+  #registers .name { width: 64px; opacity: .7; }
+  .stale { color: #d29922; }
+  button { font: inherit; }
+</style>
+</head>
+<body>
+<header>
+  <strong>zaqaru</strong>
+  <label>module <input id="module" type="file" accept=".wasm"></label>
+  <label>tape <input id="tape" type="file"></label>
+  <label>checkpoint every <input id="every" type="number" value="2000000" step="500000" style="width:9em"></label>
+  <button id="load">load</button>
+  <span id="status">choose a module and a tape, or pass ?module=…&amp;tape=…</span>
+</header>
+<div id="timeline">
+  <button id="prev" title="previous syscall">⇤</button>
+  <button id="back" title="one instruction back">−1</button>
+  <button id="play">play</button>
+  <button id="forward" title="one instruction forward">+1</button>
+  <button id="next" title="next syscall">⇥</button>
+  <input id="slider" type="range" min="0" max="0" value="0">
+  <span id="at">0</span>
+  <label>step <select id="speed"><option value="10000">10k</option><option value="100000" selected>100k</option><option value="1000000">1M</option></select></label>
+</div>
+<main>
+  <section><h2>syscalls</h2><div id="syscalls"></div></section>
+  <section><h2>processes</h2><pre id="statistics"></pre><div id="processes"></div></section>
+  <section><h2>registers</h2><div id="registers"></div></section>
+  <section><h2>memory map</h2><pre id="maps"></pre></section>
+  <section><h2>descriptors</h2><pre id="descriptors"></pre></section>
+  <section><h2>console</h2><pre id="stdout"></pre><pre id="stderr" style="opacity:.7"></pre></section>
+</main>
+<script type="module" src="./app.js"></script>
+</body>
+</html>

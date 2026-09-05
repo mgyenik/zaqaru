@@ -187,7 +187,11 @@ impl<'a, S: Store + Clone> System<'a, S> {
         };
         let pid = self.next;
         self.next += 1;
-        let mut child = Process { kernel, cache };
+        let mut child = Process {
+            kernel,
+            cache,
+            clock_base: 0,
+        };
         // The numbers the kernel could not know: it is a copy of the
         // parent's, and only the table decides who a new process is.
         child.kernel.pid = pid;
@@ -396,6 +400,20 @@ impl<'a, S: Store + Clone> System<'a, S> {
     /// for continuing: the bookkeeping it skipped is what the recorded
     /// schedule depends on.
     pub fn turn_toward(&mut self, stop_at: Option<u64>) -> Turn {
+        // The timeline's clock for this turn: everything the others have
+        // retired, so the running process can stamp a syscall with the
+        // container-wide count without reaching past itself.
+        let total = self.retired();
+        let own: u64 = self
+            .current()
+            .kernel
+            .machine
+            .threads
+            .all()
+            .iter()
+            .map(|thread| thread.tcb.retired)
+            .sum();
+        self.current().clock_base = total - own;
         let progress = match stop_at.map(|target| target.saturating_sub(self.retired())) {
             Some(0) => return Turn::Stopped,
             Some(left) if left < cpu::QUANTUM => self.current().step_exact(left),

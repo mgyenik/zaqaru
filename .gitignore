@@ -6,3 +6,6 @@
 # pointing at a file that is not in the clone.
 .claude/settings.local.json
 .claude/hooks/
+
+# The debugger page's fixture: a module and a tape, made by web/fixture.sh.
+/web/fixture

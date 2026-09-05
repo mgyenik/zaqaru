@@ -109,6 +109,11 @@ pub enum Exit {
 pub struct Process<'a, S: Store> {
     pub kernel: Kernel<'a, S, Interpreted>,
     pub cache: BlockCache,
+    /// What every *other* process has retired, living or gone, as of this
+    /// process's turn: added to this process's own count it is the
+    /// container-wide count, which is the timeline's clock. The system sets
+    /// it before each turn.
+    pub clock_base: u64,
 }
 
 impl<'a, S: Store> Process<'a, S> {
@@ -210,7 +215,11 @@ impl<'a, S: Store> Process<'a, S> {
         // the machine, which in this world *is* the control block — so the
         // only thing left is where to start.
         kernel.machine.thread_mut().rip = entry;
-        Ok(Self { kernel, cache })
+        Ok(Self {
+            kernel,
+            cache,
+            clock_base: 0,
+        })
     }
 
     /// Finds the program a container was told to start.
@@ -732,6 +741,31 @@ impl<'a, S: Store> Process<'a, S> {
         };
         let line = crate::traced(&mut self.kernel, number, arguments, &rendered);
         crate::trace(&mut self.kernel, &line);
+        // And the timeline: when, container-wide, and who.
+        let own: u64 = self
+            .kernel
+            .machine
+            .threads
+            .all()
+            .iter()
+            .map(|thread| thread.tcb.retired)
+            .sum();
+        let mut stamp = String::new();
+        crate::push_decimal(&mut stamp, (self.clock_base + own) as i64);
+        stamp.push(' ');
+        crate::push_decimal(&mut stamp, i64::from(self.kernel.pid));
+        stamp.push(' ');
+        crate::push_decimal(&mut stamp, i64::from(self.kernel.machine.threads.current().tid));
+        stamp.push(' ');
+        match crate::syscall::number::name(number) {
+            Some(name) => stamp.push_str(name),
+            None => {
+                stamp.push_str("syscall_");
+                crate::push_decimal(&mut stamp, number);
+            }
+        }
+        stamp.push('\n');
+        let _ = self.kernel.store.write(crate::paths::LOG_TIMELINE, stamp.as_bytes());
     }
 
     /// Delivers a signal, or reports what its default action does.
