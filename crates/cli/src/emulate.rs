@@ -1,23 +1,174 @@
-//! Runs a directory as a container, interpreted, and says what happened.
+//! `zaqaru emulate`: an image, run natively through the interpreter.
 //!
 //! The tool the breadth grind is driven from. A test tells you a program
 //! failed; this tells you *where*, how many instructions it got through, and
-//! what the address space looked like when it stopped — and it takes a real
-//! directory, so pointing it at a rootfs built from the host's own files is
-//! one command rather than a new test.
-//!
-//! ```text
-//! cargo run --example interpret -- <root> [argv...]
-//! ```
+//! what the address space looked like when it stopped — with no module in
+//! the way, so a native profiler sees the engine's own frames.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+use anyhow::{Result, bail};
+use clap::Args;
+use cpu::block::BlockCache;
 use kernel::abi::{Store, StoreOutcome};
 use kernel::image::Image;
 use kernel::machine::Interpreted;
 use kernel::run::{Exit, Process};
-use kernel::system::System;
 use kernel::syscall::{Enforcement, Kernel};
+use kernel::system::System;
+
+#[derive(Args)]
+pub struct Emulate {
+    /// A `docker save` tarball, or a root directory.
+    source: PathBuf,
+    /// Publish a guest port on a host port, `HOST:GUEST`. Repeatable.
+    #[arg(short, long = "publish", value_name = "HOST:GUEST", value_parser = crate::parse_port_mapping)]
+    ports: Vec<(u16, u16)>,
+    /// An environment entry, `NAME=value`, appended to the image's own.
+    #[arg(short, long = "env", value_name = "NAME=value")]
+    environment: Vec<String>,
+    /// Print a syscall trace, in `strace`'s format, to standard error.
+    #[arg(long)]
+    trace: bool,
+    /// Run the plain interpreter, without the bytecode accelerator.
+    #[arg(long)]
+    no_bytecode: bool,
+    /// Write the whole address profile here, one `file<TAB>offset<TAB>count`
+    /// line per address. Needs a build with `--features zaqaru-cpu/profile`.
+    #[arg(long, value_name = "FILE")]
+    profile_out: Option<PathBuf>,
+    /// The command to run, replacing the image's own.
+    #[arg(last = true)]
+    arguments: Vec<String>,
+}
+
+impl Emulate {
+    pub fn execute(self) -> Result<i32> {
+        // Ctrl-C becomes the container's own `SIGTERM`, at its first process.
+        let _shutdown = host::store::Shutdown::listening();
+        let baking = std::time::Instant::now();
+        let source = crate::load_source(&self.source, &self.arguments, &self.environment)?;
+        let argv: Vec<&[u8]> = source.argv.iter().map(|argument| argument.as_slice()).collect();
+        let envp: Vec<&[u8]> = source.environment.iter().map(|held| held.as_slice()).collect();
+        let image = Image::parse(&source.image.index, &source.image.blob)
+            .map_err(|error| anyhow::anyhow!("the index just baked does not parse: {error:?}"))?;
+        eprintln!(
+            "baked {} in {:.2}s",
+            self.source.display(),
+            baking.elapsed().as_secs_f64()
+        );
+
+        let kernel = Kernel::with_enforcement(
+            Terminal {
+                trace: self.trace,
+                started: std::time::Instant::now(),
+                net: match self.ports.is_empty() {
+                    true => None,
+                    false => {
+                        for (host, guest) in &self.ports {
+                            eprintln!("listening on host port {host} for guest port {guest}");
+                        }
+                        Some(std::rc::Rc::new(std::cell::RefCell::new(
+                            host::net::NetStore::new(self.ports.clone()),
+                        )))
+                    }
+                },
+            },
+            Interpreted::new(),
+            image,
+            Enforcement::Mapped,
+        );
+        let cache = match self.no_bytecode {
+            true => BlockCache::interpreting(),
+            false => BlockCache::new(),
+        };
+        let process = match Process::boot_with_cache(kernel, argv[0], &argv, &envp, cache) {
+            Ok(process) => process,
+            Err(error) => {
+                let mut message = String::new();
+                error.message(&mut message);
+                bail!("booting failed: {message}");
+            }
+        };
+
+        let mut system = System::new(process);
+        let running = std::time::Instant::now();
+        let exit = system.run();
+        let elapsed = running.elapsed().as_secs_f64();
+        // Across every process, because a container that forks does most of
+        // its work in children and a count that lost them would understate
+        // the engine by however much the guest chose to fan out.
+        let retired = system.retired();
+        let accelerated = system.accelerated();
+        let decoded = system.decoded();
+        let stall = match exit == Exit::Deadlocked {
+            true => system.stall(),
+            false => String::new(),
+        };
+        let process = system.current();
+        let share = match retired {
+            0 => 0.0,
+            _ => accelerated as f64 / retired as f64 * 100.0,
+        };
+        eprintln!(
+            "\n{retired} instructions in {elapsed:.2}s = {:.1} MIPS, {share:.1}% in bytecode, \
+             {decoded} blocks decoded",
+            retired as f64 / elapsed / 1e6
+        );
+        // Present only in a build asked for it: `--features zaqaru-cpu/histogram`.
+        // What each mnemonic *costs* differs between the native and the wasm
+        // build; how often the guest executes one does not, so this is the
+        // faster place to take the measurement.
+        if let Some(table) = cpu::histogram::report() {
+            eprint!("{table}");
+        }
+        // Likewise `--features zaqaru-cpu/profile`. Addresses are attributed
+        // against *this* process's address space, so the report is honest
+        // for a container running one process and misleading for a tree of
+        // them — which is why the thing to profile is a single `python -c`
+        // rather than the whole server.
+        match cpu::profile::hot() {
+            Some((hot, total)) => eprint!(
+                "{}",
+                attribute(&hot, total, &process.kernel.render_maps(), self.profile_out.as_deref())
+            ),
+            None if self.profile_out.is_some() => {
+                bail!("--profile-out needs a build with `--features zaqaru-cpu/profile`")
+            }
+            None => {}
+        }
+        match exit {
+            Exit::Status(status) => Ok(status),
+            other => {
+                eprintln!("{other:?}");
+                eprint!("{stall}");
+                // Only the mappings around whatever the guest touched, because
+                // a hundred-line map of a Python process buries the two lines
+                // that matter.
+                if let Exit::Signalled { address, rip, .. } = other {
+                    for (label, at) in [("address", address), ("rip", rip)] {
+                        let holder = process
+                            .kernel
+                            .space
+                            .vmas()
+                            .iter()
+                            .find(|vma| at >= vma.start && at < vma.end());
+                        match holder {
+                            Some(vma) => eprintln!(
+                                "  {label} {at:#x} is inside {:#x}..{:#x} prot {:#x}",
+                                vma.start,
+                                vma.end(),
+                                vma.prot
+                            ),
+                            None => eprintln!("  {label} {at:#x} is in no mapping"),
+                        }
+                    }
+                }
+                Ok(1)
+            }
+        }
+    }
+}
 
 /// Turns counted addresses into "which file, and how much of the run".
 ///
@@ -26,7 +177,7 @@ use kernel::syscall::{Enforcement, Kernel};
 /// is one answer and half a run inside `memcpy` is a different one. The
 /// second is the hottest individual addresses with their offset inside that
 /// file, which is what `nm` needs to turn them into names.
-fn attribute(hot: &[(u64, u64)], total: u64, maps: &str) -> String {
+fn attribute(hot: &[(u64, u64)], total: u64, maps: &str, profile_out: Option<&Path>) -> String {
     use std::fmt::Write;
 
     // `start-end ... name`, which is what `render_maps` writes.
@@ -71,7 +222,7 @@ fn attribute(hot: &[(u64, u64)], total: u64, maps: &str) -> String {
     // The whole profile, machine-readable, when somebody asks for it: an
     // engine cannot name a function and `nm` cannot count instructions, so
     // the join happens outside.
-    if let Ok(path) = std::env::var("ZAQARU_PROFILE_OUT") {
+    if let Some(path) = profile_out {
         let mut dump = String::new();
         for (address, count) in hot {
             match find(*address) {
@@ -83,8 +234,8 @@ fn attribute(hot: &[(u64, u64)], total: u64, maps: &str) -> String {
                 }
             }
         }
-        let _ = std::fs::write(&path, dump);
-        let _ = writeln!(out, "\nfull profile written to {path}");
+        let _ = std::fs::write(path, dump);
+        let _ = writeln!(out, "\nfull profile written to {}", path.display());
     }
     let _ = writeln!(out, "\nhottest addresses, with the offset `nm` wants:\n");
     let _ = writeln!(out, "  {:>6} {:>14}  {:<18} {}", "share", "retired", "file+offset", "address");
@@ -150,7 +301,7 @@ impl Store for Terminal {
         }
         // Ctrl-C, through the same flag the host's `/iso/shutdown` store
         // reads — shared rather than reimplemented, so what this driver does
-        // with a signal and what `zaqaru-run` does with one cannot drift.
+        // with a signal and what `zaqaru run` does with one cannot drift.
         if path == kernel::paths::SHUTDOWN_REQUESTED {
             return match host::store::Shutdown::asked() {
                 true => {
@@ -230,178 +381,3 @@ impl Store for Terminal {
     }
 }
 
-fn main() {
-    let mut ports: Vec<(u16, u16)> = Vec::new();
-    let raw: Vec<String> = std::env::args().skip(1).collect();
-    let mut rest: Vec<String> = Vec::new();
-    let mut index = 0;
-    while index < raw.len() {
-        match raw[index].as_str() {
-            // The same `-p HOST:GUEST` `zaqaru-run` takes, so a stack can be
-            // served from the native driver while it is being built and from
-            // the module once it is.
-            "-p" | "--publish" if index + 1 < raw.len() => {
-                if let Some((host, guest)) = raw[index + 1].split_once(':')
-                    && let (Ok(host), Ok(guest)) = (host.parse(), guest.parse())
-                {
-                    ports.push((host, guest));
-                }
-                index += 2;
-            }
-            _ => {
-                rest.push(raw[index].clone());
-                index += 1;
-            }
-        }
-    }
-    // Ctrl-C becomes the container's own `SIGTERM`, at its first process.
-    let _shutdown = host::store::Shutdown::listening();
-    let mut arguments = rest.into_iter();
-    let root = PathBuf::from(arguments.next().unwrap_or_else(|| {
-        eprintln!("usage: interpret <root> [argv...]");
-        std::process::exit(2);
-    }));
-    let given: Vec<Vec<u8>> = arguments.map(|argument| argument.into_bytes()).collect();
-
-    let baking = std::time::Instant::now();
-    // A directory or an OCI archive, because the thing worth running is
-    // usually an image somebody built rather than a tree somebody curated —
-    // and the archive carries its own entrypoint and environment.
-    let (baked, invocation) = match root.extension().is_some_and(|kind| kind == "tar") {
-        true => {
-            let archive = std::fs::read(&root).expect("read the archive");
-            let (image, invocation) =
-                image::bake_archive_as_configured(&archive, &given).expect("bake the archive");
-            (image, Some(invocation))
-        }
-        false => (
-            image::bake_directory(&root).expect("bake the directory"),
-            None,
-        ),
-    };
-    // The image's own entrypoint and environment when it has them, which is
-    // the whole difference between running an archive and running a tree.
-    let (owned, environment): (Vec<Vec<u8>>, Vec<Vec<u8>>) = match invocation {
-        // An archive's own entrypoint, unless the caller named one — which
-        // is `docker run image cmd`, and is how a stack gets poked at
-        // without rebuilding the image it lives in.
-        Some(invocation) => (
-            match given.is_empty() {
-                true => invocation.argv,
-                false => given,
-            },
-            invocation.environment,
-        ),
-        None => (
-            match given.is_empty() {
-                true => vec![b"/init".to_vec()],
-                false => given,
-            },
-            Vec::new(),
-        ),
-    };
-    let argv: Vec<&[u8]> = owned.iter().map(|argument| argument.as_slice()).collect();
-    let envp: Vec<&[u8]> = environment.iter().map(|held| held.as_slice()).collect();
-
-    let image = Image::parse(&baked.index, &baked.blob).expect("parse the image");
-    eprintln!(
-        "baked {} in {:.2}s",
-        root.display(),
-        baking.elapsed().as_secs_f64()
-    );
-
-    let kernel = Kernel::with_enforcement(
-        Terminal {
-            trace: std::env::var_os("ZAQARU_TRACE").is_some(),
-            started: std::time::Instant::now(),
-            net: match ports.is_empty() {
-                true => None,
-                false => {
-                    for (host, guest) in &ports {
-                        eprintln!("listening on host port {host} for guest port {guest}");
-                    }
-                    Some(std::rc::Rc::new(std::cell::RefCell::new(
-                        host::net::NetStore::new(ports),
-                    )))
-                }
-            },
-        },
-        Interpreted::new(),
-        image,
-        Enforcement::Mapped,
-    );
-    let process = match Process::boot(kernel, argv[0], &argv, &envp) {
-        Ok(process) => process,
-        Err(error) => {
-            let mut message = String::new();
-            error.message(&mut message);
-            eprintln!("booting failed: {message}");
-            std::process::exit(1);
-        }
-    };
-
-    let mut system = System::new(process);
-    let running = std::time::Instant::now();
-    let exit = system.run();
-    let elapsed = running.elapsed().as_secs_f64();
-    // Across every process, because a container that forks does most of its
-    // work in children and a count that lost them would understate the
-    // engine by however much the guest chose to fan out.
-    let retired = system.retired();
-    let decoded = system.decoded();
-    let stall = match exit == Exit::Deadlocked {
-        true => system.stall(),
-        false => String::new(),
-    };
-    let process = system.current();
-    eprintln!(
-        "\n{retired} instructions in {elapsed:.2}s = {:.1} MIPS",
-        retired as f64 / elapsed / 1e6
-    );
-    eprintln!("blocks decoded: {decoded}");
-    // Present only in a build asked for it: `--features zaqaru-cpu/histogram`.
-    // What each mnemonic *costs* differs between the native and the wasm
-    // build; how often the guest executes one does not, so this is the
-    // faster place to take the measurement.
-    if let Some(table) = cpu::histogram::report() {
-        eprint!("{table}");
-    }
-    // Likewise `--features zaqaru-cpu/profile`. Addresses are attributed
-    // against *this* process's address space, so the report is honest for a
-    // container running one process and misleading for a tree of them —
-    // which is why the thing to profile is a single `python -c` rather than
-    // the whole server.
-    if let Some((hot, total)) = cpu::profile::hot() {
-        eprint!("{}", attribute(&hot, total, &process.kernel.render_maps()));
-    }
-    match exit {
-        Exit::Status(status) => std::process::exit(status),
-        other => {
-            eprintln!("{other:?}");
-            eprint!("{stall}");
-            // Only the mappings around whatever the guest touched, because a
-            // hundred-line map of a Python process buries the two lines that
-            // matter.
-            if let Exit::Signalled { address, rip, .. } = other {
-                for (label, at) in [("address", address), ("rip", rip)] {
-                    let holder = process
-                        .kernel
-                        .space
-                        .vmas()
-                        .iter()
-                        .find(|vma| at >= vma.start && at < vma.end());
-                    match holder {
-                        Some(vma) => eprintln!(
-                            "  {label} {at:#x} is inside {:#x}..{:#x} prot {:#x}",
-                            vma.start,
-                            vma.end(),
-                            vma.prot
-                        ),
-                        None => eprintln!("  {label} {at:#x} is in no mapping"),
-                    }
-                }
-            }
-            std::process::exit(1);
-        }
-    }
-}

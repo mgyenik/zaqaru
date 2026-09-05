@@ -4,7 +4,7 @@
 # ///
 """Latency of the nginx + gunicorn + Django stack, native against the module.
 
-The same OCI image both ways: `docker run` on the left, `zaqaru-run` on the
+The same OCI image both ways: `docker run` on the left, `zaqaru run` on the
 right, the same `-p` convention, and the same client asking the same
 question. What is being compared is the execution path and nothing else --
 one image, built once, by an ordinary Dockerfile.

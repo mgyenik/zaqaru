@@ -44,15 +44,27 @@ pub struct Container {
     instance: wasmtime::Instance,
 }
 
+/// How to set the engine up.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct Options {
+    /// Have wasmtime write a perf map. JIT frames are anonymous machine
+    /// code, so a host profiler shows the engine as a single unresolved
+    /// address unless wasmtime writes the map that names them. Off by
+    /// default: it writes a file per process into /tmp and exists only to
+    /// be profiled.
+    pub perfmap: bool,
+}
+
 impl Container {
     /// Instantiates a linked container module against a mount table.
     pub fn instantiate(module_bytes: &[u8], mounts: MountTable) -> Result<Self> {
-        // JIT frames are anonymous machine code, so a host profiler shows
-        // the engine as a single unresolved address unless wasmtime writes
-        // the map that names them. Off by default: it writes a file per
-        // process into /tmp and exists only to be profiled.
+        Self::instantiate_with(module_bytes, mounts, Options::default())
+    }
+
+    /// The same, with the engine set up as `options` says.
+    pub fn instantiate_with(module_bytes: &[u8], mounts: MountTable, options: Options) -> Result<Self> {
         let mut configuration = wasmtime::Config::new();
-        if std::env::var_os("ZAQARU_PERFMAP").is_some() {
+        if options.perfmap {
             configuration.profiler(wasmtime::ProfilingStrategy::PerfMap);
         }
         let engine = wasmtime::Engine::new(&configuration)

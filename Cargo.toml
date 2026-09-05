@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/bake",
+    "crates/cli",
     "crates/cpu",
     "crates/guest",
     "crates/host",

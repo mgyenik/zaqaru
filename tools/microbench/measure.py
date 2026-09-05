@@ -9,7 +9,7 @@ interpreted guest inside a wasm module than when Linux runs it directly.
 
   native   the ELF, run by Linux.
   wasm     the same ELF, baked into a container with the interpreter and
-           run under wasmtime by zaqaru-run.
+           run under wasmtime by `zaqaru run`.
 
 **Three costs, kept apart, because they behave completely differently.**
 
@@ -93,8 +93,8 @@ def bake(name: str, scale: int) -> Path:
     out = WORK / f"{name}.{scale}.wasm"
     if not out.is_file():
         subprocess.run(
-            [str(REPO / "target/release/examples/bake-vm"),
-             str(ROOT), str(out), "/init", name, str(scale)],
+            [str(REPO / "target/release/zaqaru"), "bake", str(ROOT), "-o", str(out),
+             "--", "/init", name, str(scale)],
             check=True, capture_output=True,
         )
     return out
@@ -104,7 +104,7 @@ def run_once(leg: str, name: str, scale: int) -> dict:
     if leg == "native":
         command = [str(ROOT / "init"), name, str(scale)]
     else:
-        command = [str(REPO / "target/release/zaqaru-run"), str(bake(name, scale))]
+        command = [str(REPO / "target/release/zaqaru"), "run", str(bake(name, scale))]
     started = time.perf_counter()
     done = subprocess.run(["taskset", "-c", CORE] + command, capture_output=True, text=True)
     total = time.perf_counter() - started

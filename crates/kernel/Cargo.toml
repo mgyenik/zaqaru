@@ -26,10 +26,4 @@ ruzstd = { version = "0.9", default-features = false }
 # A cycle Cargo allows, and the honest one: the kernel's tests drive real
 # baked images rather than a hand-written stand-in for one.
 image = { package = "zaqaru-image", path = "../image" }
-# The `interpret` example serves a container to the host, which means real
-# sockets — and the one place they live is the host's `/iso/net` broker.
-# Sharing it rather than writing a second is the point: the edge the native
-# driver serves and the edge the module serves have to be the same protocol,
-# or the native runs stop being evidence about the module.
-host = { package = "zaqaru-host", path = "../host" }
 libc = "0.2"

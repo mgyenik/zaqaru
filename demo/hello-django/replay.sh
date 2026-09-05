@@ -15,13 +15,13 @@ set -euo pipefail
 REPO=${ZAQARU_REPO:-$(cd "$(dirname "$0")/../.." && pwd)}
 OUT=${ZAQARU_DEMO_OUT:-/tmp/zaqaru-demo}
 PORT=${1:-8080}
-RUN="$REPO/target/release/zaqaru-run"
+RUN=("$REPO/target/release/zaqaru" run)
 mkdir -p "$OUT"
 
-[ -f "$OUT/hello-django.wasm" ] || { echo "run django.sh first" >&2; exit 1; }
+[ -f "$OUT/hello-django.wasm" ] || { echo "run tools/microbench/django-latency.sh first: it bakes the module" >&2; exit 1; }
 rm -f "$OUT/session.bin" "$OUT/served.txt" "$OUT/replayed.txt"
 
-"$RUN" "$OUT/hello-django.wasm" -p "$PORT:80" --record "$OUT/session.bin" > "$OUT/served.txt" 2>&1 &
+"${RUN[@]}" "$OUT/hello-django.wasm" -p "$PORT:80" --record "$OUT/session.bin" > "$OUT/served.txt" 2>&1 &
 container=$!
 # Reaps whatever is still running however this exits. Kept armed to the end
 # rather than disarmed once the container is stopped: a script that turns its
@@ -42,7 +42,7 @@ kill -9 "$container" 2>/dev/null || true
 # No `-p`. Nothing is listening, nothing is mounted at `/iso/net`, and the
 # session is served entirely from the tape.
 echo "replaying, with no network"
-"$RUN" "$OUT/hello-django.wasm" --replay "$OUT/session.bin" > "$OUT/replayed.txt" 2>&1
+"${RUN[@]}" "$OUT/hello-django.wasm" --replay "$OUT/session.bin" > "$OUT/replayed.txt" 2>&1
 
 # The host's own lines are the host's, not the container's.
 strip() { grep -vE 'listening on host port|recorded [0-9]+ host answers' "$1"; }

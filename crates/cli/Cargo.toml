@@ -1,0 +1,25 @@
+[package]
+name = "zaqaru"
+version = "0.1.0"
+edition = "2024"
+description = "Run x86-64 OCI containers in WebAssembly: bake an image into a module, run it, or emulate it natively"
+
+[[bin]]
+name = "zaqaru"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.6", features = ["derive"] }
+bake = { package = "zaqaru-bake", path = "../bake" }
+cpu = { package = "zaqaru-cpu", path = "../cpu" }
+host = { package = "zaqaru-host", path = "../host" }
+image = { package = "zaqaru-image", path = "../image" }
+kernel = { package = "zaqaru-kernel", path = "../kernel" }
+
+# The guest archive is built for wasm32 by the build script and embedded, so
+# the installed binary bakes without a source tree or a toolchain — only
+# `wasm-ld`.
+[build-dependencies]
+anyhow = "1.0.104"
+bake = { package = "zaqaru-bake", path = "../bake" }
