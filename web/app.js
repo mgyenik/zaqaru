@@ -36,7 +36,8 @@ worker.onmessage = (event) => {
     timeline = message.timeline;
     trace = message.trace;
     $("slider").max = total;
-    $("status").textContent = `${total.toLocaleString()} instructions, ${timeline.length} syscalls, ${message.checkpoints.length} checkpoints, ${message.bytecode ? "bytecode" : "interpreter"}`;
+    const mb = (n) => (n / 1048576).toFixed(1) + " MB";
+    $("status").textContent = `${total.toLocaleString()} instructions, ${timeline.length} syscalls, ${message.checkpoints.length} checkpoints holding ${mb(message.held)} (${mb(message.naive)} as full copies, diffed in ${Math.round(message.diffing)} ms), ${message.bytecode ? "bytecode" : "interpreter"}`;
     renderTrace();
     seek(0);
     return;

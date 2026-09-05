@@ -483,15 +483,22 @@ export class Container {
 
   /// A container standing where the snapshot was taken: a fresh instance of
   /// the same module, grown to the snapshot's size, memory copied back.
+  ///
+  /// The snapshot is either dense — `memory`, as [`snapshot`] makes — or
+  /// sparse — `pages`, a map from 4 KiB page index to bytes, and `length` —
+  /// as a checkpoint store keeps. A fresh memory is zero, so sparse pages
+  /// are written straight in.
   async restore(snapshot) {
     const mounts = snapshot.mounts.snapshot();
     const container = new Container(this.module, null, mounts);
     container.instance = await WebAssembly.instantiate(this.module, { env: container.imports() });
     const have = container.memory.buffer.byteLength;
-    const want = snapshot.memory.length;
+    const want = snapshot.memory ? snapshot.memory.length : snapshot.length;
     if (want < have) throw "the snapshot's memory is smaller than a fresh instance's";
     if (want > have) container.memory.grow(Math.ceil((want - have) / 65536));
-    new Uint8Array(container.memory.buffer).set(snapshot.memory);
+    const target = new Uint8Array(container.memory.buffer);
+    if (snapshot.memory) target.set(snapshot.memory);
+    else for (const [page, bytes] of snapshot.pages) target.set(bytes.subarray(0, Math.min(bytes.length, want - page * 4096)), page * 4096);
     if (container.stackPointer !== snapshot.stackPointer) throw "the guest left state on its stack";
     return container;
   }

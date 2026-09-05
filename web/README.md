@@ -13,7 +13,11 @@ tape to replay from, and snapshot and restore. It runs under Node too, which
 is what `test.mjs` uses to check it against the wasmtime host's own run.
 `worker.js` owns the container and its checkpoints; `app.js` is the page.
 
-Seeking to an instant restores the nearest checkpoint at or before it and
-runs, interpreted, to the exact instruction. Everything the page shows is a
+Checkpoints are maps of non-zero 4 KiB pages, shared between checkpoints,
+each recording only the pages that changed since the one before
+(`checkpoints.js`): a container's memory is hundreds of megabytes and
+almost all of it is zero or unchanging. Seeking to an instant reconstructs
+the nearest checkpoint at or before it and runs, interpreted, to the exact
+instruction. Everything the page shows is a
 read of the container's own store — the isotope Server Protocol — through
 `/iso/server`.

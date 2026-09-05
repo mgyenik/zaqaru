@@ -8,6 +8,7 @@
 
 import { readFileSync } from "node:fs";
 import { Container, KIND, parseTape, standardMounts, text } from "./zaqaru.js";
+import { Checkpoints, apply, dense, diff } from "./checkpoints.js";
 
 const [modulePath, tapePath, stdoutPath] = process.argv.slice(2);
 if (!stdoutPath) {
@@ -113,6 +114,55 @@ function replayMounts() {
   const registers = stopped.ask("processes/1/threads/1/registers");
   const again = await stopped.restore(stopped.snapshot());
   check("a restored exact stop stands in the same place", again.ask("processes/1/threads/1/registers") === registers);
+}
+
+// 5. Delta checkpoints reconstruct the memory a full snapshot would have,
+//    and cost a small fraction of full copies.
+{
+  const image = new Uint8Array(5 * 4096);
+  image.set([1, 2, 3], 4096 * 1 + 7);
+  image[4096 * 3 + 50] = 9;
+  const first = diff(null, image);
+  check("a first diff keeps only the non-zero pages", Array.from(first.changed.keys()).join(",") === "1,3", Array.from(first.changed.keys()).join(","));
+  const pages = apply(new Map(), first);
+  const grown = new Uint8Array(7 * 4096);
+  grown.set(image);
+  grown[4096 * 3 + 50] = 8;
+  grown[4096 * 6 + 1] = 5;
+  const second = diff(pages, grown);
+  check("a later diff finds the changed and the new pages", Array.from(second.changed.keys()).join(",") === "3,6", Array.from(second.changed.keys()).join(","));
+  const back = dense(apply(pages, second), grown.length);
+  check("applying diffs reproduces the image", back.length === grown.length && back.every((v, i) => v === grown[i]));
+
+  const store = new Checkpoints({ fullEvery: 4 });
+  const container = await Container.instantiate(module, replayMounts());
+  container.step(0);
+  store.add(0, container);
+  const fulls = [container.snapshot().memory];
+  let at = 0;
+  const every = 300000;
+  for (let i = 1; i <= 9; i++) {
+    at += every;
+    if (container.step(at).kind === KIND.FINISHED) break;
+    store.add(container.value("statistics").retired, container);
+    fulls.push(container.snapshot().memory);
+  }
+  check("checkpoints cost a small fraction of full copies", store.length >= 6 && store.held < store.naive / 50, `held ${store.held} of ${store.naive} over ${store.length}`);
+  let exact = true;
+  for (let i = 0; i < store.length && exact; i++) {
+    const memory = store.memory(i);
+    const full = fulls[i];
+    if (memory.length !== full.length) { exact = false; break; }
+    for (let j = 0; j < memory.length; j++) if (memory[j] !== full[j]) { exact = false; break; }
+  }
+  check("every checkpoint reconstructs byte for byte", exact);
+  const backwards = store.memory(2);
+  check("a backwards reconstruction is exact", backwards.every((v, i) => v === fulls[2][i]));
+  const restored = await container.restore(store.snapshot(5));
+  check("a container restores from a sparse checkpoint", restored.value("statistics").retired === store.at(5));
+  const finished = restored.boot();
+  check("and runs to the same end", finished === 0 && text(restored.readback(["iso", "console", "stdout"])) === expected);
+  console.log(`     ${store.length} checkpoints hold ${(store.held / 1048576).toFixed(1)} MB; ${(store.naive / 1048576).toFixed(0)} MB as full copies`);
 }
 
 console.log(failures ? `${failures} failure(s)` : "all passed");

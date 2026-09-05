@@ -234,12 +234,28 @@ to `n` restores the last checkpoint at or before `n` and steps to `n`.
 Deterministic re-execution means `K` can be large: at 100 MIPS a gap of
 200 M instructions is a two-second seek worst case.
 
-Memory is the constraint. A Django module's memory is several hundred
-megabytes, so the first checkpoint is full and every later one is a delta
-against the previous, computed by comparing pages in a small wasm helper.
-Page ownership means most of memory is still while a server idles, and
-the image segment never changes. A full snapshot every few dozen deltas
-bounds the restore chain.
+Memory is the constraint, and it bites before Django does: a container's
+memory is hundreds of megabytes even for a small program, because the
+kernel reserves its guest block at boot and wasm memory never shrinks. The
+fixture's is 600 MB. Nearly all of it is zero, and nearly all of what is
+not is still between two checkpoints — the image blob never changes, and
+page ownership keeps a dormant process's pages in place.
+
+So a checkpoint is a map from 4 KiB page index to the page's bytes, holding
+only pages that are not zero (`web/checkpoints.js`). The pages are
+immutable and shared between checkpoints. A checkpoint after the first
+records the pages that changed, found by comparing memory in place
+against the previous map as 32-bit words — about 50 ms for 300 MB under
+V8, so no helper is needed — and a full map is kept every sixteenth
+checkpoint at the cost of the map alone, since its pages are the ones
+already held. Restoring never builds a dense image: a fresh wasm memory
+is zero, so the pages are written straight into it. The last reconstructed
+map is kept, so seeking within one stretch of the run pays it once.
+
+Measured on the fixture: ten checkpoints hold 16 MB where full copies
+would hold 6 GB. Checked under Node: every checkpoint of a run
+reconstructs byte for byte against a full snapshot taken at the same
+point, and a container restored from one runs to the same end.
 
 ### The page
 
@@ -285,15 +301,11 @@ harness under Node, against the wasmtime host's own run) and
 - snapshot and restore, on the wasmtime host and in the browser, with the
   byte-identical acceptance test;
 - the tape's engine-mode header;
-- the browser harness, the worker with checkpoints and seeking, and the
-  page with the timeline, the syscall log, and the panels.
+- the browser harness, the worker with delta checkpoints and seeking, and
+  the page with the timeline, the syscall log, and the panels.
 
 Not built:
 
-- **Delta checkpoints.** Every checkpoint is a full copy of memory. The
-  fixture's module is a few megabytes; a Django module's is hundreds, and
-  a run of any length would exhaust a tab. Page-diff deltas against the
-  previous checkpoint are the next piece of work.
 - **The disassembly panel**, which needs iced's formatter compiled into
   the guest behind a feature.
 - **A live mode** in the browser: a JavaScript clock and entropy, and an

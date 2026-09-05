@@ -10,10 +10,11 @@
 //               { type: "error", message }
 
 import { Container, KIND, parseTape, standardMounts, text } from "./zaqaru.js";
+import { Checkpoints } from "./checkpoints.js";
 
 let module = null;
 let tape = null;
-let checkpoints = []; // [{ at, snapshot }], ascending
+let checkpoints = null; // a Checkpoints store
 let container = null; // the one standing at the last seek
 
 function mounts() {
@@ -25,19 +26,22 @@ function mounts() {
 async function load(moduleBytes, tapeBytes, checkpointEvery) {
   module = await WebAssembly.compile(moduleBytes);
   tape = parseTape(new Uint8Array(tapeBytes));
-  checkpoints = [];
+  checkpoints = new Checkpoints();
   // One pass over the whole run: checkpoints on the way, and the timeline
   // and trace as the container wrote them.
   const first = await Container.instantiate(module, mounts());
   first.step(0); // boot, and stand at zero
-  checkpoints.push({ at: 0, snapshot: first.snapshot() });
+  checkpoints.add(0, first);
   let target = checkpointEvery;
   let total = 0;
+  let diffing = 0;
   for (;;) {
     const turn = first.step(target);
     total = first.value("statistics").retired;
     if (turn.kind === KIND.FINISHED) break;
-    checkpoints.push({ at: total, snapshot: first.snapshot() });
+    const started = performance.now();
+    checkpoints.add(total, first);
+    diffing += performance.now() - started;
     target = total + checkpointEvery;
   }
   const timeline = text(first.readback(["iso", "log", "timeline"]) ?? new Uint8Array())
@@ -51,14 +55,24 @@ async function load(moduleBytes, tapeBytes, checkpointEvery) {
   const trace = text(first.readback(["iso", "log", "debug"]) ?? new Uint8Array()).trim().split("\n").filter(Boolean);
   const output = text(first.readback(["iso", "console", "stdout"]) ?? new Uint8Array());
   container = first;
-  postMessage({ type: "loaded", total, timeline, trace, output, bytecode: tape.bytecode, checkpoints: checkpoints.map((c) => c.at) });
+  postMessage({
+    type: "loaded",
+    total,
+    timeline,
+    trace,
+    output,
+    bytecode: tape.bytecode,
+    checkpoints: Array.from({ length: checkpoints.length }, (_, i) => checkpoints.at(i)),
+    held: checkpoints.held,
+    naive: checkpoints.naive,
+    diffing,
+  });
 }
 
 async function seek(at) {
-  let base = checkpoints[0];
-  for (const checkpoint of checkpoints) if (checkpoint.at <= at) base = checkpoint;
-  container = await container.restore(base.snapshot);
-  if (at > base.at) container.stopAt(at);
+  const index = checkpoints.before(at);
+  container = await container.restore(checkpoints.snapshot(index));
+  if (at > checkpoints.at(index)) container.stopAt(at);
   const statistics = container.value("statistics");
   const processes = container.value("processes");
   const current = processes.processes.find((p) => p.pid === statistics.current) ?? processes.processes[0];

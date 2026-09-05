@@ -99,6 +99,7 @@ try {
   await until(`document.readyState === "complete" && !!document.getElementById("status") && !!window.zaqaruDebug`);
   const status = await until(`(() => { const s = document.getElementById("status")?.textContent ?? ""; return s.includes("instructions") ? s : (s.includes("error") || s.includes("Error") ? s : ""); })()`);
   check("the run loads", /instructions/.test(status), status);
+  console.log("     " + status);
   await until(`!window.zaqaruDebug.busy && document.getElementById("at").textContent === "0"`);
   const total = await evaluate("window.zaqaruDebug.total");
   check("the timeline knows the run's length", total > 4000000, String(total));
