@@ -36,6 +36,7 @@ static mut FINISHED: Option<i32> = None;
 pub const KIND_RUNNING: i32 = 0;
 pub const KIND_IDLE: i32 = 1;
 pub const KIND_FINISHED: i32 = 2;
+pub const KIND_STOPPED: i32 = 3;
 
 /// Runs the container, and answers what happened.
 ///
@@ -80,7 +81,8 @@ pub unsafe extern "C" fn zaqaru_run(until: i64) -> i32 {
             return KIND_RUNNING;
         }
         match system.turn() {
-            Turn::Ran => {}
+            // A plain turn never stops on an instruction.
+            Turn::Ran | Turn::Stopped => {}
             Turn::Idle if until < 0 => {}
             Turn::Idle => {
                 system.serve();
@@ -100,6 +102,61 @@ pub unsafe extern "C" fn zaqaru_run(until: i64) -> i32 {
                     // engine does not implement an instruction, or the
                     // kernel a syscall, must not look like a program that
                     // chose to fail.
+                    other => {
+                        let mut message = String::from("guest: the container stopped: ");
+                        describe(&other, &mut message);
+                        report_to(&mut system.current().kernel, &message);
+                        UNIMPLEMENTED
+                    }
+                };
+                unsafe { FINISHED = Some(status) };
+                return finished(status);
+            }
+        }
+    }
+}
+
+/// Runs the container until it has retired exactly `target` instructions,
+/// and holds it there.
+///
+/// The last block before the target is interpreted so the stop lands on
+/// the instruction; the scheduler does none of its between-turn work at the
+/// stop, so what the store then describes is the machine at that instant.
+/// A container stopped this way is for reading and not for continuing — a
+/// debugger resumes from a checkpoint — and asking it to run on is refused
+/// as a finished container would be.
+///
+/// # Safety
+/// As [`zaqaru_run`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zaqaru_stop_at(target: i64) -> i32 {
+    if let Some(status) = unsafe { FINISHED } {
+        return finished(status);
+    }
+    let slot = unsafe { &mut *(&raw mut SYSTEM) };
+    let system = match slot {
+        Some(system) => system,
+        None => match boot() {
+            Ok(booted) => slot.insert(booted),
+            Err(status) => {
+                unsafe { FINISHED = Some(status) };
+                return finished(status);
+            }
+        },
+    };
+    let target = target.max(0) as u64;
+    loop {
+        match system.turn_toward(Some(target)) {
+            Turn::Ran | Turn::Idle => {}
+            Turn::Stopped => {
+                system.serve();
+                return KIND_STOPPED;
+            }
+            Turn::Finished(outcome) => {
+                system.serve();
+                report_statistics(system);
+                let status = match outcome {
+                    Exit::Status(status) => status,
                     other => {
                         let mut message = String::from("guest: the container stopped: ");
                         describe(&other, &mut message);

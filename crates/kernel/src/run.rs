@@ -267,6 +267,17 @@ impl<'a, S: Store> Process<'a, S> {
     ///
     /// The same, saying what it needs when it needs something.
     pub fn step(&mut self, quantum: u64) -> Progress {
+        self.step_with(quantum, false)
+    }
+
+    /// The same, running exactly `budget` instructions through the
+    /// interpreter — see [`Engine::run_exact`]. For stopping at an
+    /// instant, never for continuing from one.
+    pub fn step_exact(&mut self, budget: u64) -> Progress {
+        self.step_with(budget, true)
+    }
+
+    fn step_with(&mut self, quantum: u64, exact: bool) -> Progress {
         // Before anything runs, and therefore *between blocks*: the control
         // block is consistent exactly at retirement boundaries, and a frame
         // built from a half-executed block would carry a lazy-flag record
@@ -303,7 +314,11 @@ impl<'a, S: Store> Process<'a, S> {
 
         // Three disjoint fields of one owner, which is what makes the
         // engine able to hold no state of its own.
-        let outcome = Engine::run(
+        let run = match exact {
+            true => Engine::run_exact,
+            false => Engine::run,
+        };
+        let outcome = run(
             self.kernel.machine.thread_mut(),
             &mut self.kernel.pages,
             &mut self.cache,

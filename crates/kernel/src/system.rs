@@ -383,7 +383,37 @@ impl<'a, S: Store + Clone> System<'a, S> {
     /// state on the wasm stack, linear memory between two turns *is* the
     /// machine, which is what a snapshot copies and a debugger stops at.
     pub fn turn(&mut self) -> Turn {
-        let why = match self.current().step(cpu::QUANTUM) {
+        self.turn_toward(None)
+    }
+
+    /// A turn that stops on an instruction. With `stop_at` set, the running
+    /// process gets the smaller of a quantum and the instructions left to
+    /// the target, interpreted exactly when it is the latter, and the
+    /// moment the container has retired the target the turn ends with
+    /// [`Turn::Stopped`] — before any of the bookkeeping a turn normally
+    /// does afterwards, so that the machine is the machine at that instant
+    /// and nothing else. A container stopped this way is for reading, not
+    /// for continuing: the bookkeeping it skipped is what the recorded
+    /// schedule depends on.
+    pub fn turn_toward(&mut self, stop_at: Option<u64>) -> Turn {
+        let progress = match stop_at.map(|target| target.saturating_sub(self.retired())) {
+            Some(0) => return Turn::Stopped,
+            Some(left) if left < cpu::QUANTUM => self.current().step_exact(left),
+            _ => self.current().step(cpu::QUANTUM),
+        };
+        if let Progress::Requested(request) = &progress {
+            // Part of the syscall that asked, and answered in the same turn
+            // whatever the target is: the state after an instruction
+            // includes what the instruction did.
+            self.answer(request.clone());
+        }
+        if let Some(target) = stop_at
+            && !matches!(progress, Progress::Finished(_))
+            && self.retired() >= target
+        {
+            return Turn::Stopped;
+        }
+        let why = match progress {
             Progress::Running => Yield::Kept,
             // The quantum expired, so every process gets a turn — the
             // same rule the threads inside one already follow, and with
@@ -395,10 +425,7 @@ impl<'a, S: Store + Clone> System<'a, S> {
             // do. Give somebody else a turn; if nobody can take it, the
             // loop below is what says so.
             Progress::Idle => Yield::Given,
-            Progress::Requested(request) => {
-                self.answer(request);
-                Yield::Kept
-            }
+            Progress::Requested(_) => Yield::Kept,
             Progress::Finished(exit) => {
                 // The edge, one last time. A process that writes a
                 // reply and exits has put those bytes in a ring and
@@ -984,6 +1011,9 @@ pub enum Turn {
     Idle,
     /// The container is finished.
     Finished(Exit),
+    /// The container has retired the instruction it was asked to stop on,
+    /// and stands there. See [`System::turn_toward`].
+    Stopped,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

@@ -50,7 +50,7 @@ pub mod arena;
 use block::{BlockCache, FetchError};
 use exec::{Cpu, Step, Trap};
 use space::Space;
-use state::Tcb;
+use state::{Staleness, Tcb};
 
 /// How many instructions a thread retires before the loop takes control back.
 ///
@@ -105,12 +105,39 @@ impl Engine {
         cache: &mut BlockCache,
         quantum: u64,
     ) -> Outcome {
+        Self::run_with(tcb, space, cache, quantum, false)
+    }
+
+    /// Runs exactly `budget` instructions, or until a syscall or a trap,
+    /// **interpreting every block**: the accelerator checks its budget only
+    /// at a back-edge, so only the interpreter stops on the instruction
+    /// asked for. The state at the stop is the state after that instruction
+    /// whichever engine would have computed it, so this is how a debugger
+    /// reaches an instant. What it also does is record whether the flags at
+    /// that instant are the last instruction's — see
+    /// [`state::Tcb::flags_staleness`].
+    ///
+    /// Not for continuing from: a run resumed here would preempt at a
+    /// different point than the accelerated run did, and a recorded
+    /// schedule would diverge. A debugger resumes from a checkpoint.
+    pub fn run_exact(tcb: &mut Tcb, space: &mut Space, cache: &mut BlockCache, budget: u64) -> Outcome {
+        Self::run_with(tcb, space, cache, budget, true)
+    }
+
+    fn run_with(
+        tcb: &mut Tcb,
+        space: &mut Space,
+        cache: &mut BlockCache,
+        quantum: u64,
+        exact: bool,
+    ) -> Outcome {
         let mut budget = quantum;
+        tcb.flags_staleness = Staleness::Unknown;
         // The one rule a bytecode trace's defer imposes: the block it names
         // is run interpreted once before the trace is consulted for it
         // again. Without it a block that hands back its own entry is
-        // re-entered forever.
-        let mut interpret_next = false;
+        // re-entered forever. An exact run interprets everything.
+        let mut interpret_next = exact;
         while budget > 0 {
             // Before anything is fetched, so a block decoded from bytes the
             // last block overwrote cannot exist.
@@ -167,9 +194,12 @@ impl Engine {
                     }
                 }
             }
-            interpret_next = false;
+            interpret_next = exact;
             let mut cpu = Cpu::new(tcb, space);
             let mut position = 0usize;
+            // The last instruction of this block that retired, for the
+            // staleness an exact run reports at its stop.
+            let mut last: Option<usize> = None;
             while position < block.instructions.len() {
                 let instruction = &block.instructions[position];
                 if budget == 0 {
@@ -199,6 +229,7 @@ impl Engine {
                             return Outcome::Trap(trap);
                         }
                     }
+                    last = Some(position);
                     if cpu.space.has_dirty_code() {
                         // Fell through, so this is where execution is.
                         cpu.tcb.rip = instruction.next_ip();
@@ -213,7 +244,7 @@ impl Engine {
                     continue;
                 }
                 match cpu.run(&block.quick[position], instruction) {
-                    Ok(Step::Retired) => {}
+                    Ok(Step::Retired) => last = Some(position),
                     Ok(Step::Syscall) => return Outcome::Syscall,
                     Err(trap) => {
                         // Where `%rip` is left is the difference between a
@@ -266,9 +297,39 @@ impl Engine {
                 }
                 position += 1;
             }
+            if exact && budget == 0 {
+                tcb.flags_staleness = staleness(block, last);
+            }
         }
         Outcome::Preempted
     }
+}
+
+/// Whether the flags record at a stop is the last retired instruction's.
+///
+/// Walking back from the last instruction of the block that retired: a
+/// writer whose flags were dead means the record was not written and is an
+/// earlier one's; a full writer whose flags were live means the record is
+/// its own; anything the fast path does not lower may or may not have
+/// written flags, and so may the block before this one, which is where
+/// the walk gives up.
+fn staleness(block: &block::Block, last: Option<usize>) -> Staleness {
+    let Some(last) = last else {
+        return Staleness::Unknown;
+    };
+    for position in (0..=last).rev() {
+        let quick = &block.quick[position];
+        if quick.flags_dead {
+            return Staleness::Stale;
+        }
+        if block::writes_flags(quick.op) {
+            return Staleness::Fresh;
+        }
+        if quick.op == quick::Op::General {
+            return Staleness::Unknown;
+        }
+    }
+    Staleness::Unknown
 }
 
 #[cfg(test)]

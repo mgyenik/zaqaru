@@ -198,12 +198,22 @@ pub type Answer = (Vec<Vec<u8>>, Result<Option<Vec<u8>>, String>);
 /// that it is exact, so the format optimises for having no way to be
 /// ambiguous about a byte — not for being readable, which is what the
 /// trace is for.
-fn encode(entries: &[Answer]) -> Vec<u8> {
+/// The tape's first bytes: what it is, and which engine made the run.
+///
+/// The schedule a tape records is a function of where quanta ended, and
+/// the accelerator ends them at a back-edge where the interpreter ends them
+/// on the instruction — so a run recorded with one does not replay under
+/// the other, and the tape says which.
+const TAPE_MAGIC: &[u8; 4] = b"ZQT1";
+
+fn encode(entries: &[Answer], bytecode: bool) -> Vec<u8> {
     let mut bytes = Vec::new();
     let piece = |held: &[u8], into: &mut Vec<u8>| {
         into.extend_from_slice(&(held.len() as u32).to_le_bytes());
         into.extend_from_slice(held);
     };
+    bytes.extend_from_slice(TAPE_MAGIC);
+    bytes.push(u8::from(bytecode));
     bytes.extend_from_slice(&(entries.len() as u32).to_le_bytes());
     for (path, answer) in entries {
         bytes.extend_from_slice(&(path.len() as u32).to_le_bytes());
@@ -230,8 +240,13 @@ fn encode(entries: &[Answer]) -> Vec<u8> {
 
 type Entries = std::collections::VecDeque<Answer>;
 
-fn decode(bytes: &[u8]) -> Result<Entries, String> {
-    let mut at = 0;
+/// A decoded tape: its entries, and whether the run used the accelerator.
+fn decode(bytes: &[u8]) -> Result<(Entries, bool), String> {
+    if bytes.len() < 5 || &bytes[..4] != TAPE_MAGIC {
+        return Err(String::from("not a tape: the file does not begin with the tape's magic"));
+    }
+    let bytecode = bytes[4] != 0;
+    let mut at = 5;
     let word = |at: &mut usize| -> Result<usize, String> {
         if *at + 4 > bytes.len() {
             return Err(String::from("a tape that ends inside a length"));
@@ -275,7 +290,7 @@ fn decode(bytes: &[u8]) -> Result<Entries, String> {
         };
         entries.push_back((path, answer));
     }
-    Ok(entries)
+    Ok((entries, bytecode))
 }
 
 /// What is mounted where, resolved by longest prefix.
@@ -432,6 +447,9 @@ pub enum Tape {
     Recording {
         entries: Vec<Answer>,
         to: std::path::PathBuf,
+        /// Whether the run being recorded uses the accelerator, written
+        /// into the tape's header.
+        bytecode: bool,
     },
     Replaying {
         entries: std::collections::VecDeque<Answer>,
@@ -528,30 +546,33 @@ impl MountTable {
     }
 
     /// Starts recording every answer, to be written when the run ends.
-    pub fn record(&mut self, to: std::path::PathBuf) {
+    /// `bytecode` says which engine the run uses; the tape carries it.
+    pub fn record(&mut self, to: std::path::PathBuf, bytecode: bool) {
         self.tape = Some(Tape::Recording {
             entries: Vec::new(),
             to,
+            bytecode,
         });
     }
 
-    /// Answers from a tape instead of from the stores.
-    pub fn replay(&mut self, from: &std::path::Path) -> Result<(), String> {
+    /// Answers from a tape instead of from the stores. Answers whether the
+    /// recorded run used the accelerator, which the replay has to match.
+    pub fn replay(&mut self, from: &std::path::Path) -> Result<bool, String> {
         let bytes = std::fs::read(from).map_err(|error| format!("reading {from:?}: {error}"))?;
-        Ok(self.tape = Some(Tape::Replaying {
-            entries: decode(&bytes)?,
-        }))
+        let (entries, bytecode) = decode(&bytes)?;
+        self.tape = Some(Tape::Replaying { entries });
+        Ok(bytecode)
     }
 
     /// Writes a recording out, if one was being made. Answers how many
     /// answers it holds.
     pub fn keep_tape(&mut self) -> Option<Result<usize, String>> {
-        let Some(Tape::Recording { entries, to }) = self.tape.take() else {
+        let Some(Tape::Recording { entries, to, bytecode }) = self.tape.take() else {
             return None;
         };
         let held = entries.len();
         Some(
-            std::fs::write(&to, encode(&entries))
+            std::fs::write(&to, encode(&entries, bytecode))
                 .map(|()| held)
                 .map_err(|error| format!("writing {to:?}: {error}")),
         )

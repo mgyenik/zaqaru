@@ -35,6 +35,8 @@ const MEMORY_EXPORT: &str = "memory";
 /// arrives through the store at `/iso/shutdown/complete` — here so that a
 /// host that mounts nothing can still tell how the run ended.
 pub const RUN_EXPORT: &str = "zaqaru_run";
+/// The same machine, run to an exact instruction and held there.
+pub const STOP_EXPORT: &str = "zaqaru_stop_at";
 
 /// What one call of the run export did. The guest packs the kind into the
 /// low byte and, when finished, the exit status into the byte above.
@@ -46,6 +48,8 @@ pub enum Turn {
     Idle,
     /// The container has exited with this status.
     Finished(i32),
+    /// The container stands on the instruction it was asked to stop at.
+    Stopped,
 }
 
 impl Turn {
@@ -54,6 +58,7 @@ impl Turn {
             0 => Ok(Turn::Running),
             1 => Ok(Turn::Idle),
             2 => Ok(Turn::Finished((word >> 8) & 0xff)),
+            3 => Ok(Turn::Stopped),
             other => bail!("the guest answered an unknown turn kind {other}"),
         }
     }
@@ -146,6 +151,14 @@ impl Container {
     /// whole machine.
     pub fn step(&mut self, until: i64) -> Result<Turn> {
         Turn::decode(self.call::<i64, i32>(RUN_EXPORT, until)?)
+    }
+
+    /// Runs the container until it has retired exactly `target`
+    /// instructions and holds it there, for reading through [`Self::ask`].
+    /// The first call boots. A container stopped this way is not for
+    /// continuing; a debugger restores a checkpoint instead.
+    pub fn stop_at(&mut self, target: i64) -> Result<Turn> {
+        Turn::decode(self.call::<i64, i32>(STOP_EXPORT, target)?)
     }
 
     /// Reads a path of the container's own store — the isotope Server

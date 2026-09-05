@@ -59,9 +59,24 @@ impl Run {
                 Box::new(host::net::NetStore::new(self.ports.clone())),
             );
         }
+        // A replayed run has to use the engine the recorded one did — the
+        // schedule depends on where quanta end, and the two engines end
+        // them differently — so the tape decides, and says so when the
+        // flag disagreed.
+        let mut no_bytecode = self.no_bytecode;
+        if let Some(from) = &self.replay {
+            let recorded_bytecode = table.replay(from).map_err(anyhow::Error::msg)?;
+            if recorded_bytecode == self.no_bytecode {
+                eprintln!(
+                    "the tape was recorded {} the bytecode accelerator; replaying the same way",
+                    if recorded_bytecode { "with" } else { "without" }
+                );
+            }
+            no_bytecode = !recorded_bytecode;
+        }
         // What the host asks of the guest is a path the host mounts: the
         // store is the only channel there is.
-        if self.trace.is_some() || self.no_bytecode {
+        if self.trace.is_some() || no_bytecode {
             let mut config = host::store::Sink::new();
             if self.trace.is_some() {
                 config.place(
@@ -69,7 +84,7 @@ impl Run {
                     b"1".to_vec(),
                 );
             }
-            if self.no_bytecode {
+            if no_bytecode {
                 config.place(
                     &[b"iso".to_vec(), b"config".to_vec(), b"bytecode".to_vec()],
                     b"0".to_vec(),
@@ -78,10 +93,7 @@ impl Run {
             table.mount(&[b"iso", b"config"], Box::new(config));
         }
         if let Some(to) = &self.record {
-            table.record(to.clone());
-        }
-        if let Some(from) = &self.replay {
-            table.replay(from).map_err(anyhow::Error::msg)?;
+            table.record(to.clone(), !no_bytecode);
         }
 
         // Compiling is not running, and a container's cost is both. wasmtime

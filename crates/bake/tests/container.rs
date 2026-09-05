@@ -206,6 +206,7 @@ int main(void) {
         match stepped.step((steps * 100_000) as i64).expect("step") {
             host::Turn::Finished(status) => break status,
             host::Turn::Running | host::Turn::Idle => {}
+            host::Turn::Stopped => unreachable!("only stop_at stops"),
         }
         // The container's own store, read while the machine is stopped
         // between turns: the isotope Server Protocol from the outside.
@@ -231,6 +232,55 @@ int main(void) {
     // container declared at boot is there too.
     let interface = readback(&mut stepped, &[b"iso", b"self", b"interface"]);
     assert!(interface.contains(r#""name":"zaqaru-container""#), "{interface}");
+    drop(workspace);
+}
+
+/// **The machine stops on an instruction.** For several targets, a fresh
+/// container run to exactly that count reports exactly that count, says
+/// whether its flags are the last instruction's, and — run twice — stands
+/// in the same place with the same registers.
+#[test]
+fn a_container_stops_on_the_instruction_asked_for() {
+    let (workspace, module) = module_for(
+        "stopped",
+        r#"
+#include <stdio.h>
+int main(void) {
+    volatile long sum = 0;
+    for (long i = 0; i < 400000; i++) sum += i ^ (i >> 3);
+    printf("%ld\n", sum);
+    return 0;
+}
+"#,
+        &["-static", "-no-pie"],
+    );
+    let bytes = std::fs::read(&module).expect("read the container");
+    let field = |json: &str, name: &str| -> Option<String> {
+        let key = format!("\"{name}\":");
+        let at = json.find(&key)? + key.len();
+        let rest = &json[at..];
+        let end = rest.find([',', '}']).unwrap_or(rest.len());
+        Some(rest[..end].trim_matches('"').to_string())
+    };
+    for target in [1i64, 12_345, 137_531, 1_000_003] {
+        let mut runs = Vec::new();
+        for _ in 0..2 {
+            let mut container =
+                host::Container::instantiate(&bytes, support::mounts_seeded(&[0x33; 32])).expect("instantiate");
+            assert_eq!(container.stop_at(target).expect("stop"), host::Turn::Stopped, "at {target}");
+            let statistics = container.ask("statistics").expect("ask");
+            assert_eq!(field(&statistics, "retired").as_deref(), Some(target.to_string().as_str()), "{statistics}");
+            let registers = container.ask("processes/1/threads/1/registers").expect("ask");
+            let stale = field(&registers, "flags_stale").expect("flags_stale is reported");
+            assert!(stale == "true" || stale == "false" || stale == "null", "{registers}");
+            runs.push(registers);
+        }
+        assert_eq!(runs[0], runs[1], "two runs to {target} stand in different places");
+    }
+    // A stop at the end is a finished container.
+    let mut container =
+        host::Container::instantiate(&bytes, support::mounts_seeded(&[0x33; 32])).expect("instantiate");
+    assert!(matches!(container.stop_at(i64::MAX).expect("stop"), host::Turn::Finished(0)));
     drop(workspace);
 }
 
@@ -495,7 +545,7 @@ int main(void) {
 
     let mut recording = support::mounts_seeded(&[0x33; 32]);
     recording.mount(&[b"iso", b"time"], Box::new(host::store::Clock::new()));
-    recording.record(tape.clone());
+    recording.record(tape.clone(), true);
     let (status, first) = boot(&module, recording);
     assert_eq!(status, 0, "the recorded run failed: {first}");
     assert!(tape.is_file(), "nothing was recorded");

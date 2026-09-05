@@ -497,9 +497,6 @@ fn lower_all(instructions: &[Instruction]) -> Vec<crate::quick::Quick> {
     // interpreter handler — can drop the record. A computed goto is
     // deliberately not in the set: its target is arbitrary and could read
     // flags, even where an interpreter's own dispatch never does.
-    let writes_flags = |op| {
-        matches!(op, Op::Add | Op::Sub | Op::Cmp | Op::And | Op::Or | Op::Xor | Op::Test)
-    };
     let ends_dead = matches!(quicks.last().map(|q| q.op), Some(Op::Call) | Some(Op::Ret));
     let mut flags_live = !ends_dead;
     for quick in quicks.iter_mut().rev() {
@@ -511,6 +508,14 @@ fn lower_all(instructions: &[Instruction]) -> Vec<crate::quick::Quick> {
         }
     }
     quicks
+}
+
+/// Whether a lowered op writes the whole flags record and reads none of it:
+/// the ops dead-flag elimination may skip, and the ones after which the
+/// record is certainly the instruction's own.
+pub fn writes_flags(op: crate::quick::Op) -> bool {
+    use crate::quick::Op;
+    matches!(op, Op::Add | Op::Sub | Op::Cmp | Op::And | Op::Or | Op::Xor | Op::Test)
 }
 
 /// Whether every instruction but the last simply falls through.
