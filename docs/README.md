@@ -10,6 +10,11 @@
 - [performance.md](performance.md) — what a container costs, where the
   time goes, how to measure it without fooling yourself, and what was
   tried and rejected.
+- [time-travel-debugger.md](time-travel-debugger.md) — design for a
+  browser page that replays a recorded container run and seeks to any
+  instruction: the re-entrant guest, the exact stop, snapshot and restore,
+  introspection, the browser harness, checkpoints, and the page. Not yet
+  built.
 - [archive/](archive/) — the design and planning documents the project
   was built from, and the write-ups of measurements that settled
   questions. Dated records, not current descriptions: they describe
