@@ -48,7 +48,6 @@ pub mod profile;
 pub mod quick;
 pub mod space;
 pub mod state;
-pub mod tier1;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub mod arena;
@@ -113,13 +112,12 @@ impl Engine {
         quantum: u64,
     ) -> Outcome {
         let mut budget = quantum;
-        // What compiled code needs to check its accesses, built once: see
-        // `space::Vitals` for why nothing inside a quantum can move it.
-        let vitals = space.vitals();
-        // The one rule a compiled block's `Interpret` exit imposes: the
-        // block it names is run interpreted once before compiled code is
-        // consulted for it again. Without it a block that hands back its
-        // own entry is re-entered forever.
+        // The one rule a bytecode trace's defer imposes: the block it names
+        // is run interpreted once before the trace is consulted for it
+        // again. Without it a block that hands back its own entry is
+        // re-entered forever. Only the accelerator reads it, so a build
+        // without one does not have it.
+        #[cfg(feature = "bytecode")]
         let mut interpret_next = false;
         while budget > 0 {
             // Before anything is fetched, so a block decoded from bytes the
@@ -133,55 +131,8 @@ impl Engine {
                 }
             };
             let block = cache.block(index);
-            if let Some((function, which, base)) = block.compiled
-                && !interpret_next
-            {
-                // The region the bake compiled for these bytes, entered
-                // at this block. It retires what it retires into the
-                // control block, stops exactly where the interpreter would
-                // when the budget runs out, and answers where execution
-                // goes next — see `tier1`.
-                #[cfg(feature = "verify")]
-                let trace = tier1::verify_before(tcb, space, cache, 8192);
-                tier1::enter(space, cache, index);
-                let before = tcb.retired;
-                let exit = tier1::call(function, tcb, &vitals, base, budget, which);
-                #[cfg(feature = "verify")]
-                tier1::verify_after(&trace, tcb, space, cache.block(index), exit);
-                let block = cache.block(index);
-                debug_assert!(
-                    tcb.retired >= before && tcb.retired - before <= budget,
-                    "a compiled block at {:#x} ({} instructions) retired {} to {} against a budget of {}, exit {:#x}",
-                    block.entry,
-                    block.instructions.len(),
-                    before,
-                    tcb.retired,
-                    budget,
-                    exit
-                );
-                let retired = tcb.retired.wrapping_sub(before);
-                tcb.compiled = tcb.compiled.wrapping_add(retired);
-                budget = budget.saturating_sub(retired);
-                tcb.rip = tier1::exit_rip(exit);
-                match tier1::exit_kind(exit) {
-                    // A block that retired nothing and points at itself —
-                    // the budget rule declining to start — must not be
-                    // called again with the same budget: the interpreter
-                    // takes the block, and the quantum ends where it
-                    // always did.
-                    tier1::KIND_CONTINUE => {
-                        interpret_next = retired == 0;
-                        continue;
-                    }
-                    tier1::KIND_SYSCALL => return Outcome::Syscall,
-                    _ => {
-                        interpret_next = true;
-                        continue;
-                    }
-                }
-            }
             // The bytecode accelerator, when built and when this block was not
-            // just told to interpret (a defer, or a tier-1 decline): run the
+            // just told to interpret (a defer): run the
             // trace, which keeps a loop's back-edge inside itself. It retires
             // into the control block and leaves exactly where the interpreter
             // would — an exit sets `rip` and the loop continues, a defer hands
@@ -206,12 +157,11 @@ impl Engine {
                     budget,
                     crate::bytecode::Resolver::Cache(cache),
                 );
-                // What ran via the accelerator, counted like tier-1's share so
-                // the run's `compiled %` reports the bytecode's coverage —
-                // which says how much of a real workload it covers and how much
-                // still defers.
+                // What ran via the accelerator, so the run's statistics report
+                // the bytecode's coverage — which says how much of a real
+                // workload it covers and how much still defers.
                 let ran = tcb.retired.wrapping_sub(before);
-                tcb.compiled = tcb.compiled.wrapping_add(ran);
+                tcb.accelerated = tcb.accelerated.wrapping_add(ran);
                 budget = budget.saturating_sub(ran);
                 match leave {
                     crate::bytecode::Leave::Exit | crate::bytecode::Leave::Preempted => continue,
@@ -226,7 +176,10 @@ impl Engine {
                     }
                 }
             }
-            interpret_next = false;
+            #[cfg(feature = "bytecode")]
+            {
+                interpret_next = false;
+            }
             let mut cpu = Cpu::new(tcb, space);
             let mut position = 0usize;
             while position < block.instructions.len() {

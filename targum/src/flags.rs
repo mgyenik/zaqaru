@@ -81,11 +81,7 @@ pub enum Rule {
 }
 
 /// The last flag-writing operation, plus the bits no rule covers.
-/// `repr(C)`, with the two enums a byte each at the front and five `u64`s
-/// behind: compiled code writes the record at `crate::state::layout`'s
-/// offsets, and this is the layout those numbers describe.
 #[derive(Clone, Copy, Debug)]
-#[repr(C)]
 pub struct Flags {
     rule: Rule,
     width: Width,

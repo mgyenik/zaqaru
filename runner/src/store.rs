@@ -200,7 +200,7 @@ pub type Answer = (Vec<Vec<u8>>, Result<Option<Vec<u8>>, String>);
 /// trace is for.
 fn encode(entries: &[Answer]) -> Vec<u8> {
     let mut bytes = Vec::new();
-    let mut piece = |held: &[u8], into: &mut Vec<u8>| {
+    let piece = |held: &[u8], into: &mut Vec<u8>| {
         into.extend_from_slice(&(held.len() as u32).to_le_bytes());
         into.extend_from_slice(held);
     };
@@ -232,7 +232,7 @@ type Entries = std::collections::VecDeque<Answer>;
 
 fn decode(bytes: &[u8]) -> Result<Entries, String> {
     let mut at = 0;
-    let mut word = |at: &mut usize| -> Result<usize, String> {
+    let word = |at: &mut usize| -> Result<usize, String> {
         if *at + 4 > bytes.len() {
             return Err(String::from("a tape that ends inside a length"));
         }
@@ -258,7 +258,7 @@ fn decode(bytes: &[u8]) -> Result<Entries, String> {
         }
         let kind = bytes[at];
         at += 1;
-        let mut held = |at: &mut usize| -> Result<Vec<u8>, String> {
+        let held = |at: &mut usize| -> Result<Vec<u8>, String> {
             let length = word(at)?;
             if *at + length > bytes.len() {
                 return Err(String::from("a tape that ends inside an answer"));

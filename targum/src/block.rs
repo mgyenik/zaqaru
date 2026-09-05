@@ -117,16 +117,6 @@ pub struct Block {
     /// path still wants the original and a lowered op that had to carry one
     /// would save nothing.
     pub quick: Vec<crate::quick::Quick>,
-    /// The function the bake compiled for exactly these bytes, if it
-    /// compiled one, and which member of it this block is: a table index
-    /// the run loop calls instead of interpreting. Looked up when the block
-    /// is decoded and never again, which is what makes it free — see
-    /// [`crate::tier1`].
-    pub compiled: Option<(u32, u32, u64)>,
-    /// Pages the compiled region's other members sit on, which the block
-    /// is registered against too: a write to any of them drops the block,
-    /// because the region was compiled for all of them together.
-    pub also: Vec<u64>,
     /// The bytecode trace transpiled from this block, when the `bytecode`
     /// feature is on — an accelerator the run loop runs in place of
     /// interpreting, with anything unmodelled deferring back. `None` when the
@@ -137,26 +127,15 @@ pub struct Block {
 }
 
 impl Block {
-    /// The pages the block's bytes came from.
+    /// The pages the block's bytes came from — every page the block is
+    /// registered against.
     fn pages(&self) -> std::ops::RangeInclusive<u64> {
         (self.entry >> PAGE_SHIFT)..=((self.end - 1) >> PAGE_SHIFT)
-    }
-
-    /// Every page the block is registered against: its own, and its
-    /// compiled region's.
-    fn all_pages(&self) -> Vec<u64> {
-        let mut pages: Vec<u64> = self.pages().collect();
-        for page in &self.also {
-            if !pages.contains(page) {
-                pages.push(*page);
-            }
-        }
-        pages
     }
 }
 
 /// Why a block ended where it did. Nothing acts on this yet; it is what a
-/// hot-block tier will select traces by, and what a diagnostic prints.
+/// diagnostic prints.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Terminator {
     /// The last instruction transfers control.
@@ -218,10 +197,6 @@ pub struct BlockCache {
     /// How many blocks have been decoded since the cache was last emptied,
     /// for the diagnostics that ask how much decoding a workload does.
     pub decoded: u64,
-    /// Of those, how many got a tier-1 compiled function attached — the
-    /// numerator of the attach rate, which separates "the bake compiled
-    /// nothing that matches" from "it matched but never ran".
-    pub attached: u64,
     pub flushes: u64,
 }
 
@@ -236,7 +211,6 @@ impl Default for BlockCache {
             recent: vec![(u64::MAX, 0); RECENT],
             registry: FastMap::default(),
             decoded: 0,
-            attached: 0,
             flushes: 0,
         }
     }
@@ -328,10 +302,7 @@ impl BlockCache {
         if self.entries.len() >= CAPACITY {
             self.flush(space);
         }
-        if block.compiled.is_some() {
-            self.attached += 1;
-        }
-        let pages: Vec<u64> = block.all_pages();
+        let pages: Vec<u64> = block.pages().collect();
         let entry = block.entry;
         let index = match self.free.pop() {
             Some(index) => {
@@ -366,7 +337,7 @@ impl BlockCache {
                 continue;
             };
             self.entries.remove(&block.entry);
-            for other in block.all_pages() {
+            for other in block.pages() {
                 if other == page {
                     continue;
                 }
@@ -443,14 +414,11 @@ fn decode(address: u64, space: &Space) -> Result<Block, FetchError> {
                 // empty case cannot loop forever because the cap is longer
                 // than the longest instruction.
                 DecoderError::NoMoreBytes if !instructions.is_empty() => {
-                    let (compiled, also) = attach(bytes, address, end, space);
                     let block = Block {
                         entry: address,
                         end,
                         quick: lower_all(&instructions),
                         simple: straight_through(&instructions),
-                        compiled,
-                        also,
                         #[cfg(feature = "bytecode")]
                         trace: None,
                         instructions,
@@ -473,29 +441,16 @@ fn decode(address: u64, space: &Space) -> Result<Block, FetchError> {
             break;
         }
     }
-    let (compiled, also) = attach(bytes, address, end, space);
     let block = Block {
         entry: address,
         end,
         quick: lower_all(&instructions),
         simple: straight_through(&instructions),
-        compiled,
-        also,
         #[cfg(feature = "bytecode")]
         trace: None,
         instructions,
     };
     Ok(finalize(block))
-}
-
-/// What the bake compiled for a decoded block's bytes, if anything: the
-/// region's function and member, and the pages of the region's other
-/// members. See [`crate::tier1::lookup`].
-fn attach(bytes: &[u8], address: u64, end: u64, space: &Space) -> (Option<(u32, u32, u64)>, Vec<u64>) {
-    match crate::tier1::lookup(&bytes[..(end - address) as usize], address, space) {
-        Some(found) => (Some((found.function, found.which, found.base)), found.pages),
-        None => (None, Vec::new()),
-    }
 }
 
 /// Lowers a block's instructions and records, for each, whether the run
@@ -575,8 +530,9 @@ fn straight_through(instructions: &[Instruction]) -> bool {
 /// itself costs — and buys two things. The kernel writes guest memory, so a
 /// syscall is a moment when the cache may need to be invalidated, and having
 /// it at a block boundary means the drain that handles it is the same drain
-/// everything else uses. And it is the rule a compiled trace will have to
-/// obey anyway, so tier zero and tier one agree about where a block can end.
+/// everything else uses. And it is the rule a bytecode trace has to obey
+/// anyway, so the interpreter and the transpiler agree about where a block
+/// can end.
 pub fn terminator(instruction: &Instruction) -> Option<Terminator> {
     if matches!(
         instruction.mnemonic(),

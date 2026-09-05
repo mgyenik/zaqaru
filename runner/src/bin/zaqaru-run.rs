@@ -280,28 +280,17 @@ fn report_cost(container: &mut runner::Container, elapsed: f64) {
         // zeros, which would read as a run that did nothing.
         return;
     };
-    let compiled = field("compiled").unwrap_or(0);
-    let attached = field("attached").unwrap_or(0);
+    let accelerated = field("accelerated").unwrap_or(0);
     let share = if retired > 0 {
-        compiled as f64 / retired as f64 * 100.0
-    } else {
-        0.0
-    };
-    let attach_rate = if decoded > 0 {
-        attached as f64 / decoded as f64 * 100.0
+        accelerated as f64 / retired as f64 * 100.0
     } else {
         0.0
     };
     eprintln!(
         "zaqaru-run: {retired} instructions in {elapsed:.2}s = {:.1} MIPS, \
-         {share:.1}% compiled, {decoded} blocks decoded ({attached} = {attach_rate:.1}% attached)",
+         {share:.1}% in bytecode, {decoded} blocks decoded",
         retired as f64 / elapsed / 1e6
     );
-
-}
-
-fn console(container: &mut runner::Container, stream: &[u8]) -> String {
-    read(container, &[b"iso", b"console", stream])
 }
 
 fn read(container: &mut runner::Container, path: &[&[u8]]) -> String {

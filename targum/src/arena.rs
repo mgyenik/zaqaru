@@ -321,14 +321,6 @@ mod tests {
         );
     }
 
-    /// The address space is one place, so these run one at a time.
-    fn exclusively<R>(body: impl FnOnce() -> R) -> R {
-        use std::sync::Mutex;
-        static ONE: Mutex<()> = Mutex::new(());
-        let _held = ONE.lock().unwrap_or_else(|poison| poison.into_inner());
-        body()
-    }
-
     fn byte(at: u64) -> u8 {
         // SAFETY: callers only read committed, current memory.
         unsafe { (at as usize as *const u8).read_volatile() }

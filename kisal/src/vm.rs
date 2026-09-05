@@ -76,17 +76,6 @@ pub unsafe extern "C" fn targum_boot() -> i32 {
         other => {
             let mut message = String::from("kisal: the container stopped: ");
             describe(&other, &mut message);
-            // The compiled blocks entered last, when there were any: the
-            // one that went wrong is usually among them and never the one
-            // that faulted.
-            let recent = targum::tier1::recent_entries();
-            if !recent.is_empty() {
-                message.push_str("; compiled blocks entered last:");
-                for entry in recent {
-                    message.push(' ');
-                    crate::push_hex(&mut message, entry);
-                }
-            }
             crate::report_to(&mut system.current().kernel, &message);
             UNIMPLEMENTED
         }
@@ -104,12 +93,10 @@ pub unsafe extern "C" fn targum_boot() -> i32 {
 fn report_statistics(system: &mut System<'_, HostStore>) {
     let mut message = String::from("retired ");
     crate::push_decimal(&mut message, system.retired() as i64);
-    message.push_str("\ncompiled ");
-    crate::push_decimal(&mut message, system.compiled() as i64);
+    message.push_str("\naccelerated ");
+    crate::push_decimal(&mut message, system.accelerated() as i64);
     message.push_str("\ndecoded ");
     crate::push_decimal(&mut message, system.decoded() as i64);
-    message.push_str("\nattached ");
-    crate::push_decimal(&mut message, system.attached() as i64);
     message.push('\n');
     let _ = crate::abi::Store::write(
         &mut system.current().kernel.store,

@@ -24,52 +24,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() -> anyhow::Result<()> {
-    // `--tier1` compiles the image's code at bake time — see
-    // `docs/tier1-plan.md` — and `--budget <MB>` bounds how much. Off, the
-    // module still carries the (empty) table the engine looks bytes up in.
-    let raw: Vec<String> = std::env::args().skip(1).collect();
-    let mut tier1 = false;
-    let mut verify = false;
-    let mut budget: usize = 32 << 20;
-    // `--only lo-hi` compiles only blocks whose address is in the range: a
-    // bisection tool, not a feature.
-    let mut only: Option<(u64, u64)> = None;
-    let mut hot: Option<String> = None;
-    let mut cluster = false;
-    let mut positional: Vec<String> = Vec::new();
-    let mut index = 0;
-    while index < raw.len() {
-        match raw[index].as_str() {
-            "--tier1" => tier1 = true,
-            "--verify" => verify = true,
-            "--budget" if index + 1 < raw.len() => {
-                budget = raw[index + 1].parse::<usize>().unwrap_or(32) << 20;
-                index += 1;
-            }
-            "--only" if index + 1 < raw.len() => {
-                let (lo, hi) = raw[index + 1].split_once('-').expect("lo-hi");
-                only = Some((
-                    u64::from_str_radix(lo.trim_start_matches("0x"), 16).expect("hex"),
-                    u64::from_str_radix(hi.trim_start_matches("0x"), 16).expect("hex"),
-                ));
-                index += 1;
-            }
-            // A file of hot instruction addresses (one hex per line, file
-            // virtual addresses), from a profile of the runtime on
-            // representative work: keep only blocks that contain one. This
-            // is the corpus experiment — compile the small hot set a profile
-            // of *our* CPython names, not a budget's worth of everything.
-            "--hot" if index + 1 < raw.len() => {
-                hot = Some(raw[index + 1].clone());
-                index += 1;
-            }
-            // Gather each file's kept blocks into one region rather than
-            // many, so transfers among them stay in wasm — the cluster.
-            "--cluster" => cluster = true,
-            other => positional.push(other.to_string()),
-        }
-        index += 1;
-    }
+    let positional: Vec<String> = std::env::args().skip(1).collect();
     let mut arguments = positional.into_iter();
     let (root, output) = match (arguments.next(), arguments.next()) {
         (Some(root), Some(output)) => (PathBuf::from(root), PathBuf::from(output)),
@@ -84,8 +39,6 @@ fn main() -> anyhow::Result<()> {
     let given: Vec<Vec<u8>> = arguments.map(|a| a.into_bytes()).collect();
 
     let started = std::time::Instant::now();
-    // The tree is read once and used twice: baked into the image, and — with
-    // `--tier1` — swept for the code the bake compiles beside it.
     let tree = match root.is_dir() {
         true => baker::tree::Tree::from_directory(&root)?,
         false => baker::layers::tree_from_archive(&std::fs::read(&root)?)?,
@@ -135,62 +88,13 @@ fn main() -> anyhow::Result<()> {
         started.elapsed().as_secs_f64()
     );
 
-    // Tier 1: the compiled blocks, or an empty table, linked either way.
-    let compiled = output.with_extension("tier1.o");
-    let built = match tier1 {
-        true => {
-            let sweeping = std::time::Instant::now();
-            let mut candidates = sweep_tree(&tree);
-            if let Some((lo, hi)) = only {
-                candidates.retain(|candidate| candidate.address >= lo && candidate.address < hi);
-            }
-            if let Some(path) = &hot {
-                let text = std::fs::read_to_string(path).expect("read the hot list");
-                let mut hots: Vec<u64> = text
-                    .lines()
-                    .filter_map(|line| u64::from_str_radix(line.trim().trim_start_matches("0x"), 16).ok())
-                    .collect();
-                hots.sort_unstable();
-                let before = candidates.len();
-                // A block is kept if any hot address falls within it.
-                candidates.retain(|candidate| {
-                    let end = candidate.address + candidate.bytes.len() as u64;
-                    let at = hots.partition_point(|&h| h < candidate.address);
-                    hots.get(at).is_some_and(|&h| h < end)
-                });
-                eprintln!(
-                    "tier 1: hot list {} kept {} of {} swept blocks",
-                    path,
-                    candidates.len(),
-                    before
-                );
-            }
-            let built = zaqaru::tier1::build(&candidates, budget, cluster);
-            eprintln!(
-                "tier 1: {} blocks from the sweep, {} compiled in {} regions ({:.1} MB of code, {} instructions, {} deferred), {} mostly deferred and left interpreted, {} past the budget, in {:.2}s",
-                candidates.len(),
-                built.members,
-                built.functions,
-                built.code_bytes as f64 / 1e6,
-                built.instructions,
-                built.deferred,
-                built.mostly_deferred,
-                built.left_out,
-                sweeping.elapsed().as_secs_f64()
-            );
-            built.object
-        }
-        false => zaqaru::tier1::object::empty(),
-    };
-    std::fs::write(&compiled, &built)?;
-
-    let mut objects = vec![image.clone(), compiled.clone()];
+    let mut objects = vec![image.clone()];
     for (crate_name, library) in [
         ("kisal", "libkisal.a"),
         ("targum", "libtargum.a"),
         ("x87", "libx87.a"),
     ] {
-        objects.push(staticlib(crate_name, library, verify)?);
+        objects.push(staticlib(crate_name, library)?);
     }
 
     let linking = std::time::Instant::now();
@@ -218,7 +122,6 @@ fn main() -> anyhow::Result<()> {
         String::from_utf8_lossy(&linked.stderr)
     );
     let _ = std::fs::remove_file(&image);
-    let _ = std::fs::remove_file(&compiled);
     eprintln!(
         "module: {:.1} MB, linked in {:.2}s",
         std::fs::metadata(&output)?.len() as f64 / 1e6,
@@ -233,7 +136,7 @@ fn main() -> anyhow::Result<()> {
 /// These are the same three objects in every container — the engine does not
 /// depend on the image — so a real bake would take them off a shelf. Built
 /// here because a tool with no shelf is a tool that works.
-fn staticlib(crate_name: &str, library: &str, verify: bool) -> anyhow::Result<PathBuf> {
+fn staticlib(crate_name: &str, library: &str) -> anyhow::Result<PathBuf> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     // A measurement hook: `ZAQARU_ENGINE_FEATURES=targum/bytecode` bakes the
     // module with the engine's bytecode accelerator on, so its rate can be
@@ -242,13 +145,7 @@ fn staticlib(crate_name: &str, library: &str, verify: bool) -> anyhow::Result<Pa
     let extra = (!engine_features.is_empty() && crate_name != "x87").then_some(&engine_features);
     // A separate target directory per feature set, so the builds do not keep
     // rebuilding each other.
-    let suffix = if verify {
-        "-verify".to_string()
-    } else if extra.is_some() {
-        "-features".to_string()
-    } else {
-        String::new()
-    };
+    let suffix = if extra.is_some() { "-features" } else { "" };
     let target = root.join("target").join(format!("wasm-{crate_name}{suffix}"));
     let mut command = Command::new(env!("CARGO"));
     command
@@ -262,9 +159,7 @@ fn staticlib(crate_name: &str, library: &str, verify: bool) -> anyhow::Result<Pa
             "wasm32-unknown-unknown",
             "--release",
         ]);
-    if verify && crate_name != "x87" {
-        command.args(["--features", "targum/verify"]);
-    } else if let Some(features) = extra {
+    if let Some(features) = extra {
         command.args(["--features", features]);
     }
     let output = command.output()?;
@@ -277,64 +172,4 @@ fn staticlib(crate_name: &str, library: &str, verify: bool) -> anyhow::Result<Pa
         .join("wasm32-unknown-unknown")
         .join("release")
         .join(library))
-}
-
-/// Every ELF in the tree, swept, in the order the bake should spend its
-/// budget: the runtime and anything under `/usr/local` first, the system's
-/// shared libraries next, everything else last.
-fn sweep_tree(tree: &baker::tree::Tree) -> Vec<zaqaru::tier1::Candidate> {
-    use baker::tree::{Body, ROOT};
-    let mut elfs: Vec<(u8, String, &[u8])> = Vec::new();
-    let mut stack: Vec<(usize, String)> = vec![(ROOT, String::new())];
-    while let Some((id, path)) = stack.pop() {
-        match &tree.node(id).body {
-            Body::Directory(entries) => {
-                for (name, child) in entries {
-                    let name = String::from_utf8_lossy(name).into_owned();
-                    stack.push((*child, format!("{path}/{name}")));
-                }
-            }
-            Body::Regular(bytes) if bytes.starts_with(b"\x7fELF") => {
-                elfs.push((rank(&path), path, bytes.as_slice()));
-            }
-            _ => {}
-        }
-    }
-    elfs.sort_by(|left, right| (left.0, &left.1).cmp(&(right.0, &right.1)));
-    let mut candidates = Vec::new();
-    for (module, (_, path, bytes)) in elfs.into_iter().enumerate() {
-        match zaqaru::tier1::sweep(bytes) {
-            Ok(mut found) => {
-                eprintln!("  swept {path}: {} blocks", found.len());
-                // Tag every block with its file, so region formation keeps
-                // members of one file together: their file addresses collide
-                // with another's, but they load at their own base.
-                for candidate in &mut found {
-                    candidate.module = module as u32;
-                }
-                candidates.extend(found);
-            }
-            Err(error) => eprintln!("  skipped {path}: {error}"),
-        }
-    }
-    candidates
-}
-
-/// Where an ELF stands in the budget's order. Evidence the bake can read
-/// without running anything; `docs/tier1-plan.md` §10.
-fn rank(path: &str) -> u8 {
-    let name = path.rsplit('/').next().unwrap_or(path);
-    if path.starts_with("/usr/local/")
-        || name.starts_with("ld-linux")
-        || name.starts_with("libc.so")
-        || name == "nginx"
-        || name.starts_with("python3")
-        || path.contains("/lib-dynload/")
-    {
-        return 0;
-    }
-    if path.contains("/x86_64-linux-gnu/") || path.starts_with("/lib/") || path.starts_with("/usr/lib/") {
-        return 1;
-    }
-    2
 }

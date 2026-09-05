@@ -436,11 +436,14 @@ const REGISTER_NAMES: [&str; 16] = [
     "r14", "r15",
 ];
 
+/// The six status flags: CF, PF, AF, ZF, SF, OF, in RFLAGS positions.
+const STATUS_FLAGS: u64 = 0x0000_08d5;
+
 /// The flag bits worth comparing: the six status flags plus the direction
 /// flag. The rest of the word is the kernel's business — the interrupt flag
 /// a userspace process cannot change, the resume and I/O-privilege bits it
 /// cannot see — and is not part of the machine this engine models.
-const COMPARED_FLAGS: u64 = 0x0000_08d5 | (1 << 10);
+const COMPARED_FLAGS: u64 = STATUS_FLAGS | (1 << 10);
 
 /// One case: a probe, its arguments, and what the two machines did.
 pub struct Comparison {
@@ -584,6 +587,19 @@ fn run(
         // this machine rather than the machine.
         let effects = flag_effects(&engine, native.rip);
         poisoned = (poisoned & !effects.defined) | effects.undefined;
+        // And what the engine deliberately does not compute. A writer whose
+        // six status flags are overwritten before anything reads them skips
+        // the lazy record (`Quick::flags_dead`), so after it the record is
+        // the previous writer's. That is unobservable to the guest except
+        // through the flags word in a signal frame delivered at a quantum
+        // boundary, which `docs/fidelity.md` records; here it is a
+        // comparison the oracle has to withhold, flag by flag, until a
+        // later instruction defines each bit again — exactly the treatment
+        // an architecturally undefined bit gets, for the same reason: the
+        // engine makes no promise about the value.
+        if flags_dead_at(engine, native.rip) {
+            poisoned |= STATUS_FLAGS;
+        }
         mnemonics.insert(effects.name);
 
         let signal = tracee.step();
@@ -831,6 +847,26 @@ fn flag_effects(engine: &Machine, address: u64) -> Effects {
         ),
         undefined: rflags(instruction.rflags_undefined()),
         name: mnemonic_name(instruction.mnemonic()),
+    }
+}
+
+/// Whether the engine will skip the lazy-flags record for the instruction
+/// at `address`, as the block it decodes there decides.
+///
+/// Under a quantum of one the engine runs exactly the first instruction of
+/// the block it fetches at `rip`, so that block's first lowered op is the
+/// decision that governs this step. Fetching it here first is harmless: the
+/// engine finds it in the cache, or re-decodes it after an invalidation the
+/// same way it would have anyway.
+fn flags_dead_at(engine: &mut Machine, address: u64) -> bool {
+    match engine.cache.entry(address, &mut engine.space) {
+        Ok(index) => engine
+            .cache
+            .block(index)
+            .quick
+            .first()
+            .is_some_and(|quick| quick.flags_dead),
+        Err(_) => false,
     }
 }
 

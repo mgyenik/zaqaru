@@ -870,7 +870,7 @@ fn statfs_describes_the_overlay_and_the_room_left() {
     /// `OVERLAYFS_SUPER_MAGIC`.
     const OVERLAY: u64 = 0x794c_7630;
     let mut kernel = Kernel::new(Recording::default(), Registers::default(), empty_image());
-    let mut buffer = GuestBytes::<120>::new();
+    let buffer = GuestBytes::<120>::new();
     let path = GuestBuffer::of(b"/\0");
     assert_eq!(
         kernel.dispatch(
@@ -898,7 +898,7 @@ fn statfs_describes_the_overlay_and_the_room_left() {
 #[test]
 fn statfs_refuses_what_is_not_there() {
     let mut kernel = Kernel::new(Recording::default(), Registers::default(), empty_image());
-    let mut buffer = GuestBytes::<120>::new();
+    let buffer = GuestBytes::<120>::new();
     let path = GuestBuffer::of(b"/nowhere\0");
     assert_eq!(
         kernel.dispatch(

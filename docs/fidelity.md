@@ -116,6 +116,19 @@ stream, where Linux's pool would give them different bytes. glibc reseeds
 it. The fix is for `/iso/random` to be asked again in the child rather than
 copied.
 
+A second is inherited from the engine: **the flags word in a signal frame
+may be an earlier instruction's.** An arithmetic instruction whose six
+status flags are overwritten before anything reads them does not record
+them (the interpreter's dead-flag elimination, and the bytecode
+transpiler's liveness analysis, which every shift and multiply it emits
+depends on). The guest cannot tell — by construction the next reader sees
+the overwriting instruction's flags — except by inspecting `EFLAGS` in the
+`ucontext` of a signal delivered at a quantum boundary that fell between
+the two. A handler that reads it sees the flags as they stood after the
+last *recorded* writer. Nothing but a debugger does that; the lockstep
+oracle withholds its flags comparison at exactly those points for exactly
+this reason.
+
 ## 3. Not built
 
 | Gap | What a guest gets today |
