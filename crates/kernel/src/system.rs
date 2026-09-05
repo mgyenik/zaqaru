@@ -363,99 +363,114 @@ impl<'a, S: Store + Clone> System<'a, S> {
     /// Runs until the container is finished, and answers what the first
     /// process ended with — which is the container's status, exactly as a
     /// process tree's is on Linux.
+    /// Runs the container to completion.
     pub fn run(&mut self) -> Exit {
         loop {
-            let why = match self.current().step(cpu::QUANTUM) {
-                Progress::Running => Yield::Kept,
-                // The quantum expired, so every process gets a turn — the
-                // same rule the threads inside one already follow, and with
-                // the same consequence: the whole interleaving, across
-                // processes as well as threads, is a function of how many
-                // instructions have retired.
-                Progress::Preempted => Yield::Quantum,
-                // This process is waiting for something only another one can
-                // do. Give somebody else a turn; if nobody can take it, the
-                // loop below is what says so.
-                Progress::Idle => Yield::Given,
-                Progress::Requested(request) => {
-                    self.answer(request);
-                    Yield::Kept
-                }
-                Progress::Finished(exit) => {
-                    // The edge, one last time. A process that writes a
-                    // reply and exits has put those bytes in a ring and
-                    // nowhere else, and the two scheduled pump points are
-                    // both about a container that keeps running: a whole
-                    // slice used, or nothing left to run. Neither happens
-                    // again after the last process goes, so without this
-                    // the final write of a run is dropped on the floor.
-                    //
-                    // Before `finish`, because that is what tears the
-                    // process down — and closing its descriptors is what
-                    // releases the ring the bytes are still sitting in.
-                    //
-                    // A long-lived server never showed this: nginx is
-                    // always still there to be pumped on somebody else's
-                    // turn. It took a program that answers once and exits.
-                    self.current().kernel.pump(None);
-                    if let Some(ending) = self.finish(exit) {
-                        return ending;
-                    }
-                    Yield::Given
-                }
-            };
-            // The edge, at a point that is a pure function of execution: a
-            // process has used a whole slice. Kernel state only — rings, the
-            // socket arena, the store — so it may run on any turn without
-            // breaking the rule the process table is built on.
-            // Every quantum, not every slice. The slice is about *fairness*
-            // — how long a process holds the processor before another gets a
-            // turn — and tying the edge to it made a response the guest had
-            // already written wait up to 1.6 million instructions, some
-            // fifty milliseconds of interpretation, before it reached the
-            // host.
-            //
-            // Sequentially that never showed: a container with nothing left
-            // to run goes idle, and the idle path pumps at once. Under
-            // concurrency nothing is idle — nginx and gunicorn always have
-            // work — so everything waited for the slice boundary, and four
-            // clients at once measured *worse* throughput than one at a
-            // time. Honest queueing behind a single worker would have held
-            // it flat.
-            //
-            // Still denominated in retired instructions, which is the
-            // property that matters: scheduling stays a pure function of
-            // execution, so a recorded run still replays. What it costs is
-            // sixteen times as many `/iso/net/events` reads — a few hundred
-            // a second, against a syscall budget in the millions.
-            if why == Yield::Quantum {
-                // Sending, every quantum. This is what a response waits on,
-                // and tying it to the slice made one sit in a ring for 1.6
-                // million instructions — some fifty milliseconds of
-                // interpretation — before it reached the host.
-                self.current().kernel.flush_edges();
-            }
-            // Receiving, and the clock, and the shutdown switch: once a
-            // slice. The inbound read is a host call, and doing it sixteen
-            // times as often cost more throughput than the promptness was
-            // worth, because it scales with the number of open connections.
-            if why == Yield::Quantum && self.slice == 0 {
-                self.current().kernel.pump(None);
-                self.current().kernel.refresh_timebase();
-                self.take_shutdown();
-            }
-            if !self.schedule(why) {
-                // Nothing runnable anywhere, which is three different things
-                // and only one of them is a deadlock.
-                if self.idle() {
-                    continue;
-                }
-                return match self.ending.clone() {
-                    Some(ending) => ending,
-                    None => Exit::Deadlocked,
-                };
+            if let Turn::Finished(exit) = self.turn() {
+                return exit;
             }
         }
+    }
+
+    /// One turn of the scheduler: the running process gets a quantum, the
+    /// edge is pumped where the rules say, and the next process is chosen.
+    ///
+    /// The whole run loop is this, repeated. It is one call rather than a
+    /// loop so that a host can hold the machine between turns — with no
+    /// state on the wasm stack, linear memory between two turns *is* the
+    /// machine, which is what a snapshot copies and a debugger stops at.
+    pub fn turn(&mut self) -> Turn {
+        let why = match self.current().step(cpu::QUANTUM) {
+            Progress::Running => Yield::Kept,
+            // The quantum expired, so every process gets a turn — the
+            // same rule the threads inside one already follow, and with
+            // the same consequence: the whole interleaving, across
+            // processes as well as threads, is a function of how many
+            // instructions have retired.
+            Progress::Preempted => Yield::Quantum,
+            // This process is waiting for something only another one can
+            // do. Give somebody else a turn; if nobody can take it, the
+            // loop below is what says so.
+            Progress::Idle => Yield::Given,
+            Progress::Requested(request) => {
+                self.answer(request);
+                Yield::Kept
+            }
+            Progress::Finished(exit) => {
+                // The edge, one last time. A process that writes a
+                // reply and exits has put those bytes in a ring and
+                // nowhere else, and the two scheduled pump points are
+                // both about a container that keeps running: a whole
+                // slice used, or nothing left to run. Neither happens
+                // again after the last process goes, so without this
+                // the final write of a run is dropped on the floor.
+                //
+                // Before `finish`, because that is what tears the
+                // process down — and closing its descriptors is what
+                // releases the ring the bytes are still sitting in.
+                //
+                // A long-lived server never showed this: nginx is
+                // always still there to be pumped on somebody else's
+                // turn. It took a program that answers once and exits.
+                self.current().kernel.pump(None);
+                if let Some(ending) = self.finish(exit) {
+                    return Turn::Finished(ending);
+                }
+                Yield::Given
+            }
+        };
+        // The edge, at a point that is a pure function of execution: a
+        // process has used a whole slice. Kernel state only — rings, the
+        // socket arena, the store — so it may run on any turn without
+        // breaking the rule the process table is built on.
+        // Every quantum, not every slice. The slice is about *fairness*
+        // — how long a process holds the processor before another gets a
+        // turn — and tying the edge to it made a response the guest had
+        // already written wait up to 1.6 million instructions, some
+        // fifty milliseconds of interpretation, before it reached the
+        // host.
+        //
+        // Sequentially that never showed: a container with nothing left
+        // to run goes idle, and the idle path pumps at once. Under
+        // concurrency nothing is idle — nginx and gunicorn always have
+        // work — so everything waited for the slice boundary, and four
+        // clients at once measured *worse* throughput than one at a
+        // time. Honest queueing behind a single worker would have held
+        // it flat.
+        //
+        // Still denominated in retired instructions, which is the
+        // property that matters: scheduling stays a pure function of
+        // execution, so a recorded run still replays. What it costs is
+        // sixteen times as many `/iso/net/events` reads — a few hundred
+        // a second, against a syscall budget in the millions.
+        if why == Yield::Quantum {
+            // Sending, every quantum. This is what a response waits on,
+            // and tying it to the slice made one sit in a ring for 1.6
+            // million instructions — some fifty milliseconds of
+            // interpretation — before it reached the host.
+            self.current().kernel.flush_edges();
+        }
+        // Receiving, and the clock, and the shutdown switch: once a
+        // slice. The inbound read is a host call, and doing it sixteen
+        // times as often cost more throughput than the promptness was
+        // worth, because it scales with the number of open connections.
+        if why == Yield::Quantum && self.slice == 0 {
+            self.current().kernel.pump(None);
+            self.current().kernel.refresh_timebase();
+            self.take_shutdown();
+        }
+        if !self.schedule(why) {
+            // Nothing runnable anywhere, which is three different things
+            // and only one of them is a deadlock.
+            if self.idle() {
+                return Turn::Idle;
+            }
+            return Turn::Finished(match self.ending.clone() {
+                Some(ending) => ending,
+                None => Exit::Deadlocked,
+            });
+        }
+        Turn::Ran
     }
 
     /// Why nothing can run, process by process and thread by thread.
@@ -944,6 +959,18 @@ impl<'a, S: Store + Clone> System<'a, S> {
 
 /// Why the running process stopped, which is what decides whether another
 /// one gets a turn.
+/// What one [`System::turn`] did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Turn {
+    /// A process ran, or was chosen; call again.
+    Ran,
+    /// Nothing was runnable and the container waited on the host, or found
+    /// a deadline to sleep towards; call again.
+    Idle,
+    /// The container is finished.
+    Finished(Exit),
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Yield {
     /// It returned from a syscall and can carry on. Switching here would put

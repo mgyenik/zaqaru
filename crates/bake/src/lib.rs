@@ -20,7 +20,7 @@ use anyhow::{Context, Result, ensure};
 pub const GUEST_ARCHIVE: &str = "libguest.a";
 
 /// The exports a container module has, and that the host calls.
-pub const BOOT_EXPORT: &str = "zaqaru_boot";
+pub const RUN_EXPORT: &str = "zaqaru_run";
 pub const REALLOC_EXPORT: &str = "cabi_realloc";
 
 /// The guest archive: everything in the module that is not the image.
@@ -116,7 +116,7 @@ pub fn link(image: &image::Image, guest: &Guest, output: &Path) -> Result<()> {
             "--fatal-warnings",
             "--export-memory",
         ])
-        .arg(format!("--export={BOOT_EXPORT}"))
+        .arg(format!("--export={RUN_EXPORT}"))
         .arg(format!("--export={REALLOC_EXPORT}"))
         // Room below the module's own data for a program that states its
         // own addresses. A position-independent one is placed above it and

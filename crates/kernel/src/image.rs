@@ -813,12 +813,12 @@ pub fn blob_length(header: &[u8]) -> Result<usize, ImageError> {
     Ok(word(header, 44) as usize)
 }
 
-/// The image the module carries, found through link-time symbols.
-///
-/// The packager emits these as two data segments and `wasm-ld` places them;
-/// nothing here knows or needs an address. Every container links an image,
-/// even an empty one, so a missing image is an undefined symbol at link time
-/// rather than a module that silently has no files.
+// The image the module carries, found through link-time symbols.
+//
+// The packager emits these as two data segments and `wasm-ld` places them;
+// nothing here knows or needs an address. Every container links an image,
+// even an empty one, so a missing image is an undefined symbol at link time
+// rather than a module that silently has no files.
 #[cfg(target_arch = "wasm32")]
 unsafe extern "C" {
     #[link_name = "__image_index"]

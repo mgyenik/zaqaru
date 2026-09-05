@@ -138,6 +138,82 @@ fn boot(module: &Path, mounts: host::store::MountTable) -> (i32, String) {
     (status, String::from_utf8(written).expect("utf-8"))
 }
 
+/// Everything a run wrote that a host can read back, for comparing two runs.
+fn readback(container: &mut host::Container, path: &[&[u8]]) -> String {
+    let path: Vec<Vec<u8>> = path.iter().map(|segment| segment.to_vec()).collect();
+    let bytes = container.mounts().read(&path).ok().flatten().unwrap_or_default();
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+/// **The host can hold the machine between turns.** The same module, run
+/// to completion in one call and in steps of one quantum, with the console
+/// output, the exit status and the retired count compared — and the
+/// stepped run has to have taken many steps, or it proved nothing.
+///
+/// A child that computes, a pipe and a `wait4`, so that the turns being
+/// stepped through include a process switch and a parked thread, which is
+/// where a scheduler resumed from outside could go wrong.
+#[test]
+fn a_container_runs_the_same_in_one_call_and_in_steps() {
+    let (workspace, module) = module_for(
+        "stepped",
+        r#"
+#include <stdio.h>
+#include <unistd.h>
+#include <sys/wait.h>
+int main(void) {
+    int fd[2];
+    pipe(fd);
+    pid_t child = fork();
+    if (child == 0) {
+        long sum = 0;
+        for (long i = 0; i < 3000000; i++) sum += i * i;
+        char text[32];
+        int length = snprintf(text, sizeof text, "%ld", sum);
+        write(fd[1], text, length);
+        _exit(3);
+    }
+    close(fd[1]);
+    char text[64];
+    int length = read(fd[0], text, sizeof text - 1);
+    text[length] = 0;
+    int status;
+    waitpid(child, &status, 0);
+    printf("child said %s and exited %d\n", text, WEXITSTATUS(status));
+    return 0;
+}
+"#,
+        &["-static", "-no-pie"],
+    );
+    let bytes = std::fs::read(&module).expect("read the container");
+
+    let mut whole = host::Container::instantiate(&bytes, support::mounts_seeded(&[0x33; 32]))
+        .expect("instantiate");
+    let status = whole.boot().expect("run in one call");
+    let (out, stats) = (
+        readback(&mut whole, &[b"iso", b"console", b"stdout"]),
+        readback(&mut whole, &[b"iso", b"log", b"statistics"]),
+    );
+    assert_eq!(status, 0);
+    assert_eq!(out, "child said 8999995500000500000 and exited 3\n");
+
+    let mut stepped = host::Container::instantiate(&bytes, support::mounts_seeded(&[0x33; 32]))
+        .expect("instantiate");
+    let mut steps = 0u64;
+    let stepped_status = loop {
+        steps += 1;
+        match stepped.step((steps * 100_000) as i64).expect("step") {
+            host::Turn::Finished(status) => break status,
+            host::Turn::Running | host::Turn::Idle => {}
+        }
+    };
+    assert!(steps > 20, "the run took only {steps} steps, so stepping was not exercised");
+    assert_eq!(stepped_status, status);
+    assert_eq!(readback(&mut stepped, &[b"iso", b"console", b"stdout"]), out);
+    assert_eq!(readback(&mut stepped, &[b"iso", b"log", b"statistics"]), stats);
+    drop(workspace);
+}
+
 /// The artifact the design is about: engine plus image, and a program the
 /// bake never looked at.
 #[test]

@@ -34,7 +34,30 @@ const MEMORY_EXPORT: &str = "memory";
 /// mount table exposes. The return value is the exit status, which also
 /// arrives through the store at `/iso/shutdown/complete` — here so that a
 /// host that mounts nothing can still tell how the run ended.
-pub const BOOT_EXPORT: &str = "zaqaru_boot";
+pub const RUN_EXPORT: &str = "zaqaru_run";
+
+/// What one call of the run export did. The guest packs the kind into the
+/// low byte and, when finished, the exit status into the byte above.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Turn {
+    /// The count asked for was reached; call again to go on.
+    Running,
+    /// Nothing was runnable and the container waited on the host once.
+    Idle,
+    /// The container has exited with this status.
+    Finished(i32),
+}
+
+impl Turn {
+    fn decode(word: i32) -> Result<Self> {
+        match word & 0xff {
+            0 => Ok(Turn::Running),
+            1 => Ok(Turn::Idle),
+            2 => Ok(Turn::Finished((word >> 8) & 0xff)),
+            other => bail!("the guest answered an unknown turn kind {other}"),
+        }
+    }
+}
 
 /// The canonical ABI's alignment for a `list`'s `(pointer, length)` pair.
 const LIST_ALIGNMENT: u32 = 4;
@@ -107,11 +130,22 @@ impl Container {
     }
 
     /// Runs the container to completion, and reports the exit status.
-    ///
-    /// One call, because a container is one program: the kernel loads it,
-    /// runs the process table, and returns when the first process exits.
     pub fn boot(&mut self) -> Result<i32> {
-        self.call::<(), i32>(BOOT_EXPORT, ())
+        loop {
+            if let Turn::Finished(status) = self.step(-1)? {
+                return Ok(status);
+            }
+        }
+    }
+
+    /// Runs the container until it has retired `until` instructions in
+    /// total, finished, or idled once. The first call boots it. A negative
+    /// `until` runs to completion.
+    ///
+    /// Between calls nothing is on the guest's stack: linear memory is the
+    /// whole machine.
+    pub fn step(&mut self, until: i64) -> Result<Turn> {
+        Turn::decode(self.call::<i64, i32>(RUN_EXPORT, until)?)
     }
 
     /// The mount table. A host that cannot see what the guest wrote cannot

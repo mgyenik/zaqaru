@@ -1,17 +1,17 @@
 //! Booting the container, from inside the module.
 //!
-//! The one export the host calls. It reads the command line and environment
-//! the bake recorded in the image, boots a kernel on the interpreter's
-//! machine, loads the program, and runs the process table until the first
-//! process exits — reporting how the run went, and what it cost, through
-//! the store.
+//! The one export the host calls. Its first call reads the command line and
+//! environment the bake recorded in the image, boots a kernel on the
+//! interpreter's machine and loads the program; every call runs the process
+//! table for as long as it is asked to, and reports how the run went, and
+//! what it cost, through the store.
 
 use cpu::block::BlockCache;
 use kernel::abi::{Store, StoreOutcome};
 use kernel::machine::Interpreted;
 use kernel::run::{Exit, Process};
 use kernel::syscall::{Enforcement, Kernel};
-use kernel::system::System;
+use kernel::system::{System, Turn};
 use kernel::{paths, push_decimal, push_hex, report_to};
 
 use crate::abi::HostStore;
@@ -24,12 +24,99 @@ use crate::abi::HostStore;
 /// program can return so that a caller reading a status can tell them apart.
 pub const UNIMPLEMENTED: i32 = 126;
 
-/// Runs the container to completion, and answers its status.
+/// The container, once booted. A static because a wasm instance *is* a
+/// process: one instance, one memory, one system — and because the host
+/// holds it between turns, when nothing is on the wasm stack.
+static mut SYSTEM: Option<System<'static, HostStore>> = None;
+/// How the container ended, once it has.
+static mut FINISHED: Option<i32> = None;
+
+/// The kinds a call to [`zaqaru_run`] answers, in the low byte; a finished
+/// container's status is in the byte above.
+pub const KIND_RUNNING: i32 = 0;
+pub const KIND_IDLE: i32 = 1;
+pub const KIND_FINISHED: i32 = 2;
+
+/// Runs the container, and answers what happened.
+///
+/// The first call boots: it reads the command line and environment the
+/// bake recorded, loads the program, and builds the process table. Every
+/// call then runs scheduler turns until the container has retired `until`
+/// instructions in total, or finished, or — when `until` is not negative —
+/// found nothing runnable and waited once on the host. A negative `until`
+/// runs to completion, which is what a plain `zaqaru run` asks for.
+///
+/// Between calls nothing is on the wasm stack, so linear memory is the
+/// whole machine: what a snapshot copies and what a debugger inspects. A
+/// call with `until` at or below the count already retired runs nothing and
+/// returns at once.
 ///
 /// # Safety
-/// Called by the host, once, on a fresh instance.
+/// Called by the host, one call at a time, on an instance nothing else
+/// drives.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn zaqaru_boot() -> i32 {
+pub unsafe extern "C" fn zaqaru_run(until: i64) -> i32 {
+    // SAFETY: one instance, one thread of execution, and the host makes one
+    // call at a time.
+    if let Some(status) = unsafe { FINISHED } {
+        return finished(status);
+    }
+    let slot = unsafe { &mut *(&raw mut SYSTEM) };
+    let system = match slot {
+        Some(system) => system,
+        None => match boot() {
+            Ok(booted) => slot.insert(booted),
+            Err(status) => {
+                unsafe { FINISHED = Some(status) };
+                return finished(status);
+            }
+        },
+    };
+    loop {
+        if until >= 0 && system.retired() >= until as u64 {
+            return KIND_RUNNING;
+        }
+        match system.turn() {
+            Turn::Ran => {}
+            Turn::Idle if until < 0 => {}
+            Turn::Idle => return KIND_IDLE,
+            Turn::Finished(outcome) => {
+                // What the run cost, before anything is said about how it
+                // ended. A module has no clock of its own worth trusting and
+                // no way to time itself, so the host measures the seconds
+                // and this supplies the numerator: how much work was done
+                // to fill them.
+                report_statistics(system);
+                let status = match outcome {
+                    Exit::Status(status) => status,
+                    // Loud, and named. A container that stopped because the
+                    // engine does not implement an instruction, or the
+                    // kernel a syscall, must not look like a program that
+                    // chose to fail.
+                    other => {
+                        let mut message = String::from("guest: the container stopped: ");
+                        describe(&other, &mut message);
+                        report_to(&mut system.current().kernel, &message);
+                        UNIMPLEMENTED
+                    }
+                };
+                unsafe { FINISHED = Some(status) };
+                return finished(status);
+            }
+        }
+    }
+}
+
+fn finished(status: i32) -> i32 {
+    KIND_FINISHED | (status & 0xff) << 8
+}
+
+/// Boots: the image's command line and environment, a kernel on the
+/// interpreter's machine, the program loaded, a process table of one.
+///
+/// A failure is reported through the store and answered as the status the
+/// container would have exited with.
+fn boot() -> Result<System<'static, HostStore>, i32> {
     report_panics();
     let image = kernel::image::baked()
         .unwrap_or_else(|error| panic!("guest: the linked image is not readable: {error:?}"));
@@ -56,7 +143,7 @@ pub unsafe extern "C" fn zaqaru_boot() -> i32 {
         true => BlockCache::interpreting(),
         false => BlockCache::new(),
     };
-    let mut process = match Process::boot_with_cache(kernel, argv[0], argv, &environment, cache) {
+    let process = match Process::boot_with_cache(kernel, argv[0], argv, &environment, cache) {
         Ok(process) => process,
         Err(error) => {
             let mut message = String::new();
@@ -67,25 +154,7 @@ pub unsafe extern "C" fn zaqaru_boot() -> i32 {
     // The process table, which is what makes a `fork` inside the module a
     // second address space rather than an error. One process is the common
     // case and costs a vector of one.
-    let mut system = System::new(process);
-    let outcome = system.run();
-    // What the run cost, before anything is said about how it ended. A
-    // module has no clock of its own worth trusting and no way to time
-    // itself, so the host measures the seconds and this supplies the
-    // numerator: how much work was done to fill them.
-    report_statistics(&mut system);
-    match outcome {
-        Exit::Status(status) => status,
-        // Loud, and named. A container that stopped because the engine does
-        // not implement an instruction, or the kernel a syscall, must not
-        // look like a program that chose to fail.
-        other => {
-            let mut message = String::from("guest: the container stopped: ");
-            describe(&other, &mut message);
-            report_to(&mut system.current().kernel, &message);
-            UNIMPLEMENTED
-        }
-    }
+    Ok(System::new(process))
 }
 
 /// Whether the host asked for a run without the bytecode accelerator.

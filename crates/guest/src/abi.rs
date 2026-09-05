@@ -22,7 +22,7 @@
 
 use kernel::abi::{Store, StoreOutcome};
 
-use crate::wire::{OPTION_SOME, ReadResult, Slice, WriteResult};
+use crate::wire::{ReadResult, Slice, WriteResult};
 
 // The two host imports. Undefined here; the host supplies them.
 //
