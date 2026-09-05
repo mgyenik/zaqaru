@@ -1,0 +1,34 @@
+[package]
+name = "zaqaru-image"
+version = "0.1.0"
+edition = "2024"
+description = "Flattens an OCI image or a directory into the blob and index a container module carries"
+
+[lib]
+name = "image"
+
+[dependencies]
+anyhow = "1.0.104"
+libc = "0.2"
+# A layer blob out of `docker save` is gzip-compressed, and DEFLATE is the one
+# format in this crate that is *not* hand-written. The tar and JSON readers
+# are, because their failure mode is silently accepting a document that means
+# something else — a skipped record, the wrong layer list. Inflate has no such
+# failure: it either produces the bytes or it does not. Hand-writing one would
+# buy nothing and risk a class of bug this project has no way to detect.
+flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
+# The index format is defined once, by the thing that reads it. A writer with
+# its own copy of the layout is a writer that can drift from the reader.
+kernel = { package = "zaqaru-kernel", path = "../kernel" }
+# Compressing the image's files. The C encoder, because the bake is native
+# and the ratio at level 3 is what the module's size is decided by; the
+# kernel decodes with a pure-Rust decoder of the same format.
+zstd = "0.13"
+
+[dev-dependencies]
+libc = "0.2"
+flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
+# The end-to-end test bakes a container and runs it: the host is ours and
+# the instantiation is wasmtime's.
+host = { package = "zaqaru-host", path = "../host" }
+wasmtime = "48.0.1"

@@ -29,7 +29,7 @@ docker build -q -t hello-django "$REPO/demo/hello-django" >/dev/null
 echo "== baking the module =="
 cargo run --manifest-path "$REPO/Cargo.toml" --release --quiet --example bake-vm -- \
     "$OUT/hello-django.tar" "$OUT/hello-django.wasm"
-cargo build --manifest-path "$REPO/Cargo.toml" --release --quiet -p runner
+cargo build --manifest-path "$REPO/Cargo.toml" --release --quiet -p host
 ls -la "$OUT/hello-django.wasm" | awk '{printf "module: %.1f MB\n", $5/1048576}'
 
 echo

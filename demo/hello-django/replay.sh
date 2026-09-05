@@ -44,7 +44,7 @@ kill -9 "$container" 2>/dev/null || true
 echo "replaying, with no network"
 "$RUN" "$OUT/hello-django.wasm" --replay "$OUT/session.bin" > "$OUT/replayed.txt" 2>&1
 
-# The runner's own lines are the runner's, not the container's.
+# The host's own lines are the host's, not the container's.
 strip() { grep -vE 'listening on host port|recorded [0-9]+ host answers' "$1"; }
 if diff <(strip "$OUT/served.txt") <(strip "$OUT/replayed.txt") > /dev/null; then
     echo

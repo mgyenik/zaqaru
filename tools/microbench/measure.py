@@ -8,7 +8,7 @@ Two legs and one question: how much slower is a program when it runs as an
 interpreted guest inside a wasm module than when Linux runs it directly.
 
   native   the ELF, run by Linux.
-  wasm     the same ELF, baked into a container with the targum engine and
+  wasm     the same ELF, baked into a container with the interpreter and
            run under wasmtime by zaqaru-run.
 
 **Three costs, kept apart, because they behave completely differently.**
@@ -35,7 +35,7 @@ finish faster than it should. That is worth about two significant figures,
 which is fine, because the answer is a ratio in the hundreds and no amount
 of scheduler noise moves it. Do not read the third digit.
 
-The one exact number here is the instruction count: targum increments a
+The one exact number here is the instruction count: the engine increments a
 counter as it decodes, so it is a property of the program rather than a
 measurement of the machine. Rates are that exact count over a noisy second.
 """

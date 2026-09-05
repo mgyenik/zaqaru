@@ -16,7 +16,7 @@ REPO=${ZAQARU_REPO:-$(cd "$(dirname "$0")/../.." && pwd)}
 PORT=8104
 OUT=${ZAQARU_DEMO_OUT:-/tmp/zaqaru-demo}/n0/interpreted.txt
 rm -f "$OUT"
-KISAL_TRACE=1 "$REPO/target/release/examples/interpret" -p "$PORT:80" \
+ZAQARU_TRACE=1 "$REPO/target/release/examples/interpret" -p "$PORT:80" \
     ${ZAQARU_DEMO_OUT:-/tmp/zaqaru-demo}/hello-django.tar > "$OUT" 2>&1 &
 pid=$!
 for _ in $(seq 40); do

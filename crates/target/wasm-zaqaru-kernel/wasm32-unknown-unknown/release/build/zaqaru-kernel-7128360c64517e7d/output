@@ -1,0 +1,3 @@
+cargo:rerun-if-changed=vdso/vdso.c
+cargo:rerun-if-changed=vdso/vdso.lds
+cargo:rustc-env=KISAL_VDSO=/home/m/git/zaqaru/crates/target/wasm-zaqaru-kernel/wasm32-unknown-unknown/release/build/zaqaru-kernel-7128360c64517e7d/out/vdso.so

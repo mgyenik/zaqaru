@@ -47,19 +47,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "baker"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "flate2",
- "kisal",
- "libc",
- "runner",
- "wasmtime",
- "zstd",
-]
-
-[[package]]
 name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -676,17 +663,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "kisal"
-version = "0.1.0"
-dependencies = [
- "baker",
- "libc",
- "runner",
- "ruzstd",
- "targum",
-]
-
-[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -919,15 +895,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "runner"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "libc",
- "wasmtime",
-]
-
-[[package]]
 name = "rustc-demangle"
 version = "0.1.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1100,16 +1067,6 @@ name = "target-lexicon"
 version = "0.13.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "adb6935a6f5c20170eeceb1a3835a49e12e19d792f6dd344ccc76a985ca5a6ca"
-
-[[package]]
-name = "targum"
-version = "0.1.0"
-dependencies = [
- "iced-x86",
- "libc",
- "object 0.40.0",
- "x87",
-]
 
 [[package]]
 name = "tempfile"
@@ -1742,7 +1699,50 @@ dependencies = [
 ]
 
 [[package]]
-name = "x87"
+name = "zaqaru-cpu"
+version = "0.1.0"
+dependencies = [
+ "iced-x86",
+ "libc",
+ "object 0.40.0",
+ "zaqaru-x87",
+]
+
+[[package]]
+name = "zaqaru-host"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "wasmtime",
+]
+
+[[package]]
+name = "zaqaru-image"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "flate2",
+ "libc",
+ "wasmtime",
+ "zaqaru-host",
+ "zaqaru-kernel",
+ "zstd",
+]
+
+[[package]]
+name = "zaqaru-kernel"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "ruzstd",
+ "zaqaru-cpu",
+ "zaqaru-host",
+ "zaqaru-image",
+]
+
+[[package]]
+name = "zaqaru-x87"
 version = "0.1.0"
 dependencies = [
  "libm",

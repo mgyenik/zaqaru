@@ -1,5 +1,5 @@
 [workspace]
-members = ["baker", "kisal", "runner", "targum", "x87"]
+members = ["crates/cpu", "crates/host", "crates/image", "crates/kernel", "crates/x87"]
 resolver = "3"
 # The interpreter-throughput spike is a standalone instrument, not a member:
 # it must not add its dependencies or build time to the workspace.
@@ -8,12 +8,12 @@ exclude = ["tools/interp-spike"]
 # Dependencies are built optimized even for tests.
 #
 # Not a preference: the suite's cost is dominated by three of them running
-# unoptimized. `iced-x86` decodes once per instruction of every function
-# translated, `wasmtime` compiles every body of every container a test
-# builds, and a dynamic-tier container is fifteen thousand bodies. The same
-# work takes 0.87s to bake and 1.97s to run through the release binaries,
-# and an order of magnitude more in a debug test — multiplied by every run
-# of every test for as long as the project exists.
+# unoptimized. `iced-x86` decodes every instruction the interpreter
+# executes, `wasmtime` compiles every body of every container a test builds,
+# and `zstd` compresses every file of every image. The same work takes
+# seconds through the release binaries and an order of magnitude more in a
+# debug test — multiplied by every run of every test for as long as the
+# project exists.
 #
 # Debug *info* is kept, and `debug-assertions` is untouched: it is set
 # independently of `opt-level`, so every `debug_assert!` and overflow check
@@ -28,9 +28,9 @@ opt-level = 2
 
 # And the interpreter, which is not a dependency but is the same kind of
 # cost. Every test that runs a real program retires tens of millions of
-# instructions through `targum::exec`, and an unoptimised dispatch loop is
+# instructions through `cpu::exec`, and an unoptimised dispatch loop is
 # an order of magnitude of that — the difference between a suite that runs
 # after every edit and one nobody runs. `debug-assertions` is untouched, so
 # every `debug_assert!` in the engine still fires.
-[profile.dev.package.targum]
+[profile.dev.package.zaqaru-cpu]
 opt-level = 3

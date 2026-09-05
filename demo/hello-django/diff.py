@@ -19,7 +19,7 @@ import sys
 
 # `strace -f`: "1234  name(args) = result".
 NATIVE = re.compile(r"^(\d+)\s+([a-z_0-9]+)\(")
-# kisal's own renderer: "[1] name(args) = result".
+# the kernel's own renderer: "[1] name(args) = result".
 INTERPRETED = re.compile(r"^\[(\d+)\]\s+([a-z_0-9]+)\(")
 
 

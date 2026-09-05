@@ -26,9 +26,9 @@ def main(trace_path: str, repo: str) -> None:
         elif signal := SIGNAL.match(line):
             signals[signal.group(2)] += 1
 
-    # What kisal *names* is what it dispatches: an unnamed number reaches the
+    # What the kernel *names* is what it dispatches: an unnamed number reaches the
     # loud-error path, so the name table is the honest list of rows.
-    source = pathlib.Path(repo, "kisal/src/syscall.rs").read_text()
+    source = pathlib.Path(repo, "kernel/src/syscall.rs").read_text()
     table = source[source.index("pub fn name(number: i64)") :]
     named = set(re.findall(r'=> "([a-z_0-9]+)"', table[: table.index("\n    }\n")]))
     missing = sorted(set(counts) - named, key=lambda name: (-counts[name], name))
@@ -56,7 +56,7 @@ def main(trace_path: str, repo: str) -> None:
         f"{n:8d}  {name:<20} {'row' if name in named else 'MISSING'}"
         for name, n in counts.most_common()
     ]
-    lines += ["", f"[missing]  {len(missing)} rows the stack calls and kisal has none for", ""]
+    lines += ["", f"[missing]  {len(missing)} rows the stack calls and the kernel has none for", ""]
     lines += [f"{counts[name]:8d}  {name}" for name in missing]
 
     out = pathlib.Path(repo, "demo/hello-django/baseline/n0-surface.txt")
