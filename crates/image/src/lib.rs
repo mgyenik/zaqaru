@@ -19,11 +19,8 @@
 
 pub mod json;
 pub mod layers;
-pub mod layout;
-pub mod object;
 pub mod tar;
 pub mod tree;
-pub mod wasm;
 pub mod xattr;
 
 use std::collections::BTreeMap;

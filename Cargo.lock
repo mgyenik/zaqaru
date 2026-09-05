@@ -1699,6 +1699,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "zaqaru-bake"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "wasmtime",
+ "zaqaru-host",
+ "zaqaru-image",
+ "zaqaru-kernel",
+]
+
+[[package]]
 name = "zaqaru-cpu"
 version = "0.1.0"
 dependencies = [
@@ -1706,6 +1717,14 @@ dependencies = [
  "libc",
  "object 0.40.0",
  "zaqaru-x87",
+]
+
+[[package]]
+name = "zaqaru-guest"
+version = "0.1.0"
+dependencies = [
+ "zaqaru-cpu",
+ "zaqaru-kernel",
 ]
 
 [[package]]
@@ -1724,8 +1743,6 @@ dependencies = [
  "anyhow",
  "flate2",
  "libc",
- "wasmtime",
- "zaqaru-host",
  "zaqaru-kernel",
  "zstd",
 ]

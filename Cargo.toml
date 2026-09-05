@@ -1,5 +1,13 @@
 [workspace]
-members = ["crates/cpu", "crates/host", "crates/image", "crates/kernel", "crates/x87"]
+members = [
+    "crates/bake",
+    "crates/cpu",
+    "crates/guest",
+    "crates/host",
+    "crates/image",
+    "crates/kernel",
+    "crates/x87",
+]
 resolver = "3"
 # The interpreter-throughput spike is a standalone instrument, not a member:
 # it must not add its dependencies or build time to the workspace.

@@ -6,10 +6,6 @@ description = "The in-guest Linux-personality kernel: syscalls handled inside th
 
 [lib]
 name = "kernel"
-# `staticlib` is what `wasm-ld` welds into the container module; `rlib` is
-# what the native unit tests link against. The kernel's logic is ordinary
-# Rust either way — that is the point of the whole arrangement.
-crate-type = ["staticlib", "rlib"]
 
 [dependencies]
 # The address space. `cpu/src/space.rs` is the page table — one bit per page

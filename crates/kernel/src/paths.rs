@@ -86,6 +86,9 @@ pub const LOG_STATISTICS: &[&[u8]] = &[b"iso", b"log", b"statistics"];
 /// path the host mounts. A container whose embedder mounts nothing here
 /// traces nothing and pays one failed read for the privilege.
 pub const CONFIG_TRACE: &[&[u8]] = &[b"iso", b"config", b"trace"];
+/// `0` to run without the bytecode accelerator; anything else, or nothing,
+/// runs with it.
+pub const CONFIG_BYTECODE: &[&[u8]] = &[b"iso", b"config", b"bytecode"];
 
 /// Where the exit status goes when the process is finished.
 ///

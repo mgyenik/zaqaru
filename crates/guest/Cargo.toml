@@ -1,0 +1,15 @@
+[package]
+name = "zaqaru-guest"
+version = "0.1.0"
+edition = "2024"
+description = "The container module's guest side: the kernel, the interpreter and the FPU as one staticlib, with the boot export and the host imports"
+
+# The one archive `wasm-ld` links beside the image object. Every other crate
+# is an ordinary library; this is the module's face.
+[lib]
+name = "guest"
+crate-type = ["staticlib"]
+
+[dependencies]
+cpu = { package = "zaqaru-cpu", path = "../cpu" }
+kernel = { package = "zaqaru-kernel", path = "../kernel" }

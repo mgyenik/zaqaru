@@ -6,10 +6,6 @@ description = "Soft emulation of the x87 FPU: extended-precision softfloat and t
 
 [lib]
 name = "x87"
-# `staticlib` is what `wasm-ld` welds into the container module; `rlib` is
-# what the native unit tests and the host-FPU oracle link against. The
-# emulation is ordinary Rust either way — same arrangement as the kernel.
-crate-type = ["staticlib", "rlib"]
 
 [dependencies]
 # The pure-Rust musl math routines, for the f64-backed transcendental

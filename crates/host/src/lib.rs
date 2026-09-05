@@ -16,7 +16,7 @@ use wasmtime::error::Context;
 use wasmtime::{Result, bail};
 
 /// The module and field names the linked module imports the store under —
-/// the core-wasm lowering of featherweight's WIT, settled in M0.
+/// the core-wasm lowering of featherweight's WIT.
 const HOST_MODULE: &str = "env";
 const READ_IMPORT: &str = "ll_read";
 const WRITE_IMPORT: &str = "ll_write";
@@ -25,7 +25,6 @@ const WRITE_IMPORT: &str = "ll_write";
 /// memory, exactly as the component canonical ABI does.
 const REALLOC_EXPORT: &str = "cabi_realloc";
 const MEMORY_EXPORT: &str = "memory";
-const TABLE_EXPORT: &str = "__indirect_function_table";
 
 /// The one thing the host calls to run a container.
 ///
@@ -76,56 +75,7 @@ impl Container {
         Ok(Self { store, instance })
     }
 
-    /// Calls a guest function through its host-entry wrapper, in the uniform
-    /// zero-information shape: every argument register of both files in,
-    /// `rax` and `xmm0` out.
-    pub fn call_guest(&mut self, name: &str, integers: [i64; 6]) -> Result<i64> {
-        let function = self
-            .instance
-            .get_typed_func::<(
-                i64,
-                i64,
-                i64,
-                i64,
-                i64,
-                i64,
-                f64,
-                f64,
-                f64,
-                f64,
-                f64,
-                f64,
-                f64,
-                f64,
-            ), (i64, f64)>(&mut self.store, name)
-            .with_context(|| format!("the module has no usable export `{name}`"))?;
-        let (result, _) = function
-            .call(
-                &mut self.store,
-                (
-                    integers[0],
-                    integers[1],
-                    integers[2],
-                    integers[3],
-                    integers[4],
-                    integers[5],
-                    0.0,
-                    0.0,
-                    0.0,
-                    0.0,
-                    0.0,
-                    0.0,
-                    0.0,
-                    0.0,
-                ),
-            )
-            .with_context(|| format!("the guest trapped inside `{name}`"))?;
-        Ok(result)
-    }
-
-    /// Calls any export by name and type. The uniform wrapper has a shape of
-    /// its own ([`Container::call_guest`]); every other export is an
-    /// ordinary typed function reached through here.
+    /// Calls any export by name and type.
     pub fn call<Parameters, Results>(
         &mut self,
         name: &str,
@@ -157,80 +107,6 @@ impl Container {
     /// well as the way a test reads back a run.
     pub fn mounts(&mut self) -> &mut MountTable {
         self.store.data_mut()
-    }
-
-    /// How much linear memory the instance has right now.
-    ///
-    /// It grows, so a caller that wants to scan all of it has to ask rather
-    /// than assume — a fixed guess reads out of bounds on a small module and
-    /// misses the tail of a large one.
-    pub fn memory_size(&mut self) -> Result<usize> {
-        let memory = self.memory()?;
-        Ok(memory.data_size(&self.store))
-    }
-
-    pub fn read_memory(&mut self, address: u32, length: usize) -> Result<Vec<u8>> {
-        let memory = self.memory()?;
-        let mut bytes = vec![0u8; length];
-        memory.read(&mut self.store, address as usize, &mut bytes)?;
-        Ok(bytes)
-    }
-
-    pub fn write_memory(&mut self, address: u32, bytes: &[u8]) -> Result<()> {
-        let memory = self.memory()?;
-        memory.write(&mut self.store, address as usize, bytes)?;
-        Ok(())
-    }
-
-    /// Guest memory from the canonical ABI's transfer arena.
-    ///
-    /// **Valid only until the guest's next syscall.** The arena exists to
-    /// carry an `ll-store` result into the guest and is reset at the top of
-    /// every syscall, which is what stops the boundary leaking — so anything
-    /// placed here is overwritten by the next call's return value, silently,
-    /// because the bytes are simply different afterwards.
-    ///
-    /// The name says so because the trap is invisible otherwise: a prefix
-    /// placed here once came back as `"iso"`, the first segment of the
-    /// console mount's result path, and every path the guest built from it
-    /// was wrong from that point on.
-    ///
-    /// Nothing in the runtime needs a longer-lived placement. Everything the
-    /// host supplies — `/iso` reads, and argv and envp at process start —
-    /// is consumed by the syscall that asked for it, and the initial stack
-    /// is built by the kernel in its own memory. If that ever stops being
-    /// true it wants a design, not a second allocator bolted on beside this
-    /// one.
-    pub fn allocate_transfer(&mut self, length: u32, align: u32) -> Result<u32> {
-        self.call::<(u32, u32, u32, u32), u32>(REALLOC_EXPORT, (0, 0, align, length))
-    }
-
-    /// Puts a host function of the guest convention into a fresh slot of the
-    /// indirect function table, and hands back the slot.
-    ///
-    /// This is how a continuation is handed to `x86_run_thread` from outside
-    /// the module: a thread is started by naming a slot, and the host needs a
-    /// way to name one. It also does the only thing that can prove the
-    /// scheduler's catch reports a *return* rather than a yield, before any
-    /// real guest continuation exists.
-    pub fn install_continuation(&mut self) -> Result<i32> {
-        let table = match self.instance.get_export(&mut self.store, TABLE_EXPORT) {
-            Some(wasmtime::Extern::Table(table)) => table,
-            _ => bail!("the container module does not export `{TABLE_EXPORT}`"),
-        };
-        let guest_type = wasmtime::FuncType::new(self.store.engine(), [], []);
-        let function = wasmtime::Func::new(&mut self.store, guest_type, |_, _, _| Ok(()));
-        let slot = table.grow(&mut self.store, 1, wasmtime::Ref::Func(Some(function)))?;
-        Ok(slot as i32)
-    }
-
-    fn memory(&mut self) -> Result<wasmtime::Memory> {
-        match self.instance.get_export(&mut self.store, MEMORY_EXPORT) {
-            Some(wasmtime::Extern::Memory(memory)) => Ok(memory),
-            _ => {
-                bail!("the container module does not export its linear memory as `{MEMORY_EXPORT}`")
-            }
-        }
     }
 }
 

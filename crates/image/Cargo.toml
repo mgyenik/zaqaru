@@ -28,7 +28,3 @@ zstd = "0.13"
 [dev-dependencies]
 libc = "0.2"
 flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
-# The end-to-end test bakes a container and runs it: the host is ours and
-# the instantiation is wasmtime's.
-host = { package = "zaqaru-host", path = "../host" }
-wasmtime = "48.0.1"

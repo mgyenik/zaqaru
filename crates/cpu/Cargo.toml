@@ -4,13 +4,8 @@ version = "0.1.0"
 edition = "2024"
 description = "The x86-64 machine: an interpreter, and the bytecode it transpiles hot blocks into"
 
-# The engine is a library in every build that matters. `staticlib` is what
-# `wasm-ld` welds into the container module beside the image object; `rlib`
-# is what the native tests and the lockstep oracle link against — the same
-# interpreter either way.
 [lib]
 name = "cpu"
-crate-type = ["staticlib", "rlib"]
 
 [features]
 # Counting what a real program retires, so that the next instruction to

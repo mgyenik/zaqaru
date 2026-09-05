@@ -18,7 +18,8 @@
 //!
 //! Everything above the store is ordinary Rust, so it is unit-tested
 //! natively in milliseconds. Emulation is reserved for what only emulation
-//! can check. The module's one entry point is in [`vm`].
+//! can check. The module's entry point, and the store's real
+//! implementation over the host imports, are the `guest` crate's.
 
 pub mod abi;
 pub mod errno;
@@ -41,7 +42,6 @@ pub mod random;
 pub mod resident;
 pub mod signal;
 pub mod run;
-pub mod vm;
 pub mod space;
 pub mod synthetic;
 pub mod syscall;
@@ -174,7 +174,7 @@ fn push_guest_string<S: Store, M: machine::Machine>(
     into.push('"');
 }
 
-pub(crate) fn push_decimal(into: &mut String, value: i64) {
+pub fn push_decimal(into: &mut String, value: i64) {
     if value < 0 {
         into.push('-');
     }
@@ -198,7 +198,7 @@ pub(crate) fn push_decimal(into: &mut String, value: i64) {
 ///
 /// Best-effort by design: if the log mount is unavailable there is nothing
 /// useful to do about it, and the panic that follows is the loud part.
-pub(crate) fn report_to<S: Store, M: machine::Machine>(
+pub fn report_to<S: Store, M: machine::Machine>(
     kernel: &mut Kernel<'_, S, M>,
     message: &str,
 ) {
@@ -206,7 +206,7 @@ pub(crate) fn report_to<S: Store, M: machine::Machine>(
 }
 
 /// Hexadecimal, because an address is only legible that way.
-pub(crate) fn push_hex(into: &mut String, value: u64) {
+pub fn push_hex(into: &mut String, value: u64) {
     into.push_str("0x");
     let mut started = false;
     for shift in (0..16).rev() {

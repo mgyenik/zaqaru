@@ -1,0 +1,19 @@
+[package]
+name = "zaqaru-bake"
+version = "0.1.0"
+edition = "2024"
+description = "Turns an image into a container module: the image object, the guest archive, and the link"
+
+[lib]
+name = "bake"
+
+[dependencies]
+anyhow = "1.0.104"
+image = { package = "zaqaru-image", path = "../image" }
+
+[dev-dependencies]
+# The image-object test reads the linked image back through the kernel's own
+# parser; the container test runs the module under the host.
+kernel = { package = "zaqaru-kernel", path = "../kernel" }
+host = { package = "zaqaru-host", path = "../host" }
+wasmtime = "48.0.1"

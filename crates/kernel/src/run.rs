@@ -673,13 +673,9 @@ impl<'a, S: Store> Process<'a, S> {
 
     /// Serves one syscall.
     fn serve(&mut self) -> Served {
-        // Whatever the host placed in guest memory for the previous call is
-        // dead now. The arena's lifetime is one call, and that is what stops
-        // the boundary leaking. Without it a container runs perfectly well
-        // until the arena fills, which for a Python process is about
-        // thirty-eight seconds in and looks like the host refusing a
-        // forty-four byte read.
-        crate::abi::reset_transfer_arena();
+        // Whatever the store handed the kernel for the previous call is dead
+        // now — see `Store::begin_syscall`.
+        self.kernel.store.begin_syscall();
         let thread = self.kernel.machine.thread();
         let number = thread.registers[NUMBER] as i64;
         let raw = ARGUMENTS.map(|index| thread.registers[index] as i64);
