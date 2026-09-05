@@ -219,9 +219,31 @@ waiting read is on the tape, so the first harness needs neither JSPI nor
 `Atomics.wait`.
 
 The page is then a StructFS client of the container. It reads
-`processes`; the harness enqueues the Request, calls `zaqaru_step` with
+`processes`; the harness enqueues the Request, calls the run export with
 the current count, and returns the Response. That is the same client
-code that will drive the wasmtime host.
+code that drives the wasmtime host.
+
+**Live.** Without a tape the container runs against the page's own clock
+and entropy, with a syscall trace on, and every answer the host gives is
+recorded. A checkpoint's mount table is then a *replay* over that same
+recording from the cursor at the checkpoint, so a seek behind the
+frontier restores a checkpoint and re-executes against the answers the
+live run was actually given — which the recording goes on accumulating
+as the live run continues. "Play" advances the frontier, checkpointing on
+the way; the slider views anything behind it.
+
+**The edge.** `Edge` in `web/zaqaru.js` speaks the `/iso/net` protocol the
+wasmtime host speaks to real TCP — `listen`, `events`, `conn/{j}/rx/{room}`,
+`conn/{j}/tx`, `conn/{j}/ctl` — to requests made by the page. A request is
+one connection whose whole request is already in, followed by end of
+file; it resolves with everything the guest sent when the guest ends the
+connection. A request to a published port the guest has not listened on
+yet waits, as a client retrying would, and connects the moment the
+listener registers. The one wait the kernel makes, `wait/{ms}`, cannot
+block in a browser and answers what there is; the worker sleeps briefly on
+an idle turn instead of spinning. So the page is `curl` to a server inside
+the container: `fixture.sh` bakes one that answers "pong", and the
+browser test sends it "ping".
 
 Check: the recorded Django run replays in the browser to the same console
 output and retired count as under wasmtime, and `statistics` read at the
@@ -302,16 +324,19 @@ harness under Node, against the wasmtime host's own run) and
   byte-identical acceptance test;
 - the tape's engine-mode header;
 - the browser harness, the worker with delta checkpoints and seeking, and
-  the page with the timeline, the syscall log, and the panels.
+  the page with the timeline, the syscall log, and the panels;
+- live mode, with the recording that makes its past seekable, and the
+  edge through which the page is the client of a server in the container.
 
 Not built:
 
 - **The disassembly panel**, which needs iced's formatter compiled into
   the guest behind a feature.
-- **A live mode** in the browser: a JavaScript clock and entropy, and an
-  edge that turns the page's own `fetch` into `/iso/net` events. The
-  harness has the stores; nothing wires a live run yet.
 - **A pre-booted Django snapshot** to start the demo from.
+- **A real wait in live mode.** The kernel's `wait/{ms}` read cannot block
+  in a browser Worker without JSPI or `Atomics.wait` on shared memory; the
+  worker sleeps between idle turns instead, which costs nothing here but
+  is not the design's blocking read.
 
 ## Order of work and size
 
