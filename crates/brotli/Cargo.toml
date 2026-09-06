@@ -1,0 +1,13 @@
+[package]
+name = "zaqaru-brotli"
+version = "0.1.0"
+edition = "2024"
+description = "A brotli decoder as a small wasm module, for the debugger page to inflate snapshots with"
+
+[lib]
+name = "brotli"
+crate-type = ["cdylib"]
+
+[dependencies]
+# The decoder only, no encoder: the page inflates, Node deflates.
+brotli-decompressor = { version = "6.0", default-features = false, features = ["std"] }

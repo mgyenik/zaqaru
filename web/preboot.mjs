@@ -3,6 +3,7 @@
 //
 //   node web/preboot.mjs <module.wasm> <out.snapshot> [--publish 80,8080]
 //                        [--quiet-ms 3000] [--quiet-instructions 2000000]
+//                        [--brotli [quality]]
 //
 // The container runs live against this process's clock and entropy, with
 // the ports named published on an edge nobody sends anything to. It is
@@ -13,6 +14,8 @@
 // since nothing can seek into the time before the file.
 
 import { readFileSync, writeFileSync } from "node:fs";
+import { brotliCompressSync, constants } from "node:zlib";
+import { wrap } from "./brotli.js";
 import { Container, Edge, KIND, standardMounts, text } from "./zaqaru.js";
 import { changedSince, encode, gzip, omit, prepare } from "./snapshot.js";
 
@@ -30,6 +33,7 @@ if (!outPath) {
 const publish = (option("publish", "") || "").split(",").map((s) => Number(s.trim())).filter(Boolean);
 const quietMs = Number(option("quiet-ms", 3000));
 const quietInstructions = Number(option("quiet-instructions", 2000000));
+const brotli = args.includes("--brotli") ? Number(option("brotli", "9")) || 9 : null;
 
 const started = performance.now();
 const module = await WebAssembly.compile(readFileSync(modulePath));
@@ -90,10 +94,16 @@ const file = encode({
   refill: true,
   mounts: mounts.save({ drop: ["iso/log"] }),
 });
-const compressed = await gzip(file);
+// gzip, or brotli wrapped with the inflated length (see brotli.js): about
+// a fifth smaller, at the cost of the page inflating it itself.
+const compressing = performance.now();
+const compressed = brotli
+  ? wrap(brotliCompressSync(file, { params: { [constants.BROTLI_PARAM_QUALITY]: brotli, [constants.BROTLI_PARAM_LGWIN]: 24, [constants.BROTLI_PARAM_SIZE_HINT]: file.length } }), file.length)
+  : await gzip(file);
+const compressedIn = performance.now() - compressing;
 writeFileSync(outPath, compressed);
 console.error(
   `preboot: quiet at ${retired.toLocaleString()} instructions after ${((performance.now() - started) / 1000).toFixed(0)} s; ` +
     `${(flushed.bytes / 1048576).toFixed(0)} MB of ${flushed.flushed} decoded blocks flushed, ${pooled} pooled buffers zeroed; ${all} pages changed of ${(memory.length / 1048576).toFixed(0)} MB, less ${cached} of ${cache.files} decompressed files (${(cache.bytes / 1048576).toFixed(0)} MB) and ${unmapped} unmapped: ${pages.size} kept; ` +
-    `${(file.length / 1048576).toFixed(1)} MB, ${(compressed.length / 1048576).toFixed(1)} MB compressed → ${outPath}`,
+    `${(file.length / 1048576).toFixed(1)} MB, ${(compressed.length / 1048576).toFixed(1)} MB as ${brotli ? `brotli-${brotli}` : "gzip"} in ${(compressedIn / 1000).toFixed(0)} s → ${outPath}`,
 );

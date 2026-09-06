@@ -9,7 +9,9 @@
 import { readFileSync } from "node:fs";
 import { Container, Edge, KIND, MountTable, parseTape, standardMounts, text } from "./zaqaru.js";
 import { Checkpoints, apply, dense, diff } from "./checkpoints.js";
-import { changedSince, decode, encode, gunzip, gzip, omit, prepare, refill } from "./snapshot.js";
+import { changedSince, decode, encode, gunzip, gzip, inflate, omit, prepare, refill } from "./snapshot.js";
+import { wrap } from "./brotli.js";
+import { brotliCompressSync, constants } from "node:zlib";
 
 const [modulePath, tapePath, stdoutPath, serverPath] = process.argv.slice(2);
 if (!stdoutPath) {
@@ -312,6 +314,13 @@ if (serverPath) {
     if (!same) break;
   }
   check("every page reads back byte for byte, repeats included", same);
+  // As brotli, inflated by the page's own decoder rather than the browser.
+  const brotli = brotliCompressSync(file, { params: { [constants.BROTLI_PARAM_QUALITY]: 9, [constants.BROTLI_PARAM_LGWIN]: 24 } });
+  const wrapped = wrap(new Uint8Array(brotli.buffer, brotli.byteOffset, brotli.length), file.length);
+  const inflated = await inflate(wrapped);
+  check("a brotli snapshot inflates through the wasm decoder to the same bytes", inflated.length === file.length && inflated.every((v, i) => v === file[i]));
+  check("a brotli snapshot is smaller than gzip", wrapped.length < compressed.length, `${wrapped.length} vs ${compressed.length}`);
+  check("a gzip snapshot still inflates", (await inflate(compressed)).length === file.length);
   check("repeated pages are stored once", file.length < pages.size * 4096, `${file.length} for ${pages.size} pages`);
   const table = MountTable.load(read.mounts);
   check("the console came through the file", text(table.readback(["iso", "console", "stdout"]) ?? new Uint8Array()) === text(original.readback(["iso", "console", "stdout"]) ?? new Uint8Array()));

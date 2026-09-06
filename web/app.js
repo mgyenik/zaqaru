@@ -92,7 +92,7 @@ worker.onmessage = (event) => {
     $("controls").classList.add("hidden");
     if (live) {
       $("port").value = message.published[0] ?? 8080;
-      status(`${message.checkpoints.length} checkpoint holding ${mb(message.held)}${message.listening.length ? `, listening on ${message.listening.join(", ")}` : `, publishing ${message.published.join(", ") || "no ports"}`}, loaded in ${(message.loading / 1000).toFixed(1)} s — press play, then send a request`);
+      status(`${message.checkpoints.length} checkpoint holding ${mb(message.held)}${message.listening.length ? `, listening on ${message.listening.join(", ")}` : `, publishing ${message.published.join(", ") || "no ports"}`}, loaded in ${(message.loading / 1000).toFixed(1)} s${message.inflated ? ` (${(message.inflated / 1000).toFixed(1)} s inflating)` : ""} — press play, then send a request`);
     } else {
       $("status").textContent = `${total.toLocaleString()} instructions, ${timeline.length} syscalls, ${message.checkpoints.length} checkpoints holding ${mb(message.held)} (${mb(message.naive)} as full copies, diffed in ${Math.round(message.diffing)} ms), ${message.bytecode ? "bytecode" : "interpreter"}, loaded in ${(message.loading / 1000).toFixed(1)} s`;
     }

@@ -320,9 +320,28 @@ other — and the file stores each once. Together: 75 MB to 39 MB
 compressed, the refill costing nothing measurable at load. What remains
 is mostly the processes themselves and their displaced copies.
 
+**Brotli.** Browsers inflate gzip natively (`DecompressionStream`) and
+brotli not at all, so the page carries a decoder: `crates/brotli`, the
+`brotli-decompressor` crate as a 237 KB wasm module with three exports,
+built by the fixture and demo scripts into `web/brotli.wasm`. A brotli
+file is wrapped with its inflated length so the output is placed at its
+exact size (`web/brotli.js`). Measured on the Django file, 223 MB raw:
+
+| compression | file | to compress | to inflate |
+| --- | --- | --- | --- |
+| gzip 6 | 39.4 MB | 2.5 s | 0.4 s, native |
+| brotli 9 | 32.7 MB | 25 s | 0.6–0.7 s, Chrome and Firefox |
+| brotli 10 | 29.3 MB | 125 s | the same |
+| brotli 11 | 28.6 MB | 228 s | 0.8 s |
+
+The demo uses quality 10: a quarter off the download for a third of a
+second more inflating, and two minutes of CI rather than four for the
+last 0.7 MB. Without `--brotli` the tool writes gzip, which needs no
+decoder.
+
 For Django (`web/demo.sh`): the boot is 3.29 G instructions, 28–32 s
 under Node — the same rate as wasmtime; 71,600 pages of the 887 MB memory
-differ from a fresh instance, of which 63,400 are kept, 39 MB compressed,
+differ from a fresh instance, of which 63,400 are kept, 29 MB as brotli,
 beside a 74 MB module. Headless Chrome loads both, refills the 31 MB of
 files, and stands the container up listening on port 80 in 1.0 s; a
 `GET /` through the edge is answered by nginx, gunicorn and Django in

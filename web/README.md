@@ -44,7 +44,10 @@ of booting one; history begins at the file's instant. Before writing the
 file the tool asks the kernel to flush its block caches and zero its page
 pool, and leaves out the decompressed files' buffers and the guest pages no
 process can reach; the page refills the files when it continues. That is
-what takes Django's file from 75 MB to 39 MB.
+what takes Django's file from 75 MB to 39 MB as gzip, and `--brotli 10`
+takes it to 29, inflated by `brotli.wasm` — a decoder built from
+`crates/brotli` by the fixture and demo scripts, since browsers inflate
+gzip natively and brotli not at all.
 
 The panels are reads of the container's store: processes, registers, the
 disassembly from `rip`, the stack under `rsp`, the memory map, descriptors,

@@ -15,7 +15,9 @@
 // Django's pages are copies of another: a forked process's page that never
 // diverged, held in place for one process and displaced for the other.
 //
-// The header is { at, stackPointer, length, pages, refill, mounts }. Only
+// The whole is gzip, or brotli wrapped as `brotli.js` describes — a fifth
+// smaller, inflated by a wasm decoder the page carries rather than by the
+// browser. The header is { at, stackPointer, length, pages, refill, mounts }. Only
 // pages the booted container changed are in the file, less what the kernel
 // puts back on request: with `refill` set, whoever continues from the file
 // writes `refill` to the container's `caches/decompressed` path, and the
@@ -23,6 +25,7 @@
 // largest part of a booted Django's memory, and a function of the image.
 
 import { diff, PAGE } from "./checkpoints.js";
+import { inflateBrotli, isBrotli } from "./brotli.js";
 
 /// What a container continued from a file needs done before it runs: the
 /// kernel refills its decompressed files. Answers what the kernel wrote.
@@ -186,4 +189,10 @@ export function gzip(bytes) {
 
 export function gunzip(bytes) {
   return through(new DecompressionStream("gzip"), bytes);
+}
+
+/// The file's bytes however it was compressed: gzip, which the browser
+/// inflates itself, or brotli, which `brotli.js` inflates.
+export function inflate(bytes) {
+  return isBrotli(bytes) ? inflateBrotli(bytes) : gunzip(bytes);
 }

@@ -74,11 +74,14 @@ EOF
 gcc -O1 -static -no-pie -fcf-protection=none -fno-stack-protector -fno-asynchronous-unwind-tables \
     -o "$out/server/init" "$out/server.c"
 cargo build --release --quiet -p zaqaru --manifest-path "$repo/Cargo.toml"
+# The brotli decoder the page inflates snapshots with.
+cargo build --release --quiet -p zaqaru-brotli --target wasm32-unknown-unknown --manifest-path "$repo/Cargo.toml"
+cp "$repo/target/wasm32-unknown-unknown/release/brotli.wasm" "$repo/web/brotli.wasm"
 "$repo/target/release/zaqaru" bake "$out/server" -o "$out/server.wasm"
 "$repo/target/release/zaqaru" bake "$out/root" -o "$out/module.wasm" -- /init a b
 "$repo/target/release/zaqaru" run --trace "$out/trace.txt" --record "$out/tape.bin" --seed 51 \
     "$out/module.wasm" > "$out/stdout.txt" 2> "$out/stderr.txt" || true
 # The server, booted and written to a file once it is listening, for the
 # page's start-from-a-snapshot mode.
-node "$repo/web/preboot.mjs" "$out/server.wasm" "$out/server.snapshot" --publish 8080 --quiet-ms 1000 2>/dev/null
+node "$repo/web/preboot.mjs" "$out/server.wasm" "$out/server.snapshot" --publish 8080 --quiet-ms 1000 --brotli 9 2>/dev/null
 echo "fixture in $out: module.wasm, tape.bin, trace.txt, stdout.txt, server.wasm, server.snapshot"

@@ -36,7 +36,7 @@ jobs:
       # that the snapshot answers GET / with Django's page.
       - run: web/demo.sh "$PWD/_site/web/demo"
       - run: |
-          cp web/index.html web/*.js _site/web/
+          cp web/index.html web/*.js web/brotli.wasm _site/web/
           cp web/pages/index.html _site/index.html
           touch _site/.nojekyll
           du -sh _site/web/demo/*

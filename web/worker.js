@@ -22,7 +22,7 @@
 
 import { Container, Edge, KIND, MountTable, parseTape, standardMounts, text } from "./zaqaru.js";
 import { Checkpoints } from "./checkpoints.js";
-import { decode, gunzip, refill } from "./snapshot.js";
+import { decode, inflate, refill } from "./snapshot.js";
 
 let module = null;
 let tape = null;
@@ -32,6 +32,7 @@ let checkpoints = null;
 let checkpointEvery = 2000000;
 let viewer = null; // the container standing at the last seek
 let origin = 0; // where history begins: 0, or a snapshot's instant
+let inflated = 0; // ms spent inflating the snapshot
 let frontier = 0;
 let finished = null;
 let timelineSeen = 0; // bytes of the timeline sink already reported
@@ -128,7 +129,9 @@ async function load({ module: moduleBytes, tape: tapeBytes, snapshot: snapshotBy
   tape = null;
   edge = new Edge(publish ?? []);
   if (snapshotBytes) {
-    const file = decode(await gunzip(new Uint8Array(snapshotBytes)));
+    const inflating = performance.now();
+    const file = decode(await inflate(new Uint8Array(snapshotBytes)));
+    inflated = performance.now() - inflating;
     const mounts = MountTable.load(file.mounts, { edge });
     mounts.record();
     live = await Container.continueFrom(module, file, mounts);
@@ -166,6 +169,7 @@ async function load({ module: moduleBytes, tape: tapeBytes, snapshot: snapshotBy
     published: publish ?? [],
     listening: [...edge.listening],
     loading: performance.now() - started,
+    inflated,
   });
 }
 
