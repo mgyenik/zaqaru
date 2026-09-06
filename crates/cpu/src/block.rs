@@ -266,8 +266,10 @@ impl BlockCache {
         // just above, and a block entry is never one byte from another.
         let slot = ((address >> 4) as usize) & (RECENT - 1);
         let (cached, index) = self.recent[slot];
+        // `get`, not an index: a flush empties the slab, and a slot may
+        // still name an index past its new end.
         if cached == address
-            && let Some(block) = &self.blocks[index]
+            && let Some(Some(block)) = self.blocks.get(index)
             && block.entry == address
         {
             return Ok(index);
@@ -384,6 +386,25 @@ impl BlockCache {
         }
     }
 
+    /// About how many bytes of heap the cache holds: every live block's
+    /// instructions, pre-decoded ops and bytecode, and the slab and tables
+    /// around them. An estimate from capacities, for accounting.
+    pub fn footprint(&self) -> usize {
+        use core::mem::size_of;
+        let mut bytes = self.blocks.capacity() * size_of::<Option<Block>>()
+            + self.free.capacity() * size_of::<usize>()
+            + self.entries.capacity() * (size_of::<u64>() + size_of::<usize>())
+            + self.registry.capacity() * (size_of::<u64>() + size_of::<Vec<usize>>());
+        for block in self.blocks.iter().flatten() {
+            bytes += block.instructions.capacity() * size_of::<Instruction>()
+                + block.quick.capacity() * size_of::<crate::quick::Quick>();
+            if let Some(trace) = &block.trace {
+                bytes += trace.code.capacity() * size_of::<crate::bytecode::Word>() + trace.ip.capacity() * size_of::<u64>();
+            }
+        }
+        bytes
+    }
+
     /// Throws the whole cache away.
     pub fn flush(&mut self, space: &mut Space) {
         for page in self.registry.keys() {
@@ -393,6 +414,7 @@ impl BlockCache {
         self.free.clear();
         self.entries.clear();
         self.registry.clear();
+        self.recent.fill((u64::MAX, 0));
         self.flushes += 1;
     }
 }

@@ -9,7 +9,7 @@
 import { readFileSync } from "node:fs";
 import { Container, Edge, KIND, MountTable, parseTape, standardMounts, text } from "./zaqaru.js";
 import { Checkpoints, apply, dense, diff } from "./checkpoints.js";
-import { changedSince, decode, encode, gunzip, gzip } from "./snapshot.js";
+import { changedSince, decode, encode, gunzip, gzip, omit, prepare, refill } from "./snapshot.js";
 
 const [modulePath, tapePath, stdoutPath, serverPath] = process.argv.slice(2);
 if (!stdoutPath) {
@@ -279,11 +279,40 @@ if (serverPath) {
   const pages = changedSince(freshMemory, memory);
   const all = diff(null, memory).changed;
   check("a snapshot file holds fewer pages than the memory has", pages.size > 0 && pages.size < all.size, `${pages.size} of ${all.size}`);
-  const file = encode({ at, stackPointer: original.stackPointer, length: memory.length, pages, mounts: mounts.save({ drop: ["iso/log"] }) });
+  // The program is bigger than the bake's compression floor, so it sits
+  // decompressed in the kernel's cache: a buffer the file can leave out.
+  const blocksBefore = original.value("caches/blocks");
+  const { flushed, pooled, cache, cacheRanges, gaps } = prepare(original);
+  check("the kernel reports its decompressed files", cache.files >= 1 && cache.ranges.length === cache.files && cache.bytes > 4096, JSON.stringify(cache).slice(0, 200));
+  check("the block caches flush", blocksBefore.live > 0 && flushed.flushed === blocksBefore.live && original.value("caches/blocks").live === 0, JSON.stringify({ blocksBefore, flushed }));
+  check("the pool zeroes on request", typeof pooled === "number");
+  // Prepared, the memory has less in it: the flushed blocks are zero. Not
+  // fewer pages — a freed block shares its pages with what lives on — but
+  // zeros, which is what the file's compression sees.
+  const naive = (await gzip(encode({ at, stackPointer: original.stackPointer, length: memory.length, pages, mounts: mounts.save({ drop: ["iso/log"] }) }))).length;
+  const prepared = changedSince(freshMemory, new Uint8Array(original.memory.buffer));
+  const before = prepared.size;
+  const omitted = omit(prepared, cacheRanges, freshMemory.length);
+  check("the cache's pages leave the file", omitted > 0 && prepared.size === before - omitted, `${omitted}`);
+  const gapped = omit(prepared, gaps, freshMemory.length);
+  console.log(`     ${pages.size} pages changed; ${flushed.flushed} blocks (${(flushed.bytes / 1024).toFixed(0)} KB) flushed → ${before}; ${omitted} cached and ${gapped} unmapped left out → ${prepared.size}`);
+  pages.clear();
+  for (const [k, v] of prepared) pages.set(k, v);
+  const file = encode({ at, stackPointer: original.stackPointer, length: memory.length, pages, refill: true, mounts: mounts.save({ drop: ["iso/log"] }) });
   const compressed = await gzip(file);
   check("the file compresses", compressed.length < file.length / 2, `${compressed.length} of ${file.length}`);
+  check("a prepared file is smaller than the memory as it stood", compressed.length < naive * 0.8, `${compressed.length} vs ${naive}`);
   const read = decode(await gunzip(compressed));
   check("the file reads back", read.at === at && read.pages.size === pages.size && read.stackPointer === original.stackPointer);
+  let same = true;
+  for (const [page, bytes] of pages) {
+    const got = read.pages.get(page);
+    if (!got || got.length !== bytes.length) { same = false; break; }
+    for (let i = 0; i < bytes.length; i++) if (got[i] !== bytes[i]) { same = false; break; }
+    if (!same) break;
+  }
+  check("every page reads back byte for byte, repeats included", same);
+  check("repeated pages are stored once", file.length < pages.size * 4096, `${file.length} for ${pages.size} pages`);
   const table = MountTable.load(read.mounts);
   check("the console came through the file", text(table.readback(["iso", "console", "stdout"]) ?? new Uint8Array()) === text(original.readback(["iso", "console", "stdout"]) ?? new Uint8Array()));
   check("the logs were dropped", (table.readback(["iso", "log", "debug"]) ?? new Uint8Array()).length === 0);
@@ -291,6 +320,15 @@ if (serverPath) {
   // file records from the file's instant on.
   const recording = table.record();
   const continued = await Container.continueFrom(module, read, table);
+  check("the file says to refill", read.refill === true);
+  const refilled = refill(continued);
+  check("the refill writes the cached files back", refilled.files === cache.files && refilled.bytes === cache.bytes, JSON.stringify(refilled));
+  const restoredMemory = new Uint8Array(continued.memory.buffer);
+  let first = -1;
+  for (const [start, length] of cache.ranges.map((r) => [Number(BigInt(r.address)), r.length])) {
+    for (let i = 0; i < length && first < 0; i++) if (restoredMemory[start + i] !== memory[start + i]) first = start + i;
+  }
+  check("the refilled bytes are the bytes that were left out", first === -1, `first difference at ${first}`);
   check("the continued container stands at the file's instant", continued.value("statistics").retired === at);
   const status = original.boot();
   const continuedStatus = continued.boot();

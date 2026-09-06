@@ -22,7 +22,7 @@
 
 import { Container, Edge, KIND, MountTable, parseTape, standardMounts, text } from "./zaqaru.js";
 import { Checkpoints } from "./checkpoints.js";
-import { decode, gunzip } from "./snapshot.js";
+import { decode, gunzip, refill } from "./snapshot.js";
 
 let module = null;
 let tape = null;
@@ -132,6 +132,7 @@ async function load({ module: moduleBytes, tape: tapeBytes, snapshot: snapshotBy
     const mounts = MountTable.load(file.mounts, { edge });
     mounts.record();
     live = await Container.continueFrom(module, file, mounts);
+    if (file.refill) refill(live);
     origin = file.at;
     // The container has run, so its clock and its logs are consulted from
     // here: whatever the file kept of the console is the boot's output.

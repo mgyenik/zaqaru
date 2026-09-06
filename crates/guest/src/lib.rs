@@ -14,5 +14,7 @@
 #[cfg(target_arch = "wasm32")]
 pub mod abi;
 #[cfg(target_arch = "wasm32")]
+pub mod alloc;
+#[cfg(target_arch = "wasm32")]
 pub mod boot;
 pub mod wire;

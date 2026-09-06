@@ -14,7 +14,7 @@
 
 import { readFileSync, writeFileSync } from "node:fs";
 import { Container, Edge, KIND, standardMounts, text } from "./zaqaru.js";
-import { changedSince, encode, gzip } from "./snapshot.js";
+import { changedSince, encode, gzip, omit, prepare } from "./snapshot.js";
 
 const args = process.argv.slice(2);
 const positional = args.filter((a) => !a.startsWith("--"));
@@ -71,19 +71,29 @@ if (finished !== null) {
   process.exit(1);
 }
 
+// What the kernel keeps that the file need not — see `prepare`: the block
+// caches are thrown away (decoded again on demand, and zeroed as they go),
+// the pooled page buffers are zeroed, the decompressed files' buffers are
+// left out and refilled by whoever continues from the file, and guest pages
+// no process maps are left out since they are filled before reuse.
+const { flushed, pooled, cache, cacheRanges, gaps } = prepare(container);
 const memory = new Uint8Array(container.memory.buffer);
 const pages = changedSince(freshMemory, memory);
+const all = pages.size;
+const cached = omit(pages, cacheRanges, freshMemory.length);
+const unmapped = omit(pages, gaps, freshMemory.length);
 const file = encode({
   at: retired,
   stackPointer: container.stackPointer,
   length: memory.length,
   pages,
+  refill: true,
   mounts: mounts.save({ drop: ["iso/log"] }),
 });
 const compressed = await gzip(file);
 writeFileSync(outPath, compressed);
 console.error(
   `preboot: quiet at ${retired.toLocaleString()} instructions after ${((performance.now() - started) / 1000).toFixed(0)} s; ` +
-    `${pages.size} pages changed of ${(memory.length / 1048576).toFixed(0)} MB; ` +
+    `${(flushed.bytes / 1048576).toFixed(0)} MB of ${flushed.flushed} decoded blocks flushed, ${pooled} pooled buffers zeroed; ${all} pages changed of ${(memory.length / 1048576).toFixed(0)} MB, less ${cached} of ${cache.files} decompressed files (${(cache.bytes / 1048576).toFixed(0)} MB) and ${unmapped} unmapped: ${pages.size} kept; ` +
     `${(file.length / 1048576).toFixed(1)} MB, ${(compressed.length / 1048576).toFixed(1)} MB compressed → ${outPath}`,
 );

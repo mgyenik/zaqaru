@@ -23,6 +23,12 @@
 
 pub mod abi;
 pub mod errno;
+
+/// Whether the module's allocator zeroes what it frees. Set by the kernel
+/// around the one operation that frees a great deal on purpose — flushing
+/// its caches for a snapshot — so that what is freed is not in the
+/// snapshot. The allocator is the guest crate's; it reads this.
+pub static SCRUB_FREED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 pub mod eventfd;
 pub mod exec;
 pub mod fd;

@@ -9,7 +9,7 @@
 
 import { readFileSync } from "node:fs";
 import { Container, Edge, KIND, MountTable, text } from "./zaqaru.js";
-import { decode, gunzip } from "./snapshot.js";
+import { decode, gunzip, refill } from "./snapshot.js";
 
 const [modulePath, snapshotPath, portText, requestText, expected] = process.argv.slice(2);
 if (!expected) {
@@ -24,6 +24,7 @@ const edge = new Edge([port]);
 const mounts = MountTable.load(file.mounts, { edge });
 mounts.record();
 const container = await Container.continueFrom(module, file, mounts);
+const refilled = file.refill ? refill(container) : { files: 0, bytes: 0 };
 const loaded = performance.now() - started;
 if (!edge.reachable(port)) {
   console.error(`check-demo: the snapshot is not listening on ${port} (listening on ${[...edge.listening].join(", ") || "nothing"})`);
@@ -52,7 +53,7 @@ if (answered === null) {
 }
 const ok = answered.includes(expected);
 console.error(
-  `check-demo: loaded in ${(loaded / 1000).toFixed(1)} s, answered in ${((performance.now() - asked) / 1000).toFixed(2)} s and ${(frontier - file.at).toLocaleString()} instructions: ` +
+  `check-demo: loaded in ${(loaded / 1000).toFixed(1)} s (${refilled.files} files, ${(refilled.bytes / 1048576).toFixed(0)} MB refilled), answered in ${((performance.now() - asked) / 1000).toFixed(2)} s and ${(frontier - file.at).toLocaleString()} instructions: ` +
     `${JSON.stringify(answered.split("\n")[0])}${ok ? "" : ` — does not contain ${JSON.stringify(expected)}`}`,
 );
 process.exit(ok ? 0 : 1);

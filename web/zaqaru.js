@@ -167,9 +167,10 @@ export class Server {
     this.pending = [];
     this.responses = new Map();
   }
-  ask(path) {
+  /// Queues a read of `path`, or — with `data`, a string — a write.
+  ask(path, data) {
     const id = this.next++;
-    this.pending.push({ id, path });
+    this.pending.push({ id, path, data });
     return id;
   }
   answer(id) {
@@ -181,8 +182,8 @@ export class Server {
     const [, , what, which] = path.map((s) => text(s));
     if (what === "requests" && which === "pending") {
       const batch = this.pending.map(
-        ({ id, path }) =>
-          `{"op":"read","path":${JSON.stringify(path)},"data":null,"respond_to":"/iso/server/responses/${id}"}`,
+        ({ id, path, data }) =>
+          `{"op":${data === undefined ? '"read"' : '"write"'},"path":${JSON.stringify(path)},"data":${data === undefined ? "null" : JSON.stringify(data)},"respond_to":"/iso/server/responses/${id}"}`,
       );
       this.pending = [];
       return bytes(`[${batch.join(",")}]`);
@@ -671,14 +672,23 @@ export class Container {
     }
   }
 
-  /// Reads a path of the container's own store; answers the Response text.
-  ask(path) {
+  /// Reads a path of the container's own store — or writes `data` to it,
+  /// for the few paths that take a write; answers the Response text.
+  ask(path, data) {
     if (!this.mounts.server) throw "nothing is mounted at /iso/server";
-    const id = this.mounts.server.ask(path);
+    const id = this.mounts.server.ask(path, data);
     this.step(0);
     const answer = this.mounts.server.answer(id);
-    if (!answer) throw `the container did not answer the read of ${path}`;
+    if (!answer) throw `the container did not answer the ${data === undefined ? "read" : "write"} of ${path}`;
     return text(answer);
+  }
+
+  /// Writes `data` to a path of the container's store; answers the value
+  /// on `ok`, or throws.
+  put(path, data) {
+    const response = JSON.parse(this.ask(path, data));
+    if (response.result !== "ok") throw `${path}: ${response.error?.type}: ${response.error?.message}`;
+    return response.value;
   }
 
   /// The container's answer to a read, parsed: the value on `ok`, or a

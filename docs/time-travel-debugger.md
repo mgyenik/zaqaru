@@ -113,8 +113,21 @@ The paths the store serves, all read-only:
 | `processes/{pid}/descriptors` | each fd: what backs it, offset, flags |
 | `processes/{pid}/threads/{tid}/disassembly` | up to forty instructions from `rip`: address, bytes, text |
 | `processes/{pid}/memory/{address}/{length}` | up to 4096 bytes of the process's memory, hex, as far as they are readable |
-| `cache` | blocks decoded, blocks live, bytes of bytecode, flushes |
+| `processes/{pid}/mapped` | the pages the process can reach, as `[start, end)` runs — the permission bits themselves |
+| `layout` | where the guest block is in linear memory |
+| `cache` | the running process's block cache: blocks decoded, live, flushes |
+| `caches` | what the kernel keeps that a snapshot need not: decompressed files, decoded blocks, pooled page buffers |
+| `caches/decompressed` | every decompressed file's buffer, address and length; **writable**: `refill` |
+| `caches/blocks` | every process's block cache; **writable**: `flush` |
+| `caches/pool` | pooled page buffers; **writable**: `zero` |
 | `meta/...` | the spec's meta lens: which paths are readable |
+
+Three paths take a write, and they are the exception to the rule below
+rather than a breach of it: each changes kernel memory in a way the guest
+cannot observe — a file decompressed again into the buffer it already had,
+a block cache the kernel will decode again on demand, a pooled buffer
+that is filled before it is handed out — and they exist so that a
+snapshot can leave out what they put back. See "Starting from a file".
 
 The disassembly is iced's fast formatter, behind the `disassembly` cargo
 feature on the cpu, kernel and guest crates; the engine itself never
@@ -282,13 +295,39 @@ was: the container's first idle check found no clock and called itself
 deadlocked.) History begins at the file's instant: the first checkpoint
 is taken there, and the slider does not go below it.
 
-For Django (`web/demo.sh`): the boot is 3.29 G instructions, 32 s under
-Node — the same rate as wasmtime; 71,900 pages of the 887 MB memory
-differ from a fresh instance, 281 MB, 75 MB compressed, beside a 74 MB
-module. Headless Chrome loads both and stands the container up listening
-on port 80 in 1.0 s; a `GET /` through the edge is answered by nginx,
-gunicorn and Django in 0.3 s and 3.9 M instructions; a seek into the
-middle of the request restores and re-executes in 0.3 s.
+**What the file leaves out.** As first written, the file was 75 MB
+compressed for Django, and a breakdown by address showed 223 of its 281
+MB of pages were the kernel's heap, not the guest's processes. The heap
+held three things a booted container does not need carried: 110 MB of
+decoded blocks — the interpreter's cache of 66,000 blocks, which it
+decodes again on demand; 31 MB of decompressed files, which are a
+function of the image; and stale copies in the page pool. So before the
+file is written the tool asks the kernel, through the three writable
+paths above, to flush every block cache, zero the pool, and name the
+decompressed buffers, and it leaves those buffers out; whoever continues
+from the file writes `refill` first. Flushing frees memory without
+clearing it, so the module's allocator (`crates/guest/src/alloc.rs`)
+zeroes what it frees while the kernel's `SCRUB_FREED` flag is set, which
+the flush sets around itself. The tool also leaves out the guest pages no
+process can reach, taken from `processes/{pid}/mapped` — the permission
+bits the interpreter checks — rather than from the memory map, which is
+for people: the first attempt read the map, the map did not name the
+`brk` heap, every process's malloc arena was zeroed, and gunicorn quietly
+restarted its worker. The map now names `[heap]`, as Linux does. Last,
+a tenth of the pages are repeats of another — a forked process's page
+that never diverged, in place for one process and displaced for the
+other — and the file stores each once. Together: 75 MB to 39 MB
+compressed, the refill costing nothing measurable at load. What remains
+is mostly the processes themselves and their displaced copies.
+
+For Django (`web/demo.sh`): the boot is 3.29 G instructions, 28–32 s
+under Node — the same rate as wasmtime; 71,600 pages of the 887 MB memory
+differ from a fresh instance, of which 63,400 are kept, 39 MB compressed,
+beside a 74 MB module. Headless Chrome loads both, refills the 31 MB of
+files, and stands the container up listening on port 80 in 1.0 s; a
+`GET /` through the edge is answered by nginx, gunicorn and Django in
+0.12–0.3 s and 3.8 M instructions; a seek into the middle of the request
+restores and re-executes in 0.3 s.
 
 Check: the recorded Django run replays in the browser to the same console
 output and retired count as under wasmtime, and `statistics` read at the

@@ -13,6 +13,9 @@
 //!
 //! **Serving a Request never changes anything the guest can observe.** It
 //! reads kernel state and writes a Response, and that is the whole of it.
+//! The three paths that take a write keep to that: they refill, flush or
+//! zero kernel caches whose contents the guest cannot tell from their
+//! absence, so that a snapshot can leave them out (see `write`).
 //! The rule is what lets the host keep `/iso/server` outside the tape: the
 //! answers to `requests/pending` are not inputs to the run, so a recording
 //! does not keep them and a replay does not check them, and a debugger can
@@ -24,6 +27,7 @@
 use core::fmt::Write as _;
 
 use crate::abi::{Store, StoreOutcome};
+use crate::machine::Machine as _;
 use crate::paths;
 
 use super::System;
@@ -34,7 +38,7 @@ use super::System;
 macro_rules! interface {
     ($disassembly:literal) => {
         concat!(
-            r#"{"name":"zaqaru-container","version":"0.1.0","serialization":"application/json","paths":{"statistics":{"read":"instructions retired and accelerated, blocks decoded, the current pid"},"processes":{"read":"every process and its threads, with what each is parked on"},"processes/{pid}/threads/{tid}/registers":{"read":"the general registers, rip, the segment base and the flags of one thread"},"processes/{pid}/maps":{"read":"the process's memory map, as /proc/self/maps renders it"},"processes/{pid}/descriptors":{"read":"the process's open descriptors"},"processes/{pid}/memory/{address}/{length}":{"read":"up to 4096 bytes of the running process's memory, hex"},"cache":{"read":"the running process's block cache"},"meta/":{"read":"which paths are readable"}"#,
+            r#"{"name":"zaqaru-container","version":"0.1.0","serialization":"application/json","paths":{"statistics":{"read":"instructions retired and accelerated, blocks decoded, the current pid"},"processes":{"read":"every process and its threads, with what each is parked on"},"processes/{pid}/threads/{tid}/registers":{"read":"the general registers, rip, the segment base and the flags of one thread"},"processes/{pid}/maps":{"read":"the process's memory map, as /proc/self/maps renders it"},"processes/{pid}/descriptors":{"read":"the process's open descriptors"},"processes/{pid}/memory/{address}/{length}":{"read":"up to 4096 bytes of the running process's memory, hex"},"processes/{pid}/mapped":{"read":"the pages the process can reach, as [start, end) runs"},"cache":{"read":"the running process's block cache"},"layout":{"read":"where the guest block is in linear memory"},"caches":{"read":"what the kernel keeps that a snapshot need not: decompressed files, decoded blocks, pooled page buffers"},"caches/blocks":{"read":"every process's block cache: live blocks and bytes","write":"`flush`: throw every block cache away, zeroing what is freed"},"caches/decompressed":{"read":"every decompressed file's buffer: address and length","write":"`refill`: decompress every cached file again into its buffer"},"caches/pool":{"read":"pooled page buffers","write":"`zero`: zero the pooled buffers"},"meta/":{"read":"which paths are readable"}"#,
             $disassembly,
             "}}"
         )
@@ -50,10 +54,12 @@ pub const INTERFACE: &str = interface!("");
 /// The most memory one read hands back.
 const MEMORY_READ_CAP: u64 = 4096;
 
-/// One Request, as the runtime queued it.
+/// One Request, as the runtime queued it. `data` is kept when it is a
+/// string, which is what the two writable paths take.
 struct Request {
     op: String,
     path: String,
+    data: Option<String>,
     respond_to: String,
 }
 
@@ -88,7 +94,11 @@ impl<'a, S: Store + Clone> System<'a, S> {
                     Err(Refusal::NotFound) => error("not_found", &format!("the container serves no {}", request.path)),
                     Err(Refusal::Unavailable(why)) => error("unavailable", &why),
                 },
-                "write" => error("not_writable", "the container's store is read-only"),
+                "write" => match self.write(&request.path, request.data.as_deref().unwrap_or("")) {
+                    Ok(value) => format!(r#"{{"result":"ok","value":{value}}}"#),
+                    Err(Refusal::NotFound) => error("not_writable", &format!("the container does not take writes at {}", request.path)),
+                    Err(Refusal::Unavailable(why)) => error("unavailable", &why),
+                },
                 other => error("invalid_path", &format!("unknown operation {other}")),
             };
             let path = segments(&request.respond_to);
@@ -122,6 +132,34 @@ impl<'a, S: Store + Clone> System<'a, S> {
                 let rip = self.containers[index].process.kernel.machine.threads.all()[position].tcb.rip;
                 Ok(disassembly(&self.containers[index].process.kernel.pages, rip))
             }
+            ["processes", pid, "mapped"] => {
+                let index = self.container_index(pid.parse().ok().ok_or(Refusal::NotFound)?).ok_or(Refusal::NotFound)?;
+                let mut out = String::from(r#"{"ranges":["#);
+                let mut run: Option<(u64, u64)> = None;
+                let mut first = true;
+                let close = |out: &mut String, run: (u64, u64), first: &mut bool| {
+                    if !*first {
+                        out.push(',');
+                    }
+                    *first = false;
+                    let _ = write!(out, r#"["{:#x}","{:#x}"]"#, run.0, run.1);
+                };
+                for page in self.containers[index].process.kernel.pages.mapped_pages() {
+                    match run {
+                        Some((start, end)) if end == page => run = Some((start, page + 4096)),
+                        Some(done) => {
+                            close(&mut out, done, &mut first);
+                            run = Some((page, page + 4096));
+                        }
+                        None => run = Some((page, page + 4096)),
+                    }
+                }
+                if let Some(done) = run {
+                    close(&mut out, done, &mut first);
+                }
+                out.push_str("]}");
+                Ok(out)
+            }
             ["processes", pid, "memory", address, length] => {
                 let index = self.container_index(pid.parse().ok().ok_or(Refusal::NotFound)?).ok_or(Refusal::NotFound)?;
                 self.in_place(index)?;
@@ -129,6 +167,38 @@ impl<'a, S: Store + Clone> System<'a, S> {
                 let length = number(length).ok_or(Refusal::NotFound)?.min(MEMORY_READ_CAP);
                 Ok(memory(&self.containers[index].process.kernel.pages, address, length))
             }
+            ["layout"] => {
+                let start = self.current().kernel.machine.guest_base();
+                let end = start.saturating_add(crate::syscall::GUEST_ADDRESS_SPACE);
+                Ok(format!(r#"{{"guest_block":{{"start":"{start:#x}","end":"{end:#x}"}}}}"#))
+            }
+            ["caches"] => {
+                let files = crate::image::decompressed_cache();
+                let (live, bytes) = self.blocks_held();
+                Ok(format!(
+                    r#"{{"decompressed":{{"files":{},"bytes":{}}},"blocks":{{"live":{live},"bytes":{bytes}}},"pool":{{"pages":{}}}}}"#,
+                    files.files,
+                    files.bytes,
+                    crate::resident::pool_pages()
+                ))
+            }
+            ["caches", "blocks"] => {
+                let (live, bytes) = self.blocks_held();
+                Ok(format!(r#"{{"live":{live},"bytes":{bytes}}}"#))
+            }
+            ["caches", "decompressed"] => {
+                let files = crate::image::decompressed_cache();
+                let mut out = format!(r#"{{"files":{},"bytes":{},"ranges":["#, files.files, files.bytes);
+                for (position, (address, length)) in files.ranges.iter().enumerate() {
+                    if position > 0 {
+                        out.push(',');
+                    }
+                    let _ = write!(out, r#"{{"address":"{address:#x}","length":{length}}}"#);
+                }
+                out.push_str("]}");
+                Ok(out)
+            }
+            ["caches", "pool"] => Ok(format!(r#"{{"pages":{}}}"#, crate::resident::pool_pages())),
             ["cache"] => {
                 let cache = &self.current().cache;
                 Ok(format!(
@@ -140,10 +210,47 @@ impl<'a, S: Store + Clone> System<'a, S> {
                 ))
             }
             ["meta"] | ["meta", ..] => Ok(String::from(
-                r#"{"paths":{"statistics":{"readable":true,"writable":false},"processes":{"readable":true,"writable":false},"processes/{pid}/threads/{tid}/registers":{"readable":true,"writable":false},"processes/{pid}/threads/{tid}/disassembly":{"readable":true,"writable":false},"processes/{pid}/maps":{"readable":true,"writable":false},"processes/{pid}/descriptors":{"readable":true,"writable":false},"processes/{pid}/memory/{address}/{length}":{"readable":true,"writable":false},"cache":{"readable":true,"writable":false}}}"#,
+                r#"{"paths":{"statistics":{"readable":true,"writable":false},"processes":{"readable":true,"writable":false},"processes/{pid}/threads/{tid}/registers":{"readable":true,"writable":false},"processes/{pid}/threads/{tid}/disassembly":{"readable":true,"writable":false},"processes/{pid}/maps":{"readable":true,"writable":false},"processes/{pid}/descriptors":{"readable":true,"writable":false},"processes/{pid}/memory/{address}/{length}":{"readable":true,"writable":false},"processes/{pid}/mapped":{"readable":true,"writable":false},"cache":{"readable":true,"writable":false},"layout":{"readable":true,"writable":false},"caches":{"readable":true,"writable":false},"caches/decompressed":{"readable":true,"writable":true},"caches/blocks":{"readable":true,"writable":true},"caches/pool":{"readable":true,"writable":true}}}"#,
             )),
             _ => Err(Refusal::NotFound),
         }
+    }
+
+    /// The two writes the store takes, both kernel-only and invisible to the
+    /// guest: they exist so that a snapshot can leave out what they can
+    /// put back.
+    fn write(&mut self, path: &str, data: &str) -> Result<String, Refusal> {
+        let parts: Vec<&str> = path.trim_matches('/').split('/').collect();
+        match (parts.as_slice(), data.trim()) {
+            (["caches", "decompressed"], "refill") => match crate::image::refill_decompressed() {
+                Ok((files, bytes)) => Ok(format!(r#"{{"files":{files},"bytes":{bytes}}}"#)),
+                Err(why) => Err(Refusal::Unavailable(format!("refilling the decompressed files failed: {why:?}"))),
+            },
+            (["caches", "pool"], "zero") => Ok(format!(r#"{{"pages":{}}}"#, crate::resident::zero_pool())),
+            (["caches", "blocks"], "flush") => {
+                let (live, bytes) = self.blocks_held();
+                // Zero what the flush frees, so that a snapshot taken next
+                // has nothing of it to keep; then back to plain frees.
+                crate::SCRUB_FREED.store(true, core::sync::atomic::Ordering::Relaxed);
+                for container in self.containers.iter_mut() {
+                    let process = &mut container.process;
+                    process.cache.flush(&mut process.kernel.pages);
+                }
+                crate::SCRUB_FREED.store(false, core::sync::atomic::Ordering::Relaxed);
+                Ok(format!(r#"{{"flushed":{live},"bytes":{bytes}}}"#))
+            }
+            (["caches", "decompressed"] | ["caches", "pool"] | ["caches", "blocks"], other) => {
+                Err(Refusal::Unavailable(format!("{path} does not take {other:?}")))
+            }
+            _ => Err(Refusal::NotFound),
+        }
+    }
+
+    /// Every process's block cache: live blocks, and about how many bytes.
+    fn blocks_held(&self) -> (usize, usize) {
+        self.containers
+            .iter()
+            .fold((0, 0), |(live, bytes), container| (live + container.process.cache.len(), bytes + container.process.cache.footprint()))
     }
 
     /// Which container and which of its threads a path names.
@@ -203,9 +310,10 @@ impl<'a, S: Store + Clone> System<'a, S> {
             }
             let _ = write!(
                 out,
-                r#"{{"pid":{},"parent":{},"state":{},"threads":["#,
+                r#"{{"pid":{},"parent":{},"displaced":{},"state":{},"threads":["#,
                 container.pid,
                 container.parent,
+                crate::resident::displaced_pages(container.process.kernel.machine.token),
                 match container.status {
                     Some(super::Ending::Exited(code)) => format!(r#"{{"exited":{code}}}"#),
                     Some(super::Ending::Signalled(signal)) => format!(r#"{{"signalled":{signal}}}"#),
@@ -401,7 +509,7 @@ fn parse_requests(bytes: &[u8]) -> Option<Vec<Request>> {
     loop {
         parser.skip_space();
         parser.expect('{')?;
-        let (mut op, mut path, mut respond_to) = (None, None, None);
+        let (mut op, mut path, mut data, mut respond_to) = (None, None, None, None);
         loop {
             parser.skip_space();
             if parser.peek() == Some('}') {
@@ -416,6 +524,7 @@ fn parse_requests(bytes: &[u8]) -> Option<Vec<Request>> {
                 "op" => op = Some(parser.string()?),
                 "path" => path = Some(parser.string()?),
                 "respond_to" => respond_to = Some(parser.string()?),
+                "data" if parser.peek() == Some('"') => data = Some(parser.string()?),
                 _ => parser.skip_value()?,
             }
             parser.skip_space();
@@ -426,6 +535,7 @@ fn parse_requests(bytes: &[u8]) -> Option<Vec<Request>> {
         requests.push(Request {
             op: op?,
             path: path?,
+            data,
             respond_to: respond_to?,
         });
         parser.skip_space();
@@ -538,6 +648,9 @@ mod tests {
         assert_eq!(requests[0].op, "read");
         assert_eq!(requests[0].path, "processes");
         assert_eq!(requests[1].respond_to, "/iso/server/responses/2");
+        assert!(requests[0].data.is_none() && requests[1].data.is_none());
+        let written = parse_requests(br#"[{"op":"write","path":"caches/pool","data":"zero","respond_to":"/iso/server/responses/3"}]"#).expect("parses");
+        assert_eq!(written[0].data.as_deref(), Some("zero"));
         assert_eq!(segments(&requests[1].respond_to), vec![b"iso".to_vec(), b"server".to_vec(), b"responses".to_vec(), b"2".to_vec()]);
         assert!(parse_requests(b"[]").expect("empty").is_empty());
         assert!(parse_requests(b"not json").is_none());

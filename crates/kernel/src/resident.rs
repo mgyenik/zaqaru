@@ -282,10 +282,26 @@ pub(crate) fn retire(token: Token) {
     });
 }
 
-/// How many pages a process holds copies of, for the tests.
-#[cfg(test)]
+/// How many pages a process holds copies of.
 pub(crate) fn displaced_pages(token: Token) -> usize {
     RESIDENCY.with_borrow(|held| held.displaced.get(token as usize).map_or(0, HashMap::len))
+}
+
+/// How many page buffers the pool keeps for reuse.
+pub(crate) fn pool_pages() -> usize {
+    RESIDENCY.with_borrow(|held| held.pool.len())
+}
+
+/// Zeroes every pooled buffer. Their bytes are stale copies nothing reads —
+/// a buffer taken from the pool is filled before it is handed out — so a
+/// snapshot that finds them zero has less to keep, and nothing changes.
+pub(crate) fn zero_pool() -> usize {
+    RESIDENCY.with_borrow_mut(|held| {
+        for page in held.pool.iter_mut() {
+            page.fill(0);
+        }
+        held.pool.len()
+    })
 }
 
 impl Residency {

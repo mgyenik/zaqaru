@@ -157,11 +157,94 @@ pub const COMPRESS_FLOOR: usize = 4096;
 /// The bytes before a compressed file's frame: its compressed length.
 pub const COMPRESSED_PREFIX: usize = 4;
 
+/// One decompressed file, kept for the container's life: the buffer, and
+/// the blob it came from so that it can be made again.
+#[derive(Clone, Copy)]
+struct Cached {
+    data: *mut u8,
+    length: usize,
+    blob_length: usize,
+}
+
 thread_local! {
     /// Decompressed files, by blob and offset. See [`Image::decompressed`].
     static DECOMPRESSED: core::cell::RefCell<
-        std::collections::HashMap<(usize, u64, u64), &'static [u8]>,
+        std::collections::HashMap<(usize, u64, u64), Cached>,
     > = core::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// What the cache holds: how many files, how many bytes, and where each
+/// buffer is. A snapshot leaves the buffers out and asks for [`refill`].
+pub struct CacheReport {
+    pub files: usize,
+    pub bytes: usize,
+    /// `(address, length)` of every buffer.
+    pub ranges: Vec<(usize, usize)>,
+}
+
+pub fn decompressed_cache() -> CacheReport {
+    DECOMPRESSED.with_borrow(|held| {
+        let mut ranges: Vec<(usize, usize)> = held
+            .values()
+            .map(|cached| (cached.data as usize, cached.length))
+            .collect();
+        ranges.sort_unstable();
+        CacheReport {
+            files: ranges.len(),
+            bytes: ranges.iter().map(|(_, length)| length).sum(),
+            ranges,
+        }
+    })
+}
+
+/// Decompresses every cached file again into the buffer it already has.
+///
+/// For a container restored from a snapshot that left the cache's buffers
+/// out: the table and the buffers' addresses are kernel memory the snapshot
+/// keeps, the bytes are a function of the blob, and the blob is in the
+/// module. Nothing the guest can observe changes — the buffers hold what
+/// they held — so this is served between turns like any other request.
+/// Answers how many files and bytes were written.
+///
+/// Sound because nothing keeps a slice of a cached file across a syscall:
+/// every caller of [`Image::contents`] copies out of it or reads it within
+/// the row, and this runs between turns, when no row is in flight.
+pub fn refill_decompressed() -> Result<(usize, usize), ImageError> {
+    let entries: Vec<((usize, u64, u64), Cached)> =
+        DECOMPRESSED.with_borrow(|held| held.iter().map(|(key, cached)| (*key, *cached)).collect());
+    let mut bytes = 0;
+    for ((blob, payload, size), cached) in &entries {
+        // SAFETY: the key names a blob that outlives every image over it —
+        // the module's own data, or a test's buffer held for the kernel's
+        // life — and `blob_length` is its length as recorded at insertion.
+        let blob: &[u8] = unsafe { core::slice::from_raw_parts(*blob as *const u8, cached.blob_length) };
+        let header = blob_span(blob, *payload, COMPRESSED_PREFIX as u64)?;
+        let length = u64::from(word(header, 0));
+        let frame = blob_span(blob, *payload + COMPRESSED_PREFIX as u64, length)?;
+        let decoded = decompress(frame, *size)?;
+        if decoded.len() != cached.length {
+            return Err(ImageError::Malformed("a cached file decompressed to a different length"));
+        }
+        // SAFETY: `data` is a live buffer of `length` bytes this table owns
+        // (leaked at insertion, never freed), and no reference into it is
+        // live between turns — see above.
+        unsafe {
+            core::ptr::copy_nonoverlapping(decoded.as_ptr(), cached.data, cached.length);
+        }
+        bytes += cached.length;
+    }
+    Ok((entries.len(), bytes))
+}
+
+/// `length` bytes of `blob` at `at`, checked at full width.
+fn blob_span(blob: &[u8], at: u64, length: u64) -> Result<&[u8], ImageError> {
+    let end = at
+        .checked_add(length)
+        .ok_or(ImageError::Malformed("file contents overrun the blob"))?;
+    if end > blob.len() as u64 {
+        return Err(ImageError::Malformed("file contents overrun the blob"));
+    }
+    Ok(&blob[at as usize..end as usize])
 }
 
 /// Decodes one zstd frame that must come to exactly `expected` bytes.
@@ -642,13 +725,7 @@ impl<'a> Image<'a> {
 
     /// `length` bytes of the blob at `at`, checked at full width.
     fn blob_span(&self, at: u64, length: u64) -> Result<&'a [u8], ImageError> {
-        let end = at
-            .checked_add(length)
-            .ok_or(ImageError::Malformed("file contents overrun the blob"))?;
-        if end > self.blob.len() as u64 {
-            return Err(ImageError::Malformed("file contents overrun the blob"));
-        }
-        Ok(&self.blob[at as usize..end as usize])
+        blob_span(self.blob, at, length)
     }
 
     /// A compressed file's bytes.
@@ -667,18 +744,28 @@ impl<'a> Image<'a> {
         // lies about a file's size is caught at every open and not just
         // the first.
         let key = (self.blob.as_ptr() as usize, inode.payload, inode.size);
-        if let Some(held) = DECOMPRESSED.with_borrow(|held| held.get(&key).copied()) {
-            return Ok(held);
+        if let Some(cached) = DECOMPRESSED.with_borrow(|held| held.get(&key).copied()) {
+            // SAFETY: a buffer the table owns for the container's life.
+            return Ok(unsafe { core::slice::from_raw_parts(cached.data, cached.length) });
         }
         let header = self.blob_span(inode.payload, COMPRESSED_PREFIX as u64)?;
         let length = u64::from(word(header, 0));
         let frame = self.blob_span(inode.payload + COMPRESSED_PREFIX as u64, length)?;
         let bytes = decompress(frame, inode.size)?;
-        let leaked: &'static [u8] = Box::leak(bytes.into_boxed_slice());
+        let length = bytes.len();
+        let data = Box::into_raw(bytes.into_boxed_slice()) as *mut u8;
         DECOMPRESSED.with_borrow_mut(|held| {
-            held.insert(key, leaked);
+            held.insert(
+                key,
+                Cached {
+                    data,
+                    length,
+                    blob_length: self.blob.len(),
+                },
+            );
         });
-        Ok(leaked)
+        // SAFETY: as above; the buffer was just made and is never freed.
+        Ok(unsafe { core::slice::from_raw_parts(data, length) })
     }
 
     pub fn symlink_target(&self, inode: &Inode) -> Result<&'a [u8], ImageError> {

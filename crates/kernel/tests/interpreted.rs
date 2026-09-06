@@ -2734,7 +2734,15 @@ int main(void) {
             {"op":"read","path":"nothing","data":null,"respond_to":"/iso/server/responses/7"},
             {"op":"read","path":"processes/1/threads/1/disassembly","data":null,"respond_to":"/iso/server/responses/8"},
             {"op":"read","path":"processes/1/memory/0x400000/16","data":null,"respond_to":"/iso/server/responses/9"},
-            {"op":"read","path":"processes/1/memory/0x10/16","data":null,"respond_to":"/iso/server/responses/10"}]"#
+            {"op":"read","path":"processes/1/memory/0x10/16","data":null,"respond_to":"/iso/server/responses/10"},
+            {"op":"read","path":"caches","data":null,"respond_to":"/iso/server/responses/11"},
+            {"op":"write","path":"caches/decompressed","data":"refill","respond_to":"/iso/server/responses/12"},
+            {"op":"write","path":"caches/pool","data":"zero","respond_to":"/iso/server/responses/13"},
+            {"op":"write","path":"caches/pool","data":"drop","respond_to":"/iso/server/responses/14"},
+            {"op":"read","path":"layout","data":null,"respond_to":"/iso/server/responses/15"},
+            {"op":"write","path":"caches/blocks","data":"flush","respond_to":"/iso/server/responses/16"},
+            {"op":"read","path":"caches/blocks","data":null,"respond_to":"/iso/server/responses/17"},
+            {"op":"read","path":"processes/1/mapped","data":null,"respond_to":"/iso/server/responses/18"}]"#
             .to_vec(),
     );
     system.serve();
@@ -2749,7 +2757,7 @@ int main(void) {
     assert!(statistics.starts_with(r#"{"result":"ok","value":{"retired":"#), "{statistics}");
     assert!(statistics.contains(r#""current":1"#), "{statistics}");
     let processes = response("2");
-    assert!(processes.contains(r#""pid":1,"parent":0,"state":"live""#), "{processes}");
+    assert!(processes.contains(r#""pid":1,"parent":0,"displaced":0,"state":"live""#), "{processes}");
     assert!(processes.contains(r#""tid":1,"rip":"0x"#), "{processes}");
     let registers = response("3");
     assert!(registers.contains(r#""rsp":"0x"#) && registers.contains(r#""flags_stale":null"#), "{registers}");
@@ -2772,6 +2780,24 @@ int main(void) {
     let memory = response("9");
     assert!(memory.starts_with(r#"{"result":"ok","value":{"address":"0x400000","bytes":"7f454c46"#), "an ELF header: {memory}");
     assert!(response("10").contains(r#""bytes":"""#), "{}", response("10"));
+    // The program is bigger than the bake's compression floor, so it sits
+    // decompressed in the cache; the refill writes it again, the same.
+    let caches = response("11");
+    assert!(caches.contains(r#""decompressed":{"files":1,"bytes":"#), "{caches}");
+    assert!(response("12").starts_with(r#"{"result":"ok","value":{"files":1,"bytes":"#), "{}", response("12"));
+    assert!(response("13").starts_with(r#"{"result":"ok","value":{"pages":"#), "{}", response("13"));
+    assert!(response("14").contains(r#""type":"unavailable""#), "{}", response("14"));
+    assert!(response("15").contains(r#""guest_block":{"start":"0x"#), "{}", response("15"));
+    // Blocks were decoded to get this far; the flush throws them away and
+    // the run below decodes them again and finishes the same.
+    let flushed = response("16");
+    assert!(flushed.starts_with(r#"{"result":"ok","value":{"flushed":"#) && !flushed.contains(r#""flushed":0,"#), "{flushed}");
+    assert!(response("17").contains(r#""live":0,"#), "{}", response("17"));
+    // The reachable pages, as the permission bits have them: the program's
+    // text at 0x400000 begins the first run.
+    assert!(response("18").starts_with(r#"{"result":"ok","value":{"ranges":[["0x400000","0x"#), "{}", response("18"));
+    // And the maps name the brk heap, as /proc/self/maps does.
+    assert!(maps.contains("[heap]"), "{maps}");
     // And the guest saw none of it: the run finishes as it always does.
     assert_eq!(system.run(), Exit::Status(0));
 }

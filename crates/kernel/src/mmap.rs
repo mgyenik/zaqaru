@@ -316,8 +316,19 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
     /// engine counts where a guest spent itself and only the kernel knows
     /// what is mapped there.
     pub fn render_maps(&self) -> String {
-        let mut rendered = String::new();
+        // Lines gathered and sorted by address, because the brk heap is
+        // not in the tree and has to take its place among what is.
+        let mut lines: Vec<(u64, String)> = Vec::new();
+        if self.space.brk_current() > self.space.brk_start() {
+            let mut line = String::new();
+            hex(&mut line, self.space.brk_start());
+            line.push('-');
+            hex(&mut line, self.space.brk_current());
+            line.push_str(" rw-p 00000000 00:00 0                          [heap]\n");
+            lines.push((self.space.brk_start(), line));
+        }
         for vma in self.space.vmas() {
+            let mut rendered = String::new();
             hex(&mut rendered, vma.start);
             rendered.push('-');
             hex(&mut rendered, vma.end());
@@ -352,8 +363,10 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
                 }
             }
             rendered.push('\n');
+            lines.push((vma.start, rendered));
         }
-        rendered
+        lines.sort_by_key(|(start, _)| *start);
+        lines.into_iter().map(|(_, line)| line).collect()
     }
 
     /// The path a mapped file has, found by searching for it.

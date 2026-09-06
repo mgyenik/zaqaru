@@ -40,7 +40,11 @@ recording. The edge panel sends a request to a listener inside the
 container and shows what came back, with the instant it was answered as a
 link. A snapshot (`snapshot.js`, written by `preboot.mjs` once a container
 has booted and gone quiet) starts the live run from a booted server instead
-of booting one; history begins at the file's instant.
+of booting one; history begins at the file's instant. Before writing the
+file the tool asks the kernel to flush its block caches and zero its page
+pool, and leaves out the decompressed files' buffers and the guest pages no
+process can reach; the page refills the files when it continues. That is
+what takes Django's file from 75 MB to 39 MB.
 
 The panels are reads of the container's store: processes, registers, the
 disassembly from `rip`, the stack under `rsp`, the memory map, descriptors,
