@@ -1,11 +1,18 @@
-// Drives the debugger page in headless Chrome over the DevTools protocol and
-// checks what it shows: the run loads, a seek lands on the instruction, the
-// panels fill in, and clicking a syscall seeks to it.
+// Drives the debugger page in a headless browser and checks what it shows:
+// the run loads, a seek lands on the instruction, the panels fill in,
+// clicking a syscall seeks to it, a live server answers through the edge, a
+// snapshot continues, and — when web/demo.sh has been run — Django answers
+// and is seekable.
 //
-//   node web/browser-test.mjs [chrome-binary] [--only replay|live|snapshot|django]
+//   node web/browser-test.mjs [--browser chrome|firefox] [--binary path]
+//                             [--driver geckodriver] [--only replay|live|snapshot|django]
 //
-// Serves the repository itself on a local port, so the fixture at
-// web/fixture (from web/fixture.sh) is what the page loads.
+// Chrome is driven over the DevTools protocol, Firefox over WebDriver
+// through geckodriver. A Firefox installed as a snap wants the snap's own
+// driver, `--driver firefox.geckodriver`, since a geckodriver outside the
+// snap may not start the browser inside it. Serves the repository itself
+// on a local port, so the fixture at web/fixture (from web/fixture.sh) is
+// what the page loads.
 
 import { spawn } from "node:child_process";
 import { createServer } from "node:http";
@@ -14,8 +21,11 @@ import { readFile } from "node:fs/promises";
 import { extname, join, normalize } from "node:path";
 
 const root = new URL("..", import.meta.url).pathname;
-const only = process.argv.includes("--only") ? process.argv[process.argv.indexOf("--only") + 1] : null;
-const chrome = process.argv.slice(2).find((a, i, all) => !a.startsWith("--") && all[i - 1] !== "--only") ?? "google-chrome";
+const option = (name, fallback) => (process.argv.includes(`--${name}`) ? process.argv[process.argv.indexOf(`--${name}`) + 1] : fallback);
+const only = option("only", null);
+const kind = option("browser", "chrome");
+const binary = option("binary", kind === "chrome" ? "google-chrome" : null);
+const driver = option("driver", "geckodriver");
 const runs = (scenario) => only === null || only === scenario;
 const types = { ".html": "text/html", ".js": "text/javascript", ".mjs": "text/javascript", ".wasm": "application/wasm", ".bin": "application/octet-stream", ".snapshot": "application/octet-stream", ".txt": "text/plain" };
 const demo = existsSync(join(root, "web/demo/hello-django.snapshot"));
@@ -36,11 +46,6 @@ await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
 const port = server.address().port;
 const page = `http://127.0.0.1:${port}/web/?module=fixture/module.wasm&tape=fixture/tape.bin`;
 
-const debugPort = 9300 + Math.floor(Math.random() * 500);
-// Chrome's own stderr goes to a file beside its profile, for when a tab dies.
-const chromeLog = `/tmp/zaqaru-browser-test-${process.pid}.log`;
-const browser = spawn(chrome, ["--headless=new", "--disable-gpu", "--no-sandbox", `--remote-debugging-port=${debugPort}`, "--user-data-dir=/tmp/zaqaru-browser-test-" + process.pid, "about:blank"], { stdio: ["ignore", "ignore", openSync(chromeLog, "w")] });
-
 let failures = 0;
 function check(name, condition, detail = "") {
   if (condition) console.log(`ok   ${name}`);
@@ -51,8 +56,13 @@ function check(name, condition, detail = "") {
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const consoleLines = [];
+// The browser's own stderr goes to a file, for when a tab dies.
+const browserLog = `/tmp/zaqaru-browser-test-${process.pid}.log`;
 
-try {
+/// Headless Chrome over the DevTools protocol: `{ navigate, evaluate, close }`.
+async function chrome() {
+  const debugPort = 9300 + Math.floor(Math.random() * 500);
+  const browser = spawn(binary, ["--headless=new", "--disable-gpu", "--no-sandbox", `--remote-debugging-port=${debugPort}`, "--user-data-dir=/tmp/zaqaru-browser-test-" + process.pid, "about:blank"], { stdio: ["ignore", "ignore", openSync(browserLog, "w")] });
   let version = null;
   for (let attempt = 0; attempt < 50 && !version; attempt++) {
     try {
@@ -69,6 +79,7 @@ try {
   });
   let next = 1;
   const waiting = new Map();
+  let crashed = false;
   socket.onmessage = (event) => {
     const message = JSON.parse(event.data);
     if (message.id && waiting.has(message.id)) {
@@ -79,7 +90,6 @@ try {
     if (message.method === "Runtime.exceptionThrown") consoleLines.push("exception: " + JSON.stringify(message.params.exceptionDetails.exception?.description ?? message.params.exceptionDetails.text));
     if (message.method === "Inspector.targetCrashed" || message.method === "Target.targetCrashed") crashed = true;
   };
-  let crashed = false;
   socket.onclose = () => (crashed = true);
   browser.on("exit", () => (crashed = true));
   const send = (method, params = {}, sessionId) =>
@@ -90,7 +100,7 @@ try {
         if (crashed) {
           clearInterval(timer);
           waiting.delete(id);
-          reject(`the page or the browser died; see ${chromeLog}`);
+          reject(`the page or the browser died; see ${browserLog}`);
         }
       }, 500);
       waiting.set(id, (reply) => {
@@ -103,11 +113,65 @@ try {
   const { result: { sessionId } } = await send("Target.attachToTarget", { targetId, flatten: true });
   await send("Runtime.enable", {}, sessionId);
   await send("Inspector.enable", {}, sessionId);
-  const evaluate = async (expression) => {
-    const reply = await send("Runtime.evaluate", { expression, returnByValue: true, awaitPromise: true }, sessionId);
-    if (reply.result?.exceptionDetails) throw reply.result.exceptionDetails.exception?.description ?? "evaluation failed";
-    return reply.result?.result?.value;
+  return {
+    navigate: (url) => send("Page.navigate", { url }, sessionId),
+    evaluate: async (expression) => {
+      const reply = await send("Runtime.evaluate", { expression, returnByValue: true, awaitPromise: true }, sessionId);
+      if (reply.result?.exceptionDetails) throw reply.result.exceptionDetails.exception?.description ?? "evaluation failed";
+      return reply.result?.result?.value;
+    },
+    close: () => browser.kill(),
   };
+}
+
+/// Headless Firefox over WebDriver, through geckodriver. Expressions go
+/// through `eval` so that a statement list means what it means in Chrome's
+/// `Runtime.evaluate`: the last statement's value.
+async function firefox() {
+  const driverPort = 4400 + Math.floor(Math.random() * 500);
+  const process_ = spawn(driver, ["--port", String(driverPort), ...(binary ? ["--binary", binary] : [])], { stdio: ["ignore", "ignore", openSync(browserLog, "w")] });
+  let alive = true;
+  process_.on("exit", () => (alive = false));
+  const base = `http://127.0.0.1:${driverPort}`;
+  const call = async (method, path, body) => {
+    if (!alive) throw `geckodriver died; see ${browserLog}`;
+    const response = await fetch(base + path, { method, headers: { "content-type": "application/json" }, body: body === undefined ? undefined : JSON.stringify(body) });
+    const reply = await response.json();
+    if (!response.ok) throw `${reply.value?.error}: ${reply.value?.message}`;
+    return reply.value;
+  };
+  let session = null;
+  let refusal = null;
+  for (let attempt = 0; attempt < 60 && !session; attempt++) {
+    try {
+      session = await call("POST", "/session", { capabilities: { alwaysMatch: { "moz:firefoxOptions": { args: ["-headless"] } } } });
+    } catch (why) {
+      refusal = String(why);
+      await sleep(500);
+    }
+  }
+  if (!session) throw `geckodriver did not open a session: ${refusal}`;
+  const id = session.sessionId;
+  await call("POST", `/session/${id}/url`, { url: page });
+  return {
+    navigate: (url) => call("POST", `/session/${id}/url`, { url }),
+    evaluate: async (expression) => {
+      const value = await call("POST", `/session/${id}/execute/sync`, { script: "return eval(arguments[0]);", args: [expression] });
+      return value === null ? undefined : value;
+    },
+    close: async () => {
+      try {
+        await call("DELETE", `/session/${id}`);
+      } catch {}
+      process_.kill();
+    },
+  };
+}
+
+let browser = null;
+try {
+  browser = await (kind === "firefox" ? firefox() : chrome());
+  const { navigate, evaluate } = browser;
   const until = async (expression, timeout = 120000) => {
     const started = Date.now();
     for (;;) {
@@ -165,7 +229,7 @@ try {
   if (runs("live")) {
   // Live: the server module, run against the page's own clock, with a
   // request sent through the edge box.
-  await send("Page.navigate", { url: `http://127.0.0.1:${port}/web/?module=fixture/server.wasm&live=8080` }, sessionId);
+  await navigate(`http://127.0.0.1:${port}/web/?module=fixture/server.wasm&live=8080`);
   await until(`document.readyState === "complete" && !!window.zaqaruDebug && window.zaqaruDebug.live === true`);
   await until(`!window.zaqaruDebug.busy && document.getElementById("status").textContent.includes("press play")`);
   await evaluate(`document.getElementById("request").value = "ping\\n"; document.getElementById("send").click()`);
@@ -186,7 +250,7 @@ try {
   if (runs("snapshot")) {
   // From a snapshot: the same server, already listening when the page
   // loads it, its history beginning at the file's instant.
-  await send("Page.navigate", { url: `http://127.0.0.1:${port}/web/?module=fixture/server.wasm&snapshot=fixture/server.snapshot&live=8080` }, sessionId);
+  await navigate(`http://127.0.0.1:${port}/web/?module=fixture/server.wasm&snapshot=fixture/server.snapshot&live=8080`);
   await until(`document.readyState === "complete" && !!window.zaqaruDebug && window.zaqaruDebug.live === true && window.zaqaruDebug.origin > 0`);
   await until(`!window.zaqaruDebug.busy && document.getElementById("status").textContent.includes("press play")`);
   const origin = await evaluate("window.zaqaruDebug.origin");
@@ -214,7 +278,7 @@ try {
   // The demo itself, when it has been made: nginx, gunicorn and Django,
   // booted, answering a request from the page.
   if (demo && runs("django")) {
-    await send("Page.navigate", { url: `http://127.0.0.1:${port}/web/?module=demo/hello-django.wasm&snapshot=demo/hello-django.snapshot&live=80` }, sessionId);
+    await navigate(`http://127.0.0.1:${port}/web/?module=demo/hello-django.wasm&snapshot=demo/hello-django.snapshot&live=80`);
     await until(`document.readyState === "complete" && !!window.zaqaruDebug && window.zaqaruDebug.live === true && window.zaqaruDebug.origin > 0`, 180000);
     await until(`!window.zaqaruDebug.busy && document.getElementById("status").textContent.includes("press play")`, 60000);
     const djangoStatus = await evaluate(`document.getElementById("status").textContent`);
@@ -248,7 +312,7 @@ try {
   failures++;
 } finally {
   if (consoleLines.length) console.log("console:\n  " + consoleLines.join("\n  "));
-  browser.kill();
+  if (browser) await browser.close();
   server.close();
 }
 console.log(failures ? `${failures} failure(s)` : "all passed");

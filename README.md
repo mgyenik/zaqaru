@@ -66,7 +66,8 @@ a thread's registers, the instructions at `rip`, the stack, the memory
 map, the descriptors and the console as of that instant, with the syscall
 log as a clickable time axis. `web/demo.sh` makes the demo: nginx,
 gunicorn and Django, booted, answering the page's own `GET /` and seekable
-into the middle of it. It rests on two facts about a container: every run
+into the middle of it; it is published at <https://mgyenik.github.io/zaqaru/>.
+It rests on two facts about a container: every run
 is a pure function of its tape, and between two instructions linear memory
 is the whole machine. See
 [web/README.md](web/README.md) and

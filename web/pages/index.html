@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>zaqaru — a container, in time</title>
+<style>
+  :root { color-scheme: light dark; font: 15px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace; }
+  body { margin: 0; padding: 40px 20px 60px; max-width: 46em; margin-inline: auto; }
+  h1 { font-size: 1.6em; margin: 0 0 4px; }
+  h1 small { font-weight: normal; opacity: .7; font-size: .6em; display: block; }
+  h2 { font-size: 1em; margin: 28px 0 8px; text-transform: uppercase; letter-spacing: .05em; opacity: .7; }
+  p, li { margin: 0 0 10px; }
+  ol { padding-left: 1.4em; }
+  code { background: #8882; padding: 0 4px; border-radius: 3px; }
+  .go { display: inline-block; margin: 16px 0 6px; padding: 10px 18px; border: 2px solid currentColor; border-radius: 6px; color: inherit; text-decoration: none; font-weight: 600; }
+  .go:hover { background: #8882; }
+  .note { border-left: 3px solid #d29922; padding: 6px 12px; margin: 14px 0; opacity: .9; }
+  table { border-collapse: collapse; margin: 8px 0; }
+  td { padding: 2px 14px 2px 0; }
+  td:last-child { text-align: right; }
+  a { color: #58a6ff; }
+</style>
+</head>
+<body>
+<h1>zaqaru <small>an x86-64 container in a wasm module, with a time-travel debugger</small></h1>
+
+<p>Behind the button below is an ordinary Debian image — nginx, gunicorn
+and Django, five processes, nothing rebuilt — running as a WebAssembly
+module in this browser tab, on an x86-64 interpreter written in Rust and a
+small Linux-personality kernel compiled into the same module. It was booted
+once, in CI, and written to a file; the page continues it from that
+instant, already listening on port 80.</p>
+
+<p>The page is the server's only client. It sends the container an HTTP
+request, nginx proxies it to gunicorn, Django answers, and the response
+comes back to the page. Then the slider goes backwards: every instruction
+the request cost is an instant the machine can be stood on again —
+processes, registers, the instructions at <code>rip</code>, the stack, the
+memory map, the descriptors, the syscall log — because a container's run
+is a pure function of what the host answered it, and between two
+instructions the module's memory is the whole machine.</p>
+
+<a class="go" href="web/?module=demo/hello-django.wasm&amp;snapshot=demo/hello-django.snapshot&amp;live=80">open the demo →</a>
+
+<div class="note">It downloads about 150 MB — the module is 74 MB, the
+booted snapshot 75 MB — and the tab needs about 1.5 GB of memory. A
+desktop browser, then; it has been run in Chrome and Firefox.</div>
+
+<h2>what to do</h2>
+<ol>
+  <li>Wait for the status line to say <i>listening on 80 — press play</i>. Loading takes a second once the files are in.</li>
+  <li>Press <b>play</b>, then <b>send</b> in the edge panel. The request is <code>GET / HTTP/1.0</code>; the answer arrives in a fraction of a second with the instant it was answered.</li>
+  <li>Drag the slider back into the request, or click a syscall in the log — <code>accept4</code>, <code>recvfrom</code>, <code>sendto</code>, the write of the response. The container restores the nearest checkpoint and re-executes to that exact instruction; the panels show the machine as it was.</li>
+  <li>Step with <b>−1</b> and <b>+1</b>. Every instruction is an addressable instant.</li>
+</ol>
+
+<h2>what it costs</h2>
+<table>
+  <tr><td>Django's boot, done once in CI</td><td>3.29 G instructions, about half a minute</td></tr>
+  <tr><td>standing the container up from the snapshot</td><td>about 1 s</td></tr>
+  <tr><td>a request through nginx, gunicorn and Django</td><td>about 4 M instructions, a fraction of a second</td></tr>
+  <tr><td>a seek into the middle of the request</td><td>a fraction of a second</td></tr>
+</table>
+
+<h2>how</h2>
+<p>Source, design and measurements: <a href="https://github.com/mgyenik/zaqaru">github.com/mgyenik/zaqaru</a>
+— <code>docs/time-travel-debugger.md</code> for the design, <code>web/</code> for the page and the JavaScript host.
+The debugger asks the container questions through the isotope Server Protocol: the container is a StructFS store, and every panel is a read of one of its paths.</p>
+</body>
+</html>

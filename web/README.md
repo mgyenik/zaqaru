@@ -3,7 +3,13 @@
 A time-travel debugger for a container, in a browser: stand nginx, gunicorn
 and Django on any instruction of a request the page itself sent.
 
-The demo, which wants docker and about a minute:
+The demo is published at <https://mgyenik.github.io/zaqaru/>, built from
+source by `.github/workflows/pages.yml` on every push to `main`: the
+workflow runs `web/demo.sh`, checks the snapshot answers `GET /` with
+Django's page (`check-demo.mjs`), and deploys it beside the page and the
+landing page in `web/pages/`. Nothing built is committed.
+
+To make the demo locally, which wants docker and about a minute:
 
     web/demo.sh                           # bakes demo/hello-django, boots it under Node, writes the snapshot
     python3 -m http.server -d . 8000
@@ -15,6 +21,7 @@ The fixture and the tests:
     web/fixture.sh web/fixture            # a small program baked, run and recorded; a server, and its snapshot
     node web/test.mjs web/fixture/module.wasm web/fixture/tape.bin web/fixture/stdout.txt web/fixture/server.wasm
     node web/browser-test.mjs             # the page itself, in headless Chrome; drives the demo too when it exists
+    node web/browser-test.mjs --browser firefox --driver firefox.geckodriver   # the same in Firefox (snap)
     # replay:    http://localhost:8000/web/?module=fixture/module.wasm&tape=fixture/tape.bin
     # live:      http://localhost:8000/web/?module=fixture/server.wasm&live=8080
     #            then press play and send "ping\n" to port 8080

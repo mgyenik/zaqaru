@@ -386,7 +386,11 @@ harness under Node, against the wasmtime host's own run) and
 - the snapshot file, the tool that writes one from a quiet container, and
   the page continuing from it — and the demo: `web/demo.sh` makes the
   Django module and its snapshot, and the browser test drives the page
-  through a request and a seek into it when they are present.
+  through a request and a seek into it when they are present, in headless
+  Chrome and in headless Firefox;
+- the demo published, built from source on every push by
+  `.github/workflows/pages.yml` and checked to answer before it is deployed,
+  at <https://mgyenik.github.io/zaqaru/>.
 
 Not built:
 

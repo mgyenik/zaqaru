@@ -1,0 +1,58 @@
+# The demo, built from source and published on GitHub Pages: the Django
+# image baked into a module, booted under Node and written to a snapshot,
+# checked to answer a request, then deployed beside the page. Nothing built
+# is committed; every push to main rebuilds it.
+name: pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      # wasm-ld, which the bake links the module with.
+      - run: sudo apt-get update && sudo apt-get install -y lld
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # Bakes demo/hello-django, boots it, writes the snapshot, and checks
+      # that the snapshot answers GET / with Django's page.
+      - run: web/demo.sh "$PWD/_site/web/demo"
+      - run: |
+          cp web/index.html web/*.js _site/web/
+          cp web/pages/index.html _site/index.html
+          touch _site/.nojekyll
+          du -sh _site/web/demo/*
+      - uses: actions/configure-pages@v5
+        with:
+          enablement: true
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
