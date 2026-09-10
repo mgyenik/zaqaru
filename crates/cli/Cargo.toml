@@ -2,6 +2,7 @@
 name = "zaqaru"
 version = "0.1.0"
 edition = "2024"
+license.workspace = true
 description = "Run x86-64 OCI containers in WebAssembly: bake an image into a module, run it, or emulate it natively"
 
 [[bin]]

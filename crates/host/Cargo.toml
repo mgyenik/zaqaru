@@ -2,6 +2,7 @@
 name = "zaqaru-host"
 version = "0.1.0"
 edition = "2024"
+license.workspace = true
 description = "The wasmtime host: the two ll-store imports, the mount table, and the network edge"
 
 [lib]

@@ -2,6 +2,7 @@
 name = "zaqaru-brotli"
 version = "0.1.0"
 edition = "2024"
+license.workspace = true
 description = "A brotli decoder as a small wasm module, for the debugger page to inflate snapshots with"
 
 [lib]

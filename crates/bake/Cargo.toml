@@ -2,6 +2,7 @@
 name = "zaqaru-bake"
 version = "0.1.0"
 edition = "2024"
+license.workspace = true
 description = "Turns an image into a container module: the image object, the guest archive, and the link"
 
 [lib]

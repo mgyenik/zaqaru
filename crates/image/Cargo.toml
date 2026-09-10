@@ -2,6 +2,7 @@
 name = "zaqaru-image"
 version = "0.1.0"
 edition = "2024"
+license.workspace = true
 description = "Flattens an OCI image or a directory into the blob and index a container module carries"
 
 [lib]

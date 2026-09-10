@@ -12,6 +12,9 @@ members = [
 ]
 resolver = "3"
 
+[workspace.package]
+license = "MIT OR Apache-2.0"
+
 # Dependencies are built optimized even for tests.
 #
 # Not a preference: the suite's cost is dominated by three of them running

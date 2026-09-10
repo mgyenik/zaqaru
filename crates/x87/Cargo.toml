@@ -2,6 +2,7 @@
 name = "zaqaru-x87"
 version = "0.1.0"
 edition = "2024"
+license.workspace = true
 description = "Soft emulation of the x87 FPU: extended-precision softfloat and the register stack"
 
 [lib]

@@ -2,6 +2,7 @@
 name = "zaqaru-cpu"
 version = "0.1.0"
 edition = "2024"
+license.workspace = true
 description = "The x86-64 machine: an interpreter, and the bytecode it transpiles hot blocks into"
 
 [lib]
