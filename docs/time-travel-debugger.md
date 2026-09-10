@@ -110,7 +110,9 @@ The paths the store serves, all read-only:
 | `processes` | every process: pid, parent, state, exit status if unreaped, and each thread's tid and state, with what it is parked on. The stall report, structured |
 | `processes/{pid}/threads/{tid}/registers` | the sixteen general registers, `rip`, the segment base, the flags as materialised, and `flags_stale` (see below) |
 | `processes/{pid}/maps` | the VMA tree, the fields `/proc/self/maps` shows |
-| `processes/{pid}/descriptors` | each fd: what backs it, offset, flags |
+| `processes/{pid}/descriptors` | each fd: what backs it, the path it was opened by (as `/proc/self/fd` shows it), offset, flags |
+| `processes/{pid}/files/{path}` | the process's view of the filesystem at a path — its own view, since a fork copies the writable layer and the working directory: a directory's entries with kind and size, a regular file's contents (text, or hex when not text; capped at 16 KiB), a symlink's target; with the working directory. The final component is not followed |
+| `net` | every socket in the container: family, kind, state (idle, bound, listening with its backlog and queue, connected with both addresses and the bytes queued each way), the host's edge number when the host terminates it, and which processes hold a descriptor on it |
 | `processes/{pid}/threads/{tid}/disassembly` | up to forty instructions from `rip`: address, bytes, text |
 | `processes/{pid}/memory/{address}/{length}` | up to 4096 bytes of the process's memory, hex, as far as they are readable |
 | `processes/{pid}/mapped` | the pages the process can reach, as `[start, end)` runs — the permission bits themselves |
@@ -384,18 +386,59 @@ point, and a container restored from one runs to the same end.
 
 ### The page
 
-A timeline over retired instructions; play, pause, step forward by one
-instruction, step back as a seek, and previous and next syscall. The
-syscall log as a clickable time axis, holding rows only for a window of
-three hundred around the present — a run is a million syscalls long before
-it is interesting — and rebuilt when the present leaves the window. Panels
-for the running process and thread, each a read of the container's store:
-processes, registers, the disassembly from `rip`, 256 bytes of stack under
-`rsp` as quadwords, the memory map, descriptors, the console, and the
-edge, where a request is typed and its answer shown with the instants it
-was sent and answered, the latter a link that seeks there. Live, "play"
-advances the frontier four million instructions a tick and renders each
-one, so the panels move while the container runs.
+A store browser with a time axis. A timeline over retired instructions;
+play, pause, step forward by one instruction, step back as a seek, and
+previous and next event. Live, "play" advances the frontier four million
+instructions a tick and renders each one, so the panels move while the
+container runs.
+
+**The panels come from the store.** The worker reads the container's
+`meta` lens once and, at every instant, reads every path it declares
+that the instant can fill: `{pid}` and `{tid}` from the process and
+thread in view — the running ones unless a process card was clicked —
+`{path}` from where the page is browsing, the memory under `rsp` once the
+registers say where it is. Each panel is titled by the concrete path it
+read, offers the raw JSON value beside its rendering, and a path the
+kernel adds appears on the page with nothing changed here. A path bar
+reads any path at the instant in view. The few patterns with a renderer
+of their own — processes, files, descriptors, net, registers,
+disassembly, memory, maps — stand in the open; the rest show as the
+values they are, and the machine-level ones fold under "the machine".
+
+**The timeline is the container's traffic with the host.** The tape is
+a StructFS store, and the page shows it: every read and write under
+`/iso` — the clock, entropy, the console, the bytes of a request crossing
+the edge — as a row beside the syscalls, with what crossed. An exchange
+is placed at the syscall it was made in: the kernel stamps a syscall on
+its timeline as the call returns, so the host counts stamps and an
+exchange made during syscall *N* carries *N*. That is exact for
+everything a syscall asks the host, and one syscall early for the few
+reads the kernel makes between turns (its poll of the network's events
+and of the shutdown switch), which land on the next stamp. The rows of a
+syscall's exchanges come before the syscall's own row, since the row is
+what the call returned. An idle container polls the host at every wake
+— the clock, the network's events, the shutdown switch — so by default
+the polls that found nothing are left out and repeats of one path at one
+stamp fold into a row that says how many; "everything, unfolded" shows
+each as it was. The list holds rows only for a window of three hundred
+around the present and is rebuilt when the present leaves it.
+
+**Files at an instant.** The `files` panel browses the process's
+filesystem — the image with the process's writable layer over it — as
+it stood at the instant: a directory lists, a file shows its contents, a
+descriptor's path is a link into it.
+
+**Pin and diff.** Values are structured, so what changed between two
+instants is a diff of two JSON values. Pinning an instant makes every
+panel show, under its rendering, the keys added, gone and changed since:
+arrays whose elements carry an identity — a pid, an fd, a socket id, a
+name — are matched by it, so a descriptor closed in the middle shows as
+that one descriptor gone.
+
+The edge, where a request is typed and its answer shown with the instants
+it was sent and answered, the latter a link that seeks there, and the
+console are the host's side of the boundary rather than paths of the
+container's store, and the page says so in their titles.
 
 ## Two things the page must say
 
@@ -448,7 +491,13 @@ harness under Node, against the wasmtime host's own run) and
   Chrome and in headless Firefox;
 - the demo published, built from source on every push by
   `.github/workflows/pages.yml` and checked to answer before it is deployed,
-  at <https://mgyenik.github.io/zaqaru/>.
+  at <https://mgyenik.github.io/zaqaru/>;
+- the page as a store browser: panels generated from the `meta` lens and
+  titled by their paths, the raw value beside each rendering, a path bar,
+  a process chosen by clicking it; the `files` and `net` paths and the
+  descriptors' paths in the kernel; the exchanges with the host on the
+  timeline beside the syscalls, stamped by the host with the syscall each
+  was made in; and pin-and-diff between two instants.
 
 Not built:
 

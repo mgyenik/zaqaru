@@ -1073,6 +1073,26 @@ fn a_relative_path_starts_at_the_working_directory() {
 }
 
 #[test]
+fn getcwd_survives_the_working_directory_being_copied_up() {
+    let mut fixture = fixture("cwd-copied-up");
+    let etc = fixture.arena.path("/etc");
+    assert_eq!(fixture.call(number::CHDIR, [etc, 0, 0, 0, 0, 0]), 0);
+    // Creating a file in it copies `/etc` up; the working directory still
+    // holds the number it had below, and must still have a name.
+    let created = fixture.open("/etc/new", open_flags::WRITE_ONLY | open_flags::CREATE);
+    assert!(created >= 0);
+    let buffer = fixture.arena.buffer(64);
+    let length = fixture.call(number::GETCWD, [buffer, 64, 0, 0, 0, 0]);
+    assert_eq!(fixture.arena.read(buffer, length as usize), b"/etc\0");
+    // And a relative open from there records the path it was opened by.
+    let relative = fixture.arena.path("hosts");
+    let fd = fixture.call(number::OPEN, [relative, 0, 0, 0, 0, 0]);
+    assert!(fd >= 0);
+    assert_eq!(fixture.kernel.files.name(fd as i32), Some(&b"/etc/hosts"[..]));
+    assert_eq!(fixture.kernel.files.name(created as i32), Some(&b"/etc/new"[..]));
+}
+
+#[test]
 fn getcwd_reports_the_root_and_refuses_a_buffer_too_small() {
     let mut fixture = fixture("getcwd");
     let buffer = fixture.arena.buffer(64);

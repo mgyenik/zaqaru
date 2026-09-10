@@ -132,6 +132,37 @@ pub struct FdTable {
     /// identity is its index, which is what a future `epoll` registration
     /// records and what fd hoisting at fork will migrate.
     descriptions: Vec<Option<OpenFile>>,
+    /// The path each description was opened by, parallel to `descriptions`,
+    /// for the ones that were opened by a path at all.
+    ///
+    /// What `/proc/self/fd/N` shows on Linux, kept for the same reader: the
+    /// container's store names a descriptor's file by the path it was
+    /// opened with rather than by an inode number nothing else can look
+    /// up. The path as the caller spelled it, made absolute against the
+    /// directory it was relative to, and never re-resolved — a rename
+    /// afterwards leaves it stale, as it does on Linux.
+    ///
+    /// Held inline like [`Resume`], for the same reason: `open` is on the
+    /// path the filesystem design promises is allocation-free, and a
+    /// bounded record costs a copy where a `Vec` would cost an allocation.
+    /// A path longer than the record is not kept, and the store says null.
+    names: Vec<Option<Name>>,
+}
+
+/// The longest opened-by path a descriptor records.
+pub const NAME_LIMIT: usize = 256;
+
+/// An opened-by path, held inline.
+#[derive(Clone, Copy)]
+struct Name {
+    bytes: [u8; NAME_LIMIT],
+    length: u16,
+}
+
+impl Name {
+    fn as_slice(&self) -> &[u8] {
+        &self.bytes[..self.length as usize]
+    }
 }
 
 impl FdTable {
@@ -191,6 +222,28 @@ impl FdTable {
                 Err(errno)
             }
         }
+    }
+
+    /// Records the path a descriptor's description was opened by. A path
+    /// longer than [`NAME_LIMIT`] is not recorded.
+    pub fn set_name(&mut self, fd: i32, name: &[u8]) -> Result<(), Errno> {
+        let description = self.description_index(fd)?;
+        let slot = self.names.get_mut(description).ok_or(Errno::BadFile)?;
+        *slot = (name.len() <= NAME_LIMIT).then(|| {
+            let mut held = Name {
+                bytes: [0; NAME_LIMIT],
+                length: name.len() as u16,
+            };
+            held.bytes[..name.len()].copy_from_slice(name);
+            held
+        });
+        Ok(())
+    }
+
+    /// The path a descriptor was opened by, when it was opened by one.
+    pub fn name(&self, fd: i32) -> Option<&[u8]> {
+        let description = self.description_index(fd).ok()?;
+        self.names.get(description)?.as_ref().map(Name::as_slice)
     }
 
     /// Records where a directory scan stopped, so the next batch can pick
@@ -499,6 +552,9 @@ impl FdTable {
         if self.resume.len() <= description {
             self.resume.resize(description + 1, None);
         }
+        if self.names.len() <= description {
+            self.names.resize(description + 1, None);
+        }
     }
 
     fn claim_description(&mut self, file: OpenFile) -> Result<usize, Errno> {
@@ -553,6 +609,9 @@ impl FdTable {
             // The scan's position goes with the description, so a reused
             // slot cannot resume the previous directory's listing.
             if let Some(slot) = self.resume.get_mut(description) {
+                *slot = None;
+            }
+            if let Some(slot) = self.names.get_mut(description) {
                 *slot = None;
             }
         }

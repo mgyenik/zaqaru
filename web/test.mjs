@@ -221,14 +221,19 @@ if (serverPath) {
   edge.request(8080, new TextEncoder().encode("ping\n")).then((response) => (answered = text(response)));
   let refused = null;
   edge.request(9999, new Uint8Array()).catch((why) => (refused = why));
+  let net = null;
   for (let i = 0; i < 400 && status === null; i++) {
     at += 200000;
     const turn = container.step(at);
     if (turn.kind === KIND.FINISHED) status = turn.status;
     if (turn.kind === KIND.IDLE) at = container.value("statistics").retired;
+    // The network as the store shows it, the first time the listener is up.
+    if (net === null && edge.reachable(8080)) net = container.value("net");
     await new Promise((resolve) => setImmediate(resolve));
   }
   check("a request to an unpublished port is refused", /not published/.test(refused ?? ""), String(refused));
+  const listener = net?.sockets.find((s) => s.state.listening);
+  check("the net path shows the listener on 0.0.0.0:8080, held by pid 1", listener?.state.listening.address === "0.0.0.0:8080" && listener.holders.join() === "1", JSON.stringify(net));
   check("the guest published its listener", edge.reachable(8080));
   check("the guest answered the request", answered === "pong\n", JSON.stringify(answered));
   check("the guest read the request", text(container.readback(["iso", "console", "stdout"]) ?? new Uint8Array()) === "listening on 8080\nread 5: ping\n", JSON.stringify(text(container.readback(["iso", "console", "stdout"]) ?? new Uint8Array())));
@@ -345,6 +350,46 @@ if (serverPath) {
   check("and prints the same", text(continued.readback(["iso", "console", "stdout"])) === text(original.readback(["iso", "console", "stdout"])));
   check("the continued run was recorded", recording.length > 0, `${recording.length} answers`);
   console.log(`     ${pages.size} pages, ${(file.length / 1024).toFixed(0)} KB, ${(compressed.length / 1024).toFixed(0)} KB compressed`);
+}
+
+// 10. The store beyond the machine: a process's files and descriptors by
+//    path, and the host's side of every exchange placed on the syscall
+//    timeline.
+{
+  const container = await Container.instantiate(module, replayMounts());
+  container.stopAt(500000);
+  const root = container.value("processes/1/files");
+  check("the root directory lists the program", root.kind === "directory" && root.path === "/" && root.entries.some((e) => e.name === "init" && e.kind === "file"), JSON.stringify(root).slice(0, 200));
+  const program = container.value("processes/1/files/init");
+  check("the program reads as a file whose bytes begin with the ELF magic", program.kind === "file" && program.hex.startsWith("7f454c46") && program.truncated === true, JSON.stringify(program).slice(0, 120));
+  let missing = null;
+  try {
+    container.value("processes/1/files/nothing-here");
+  } catch (why) {
+    missing = String(why);
+  }
+  check("a file that is not there is not found", /not_found/.test(missing ?? ""), String(missing));
+  const descriptors = container.value("processes/1/descriptors");
+  check("console descriptors have no path", descriptors.length >= 3 && descriptors.every((d) => d.path === null || typeof d.path === "string"), JSON.stringify(descriptors));
+  const meta = container.value("meta");
+  check("the meta lens declares the files and net paths", meta.paths["processes/{pid}/files/{path}"]?.readable === true && meta.paths.net?.readable === true);
+  // The exchanges of a whole run, from a container run to its end.
+  const mounts = replayMounts();
+  const observed = mounts.observe();
+  const whole = await Container.instantiate(module, mounts);
+  whole.boot();
+  const timeline = text(whole.readback(["iso", "log", "timeline"])).trim().split("\n").length;
+  check("the exchanges were observed", observed.length > 10, `${observed.length}`);
+  check("every exchange is stamped with a syscall on the timeline", observed.every((e) => Number.isInteger(e.syscall) && e.syscall <= timeline), JSON.stringify(observed.slice(0, 3)));
+  check("the stamps never go backwards", observed.every((e, i) => i === 0 || e.syscall >= observed[i - 1].syscall));
+  check("the clock and the console are among them", observed.some((e) => e.op === "read" && /^iso\/(time|random)\//.test(e.path)) && observed.some((e) => e.op === "write" && e.path === "iso/console/stdout"), JSON.stringify(observed.map((e) => e.path).slice(0, 12)));
+  check("the log and the server are not", observed.every((e) => !e.path.startsWith("iso/log") && !e.path.startsWith("iso/server")));
+  const stdout = observed.find((e) => e.path === "iso/console/stdout");
+  check("a text exchange keeps its text", stdout && stdout.text !== null && stdout.text.startsWith("child said"), JSON.stringify(stdout));
+  // A restored container re-executes exchanges the run already logged, so
+  // a copy of the table does not log.
+  const copy = mounts.snapshot();
+  check("a snapshot of the table keeps the syscall clock and drops the observation", copy.syscalls === mounts.syscalls && copy.observed === null);
 }
 
 console.log(failures ? `${failures} failure(s)` : "all passed");

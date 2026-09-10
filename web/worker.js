@@ -12,12 +12,21 @@
 // `snapshot.js`), the live run starts from a container somebody already
 // booted, and its history begins there.
 //
+// What a seek hands back is not a fixed set of panels: the worker reads
+// the container's `meta` lens once, and at every instant reads every path
+// it declares that the instant can fill — `{pid}` and `{tid}` from the
+// process and thread in view, `{path}` from the page's browsing, the
+// memory under `rsp`. A path the kernel adds appears on the page with no
+// change here.
+//
 // Messages in:  { type: "load", module, tape | null, snapshot | null, checkpointEvery, publish }
-//               { type: "advance", by }          live: run the frontier on
-//               { type: "seek", at }
-//               { type: "request", id, port, request }   live: through the edge
+//               { type: "advance", by }                 live: run the frontier on
+//               { type: "seek", at, context }           context: { pid, tid, path }
+//               { type: "read", id, path }              one path, at the instant in view
+//               { type: "request", id, port, request }  live: through the edge
 // Messages out: { type: "loaded", ... }  { type: "progress", ... }
-//               { type: "state", ... }   { type: "response", id, response }
+//               { type: "state", ... }   { type: "value", id, path, value | error }
+//               { type: "response", id, response }
 //               { type: "error", message }
 
 import { Container, Edge, KIND, MountTable, parseTape, standardMounts, text } from "./zaqaru.js";
@@ -37,6 +46,9 @@ let frontier = 0;
 let finished = null;
 let timelineSeen = 0; // bytes of the timeline sink already reported
 let traceSeen = 0;
+let observed = null; // the mount table's exchange log
+let observedSeen = 0; // entries of it already reported
+let meta = null; // the store's meta lens: { paths: { pattern: { readable, writable } } }
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -57,8 +69,8 @@ function parseTimeline(textSoFar) {
     });
 }
 
-/// What the container has logged since last asked: new timeline entries
-/// and trace lines.
+/// What the container has logged since last asked: new timeline entries,
+/// trace lines, and exchanges across the boundary.
 function growth(container) {
   const timelineText = text(container.readback(["iso", "log", "timeline"]) ?? new Uint8Array());
   const traceText = text(container.readback(["iso", "log", "debug"]) ?? new Uint8Array());
@@ -66,11 +78,26 @@ function growth(container) {
   const trace = traceText.slice(traceSeen).split("\n").filter(Boolean);
   timelineSeen = timelineText.length;
   traceSeen = traceText.length;
-  return { timeline, trace };
+  const exchanges = observed ? observed.slice(observedSeen) : [];
+  observedSeen = observed ? observed.length : 0;
+  return { timeline, trace, exchanges };
 }
 
 function console_(container, stream) {
   return text(container.readback(["iso", "console", stream]) ?? new Uint8Array());
+}
+
+/// The store's declaration of itself: the meta lens for what is readable,
+/// the manifest for what each path means.
+function describe(container) {
+  meta = container.value("meta");
+  let manifest = null;
+  try {
+    manifest = JSON.parse(container.manifest());
+  } catch {
+    manifest = null;
+  }
+  return { meta, interface: manifest?.paths ?? {} };
 }
 
 async function load({ module: moduleBytes, tape: tapeBytes, snapshot: snapshotBytes, checkpointEvery: every, publish }) {
@@ -80,12 +107,15 @@ async function load({ module: moduleBytes, tape: tapeBytes, snapshot: snapshotBy
   checkpoints = new Checkpoints();
   timelineSeen = 0;
   traceSeen = 0;
+  observedSeen = 0;
   finished = null;
   origin = 0;
   if (tapeBytes) {
     tape = parseTape(new Uint8Array(tapeBytes));
     live = null;
-    const first = await Container.instantiate(module, replayMounts());
+    const mounts = replayMounts();
+    observed = mounts.observe();
+    const first = await Container.instantiate(module, mounts);
     first.step(0);
     checkpoints.add(0, first);
     let target = checkpointEvery;
@@ -104,7 +134,7 @@ async function load({ module: moduleBytes, tape: tapeBytes, snapshot: snapshotBy
       target = total + checkpointEvery;
     }
     frontier = total;
-    const { timeline, trace } = growth(first);
+    const { timeline, trace, exchanges } = growth(first);
     viewer = first;
     postMessage({
       type: "loaded",
@@ -115,6 +145,8 @@ async function load({ module: moduleBytes, tape: tapeBytes, snapshot: snapshotBy
       finished,
       timeline,
       trace,
+      exchanges,
+      ...describe(first),
       output: console_(first, "stdout"),
       bytecode: tape.bytecode,
       checkpoints: Array.from({ length: checkpoints.length }, (_, i) => checkpoints.at(i)),
@@ -134,6 +166,7 @@ async function load({ module: moduleBytes, tape: tapeBytes, snapshot: snapshotBy
     inflated = performance.now() - inflating;
     const mounts = MountTable.load(file.mounts, { edge });
     mounts.record();
+    observed = mounts.observe();
     live = await Container.continueFrom(module, file, mounts);
     if (file.refill) refill(live);
     origin = file.at;
@@ -142,6 +175,7 @@ async function load({ module: moduleBytes, tape: tapeBytes, snapshot: snapshotBy
   } else {
     const mounts = standardMounts({ seed: null, config: { trace: 1 }, edge });
     mounts.record();
+    observed = mounts.observe();
     live = await Container.instantiate(module, mounts);
     live.step(0);
   }
@@ -160,6 +194,8 @@ async function load({ module: moduleBytes, tape: tapeBytes, snapshot: snapshotBy
     finished: null,
     timeline: [],
     trace: [],
+    exchanges: [],
+    ...describe(live),
     output: console_(live, "stdout"),
     bytecode: true,
     checkpoints: [origin],
@@ -200,7 +236,7 @@ async function advance(by) {
     break;
   }
   if (finished !== null) checkpoints.add(frontier, live);
-  const { timeline, trace } = growth(live);
+  const { timeline, trace, exchanges } = growth(live);
   postMessage({
     type: "progress",
     frontier,
@@ -208,6 +244,7 @@ async function advance(by) {
     idle: idles > 20,
     timeline,
     trace,
+    exchanges,
     stdout: console_(live, "stdout"),
     listening: edge ? [...edge.listening] : [],
     checkpoints: checkpoints.length,
@@ -215,62 +252,87 @@ async function advance(by) {
   });
 }
 
-function ask(container, path, fallback) {
+/// One read of the container in view: `{ pattern, value }` or
+/// `{ pattern, error }`, never a throw — a refusal is something to show.
+function read(container, pattern, path) {
   try {
-    return container.value(path);
+    return { pattern, value: container.value(path) };
   } catch (why) {
-    return typeof fallback === "function" ? fallback(String(why)) : fallback;
+    return { pattern, error: String(why) };
   }
 }
 
-/// The machine at `at`: the frontier itself when asked for the frontier,
-/// otherwise a restored checkpoint run exactly to the instant.
-async function seek(at) {
+/// A pattern of the meta lens with its parameters filled from `fill`, or
+/// null when one of them has no value here.
+function instantiate(pattern, fill) {
+  let missing = false;
+  const path = pattern.replace(/\{(\w+)\}/g, (_, name) => {
+    if (fill[name] === undefined || fill[name] === null) missing = true;
+    return String(fill[name] ?? "");
+  });
+  return missing ? null : path.replace(/\/+$/, "");
+}
+
+/// Stands a container at `at`: the frontier itself when asked for the
+/// frontier, otherwise a restored checkpoint run exactly to the instant.
+async function stand(at) {
   if (at < origin) at = origin;
-  let restored = 0;
   if (live && at >= frontier) {
     viewer = live;
-    at = frontier;
-  } else {
-    const began = performance.now();
-    const index = checkpoints.before(at);
-    viewer = await Container.fromSnapshot(module, checkpoints.snapshot(index));
-    if (at > checkpoints.at(index)) viewer.stopAt(at);
-    restored = performance.now() - began;
+    return 0;
   }
-  const statistics = viewer.value("statistics");
-  const processes = viewer.value("processes");
-  const current = processes.processes.find((p) => p.pid === statistics.current) ?? processes.processes[0];
-  const thread = current?.threads.find((t) => t.state === "runnable") ?? current?.threads[0];
-  let registers = null;
-  let disassembly = [];
-  let stack = null;
-  let maps = null;
-  let descriptors = [];
-  if (current && thread) {
-    const base = `processes/${current.pid}`;
-    registers = ask(viewer, `${base}/threads/${thread.tid}/registers`, (why) => ({ error: why }));
-    disassembly = ask(viewer, `${base}/threads/${thread.tid}/disassembly`, []);
-    if (registers && !registers.error) stack = ask(viewer, `${base}/memory/${registers.rsp}/256`, null);
-    maps = ask(viewer, `${base}/maps`, (why) => why);
-    descriptors = ask(viewer, `${base}/descriptors`, []);
+  const began = performance.now();
+  const index = checkpoints.before(at);
+  viewer = await Container.fromSnapshot(module, checkpoints.snapshot(index));
+  if (at > checkpoints.at(index)) viewer.stopAt(at);
+  return performance.now() - began;
+}
+
+/// The machine at `at`, as every path of its store the instant can fill.
+/// `context` says which process and thread the page is looking at (the
+/// running ones when it says nothing) and where it is browsing the files.
+async function seek(at, context = {}) {
+  const restored = await stand(at);
+  const values = {};
+  const statistics = read(viewer, "statistics", "statistics");
+  const processes = read(viewer, "processes", "processes");
+  values.statistics = statistics;
+  values.processes = processes;
+  const all = processes.value?.processes ?? [];
+  const running = statistics.value?.current;
+  const current = all.find((p) => p.pid === context.pid) ?? all.find((p) => p.pid === running) ?? all[0];
+  const thread = current?.threads.find((t) => t.tid === context.tid) ?? current?.threads.find((t) => t.state === "runnable") ?? current?.threads[0];
+  const fill = { pid: current?.pid, tid: thread?.tid, path: (context.path ?? "").replace(/^\/+/, "") };
+  for (const [pattern, lens] of Object.entries(meta?.paths ?? {})) {
+    if (!lens.readable || pattern === "meta" || pattern.startsWith("meta/") || pattern.includes("{address}")) continue;
+    const path = instantiate(pattern, fill);
+    if (path === null || values[path]) continue;
+    values[path] = read(viewer, pattern, path);
+  }
+  // The memory under the stack pointer, once the registers say where it is.
+  const registers = fill.tid !== undefined ? values[`processes/${fill.pid}/threads/${fill.tid}/registers`]?.value : null;
+  if (registers?.rsp) {
+    const pattern = "processes/{pid}/memory/{address}/{length}";
+    const path = instantiate(pattern, { ...fill, address: registers.rsp, length: 256 });
+    values[path] = read(viewer, pattern, path);
   }
   postMessage({
     type: "state",
-    at: statistics.retired,
+    at: statistics.value?.retired ?? at,
     restored,
-    statistics,
-    processes,
-    thread: thread ? { pid: current.pid, tid: thread.tid } : null,
-    registers,
-    disassembly,
-    stack,
-    maps,
-    descriptors,
+    pid: current?.pid ?? null,
+    tid: thread?.tid ?? null,
+    values,
     stdout: console_(viewer, "stdout"),
     stderr: console_(viewer, "stderr"),
     log: text(viewer.readback(["iso", "log", "error"]) ?? new Uint8Array()),
   });
+}
+
+/// One path, read at the instant in view.
+function readOne(id, path) {
+  const answer = viewer ? read(viewer, path, path) : { pattern: path, error: "nothing is loaded" };
+  postMessage({ type: "value", id, path, ...answer });
 }
 
 /// Live: a request through the edge. The response arrives once the guest
@@ -289,7 +351,8 @@ onmessage = async (event) => {
   try {
     if (message.type === "load") await load(message);
     else if (message.type === "advance") await advance(message.by);
-    else if (message.type === "seek") await seek(message.at);
+    else if (message.type === "seek") await seek(message.at, message.context);
+    else if (message.type === "read") readOne(message.id, message.path);
     else if (message.type === "request") request(message.id, message.port, message.request);
   } catch (why) {
     postMessage({ type: "error", message: String(why?.stack ?? why) });

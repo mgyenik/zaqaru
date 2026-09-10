@@ -294,6 +294,15 @@ impl Sockets {
         self.entries.get(id as usize)?.as_ref()
     }
 
+    /// Every socket there is, with its identifier, for the container's
+    /// store.
+    pub fn all(&self) -> impl Iterator<Item = (u32, &Socket)> + '_ {
+        self.entries
+            .iter()
+            .enumerate()
+            .filter_map(|(id, held)| Some((id as u32, held.as_ref()?)))
+    }
+
     pub fn get_mut(&mut self, id: u32) -> Option<&mut Socket> {
         self.entries.get_mut(id as usize)?.as_mut()
     }

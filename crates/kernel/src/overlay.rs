@@ -190,7 +190,7 @@ impl<'a> Overlay<'a> {
 
     /// A lower node's upper twin, if it has one. Applied wherever a number
     /// leaves the lower layer, so that one file has one identity.
-    fn promote(&self, number: u32) -> u32 {
+    pub fn promote(&self, number: u32) -> u32 {
         if is_upper(number) {
             return number;
         }

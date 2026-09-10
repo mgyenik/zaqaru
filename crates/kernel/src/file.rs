@@ -191,6 +191,19 @@ fn names_working_directory(dirfd: i64) -> bool {
     dirfd as i32 == at::FDCWD as i32
 }
 
+/// Appends `/path` to the `length` bytes of a directory already in
+/// `into`, with one slash between them whatever the directory ends in;
+/// the new length, or `None` when it does not fit.
+fn join_path(into: &mut [u8], length: usize, path: &[u8]) -> Option<usize> {
+    let mut end = length;
+    if end == 0 || into[end - 1] != b'/' {
+        *into.get_mut(end)? = b'/';
+        end += 1;
+    }
+    into.get_mut(end..end + path.len())?.copy_from_slice(path);
+    Some(end + path.len())
+}
+
 impl<S: Store, M: Machine> Kernel<'_, S, M> {
     // ---- resolution helpers ------------------------------------------
 
@@ -327,7 +340,10 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
                             flags & !open_flags::CLOEXEC,
                             flags & open_flags::CLOEXEC != 0,
                         ) {
-                            Ok(fd) => Outcome::Done(fd as i64),
+                            Ok(fd) => {
+                                self.name_descriptor(fd, arguments.get(0), arguments.get(1));
+                                Outcome::Done(fd as i64)
+                            }
                             Err(errno) => Outcome::Done(errno.as_result()),
                         };
                     }
@@ -407,9 +423,52 @@ impl<S: Store, M: Machine> Kernel<'_, S, M> {
             flags & !open_flags::CLOEXEC,
             flags & open_flags::CLOEXEC != 0,
         ) {
-            Ok(fd) => Outcome::Done(fd as i64),
+            Ok(fd) => {
+                self.name_descriptor(fd, arguments.get(0), arguments.get(1));
+                Outcome::Done(fd as i64)
+            }
             Err(errno) => Outcome::Done(errno.as_result()),
         }
+    }
+
+    /// Records the path a just-opened descriptor was opened by, made
+    /// absolute: as given when it began with a slash, else under the
+    /// working directory or under the path the `dirfd` was itself opened
+    /// by. For the container's store, which shows a descriptor's file the
+    /// way `/proc/self/fd` does; nothing the guest can observe.
+    ///
+    /// The working directory's path is walked up only for a relative open
+    /// from it, which is the one case with nothing cheaper to hand.
+    ///
+    /// Allocates nothing: the record is inline in the table, and the joined
+    /// path is built on the stack.
+    fn name_descriptor(&mut self, fd: i32, dirfd: i64, path: i64) {
+        let Ok(path) = self.path_at(path) else {
+            return;
+        };
+        if path.first() == Some(&b'/') {
+            let _ = self.files.set_name(fd, path);
+            return;
+        }
+        let mut joined = [0u8; PATH_MAX];
+        let length = if names_working_directory(dirfd) {
+            match self.vfs.absolute_path(self.vfs.working_directory(), &mut joined) {
+                Ok(length) => length,
+                Err(_) => return,
+            }
+        } else {
+            match self.files.name(dirfd as i32) {
+                Some(directory) if directory.len() <= joined.len() => {
+                    joined[..directory.len()].copy_from_slice(directory);
+                    directory.len()
+                }
+                _ => return,
+            }
+        };
+        let Some(length) = join_path(&mut joined, length, path) else {
+            return;
+        };
+        let _ = self.files.set_name(fd, &joined[..length]);
     }
 
     /// `ioctl`, which answers exactly one family of requests and answers it

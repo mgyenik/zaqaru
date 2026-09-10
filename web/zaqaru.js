@@ -372,12 +372,27 @@ export function parseTape(raw) {
 
 // ---- the mount table --------------------------------------------------------
 
+/// How much of an exchange's bytes the observation log keeps, as text
+/// when they are text.
+const PREVIEW = 96;
+
+function preview(data) {
+  if (!data || !data.length) return "";
+  const head = data.subarray(0, PREVIEW);
+  for (const byte of head) if ((byte < 0x20 && byte !== 0x0a && byte !== 0x0d && byte !== 0x09) || byte > 0x7e) return null;
+  return text(head);
+}
+
 export class MountTable {
   constructor() {
     this.mounts = [];
     this.tape = null; // { entries, at } when replaying
     this.recording = null; // [] when recording
     this.server = null;
+    /// How many syscalls the kernel has stamped on its timeline: the
+    /// clock an observed exchange is placed by. See `observe`.
+    this.syscalls = 0;
+    this.observed = null; // [] when observing
   }
   mount(prefix, store) {
     this.mounts.push({ prefix: segmentsOf(prefix), store });
@@ -400,6 +415,29 @@ export class MountTable {
     this.recording = [];
     return this.recording;
   }
+  /// Starts keeping a log of every exchange across the boundary, for a
+  /// debugger's time axis: `{ op, path, syscall, bytes, text, error }`.
+  ///
+  /// `syscall` is the number of syscalls the kernel had stamped on its
+  /// timeline when the exchange happened. The kernel stamps a syscall as
+  /// it returns, so an exchange made *during* syscall N carries N and is
+  /// placed at that syscall's instant — exact for the clock, entropy,
+  /// console and network reads a syscall makes, and one syscall early
+  /// for the few the kernel makes between turns (its poll of the
+  /// network's events, of the shutdown switch), which land on the next
+  /// stamp. The timeline itself, the trace and the server protocol are
+  /// left out: the first two are the axis, not traffic on it.
+  observe() {
+    this.observed = [];
+    return this.observed;
+  }
+  isLogPath(path) {
+    return path.length >= 2 && text(path[0]) === "iso" && text(path[1]) === "log";
+  }
+  note(op, path, data, error) {
+    if (!this.observed || this.isServerPath(path) || this.isLogPath(path)) return;
+    this.observed.push({ op, path: key(path), syscall: this.syscalls, bytes: data ? data.length : 0, text: data ? preview(data) : null, error: error ?? null });
+  }
   resolve(path) {
     return this.mounts.find(({ prefix }) => prefix.length <= path.length && samePath(prefix, path.slice(0, prefix.length)));
   }
@@ -414,9 +452,12 @@ export class MountTable {
     if (!this.isServerPath(path)) {
       if (this.tape) {
         const entry = this.tape.entries[this.tape.at++];
-        if (!entry) return { error: `the tape ran out at ${key(path)}` };
-        if (!samePath(entry.path, path)) return { error: `the tape says ${key(entry.path)} and the run asked ${key(path)}` };
-        return entry.answer;
+        let answer;
+        if (!entry) answer = { error: `the tape ran out at ${key(path)}` };
+        else if (!samePath(entry.path, path)) answer = { error: `the tape says ${key(entry.path)} and the run asked ${key(path)}` };
+        else answer = entry.answer;
+        this.note("read", path, answer.ok ?? null, answer.error);
+        return answer;
       }
     }
     const found = this.resolve(path);
@@ -430,16 +471,21 @@ export class MountTable {
       }
     }
     if (this.recording && !this.isServerPath(path)) this.recording.push({ path, answer });
+    this.note("read", path, answer.ok ?? null, answer.error);
     return answer;
   }
   write(path, data) {
+    if (path.length === 3 && this.isLogPath(path) && text(path[2]) === "timeline") this.syscalls++;
     const found = this.resolve(path);
     if (!found) return { error: `nothing is mounted at ${key(path)}` };
+    let answer;
     try {
-      return { ok: found.store.write(path, data) };
+      answer = { ok: found.store.write(path, data) };
     } catch (why) {
-      return { error: String(why) };
+      answer = { error: String(why) };
     }
+    this.note("write", path, data, answer.error);
+    return answer;
   }
   /// What a sink holds, for the host reading back what the container wrote.
   readback(path) {
@@ -457,6 +503,9 @@ export class MountTable {
     if (this.recording) copy.tape = { entries: this.recording, at: this.recording.length };
     else copy.tape = this.tape ? { entries: this.tape.entries, at: this.tape.at } : null;
     copy.server = this.server;
+    // The syscall clock continues; the observation does not — a restored
+    // container re-executes exchanges the live one already logged.
+    copy.syscalls = this.syscalls;
     return copy;
   }
   /// Every store's state as JSON: what a container written to a file keeps

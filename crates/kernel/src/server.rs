@@ -38,7 +38,7 @@ use super::System;
 macro_rules! interface {
     ($disassembly:literal) => {
         concat!(
-            r#"{"name":"zaqaru-container","version":"0.1.0","serialization":"application/json","paths":{"statistics":{"read":"instructions retired and accelerated, blocks decoded, the current pid"},"processes":{"read":"every process and its threads, with what each is parked on"},"processes/{pid}/threads/{tid}/registers":{"read":"the general registers, rip, the segment base and the flags of one thread"},"processes/{pid}/maps":{"read":"the process's memory map, as /proc/self/maps renders it"},"processes/{pid}/descriptors":{"read":"the process's open descriptors"},"processes/{pid}/memory/{address}/{length}":{"read":"up to 4096 bytes of the running process's memory, hex"},"processes/{pid}/mapped":{"read":"the pages the process can reach, as [start, end) runs"},"cache":{"read":"the running process's block cache"},"layout":{"read":"where the guest block is in linear memory"},"caches":{"read":"what the kernel keeps that a snapshot need not: decompressed files, decoded blocks, pooled page buffers"},"caches/blocks":{"read":"every process's block cache: live blocks and bytes","write":"`flush`: throw every block cache away, zeroing what is freed"},"caches/decompressed":{"read":"every decompressed file's buffer: address and length","write":"`refill`: decompress every cached file again into its buffer"},"caches/pool":{"read":"pooled page buffers","write":"`zero`: zero the pooled buffers"},"meta/":{"read":"which paths are readable"}"#,
+            r#"{"name":"zaqaru-container","version":"0.1.0","serialization":"application/json","paths":{"statistics":{"read":"instructions retired and accelerated, blocks decoded, the current pid"},"processes":{"read":"every process and its threads, with what each is parked on"},"processes/{pid}/threads/{tid}/registers":{"read":"the general registers, rip, the segment base and the flags of one thread"},"processes/{pid}/maps":{"read":"the process's memory map, as /proc/self/maps renders it"},"processes/{pid}/descriptors":{"read":"the process's open descriptors, each with the path it was opened by"},"processes/{pid}/files/{path}":{"read":"the process's view of the filesystem at a path: a directory's entries, a file's contents, a symlink's target"},"net":{"read":"every socket in the container: listeners, connections and what is queued each way, and which processes hold each"},"processes/{pid}/memory/{address}/{length}":{"read":"up to 4096 bytes of the running process's memory, hex"},"processes/{pid}/mapped":{"read":"the pages the process can reach, as [start, end) runs"},"cache":{"read":"the running process's block cache"},"layout":{"read":"where the guest block is in linear memory"},"caches":{"read":"what the kernel keeps that a snapshot need not: decompressed files, decoded blocks, pooled page buffers"},"caches/blocks":{"read":"every process's block cache: live blocks and bytes","write":"`flush`: throw every block cache away, zeroing what is freed"},"caches/decompressed":{"read":"every decompressed file's buffer: address and length","write":"`refill`: decompress every cached file again into its buffer"},"caches/pool":{"read":"pooled page buffers","write":"`zero`: zero the pooled buffers"},"meta/":{"read":"which paths are readable"}"#,
             $disassembly,
             "}}"
         )
@@ -122,6 +122,11 @@ impl<'a, S: Store + Clone> System<'a, S> {
                 let index = self.container_index(pid.parse().ok().ok_or(Refusal::NotFound)?).ok_or(Refusal::NotFound)?;
                 Ok(self.descriptors(index))
             }
+            ["processes", pid, "files", rest @ ..] => {
+                let index = self.container_index(pid.parse().ok().ok_or(Refusal::NotFound)?).ok_or(Refusal::NotFound)?;
+                self.files(index, rest)
+            }
+            ["net"] => Ok(self.net()),
             ["processes", pid, "threads", tid, "registers"] => {
                 let (index, position) = self.thread_index(pid, tid)?;
                 Ok(registers(&self.containers[index].process.kernel.machine.threads.all()[position].tcb))
@@ -210,7 +215,7 @@ impl<'a, S: Store + Clone> System<'a, S> {
                 ))
             }
             ["meta"] | ["meta", ..] => Ok(String::from(
-                r#"{"paths":{"statistics":{"readable":true,"writable":false},"processes":{"readable":true,"writable":false},"processes/{pid}/threads/{tid}/registers":{"readable":true,"writable":false},"processes/{pid}/threads/{tid}/disassembly":{"readable":true,"writable":false},"processes/{pid}/maps":{"readable":true,"writable":false},"processes/{pid}/descriptors":{"readable":true,"writable":false},"processes/{pid}/memory/{address}/{length}":{"readable":true,"writable":false},"processes/{pid}/mapped":{"readable":true,"writable":false},"cache":{"readable":true,"writable":false},"layout":{"readable":true,"writable":false},"caches":{"readable":true,"writable":false},"caches/decompressed":{"readable":true,"writable":true},"caches/blocks":{"readable":true,"writable":true},"caches/pool":{"readable":true,"writable":true}}}"#,
+                r#"{"paths":{"statistics":{"readable":true,"writable":false},"processes":{"readable":true,"writable":false},"processes/{pid}/threads/{tid}/registers":{"readable":true,"writable":false},"processes/{pid}/threads/{tid}/disassembly":{"readable":true,"writable":false},"processes/{pid}/maps":{"readable":true,"writable":false},"processes/{pid}/descriptors":{"readable":true,"writable":false},"processes/{pid}/files/{path}":{"readable":true,"writable":false},"net":{"readable":true,"writable":false},"processes/{pid}/memory/{address}/{length}":{"readable":true,"writable":false},"processes/{pid}/mapped":{"readable":true,"writable":false},"cache":{"readable":true,"writable":false},"layout":{"readable":true,"writable":false},"caches":{"readable":true,"writable":false},"caches/decompressed":{"readable":true,"writable":true},"caches/blocks":{"readable":true,"writable":true},"caches/pool":{"readable":true,"writable":true}}}"#,
             )),
             _ => Err(Refusal::NotFound),
         }
@@ -350,14 +355,171 @@ impl<'a, S: Store + Clone> System<'a, S> {
                 Ok(open) => (open.offset, open.flags, files.close_on_exec(fd).unwrap_or(false)),
                 Err(_) => (0, 0, false),
             };
+            let path = match files.name(fd) {
+                Some(name) => quoted(&String::from_utf8_lossy(name)),
+                None => String::from("null"),
+            };
             let _ = write!(
                 out,
-                r#"{{"fd":{fd},"what":{},"offset":{offset},"flags":{flags},"cloexec":{cloexec}}}"#,
+                r#"{{"fd":{fd},"what":{},"path":{path},"offset":{offset},"flags":{flags},"cloexec":{cloexec}}}"#,
                 quoted(&what)
             );
         }
         out.push(']');
         out
+    }
+
+    /// A process's view of the filesystem at a path — its own view, since a
+    /// fork copies the writable layer and the working directory. The final
+    /// component is not followed, so a symlink shows as one; a directory
+    /// lists its entries, a regular file gives its contents up to a cap.
+    fn files(&self, index: usize, rest: &[&str]) -> Result<String, Refusal> {
+        use crate::image::file_type;
+        use crate::vfs::Lookup;
+        let mut path = String::from("/");
+        path.push_str(&rest.join("/"));
+        let vfs = &self.containers[index].process.kernel.vfs;
+        let cwd = {
+            let mut into = vec![0u8; crate::file::PATH_MAX];
+            match vfs.absolute_path(vfs.working_directory(), &mut into) {
+                Ok(length) => quoted(&String::from_utf8_lossy(&into[..length])),
+                Err(_) => String::from("null"),
+            }
+        };
+        let refused = |errno: crate::errno::Errno| match errno {
+            crate::errno::Errno::NoEntry => Refusal::NotFound,
+            other => Refusal::Unavailable(format!("{path}: {}", other.name())),
+        };
+        let vnode = vfs.resolve(vfs.root(), path.as_bytes(), Lookup::NO_FOLLOW).map_err(refused)?;
+        let inode = vfs.inode(vnode).map_err(refused)?;
+        let filesystem = vfs.filesystem_of(vnode).map_err(refused)?;
+        let mut out = format!(r#"{{"path":{},"cwd":{cwd},"mode":"{:o}","size":{},"mtime":{},"#, quoted(&path), inode.mode, inode.size, inode.mtime_sec);
+        match inode.file_type() {
+            file_type::DIRECTORY => {
+                out.push_str(r#""kind":"directory","entries":["#);
+                let mut entries = filesystem.entries(&inode, vnode.inode).map_err(refused)?;
+                let mut count = 0;
+                while let Some(entry) = entries.next().map_err(refused)? {
+                    if count == FILES_ENTRY_CAP {
+                        break;
+                    }
+                    if count > 0 {
+                        out.push(',');
+                    }
+                    count += 1;
+                    let (kind, size) = match filesystem.inode(entry.inode) {
+                        Ok(child) => (kind_name(child.file_type()), child.size),
+                        Err(_) => ("unknown", 0),
+                    };
+                    let _ = write!(out, r#"{{"name":{},"kind":"{kind}","size":{size}}}"#, quoted(&String::from_utf8_lossy(entry.name)));
+                }
+                out.push(']');
+                let truncated = entries.next().map_err(refused)?.is_some();
+                let _ = write!(out, r#","truncated":{truncated}}}"#);
+            }
+            file_type::REGULAR => {
+                let contents = filesystem.contents(&inode, vnode.inode).map_err(refused)?;
+                let shown = &contents[..contents.len().min(FILES_CONTENT_CAP)];
+                out.push_str(r#""kind":"file","#);
+                match core::str::from_utf8(shown) {
+                    Ok(text) if text.chars().all(|c| !c.is_control() || matches!(c, '\n' | '\r' | '\t')) => {
+                        let _ = write!(out, r#""text":{}"#, quoted(text));
+                    }
+                    _ => {
+                        let _ = write!(out, r#""hex":"{}""#, hex(&shown[..shown.len().min(FILES_HEX_CAP)]));
+                    }
+                }
+                let _ = write!(out, r#","truncated":{}}}"#, contents.len() > shown.len());
+            }
+            file_type::SYMLINK => {
+                let target = filesystem.symlink_target(&inode, vnode.inode).map_err(refused)?;
+                let _ = write!(out, r#""kind":"symlink","target":{}}}"#, quoted(&String::from_utf8_lossy(target)));
+            }
+            other => {
+                let _ = write!(out, r#""kind":"{}"}}"#, kind_name(other));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Every socket in the container, with what it is doing and which
+    /// processes hold a descriptor on it.
+    fn net(&self) -> String {
+        use crate::socket::{Address, State};
+        let kernel = &self.containers[self.current].process.kernel;
+        let sockets = kernel.sockets.borrow();
+        let rings = kernel.rings.borrow();
+        let address = |address: &Address| match address {
+            Address::Unbound => String::from("null"),
+            Address::Inet { address, port } => {
+                quoted(&format!("{}.{}.{}.{}:{port}", address >> 24, (address >> 16) & 0xff, (address >> 8) & 0xff, address & 0xff))
+            }
+            Address::Unix { path, .. } => quoted(&String::from_utf8_lossy(path)),
+        };
+        let mut out = String::from(r#"{"sockets":["#);
+        for (position, (id, socket)) in sockets.all().enumerate() {
+            if position > 0 {
+                out.push(',');
+            }
+            let holders: Vec<String> = self
+                .containers
+                .iter()
+                .filter(|container| container.process.kernel.files.socket_ids().any(|held| held == id))
+                .map(|container| container.pid.to_string())
+                .collect();
+            let family = match socket.family {
+                crate::socket::family::INET => String::from(r#""inet""#),
+                crate::socket::family::UNIX => String::from(r#""unix""#),
+                other => other.to_string(),
+            };
+            let edge = socket.edge.map_or(String::from("null"), |edge| edge.to_string());
+            let state = match &socket.state {
+                State::Idle => String::from(r#""idle""#),
+                State::Bound(at) => format!(r#"{{"bound":{}}}"#, address(at)),
+                State::Listening { address: at, backlog, queue } => {
+                    format!(r#"{{"listening":{{"address":{},"backlog":{backlog},"queued":{}}}}}"#, address(at), queue.len())
+                }
+                State::Connected(endpoint) => format!(
+                    r#"{{"connected":{{"local":{},"peer":{},"receive_queued":{},"transmit_queued":{},"read_shut":{},"write_shut":{}}}}}"#,
+                    address(&endpoint.local),
+                    address(&endpoint.peer),
+                    rings.queued(endpoint.receive),
+                    rings.queued(endpoint.transmit),
+                    endpoint.read_shut,
+                    endpoint.write_shut
+                ),
+            };
+            let _ = write!(
+                out,
+                r#"{{"id":{id},"family":{family},"kind":{},"edge":{edge},"references":{},"holders":[{}],"state":{state}}}"#,
+                socket.kind,
+                socket.references,
+                holders.join(",")
+            );
+        }
+        out.push_str("]}");
+        out
+    }
+}
+
+/// How much of a file the `files` path hands back, and how many entries of
+/// a directory: a page's worth, not a dump.
+const FILES_CONTENT_CAP: usize = 16384;
+const FILES_HEX_CAP: usize = 4096;
+const FILES_ENTRY_CAP: usize = 4096;
+
+/// A file type's name, as the `files` path says it.
+fn kind_name(file_type: u32) -> &'static str {
+    use crate::image::file_type;
+    match file_type {
+        file_type::DIRECTORY => "directory",
+        file_type::REGULAR => "file",
+        file_type::SYMLINK => "symlink",
+        file_type::FIFO => "fifo",
+        file_type::CHARACTER => "character",
+        file_type::BLOCK => "block",
+        file_type::SOCKET => "socket",
+        _ => "unknown",
     }
 }
 

@@ -437,13 +437,20 @@ impl<'a> Vfs<'a> {
     }
 
     /// Which of a directory's entries names a given inode.
+    ///
+    /// The child is compared by its current identity: a working directory
+    /// taken before the directory was copied up still holds the lower
+    /// number, and the listing shows the copy. Measured — `getcwd` in a
+    /// gunicorn worker answered `ENOENT` once Python had written a
+    /// `__pycache__` under it.
     fn name_in(&self, directory: Vnode, child: Vnode) -> Result<&[u8], Errno> {
         let inode = self.inode(directory)?;
         let filesystem = self.filesystem_of(directory)?;
+        let wanted = filesystem.promote(child.inode);
         let count = filesystem.entry_count(&inode, directory.inode)?;
         for position in 0..count {
             let entry = filesystem.entry(&inode, directory.inode, position)?;
-            if entry.inode == child.inode {
+            if entry.inode == wanted {
                 return Ok(entry.name);
             }
         }

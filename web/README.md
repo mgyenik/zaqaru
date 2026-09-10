@@ -49,10 +49,21 @@ takes it to 29, inflated by `brotli.wasm` — a decoder built from
 `crates/brotli` by the fixture and demo scripts, since browsers inflate
 gzip natively and brotli not at all.
 
-The panels are reads of the container's store: processes, registers, the
-disassembly from `rip`, the stack under `rsp`, the memory map, descriptors,
-the console. The syscall log holds rows for a window around the present, so
-a run of a million syscalls stays quick.
+The page is a store browser with a time axis. The panels come from the
+container's own `meta` lens — the worker reads every path the lens
+declares that the instant can fill, so a path the kernel adds appears on
+the page unasked — and each is titled by the path it read, with the raw
+JSON value a click away; a path bar reads any path at the instant in view.
+Processes, the process's files (browsed as they stood at the instant),
+its descriptors with the paths they were opened by, and the container's
+sockets stand in the open; registers, the disassembly from `rip`, the
+stack under `rsp`, the memory map and the caches fold under "the
+machine". Clicking a process card views that process's paths. The
+timeline shows the container's exchanges with the host — every read and
+write under `/iso`, with what crossed — beside its syscalls, each placed
+at the syscall it was made in, and holds rows for a window around the
+present so a run of a million events stays quick. Pinning an instant makes
+every panel show what changed since it.
 
 Checkpoints are maps of non-zero 4 KiB pages, shared between checkpoints,
 each recording only the pages that changed since the one before

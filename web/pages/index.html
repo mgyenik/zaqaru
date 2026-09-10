@@ -35,11 +35,21 @@ instant, already listening on port 80.</p>
 <p>The page is the server's only client. It sends the container an HTTP
 request, nginx proxies it to gunicorn, Django answers, and the response
 comes back to the page. Then the slider goes backwards: every instruction
-the request cost is an instant the machine can be stood on again —
-processes, registers, the instructions at <code>rip</code>, the stack, the
-memory map, the descriptors, the syscall log — because a container's run
-is a pure function of what the host answered it, and between two
-instructions the module's memory is the whole machine.</p>
+the request cost is an instant the machine can be stood on again — its
+processes, their files and descriptors and sockets as they were, the
+bytes that crossed between the container and the page, and underneath,
+the registers, the instructions at <code>rip</code>, the stack, the memory
+map — because a container's run is a pure function of what the host
+answered it, and between two instructions the module's memory is the
+whole machine.</p>
+
+<p>The container is a StructFS store, and the page is a browser of it
+with a time axis: every panel is a read of one of the store's paths at
+the chosen instant, titled by the path, the raw value a click away, and
+the panels themselves are what the store's <code>meta</code> lens
+declares. The timeline is the store's traffic — the container's reads
+and writes to the host, the clock, the request's bytes — beside its
+syscalls. Pin an instant and every panel shows what changed since.</p>
 
 <a class="go" href="web/?module=demo/hello-django.wasm&amp;snapshot=demo/hello-django.snapshot&amp;live=80">open the demo →</a>
 
@@ -51,8 +61,9 @@ desktop browser, then; it has been run in Chrome and Firefox.</div>
 <ol>
   <li>Wait for the status line to say <i>listening on 80 — press play</i>. Loading takes a second once the files are in.</li>
   <li>Press <b>play</b>, then <b>send</b> in the edge panel. The request is <code>GET / HTTP/1.0</code>; the answer arrives in a fraction of a second with the instant it was answered.</li>
-  <li>Drag the slider back into the request, or click a syscall in the log — <code>accept4</code>, <code>recvfrom</code>, <code>sendto</code>, the write of the response. The container restores the nearest checkpoint and re-executes to that exact instruction; the panels show the machine as it was.</li>
-  <li>Step with <b>−1</b> and <b>+1</b>. Every instruction is an addressable instant.</li>
+  <li>Drag the slider back into the request, or click a row of the timeline — the request's bytes arriving from the page, <code>accept4</code>, <code>recvfrom</code>, <code>sendto</code>, the response going out. The container restores the nearest checkpoint and re-executes to that exact instruction; the panels show the machine as it was.</li>
+  <li>Browse the files panel — <code>/etc/nginx/nginx.conf</code>, nginx's logs under <code>/var/log</code> — as they stood at that instant; click a process to view its paths; type any path of the store into the bar at the top and read it.</li>
+  <li>Press <b>pin</b>, move, and every panel says what changed since. Step with <b>−1</b> and <b>+1</b>: every instruction is an addressable instant.</li>
 </ol>
 
 <h2>what it costs</h2>

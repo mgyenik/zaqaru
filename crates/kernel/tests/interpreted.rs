@@ -2709,11 +2709,24 @@ fn the_container_serves_its_own_store() {
     let (_tree, baked) = image_of(
         "served",
         r#"
+#include <fcntl.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 #include <unistd.h>
 int main(void) {
+    int held = open("/init", O_RDONLY);
+    int server = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in mine = {0};
+    mine.sin_family = AF_INET;
+    mine.sin_addr.s_addr = htonl(INADDR_ANY);
+    mine.sin_port = htons(8080);
+    bind(server, (struct sockaddr *)&mine, sizeof mine);
+    listen(server, 8);
     volatile long sum = 0;
     for (long i = 0; i < 2000000; i++) sum += i;
     write(1, "done\n", 5);
+    close(held);
+    close(server);
     return 0;
 }
 "#,
@@ -2721,8 +2734,13 @@ int main(void) {
     );
     let image = Image::parse(&baked.index, &baked.blob).expect("parse the image");
     let mut system = boot("served", image);
-    for _ in 0..3 {
+    // Run until the program has opened its file and its socket, which is
+    // where the loop begins: the store is asked while it counts.
+    let mut turns = 0;
+    while system.current().kernel.sockets.borrow().listeners().is_empty() {
         assert_ne!(system.turn(), Turn::Finished(Exit::Status(0)), "finished before it was asked anything");
+        turns += 1;
+        assert!(turns < 1000, "the program never opened its descriptors");
     }
     system.current().kernel.store.borrow_mut().pending = Some(
         br#"[{"op":"read","path":"statistics","data":null,"respond_to":"/iso/server/responses/1"},
@@ -2742,7 +2760,12 @@ int main(void) {
             {"op":"read","path":"layout","data":null,"respond_to":"/iso/server/responses/15"},
             {"op":"write","path":"caches/blocks","data":"flush","respond_to":"/iso/server/responses/16"},
             {"op":"read","path":"caches/blocks","data":null,"respond_to":"/iso/server/responses/17"},
-            {"op":"read","path":"processes/1/mapped","data":null,"respond_to":"/iso/server/responses/18"}]"#
+            {"op":"read","path":"processes/1/mapped","data":null,"respond_to":"/iso/server/responses/18"},
+            {"op":"read","path":"processes/1/files","data":null,"respond_to":"/iso/server/responses/19"},
+            {"op":"read","path":"processes/1/files/init","data":null,"respond_to":"/iso/server/responses/20"},
+            {"op":"read","path":"processes/1/files/nothing-here","data":null,"respond_to":"/iso/server/responses/21"},
+            {"op":"read","path":"net","data":null,"respond_to":"/iso/server/responses/22"},
+            {"op":"read","path":"meta","data":null,"respond_to":"/iso/server/responses/23"}]"#
             .to_vec(),
     );
     system.serve();
@@ -2765,6 +2788,11 @@ int main(void) {
     assert!(maps.contains("r-xp") || maps.contains("rw-p"), "{maps}");
     let descriptors = response("5");
     assert!(descriptors.contains(r#""fd":1"#), "{descriptors}");
+    // The descriptor opened by a path says which, as /proc/self/fd would;
+    // the console streams were not opened by one.
+    assert!(descriptors.contains(r#""fd":3,"what":"file:"#) && descriptors.contains(r#""path":"/init""#), "{descriptors}");
+    assert!(descriptors.contains(r#""what":"console:Output","path":null"#), "{descriptors}");
+    assert!(descriptors.contains(r#""what":"socket0","path":null"#), "{descriptors}");
     assert!(response("6").contains(r#""type":"not_writable""#));
     assert!(response("7").contains(r#""type":"not_found""#));
     // The disassembly begins at rip, and its first bytes are the bytes the
@@ -2798,6 +2826,24 @@ int main(void) {
     assert!(response("18").starts_with(r#"{"result":"ok","value":{"ranges":[["0x400000","0x"#), "{}", response("18"));
     // And the maps name the brk heap, as /proc/self/maps does.
     assert!(maps.contains("[heap]"), "{maps}");
+    // The process's filesystem: the root lists the program, the program is
+    // a file whose bytes begin with the ELF magic (and are shown as hex,
+    // since they are not text), and a name that is not there is not found.
+    let root = response("19");
+    assert!(root.starts_with(r#"{"result":"ok","value":{"path":"/","cwd":"/","#), "{root}");
+    assert!(root.contains(r#""kind":"directory","entries":["#) && root.contains(r#"{"name":"init","kind":"file","size":"#), "{root}");
+    let program = response("20");
+    assert!(program.contains(r#""kind":"file","hex":"7f454c46"#) && program.contains(r#""truncated":true"#), "{program}");
+    assert!(response("21").contains(r#""type":"not_found""#), "{}", response("21"));
+    // The network: one socket, listening on 8080, held by pid 1.
+    let net = response("22");
+    assert!(
+        net.contains(r#"{"id":0,"family":"inet","kind":1,"edge":null,"references":1,"holders":[1],"state":{"listening":{"address":"0.0.0.0:8080","backlog":8,"queued":0}}}"#),
+        "{net}"
+    );
+    // And the meta lens declares the new paths readable.
+    let meta = response("23");
+    assert!(meta.contains(r#""processes/{pid}/files/{path}":{"readable":true,"writable":false}"#) && meta.contains(r#""net":{"readable":true"#), "{meta}");
     // And the guest saw none of it: the run finishes as it always does.
     assert_eq!(system.run(), Exit::Status(0));
 }

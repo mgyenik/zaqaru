@@ -176,6 +176,17 @@ impl<'a> Filesystem<'a> {
         }
     }
 
+    /// A number's current identity: a lower directory that has since been
+    /// copied up answers as its upper copy, so that a vnode taken before
+    /// the copy — a working directory, a descriptor — still names the
+    /// directory a listing shows.
+    pub fn promote(&self, number: u32) -> u32 {
+        match self {
+            Self::Image(_) => number,
+            Self::Overlay(overlay) => overlay.promote(number),
+        }
+    }
+
     /// The image underneath, whichever kind this is.
     pub fn lower(&self) -> &Image<'a> {
         match self {
