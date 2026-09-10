@@ -906,6 +906,17 @@ fn prot_of(load: &Load) -> i32 {
     prot
 }
 
+/// The `comm` a path gives a process: its basename, cut to what the
+/// sixteen-byte field holds.
+fn asked_name(path: &[u8]) -> String {
+    let base = path
+        .iter()
+        .rposition(|byte| *byte == b'/')
+        .map_or(path, |slash| &path[slash + 1..]);
+    let text = String::from_utf8_lossy(base);
+    text.chars().take(15).collect()
+}
+
 /// How much stack a process starts with, matching Linux's default
 /// `RLIMIT_STACK`. It is an ordinary mapping, so `/proc/self/maps` shows it
 /// and `pthread_getattr_np` can find its bounds like any other.
@@ -919,6 +930,7 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
     /// what Linux hands `_start` — zero — because a wasm global starts at
     /// zero and nothing has run yet.
     pub fn exec(&mut self, path: &[u8], argv: &[&[u8]], envp: &[&[u8]]) -> Result<u64, Error> {
+        let original = path;
         // A script names the program that runs it, so resolving that comes
         // first and can happen more than once — a script whose interpreter
         // is itself a script.
@@ -932,7 +944,13 @@ impl<S: crate::abi::Store, M: crate::machine::Machine> crate::syscall::Kernel<'_
             true => &rebuilt,
             false => argv,
         };
-        self.exec_program(path, argv, envp)
+        // `comm` is the basename of what was *asked* for, script or not,
+        // which is what Linux does and why `ps` says `gunicorn` for a
+        // process whose `exe` is the Python interpreter.
+        let asked = asked_name(original);
+        let entry = self.exec_program(path, argv, envp)?;
+        self.comm = asked;
+        Ok(entry)
     }
 
     /// Follows `#!` lines until something is an ELF, and answers the program

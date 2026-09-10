@@ -2,14 +2,20 @@
 // store; every panel is a read of one of its paths at the chosen instant,
 // and the panels themselves come from the store's own `meta` lens rather
 // than from a list kept here. The timeline is the container's traffic with
-// the host — its reads and writes under `/iso` — beside its syscalls.
-// Everything the page knows comes from the worker.
+// the host — its reads and writes under `/iso` — beside its syscalls, and
+// the row you click chooses what the panels look at: a path in a syscall's
+// arguments opens the file, a descriptor opens what it names, bytes on a
+// connection open the socket. Everything the page knows comes from the
+// worker.
 //
 // Three ways in. With a tape, the run is fixed and every instant is a seek.
 // Live, the container runs against this page's clock and entropy; "play"
 // advances the frontier, the slider views anything behind it, and a request
 // typed into the edge box goes to a listener inside the container. With a
 // snapshot, the live run starts from a container somebody already booted.
+// Live, the page opens on the edge box alone — nothing has happened yet —
+// and when the first answer arrives it stands the machine on the instant
+// the request came in and shows everything.
 
 const worker = new Worker("./worker.js", { type: "module" });
 const $ = (id) => document.getElementById(id);
@@ -25,6 +31,7 @@ let timeline = []; // { at, pid, tid, name } per syscall
 let trace = []; // the strace line for each
 let exchanges = []; // { op, path, syscall, bytes, text, error } per host exchange
 let events = []; // the two merged, as the timeline shows them
+let spans = []; // { sent, answered } per request answered through the edge
 let playing = null;
 let current = 0;
 let busy = false;
@@ -37,11 +44,19 @@ let interface_ = {}; // the manifest's description of each path
 let context = { pid: null, tid: null, path: "" }; // what the panels look at
 let values = {}; // the last state's values, by concrete path
 let pinned = null; // { at, values } when pinned
+let pending = null; // { at, kind, ... }: what to focus once the state at `at` arrives
 let nextRead = 0;
 const reads = new Map(); // id -> { resolve, reject }
 
+const FILES = "processes/{pid}/files/{path}";
+const DESCRIPTORS = "processes/{pid}/descriptors";
+
+function clamp(at) {
+  return Math.max(origin, Math.min(live ? frontier : total, Math.round(at)));
+}
+
 function seek(at) {
-  at = Math.max(origin, Math.min(live ? frontier : total, Math.round(at)));
+  at = clamp(at);
   if (busy) {
     queued = { seek: at };
     return;
@@ -82,13 +97,71 @@ const mb = (n) => (n / 1048576).toFixed(1) + " MB";
 function status(extra = "") {
   if (live) {
     const parts = [
-      `live${origin ? `, from a snapshot at ${origin.toLocaleString()}` : ""}: ${(frontier - origin).toLocaleString()} instructions so far`,
-      `${timeline.length} syscalls, ${exchanges.length} exchanges`,
+      origin ? "live from a snapshot" : "live",
+      `${(frontier - origin).toLocaleString()} instructions`,
+      `${timeline.length} syscalls`,
+      `${exchanges.length} exchanges`,
       extra,
       finished !== null ? `exited ${finished}` : "",
     ].filter(Boolean);
-    $("status").textContent = parts.join(", ");
+    $("status").textContent = parts.join(" · ");
   }
+}
+
+// ---- names and colours ---------------------------------------------------------
+//
+// A process is named by what it was started from — nginx, gunicorn — and
+// keeps one colour for the run, so the timeline, the lane strip under the
+// slider and the process cards all say the same thing.
+
+const PALETTE = ["#58a6ff", "#3fb950", "#d29922", "#f778ba", "#a371f7", "#f0883e", "#79c0ff", "#56d364", "#e3b341", "#ff7b72"];
+const colors = new Map(); // pid -> colour
+const names = new Map(); // pid -> name
+
+function colorOf(pid) {
+  if (!colors.has(pid)) colors.set(pid, PALETTE[colors.size % PALETTE.length]);
+  return colors.get(pid);
+}
+
+function nameOf(pid) {
+  return names.get(pid) ?? `pid ${pid}`;
+}
+
+function learnNames(processes) {
+  for (const p of processes ?? []) {
+    const base = p.comm || (p.exe ?? "").split("/").filter(Boolean).pop();
+    names.set(p.pid, base || `pid ${p.pid}`);
+    colorOf(p.pid);
+  }
+}
+
+/// The strip under the slider: which process ran when, from the pid on
+/// each syscall's stamp, and a band for each request from sent to answered.
+function drawLanes() {
+  const canvas = $("lanes");
+  const width = canvas.clientWidth || 1;
+  const height = canvas.clientHeight || 12;
+  const scale = window.devicePixelRatio || 1;
+  if (canvas.width !== Math.round(width * scale) || canvas.height !== Math.round(height * scale)) {
+    canvas.width = Math.round(width * scale);
+    canvas.height = Math.round(height * scale);
+  }
+  const g = canvas.getContext("2d");
+  g.setTransform(scale, 0, 0, scale, 0, 0);
+  g.clearRect(0, 0, width, height);
+  const end = live ? frontier : total;
+  const span = Math.max(1, end - origin);
+  const x = (at) => ((at - origin) / span) * width;
+  g.fillStyle = "#8883";
+  g.fillRect(0, 0, width, 8);
+  for (let i = 0; i < timeline.length; i++) {
+    const from = x(timeline[i].at);
+    const to = i + 1 < timeline.length ? x(timeline[i + 1].at) : x(end);
+    g.fillStyle = colorOf(timeline[i].pid);
+    g.fillRect(from, 0, Math.max(1, to - from), 8);
+  }
+  g.fillStyle = "#58a6ff";
+  for (const s of spans) g.fillRect(x(s.sent), 9, Math.max(2, x(s.answered) - x(s.sent)), 3);
 }
 
 worker.onmessage = (event) => {
@@ -110,18 +183,23 @@ worker.onmessage = (event) => {
     exchanges = message.exchanges;
     meta = message.meta;
     interface_ = message.interface;
+    spans = [];
     $("slider").min = origin;
     $("slider").max = live ? frontier : total;
     $("controls").classList.add("hidden");
     buildPanels();
     if (live) {
       $("port").value = message.published[0] ?? 8080;
-      status(`${message.checkpoints.length} checkpoint holding ${mb(message.held)}${message.listening.length ? `, listening on ${message.listening.join(", ")}` : `, publishing ${message.published.join(", ") || "no ports"}`}, loaded in ${(message.loading / 1000).toFixed(1)} s${message.inflated ? ` (${(message.inflated / 1000).toFixed(1)} s inflating)` : ""} — press play, then send a request`);
+      const where = message.listening.length ? `listening on ${message.listening.join(", ")}` : `publishing ${message.published.join(", ") || "no ports"}`;
+      status(`${where} — send the request · loaded in ${(message.loading / 1000).toFixed(1)} s${message.inflated ? ` (${(message.inflated / 1000).toFixed(1)} s inflating)` : ""}`);
+      // Nothing has happened yet: the edge box alone, until something has.
+      if (message.published.length) document.body.classList.add("opening");
     } else {
-      $("status").textContent = `${total.toLocaleString()} instructions, ${timeline.length} syscalls, ${exchanges.length} exchanges, ${message.checkpoints.length} checkpoints holding ${mb(message.held)} (${mb(message.naive)} as full copies, diffed in ${Math.round(message.diffing)} ms), ${message.bytecode ? "bytecode" : "interpreter"}, loaded in ${(message.loading / 1000).toFixed(1)} s`;
+      $("status").textContent = `${total.toLocaleString()} instructions · ${timeline.length} syscalls · ${exchanges.length} exchanges · ${message.checkpoints.length} checkpoints holding ${mb(message.held)} · ${message.bytecode ? "bytecode" : "interpreter"} · loaded in ${(message.loading / 1000).toFixed(1)} s`;
     }
     rebuildEvents();
     renderEvents(true);
+    drawLanes();
     seek(origin);
     return;
   }
@@ -133,9 +211,10 @@ worker.onmessage = (event) => {
     trace.push(...message.trace);
     exchanges.push(...message.exchanges);
     $("slider").max = frontier;
-    status(`${message.checkpoints} checkpoints holding ${mb(message.held)}${message.listening.length ? `, listening on ${message.listening.join(", ")}` : ""}${message.idle && finished === null ? ", idle" : ""}`);
+    status(`${message.listening.length ? `listening on ${message.listening.join(", ")}` : ""}${message.idle && finished === null ? " · idle" : ""}`);
     rebuildEvents();
     renderEvents(true);
+    drawLanes();
     if (finished !== null) stop();
     if (!drain()) seek(frontier);
     return;
@@ -164,22 +243,51 @@ worker.onmessage = (event) => {
     if (!box) return;
     responses++;
     if (message.error) box.querySelector(".meta").textContent += ` — ${message.error}`;
-    else {
-      const meta_ = box.querySelector(".meta");
-      meta_.textContent = `#${message.id} sent at ${message.sent.toLocaleString()}, answered at ${message.answered.toLocaleString()} — `;
-      const link = document.createElement("a");
-      link.textContent = `seek to the answer`;
-      link.onclick = () => {
-        stop();
-        seek(message.answered);
-      };
-      meta_.appendChild(link);
-      const body = document.createElement("pre");
-      body.textContent = message.response;
-      box.appendChild(body);
-    }
+    else answered(box, message);
   }
 };
+
+/// The instant a request sent at `sent` came into the container: the
+/// accept that took the connection, else the first read of its bytes.
+function arrivalOf(sent) {
+  const accepted = timeline.find((t) => t.at >= sent && (t.name === "accept4" || t.name === "accept"));
+  if (accepted) return accepted.at;
+  for (const e of exchanges) {
+    const at = timeline[e.syscall]?.at ?? frontier;
+    if (at >= sent && e.op === "read" && /^iso\/net\/conn\/\d+\/rx/.test(e.path) && e.bytes > 0) return at;
+  }
+  return sent;
+}
+
+/// A response has come back through the edge: mark the request's span,
+/// offer its two instants as links, and — the first time, from the opening
+/// state — stand the machine on the instant the request arrived.
+function answered(box, message) {
+  spans.push({ sent: message.sent, answered: message.answered });
+  drawLanes();
+  const meta_ = box.querySelector(".meta");
+  meta_.textContent = `#${message.id} sent at ${message.sent.toLocaleString()}, answered at ${message.answered.toLocaleString()} — `;
+  const arrival = document.createElement("a");
+  arrival.textContent = "seek to its arrival";
+  arrival.onclick = () => go(arrivalOf(message.sent), null);
+  const answer = document.createElement("a");
+  answer.textContent = "to the answer";
+  answer.onclick = () => go(message.answered, null);
+  meta_.append(arrival, " · ", answer);
+  const body = document.createElement("pre");
+  body.textContent = message.response;
+  box.appendChild(body);
+  if (document.body.classList.contains("opening")) {
+    leaveOpening();
+    go(arrivalOf(message.sent), null);
+  }
+}
+
+function leaveOpening() {
+  if (!document.body.classList.contains("opening")) return;
+  document.body.classList.remove("opening");
+  drawLanes();
+}
 
 // ---- the timeline ------------------------------------------------------------
 //
@@ -200,7 +308,7 @@ function describeExchange(e) {
   else if (e.text !== null && e.text.length === e.bytes) what = JSON.stringify(e.text);
   else if (e.text !== null) what = `${e.bytes} bytes ${JSON.stringify(e.text)}…`;
   else what = `${e.bytes} bytes`;
-  return `${e.op.padEnd(5)} /${e.path} ${arrow} ${what}`;
+  return `<span class="op">${e.op.padEnd(5)}</span> ${escape("/" + e.path)} ${arrow} ${escape(what)}`;
 }
 
 /// Whether an exchange is a poll that found nothing: the kernel, idle,
@@ -255,9 +363,70 @@ function position() {
   return low - 1;
 }
 
-function eventText(event) {
-  if (event.kind === "syscall") return trace[event.index] ?? timeline[event.index].name;
-  return describeExchange(exchanges[event.index]) + (event.count > 1 ? `  ×${event.count}` : "");
+// Which syscalls take a descriptor first, and which hand one back, so the
+// numbers in a trace line can be links to what they name.
+const FD_TAKING = new Set(["read", "write", "close", "fstat", "lseek", "ioctl", "pread64", "pwrite64", "readv", "writev", "sendto", "recvfrom", "sendmsg", "recvmsg", "shutdown", "bind", "listen", "accept", "accept4", "connect", "getsockname", "getpeername", "setsockopt", "getsockopt", "fcntl", "flock", "fsync", "fdatasync", "ftruncate", "getdents64", "fchdir", "fchmod", "fchown", "epoll_ctl", "epoll_wait", "dup", "dup2", "dup3", "sendfile", "mmap"]);
+const FD_RETURNING = new Set(["open", "openat", "socket", "accept", "accept4", "dup", "dup2", "dup3", "epoll_create1", "eventfd2", "memfd_create", "socketpair"]);
+
+function numberOf(token) {
+  return token.startsWith("0x") ? parseInt(token.slice(2), 16) : Number(token);
+}
+
+function fdLink(token) {
+  const fd = numberOf(token);
+  return fd >= 0 && fd < 65536 ? `<a class="link fd" data-fd="${fd}">${token}</a>` : token;
+}
+
+/// A trace line with its paths and descriptors as links.
+function linkify(line) {
+  const m = line.match(/^(\w+)\((.*)\) = (.*)$/s);
+  if (!m) return escape(line);
+  const [, name, args, ret] = m;
+  let html = escape(args).replace(/&quot;(\/[^&]*?)&quot;/g, (_, path) => `&quot;<a class="link file" data-path="${path}">${path}</a>&quot;`);
+  if (FD_TAKING.has(name)) {
+    const which = name === "mmap" ? 4 : 0;
+    const parts = html.split(", ");
+    if (parts[which] !== undefined && /^(0x[0-9a-f]+|\d+)$/.test(parts[which])) parts[which] = fdLink(parts[which]);
+    if (name === "epoll_ctl" && parts[2] !== undefined && /^(0x[0-9a-f]+|\d+)$/.test(parts[2])) parts[2] = fdLink(parts[2]);
+    html = parts.join(", ");
+  }
+  const retHtml = FD_RETURNING.has(name) && /^\d+$/.test(ret) ? fdLink(ret) : escape(ret);
+  return `${name}(${html}) = ${retHtml}`;
+}
+
+/// What a row is about, for the panels to open on: the first path in a
+/// syscall's arguments, else the descriptor it took; a connection's edge
+/// for bytes on it; the console for what was written there.
+function focusOf(event) {
+  if (event.kind === "syscall") {
+    const line = trace[event.index] ?? "";
+    const path = line.match(/"(\/[^"]*)"/);
+    if (path) return { kind: "file", path: path[1] };
+    const m = line.match(/^\[\d+\] (\w+)\((0x[0-9a-f]+|\d+)/);
+    if (m && FD_TAKING.has(m[1]) && m[1] !== "mmap") {
+      const fd = numberOf(m[2]);
+      if (fd < 65536) return { kind: "fd", fd };
+    }
+    return null;
+  }
+  const e = exchanges[event.index];
+  const conn = e.path.match(/^iso\/net\/conn\/(\d+)\//);
+  if (conn) return { kind: "edge", edge: Number(conn[1]) };
+  if (e.path.startsWith("iso/console/")) return { kind: "console" };
+  return null;
+}
+
+function rowHtml(event) {
+  const at = `<span class="at">${event.at.toLocaleString().padStart(14)}</span>`;
+  if (event.kind === "syscall") {
+    const t = timeline[event.index];
+    const line = (trace[event.index] ?? t.name).replace(/^\[\d+\] /, "");
+    return `${at}  <span class="who" style="color:${colorOf(t.pid)}">${escape(nameOf(t.pid))}</span> ${linkify(line)}`;
+  }
+  const e = exchanges[event.index];
+  const pid = timeline[e.syscall]?.pid;
+  const who = pid === undefined ? `<span class="who"></span>` : `<span class="who" style="color:${colorOf(pid)}">${escape(nameOf(pid))}</span>`;
+  return `${at}  ${who} ${describeExchange(e)}${event.count > 1 ? `  ×${event.count}` : ""}`;
 }
 
 function renderEvents(force = false) {
@@ -281,11 +450,9 @@ function renderEvents(force = false) {
       row.className = `event ${event.kind}${event.kind === "exchange" && exchanges[event.index].error ? " error" : ""}`;
       row.dataset.at = event.at;
       row.dataset.index = index;
-      row.textContent = `${event.at.toLocaleString().padStart(14)}  ${eventText(event)}`;
-      row.onclick = () => {
-        stop();
-        seek(event.at);
-      };
+      const pid = event.kind === "syscall" ? timeline[event.index].pid : timeline[exchanges[event.index].syscall]?.pid;
+      if (pid !== undefined) row.style.borderLeftColor = colorOf(pid);
+      row.innerHTML = rowHtml(event);
       list.appendChild(row);
     }
     if (to < events.length) {
@@ -304,29 +471,46 @@ function renderEvents(force = false) {
   if (marked) marked.scrollIntoView({ block: "nearest" });
 }
 
+// A click on a row seeks to it and opens what it is about; a click on a
+// link in the row opens that instead.
+$("events").onclick = (click) => {
+  const row = click.target.closest(".event");
+  if (!row) return;
+  const event = events[Number(row.dataset.index)];
+  const link = click.target.closest("a.link");
+  let focus = focusOf(event);
+  if (link) focus = link.dataset.path !== undefined ? { kind: "file", path: link.dataset.path } : { kind: "fd", fd: Number(link.dataset.fd) };
+  go(event.at, focus);
+};
+
 $("filter").onchange = () => {
   rebuildEvents();
   renderEvents(true);
 };
 
+/// Seeks to `at` and, once there, opens what `focus` names.
+function go(at, focus) {
+  stop();
+  leaveOpening();
+  at = clamp(at);
+  if (focus?.kind === "file") context.path = focus.path.replace(/^\/+/, "");
+  pending = focus ? { at, ...focus } : null;
+  seek(at);
+}
+
 // ---- the panels --------------------------------------------------------------
 //
 // One panel per readable pattern of the meta lens. A few patterns have a
 // renderer that knows their shape; the rest are shown as the JSON they
-// are. Which panels stand in the open and which fold under "the machine"
-// is the one opinion the page keeps.
+// are. Which panels stand in the open, which fold under "the machine" and
+// which under "kernel internals" is the one opinion the page keeps.
 
-const OPEN = ["processes", "processes/{pid}/files/{path}", "processes/{pid}/descriptors", "net"];
-const MACHINE_ORDER = [
+const OPEN = ["processes", FILES, DESCRIPTORS, "net"];
+const MACHINE = [
   "processes/{pid}/threads/{tid}/registers",
   "processes/{pid}/threads/{tid}/disassembly",
   "processes/{pid}/memory/{address}/{length}",
   "processes/{pid}/maps",
-  "processes/{pid}/mapped",
-  "statistics",
-  "cache",
-  "caches",
-  "layout",
 ];
 const panels = new Map(); // pattern -> { element, body, raw, diff, pathLabel }
 
@@ -359,6 +543,7 @@ function buildPanels() {
   panels.clear();
   $("panels").innerHTML = "";
   $("machine").querySelector(".grid").innerHTML = "";
+  $("internals").querySelector(".grid").innerHTML = "";
   const readable = Object.entries(meta?.paths ?? {})
     .filter(([pattern, lens]) => lens.readable && pattern !== "meta" && !pattern.startsWith("meta/"))
     .map(([pattern]) => pattern);
@@ -367,10 +552,10 @@ function buildPanels() {
   // container's store but is what the page is to it: its edge, its console.
   makeEdgePanel();
   makeConsolePanel();
-  const rest = readable.filter((pattern) => !OPEN.includes(pattern));
-  rest.sort((a, b) => (MACHINE_ORDER.indexOf(a) + 1 || 99) - (MACHINE_ORDER.indexOf(b) + 1 || 99) || a.localeCompare(b));
-  for (const pattern of rest) makePanel(pattern, pattern, $("machine").querySelector(".grid"));
-  // The path bar's suggestions: every pattern, filled in as far as known.
+  for (const pattern of MACHINE) if (readable.includes(pattern)) makePanel(pattern, pattern, $("machine").querySelector(".grid"));
+  const rest = readable.filter((pattern) => !OPEN.includes(pattern) && !MACHINE.includes(pattern)).sort();
+  for (const pattern of rest) makePanel(pattern, pattern, $("internals").querySelector(".grid"));
+  // The path bar's suggestions: every pattern.
   $("paths").innerHTML = readable.map((pattern) => `<option value="${escape(pattern)}">`).join("");
 }
 
@@ -395,6 +580,7 @@ function makeEdgePanel() {
 function makeConsolePanel() {
   const element = document.createElement("section");
   element.className = "panel";
+  element.id = "console";
   element.innerHTML = `<h2><span class="path">/iso/console</span> — what the container wrote</h2><pre id="stdout"></pre><pre id="stderr" style="opacity:.7"></pre>`;
   $("panels").appendChild(element);
 }
@@ -446,6 +632,7 @@ function hexRows(hex) {
 
 function browse(path) {
   context.path = path.replace(/\/+/g, "/").replace(/^\//, "");
+  pending = { at: current, kind: "file" };
   seek(current);
 }
 
@@ -462,14 +649,18 @@ function parentOf(path) {
   return cut <= 0 ? "" : trimmed.slice(0, cut);
 }
 
+function processLabel(p) {
+  return `<span style="color:${colorOf(p.pid)}">${escape(nameOf(p.pid))}</span> · pid ${p.pid}`;
+}
+
 const renderers = {
   processes(value, panel, state) {
     const s = values.statistics?.value;
     const running = s?.current;
-    let html = s ? `<div style="opacity:.7;margin-bottom:4px">retired ${s.retired.toLocaleString()} · in bytecode ${s.accelerated.toLocaleString()} · blocks decoded ${s.decoded} · running pid ${running}</div>` : "";
+    let html = s ? `<div style="opacity:.7;margin-bottom:4px">retired ${s.retired.toLocaleString()} · in bytecode ${s.accelerated.toLocaleString()} · running ${escape(nameOf(running))} (pid ${running})</div>` : "";
     for (const p of value.processes) {
       const state_ = typeof p.state === "string" ? p.state : JSON.stringify(p.state);
-      html += `<div class="process${p.pid === running ? " current" : ""}${p.pid === state.pid ? " viewing" : ""}" data-pid="${p.pid}" title="view this process's paths"><b>pid ${p.pid}</b> parent ${p.parent} · ${escape(state_)}${p.displaced ? ` · ${p.displaced} pages displaced` : ""}${p.pid === state.pid ? " · in view" : ""}` +
+      html += `<div class="process${p.pid === running ? " current" : ""}${p.pid === state.pid ? " viewing" : ""}" data-pid="${p.pid}" title="view this process's paths" style="border-left-color:${colorOf(p.pid)}"><b>${processLabel(p)}</b> · parent ${p.parent ? `${escape(nameOf(p.parent))} (${p.parent})` : "none"} · ${escape(state_)}${p.displaced ? ` · ${p.displaced} pages displaced` : ""}${p.pid === state.pid ? " · in view" : ""}` +
         p.threads.map((t) => `<div class="thread${t.tid === state.tid && p.pid === state.pid ? " viewing" : ""}" data-pid="${p.pid}" data-tid="${t.tid}">tid ${t.tid} @ ${t.rip} · ${escape(t.state)} · retired ${t.retired.toLocaleString()}</div>`).join("") +
         `</div>`;
     }
@@ -480,7 +671,7 @@ const renderers = {
     };
   },
 
-  "processes/{pid}/files/{path}"(value, panel) {
+  [FILES](value, panel) {
     const path = value.path;
     const parts = path.split("/").filter(Boolean);
     let crumb = `<div class="crumb"><a data-path="">/</a>`;
@@ -510,10 +701,10 @@ const renderers = {
     for (const link of panel.body.querySelectorAll("a[data-path]")) link.onclick = () => browse(link.dataset.path);
   },
 
-  "processes/{pid}/descriptors"(value, panel) {
+  [DESCRIPTORS](value, panel) {
     let html = `<table><tr><th>fd</th><th>what</th><th>path</th><th>offset</th><th>flags</th></tr>`;
     for (const d of value) {
-      html += `<tr><td>${d.fd}</td><td>${escape(d.what)}</td><td>${d.path ? `<a class="link" data-path="${escape(d.path)}">${escape(d.path)}</a>` : ""}</td><td>${d.offset}</td><td>${d.flags}${d.cloexec ? " cloexec" : ""}</td></tr>`;
+      html += `<tr data-fd="${d.fd}"><td>${d.fd}</td><td>${escape(d.what)}</td><td>${d.path ? `<a class="link" data-path="${escape(d.path)}">${escape(d.path)}</a>` : ""}</td><td>${d.offset}</td><td>${d.flags}${d.cloexec ? " cloexec" : ""}</td></tr>`;
     }
     panel.body.innerHTML = html + "</table>";
     for (const link of panel.body.querySelectorAll("a[data-path]")) link.onclick = () => browse(link.dataset.path);
@@ -533,14 +724,15 @@ const renderers = {
         const c = s.state.connected;
         state = `connected ${c.local} ↔ ${c.peer} · ${c.receive_queued} bytes to read, ${c.transmit_queued} to send${c.read_shut ? " · read shut" : ""}${c.write_shut ? " · write shut" : ""}`;
       } else state = escape(JSON.stringify(s.state));
-      return `<div class="socket"><span class="id">socket${s.id}</span> ${s.family} ${s.kind === 1 ? "stream" : s.kind === 2 ? "dgram" : "kind " + s.kind}${s.edge !== null ? ` · <b>edge conn/${s.edge}</b>` : ""} · held by pid ${s.holders.join(", ") || "nobody"}<div class="thread">${state}</div></div>`;
+      const holders = s.holders.map((pid) => `<span style="color:${colorOf(pid)}">${escape(nameOf(pid))}</span> (${pid})`).join(", ") || "nobody";
+      return `<div class="socket" data-socket="${s.id}" data-edge="${s.edge ?? ""}"><span class="id">socket${s.id}</span> ${s.family} ${s.kind === 1 ? "stream" : s.kind === 2 ? "dgram" : "kind " + s.kind}${s.edge !== null ? ` · <b>edge conn/${s.edge}</b>` : ""} · held by ${holders}<div class="thread">${state}</div></div>`;
     }).join("");
   },
 
   "processes/{pid}/threads/{tid}/registers"(r, panel, state) {
-    const names = ["rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "rip", "fs_base"];
-    panel.body.innerHTML = `<div class="registers"><div><span class="name">thread</span><span class="value">pid ${state.pid} tid ${state.tid}</span></div>` +
-      names.map((n) => `<div><span class="name">${n}</span><span class="value">${r[n]}</span></div>`).join("") +
+    const names_ = ["rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "rip", "fs_base"];
+    panel.body.innerHTML = `<div class="registers"><div><span class="name">thread</span><span class="value">${escape(nameOf(state.pid))} pid ${state.pid} tid ${state.tid}</span></div>` +
+      names_.map((n) => `<div><span class="name">${n}</span><span class="value">${r[n]}</span></div>`).join("") +
       `<div><span class="name">flags</span><span class="value ${r.flags_stale ? "stale" : ""}">${r.flags}${r.flags_stale === true ? " (stale: a later instruction overwrote them before anything read them)" : r.flags_stale === null ? " (freshness unknown at this stop)" : ""}</span></div></div>`;
   },
 
@@ -572,6 +764,7 @@ function concreteOf(pattern) {
 function render(state) {
   current = state.at;
   values = state.values;
+  learnNames(values.processes?.value?.processes);
   $("slider").value = current;
   $("at").textContent = current.toLocaleString();
   $("took").textContent = live && current === frontier ? "the frontier" : state.restored ? `restored in ${Math.round(state.restored)} ms` : "";
@@ -585,7 +778,7 @@ function render(state) {
     } else if (held.error !== undefined) {
       panel.body.innerHTML = `<div class="refusal">${escape(held.error)}</div>`;
       panel.raw.textContent = held.error;
-      if (pattern === "processes/{pid}/files/{path}") {
+      if (pattern === FILES) {
         panel.body.innerHTML += ` <a class="link" data-path="">back to /</a>`;
         panel.body.querySelector("a").onclick = () => browse("");
       }
@@ -600,6 +793,65 @@ function render(state) {
   $("stdout").textContent = state.stdout;
   $("stderr").textContent = state.stderr + (state.log ? "\n" + state.log : "");
   renderEvents();
+  applyFocus(state);
+}
+
+// ---- focus -------------------------------------------------------------------
+//
+// What the clicked row was about, opened once the machine stands at its
+// instant: a file browses to it; a descriptor browses to its file, or
+// lights up its socket, or its row; a connection lights up its socket.
+
+function highlight(element) {
+  if (!element) return;
+  element.classList.add("focused");
+  const details = element.closest("details");
+  if (details) details.open = true;
+  element.scrollIntoView({ block: "nearest" });
+}
+
+function applyFocus(state) {
+  for (const element of document.querySelectorAll(".panel.focused")) element.classList.remove("focused");
+  if (!pending || pending.at !== state.at) return;
+  const focus = pending;
+  pending = null;
+  if (focus.kind === "file") highlight(panels.get(FILES)?.element);
+  else if (focus.kind === "console") highlight($("console"));
+  else if (focus.kind === "edge") {
+    const panel = panels.get("net");
+    highlight(panel?.element);
+    const socket = panel?.body.querySelector(`.socket[data-edge="${focus.edge}"]`);
+    if (socket) {
+      socket.classList.add("hit");
+      socket.scrollIntoView({ block: "nearest" });
+    }
+  } else if (focus.kind === "fd") {
+    const descriptors = values[concreteOf(DESCRIPTORS)]?.value ?? [];
+    const d = descriptors.find((d) => d.fd === focus.fd);
+    if (!d) return;
+    if (d.path) {
+      // The descriptor names a file: browse to it, and come back here.
+      context.path = d.path.replace(/^\/+/, "");
+      pending = { at: state.at, kind: "file" };
+      seek(state.at);
+      return;
+    }
+    const socket = d.what.match(/^socket(\d+)$/);
+    if (socket) {
+      const panel = panels.get("net");
+      highlight(panel?.element);
+      const row = panel?.body.querySelector(`.socket[data-socket="${socket[1]}"]`);
+      if (row) {
+        row.classList.add("hit");
+        row.scrollIntoView({ block: "nearest" });
+      }
+    } else {
+      const panel = panels.get(DESCRIPTORS);
+      highlight(panel?.element);
+      const row = panel?.body.querySelector(`tr[data-fd="${focus.fd}"]`);
+      if (row) row.classList.add("hit");
+    }
+  }
 }
 
 // ---- pin and diff --------------------------------------------------------------
@@ -715,6 +967,7 @@ function stop() {
 
 $("slider").oninput = (event) => {
   stop();
+  leaveOpening();
   seek(Number(event.target.value));
 };
 $("play").onclick = () => {
@@ -725,19 +978,18 @@ $("play").onclick = () => {
   if (live) advance(LIVE_TICK);
   else seek(current + playing);
 };
-$("back").onclick = () => { stop(); seek(current - 1); };
-$("forward").onclick = () => { stop(); if (live && current === frontier) advance(1); else seek(current + 1); };
+$("back").onclick = () => go(current - 1, null);
+$("forward").onclick = () => { stop(); leaveOpening(); if (live && current === frontier) advance(1); else seek(current + 1); };
 $("prev").onclick = () => {
-  stop();
   const now = position();
-  if (now >= 0 && events[now].at === current && now > 0) seek(events[now - 1].at);
-  else if (now >= 0) seek(events[now].at);
+  if (now >= 0 && events[now].at === current && now > 0) go(events[now - 1].at, focusOf(events[now - 1]));
+  else if (now >= 0) go(events[now].at, focusOf(events[now]));
 };
 $("next").onclick = () => {
-  stop();
   const after = position() + 1;
-  if (after < events.length) seek(events[after].at);
+  if (after < events.length) go(events[after].at, focusOf(events[after]));
 };
+window.addEventListener("resize", drawLanes);
 
 function send(port, request) {
   const id = nextRequest++;
@@ -774,6 +1026,7 @@ window.zaqaruDebug = {
   browse,
   view,
   pin,
+  go,
   get current() {
     return current;
   },
@@ -815,6 +1068,18 @@ window.zaqaruDebug = {
   },
   get pinned() {
     return pinned;
+  },
+  get pending() {
+    return pending;
+  },
+  get spans() {
+    return spans;
+  },
+  get names() {
+    return Object.fromEntries(names);
+  },
+  get opening() {
+    return document.body.classList.contains("opening");
   },
 };
 

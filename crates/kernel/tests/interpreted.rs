@@ -1241,6 +1241,50 @@ int main(void) {
     );
 }
 
+/// `comm` is the basename of what `execve` was asked to run, a script's
+/// name and not its interpreter's, until `PR_SET_NAME` changes it — and
+/// `/proc/self/exe` stays the interpreter throughout. What names a process
+/// on the debugger's page.
+#[test]
+fn a_process_is_named_by_what_was_asked_to_run() {
+    let (_tree, baked) = image_with(
+        "comm",
+        r#"
+#include <stdio.h>
+#include <string.h>
+#include <sys/prctl.h>
+#include <unistd.h>
+int main(void) {
+    char name[16] = {0};
+    prctl(PR_GET_NAME, name);
+    printf("started as %s\n", name);
+    prctl(PR_SET_NAME, "renamed");
+    memset(name, 0, sizeof name);
+    prctl(PR_GET_NAME, name);
+    printf("now %s\n", name);
+    return 0;
+}
+"#,
+        Linkage::Static,
+        &[Plugin {
+            path: "/run",
+            form: Form::Data,
+            source: "#!/init\n",
+        }],
+    );
+    let image = Image::parse(&baked.index, &baked.blob).expect("parse the image");
+    let kernel = Kernel::with_enforcement(Shared::new(Console::default()), Interpreted::new(), image, Enforcement::Mapped);
+    let process = Process::boot_with_cache(kernel, b"/run", &[b"/run"], &[], BlockCache::new()).expect("boot the script");
+    let mut system = System::new(process);
+    assert_eq!(system.current().kernel.comm, "run", "named for the script");
+    assert_eq!(system.current().kernel.executable, "/init", "exe is the interpreter");
+    assert_eq!(system.run(), Exit::Status(0));
+    let output = system.current().kernel.store.borrow().contents(kernel::paths::CONSOLE_STDOUT);
+    assert_eq!(String::from_utf8_lossy(&output), "started as run\nnow renamed\n");
+    assert_eq!(system.current().kernel.comm, "renamed");
+    assert_eq!(system.current().kernel.executable, "/init", "PR_SET_NAME does not move exe");
+}
+
 /// **`SIGCHLD`**, which is how a program that is not sitting in `wait4`
 /// finds out that a child has finished.
 ///
@@ -2780,7 +2824,7 @@ int main(void) {
     assert!(statistics.starts_with(r#"{"result":"ok","value":{"retired":"#), "{statistics}");
     assert!(statistics.contains(r#""current":1"#), "{statistics}");
     let processes = response("2");
-    assert!(processes.contains(r#""pid":1,"parent":0,"displaced":0,"state":"live""#), "{processes}");
+    assert!(processes.contains(r#""pid":1,"parent":0,"exe":"/init","comm":"init","displaced":0,"state":"live""#), "{processes}");
     assert!(processes.contains(r#""tid":1,"rip":"0x"#), "{processes}");
     let registers = response("3");
     assert!(registers.contains(r#""rsp":"0x"#) && registers.contains(r#""flags_stale":null"#), "{registers}");

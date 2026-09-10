@@ -107,7 +107,7 @@ The paths the store serves, all read-only:
 | path | value |
 | --- | --- |
 | `statistics` | retired, accelerated, decoded, current pid; the line `/iso/log/statistics` carries at exit, as a value, at any time |
-| `processes` | every process: pid, parent, state, exit status if unreaped, and each thread's tid and state, with what it is parked on. The stall report, structured |
+| `processes` | every process: pid, parent, `exe` (the path it was started from) and `comm` (the basename of what `execve` was asked to run — a script's name, not its interpreter's — or the name it set with `prctl`), state, exit status if unreaped, and each thread's tid and state, with what it is parked on. The stall report, structured |
 | `processes/{pid}/threads/{tid}/registers` | the sixteen general registers, `rip`, the segment base, the flags as materialised, and `flags_stale` (see below) |
 | `processes/{pid}/maps` | the VMA tree, the fields `/proc/self/maps` shows |
 | `processes/{pid}/descriptors` | each fd: what backs it, the path it was opened by (as `/proc/self/fd` shows it), offset, flags |
@@ -435,10 +435,28 @@ arrays whose elements carry an identity — a pid, an fd, a socket id, a
 name — are matched by it, so a descriptor closed in the middle shows as
 that one descriptor gone.
 
-The edge, where a request is typed and its answer shown with the instants
-it was sent and answered, the latter a link that seeks there, and the
-console are the host's side of the boundary rather than paths of the
-container's store, and the page says so in their titles.
+**Names, lanes, and the opening.** A process is named by its `comm`, which the `processes` path carries — and keeps one
+colour for the run: on its card, on every timeline row it made, and on
+a lane strip under the slider that shows which process ran when, from
+the pid on each syscall's stamp. Live, the page opens on the edge box
+alone, since nothing has happened yet; when the first answer arrives it
+marks the request's span on the strip, from sent to answered, and stands
+the machine on the instant the request came in — the `accept` that took
+the connection — with everything shown. Each answer offers that instant
+and its own as links.
+
+**The row you click chooses what the panels look at.** A path in a
+syscall's arguments is a link into the files panel; a descriptor number
+is a link to what it names — its file, browsed to, or its socket in the
+net panel, lit; bytes crossing a connection light the socket the host
+terminates. Clicking the row itself opens the first of those it has.
+
+The edge, where a request is typed and its answer shown, and the console
+are the host's side of the boundary rather than paths of the container's
+store, and the page says so in their titles. Registers, disassembly, the
+stack and the memory map fold under "the machine"; the statistics, the
+caches and the layout, which exist for the snapshot tool, fold under
+"kernel internals".
 
 ## Two things the page must say
 

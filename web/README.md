@@ -63,7 +63,13 @@ timeline shows the container's exchanges with the host — every read and
 write under `/iso`, with what crossed — beside its syscalls, each placed
 at the syscall it was made in, and holds rows for a window around the
 present so a run of a million events stays quick. Pinning an instant makes
-every panel show what changed since it.
+every panel show what changed since it. Processes are named by what they
+were started from and coloured, on their cards, on the timeline's rows
+and on a lane strip under the slider that shows which ran when; a syscall
+row's paths and descriptors are links into the files, descriptors and net
+panels, and clicking a row opens what it is about. Live, the page opens on
+the edge box alone and, when the first answer arrives, stands the machine
+on the instant the request came in.
 
 Checkpoints are maps of non-zero 4 KiB pages, shared between checkpoints,
 each recording only the pages that changed since the one before

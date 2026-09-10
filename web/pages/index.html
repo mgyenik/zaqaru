@@ -59,9 +59,8 @@ desktop browser, then; it has been run in Chrome and Firefox.</div>
 
 <h2>what to do</h2>
 <ol>
-  <li>Wait for the status line to say <i>listening on 80 — press play</i>. Loading takes a second once the files are in.</li>
-  <li>Press <b>play</b>, then <b>send</b> in the edge panel. The request is <code>GET / HTTP/1.0</code>; the answer arrives in a fraction of a second with the instant it was answered.</li>
-  <li>Drag the slider back into the request, or click a row of the timeline — the request's bytes arriving from the page, <code>accept4</code>, <code>recvfrom</code>, <code>sendto</code>, the response going out. The container restores the nearest checkpoint and re-executes to that exact instruction; the panels show the machine as it was.</li>
+  <li>Press <b>send</b>. The request is <code>GET / HTTP/1.0</code>; the answer arrives in a fraction of a second, and the page stands the container on the instant the request came in.</li>
+  <li>Click rows of the timeline — the request's bytes arriving from the page, <code>accept4</code>, <code>recvfrom</code>, <code>sendto</code>, the response going out — or drag the slider inside the request's span. The container restores the nearest checkpoint and re-executes to that exact instruction; the panels show the machine as it was. Paths and descriptors in a row are links to what they name.</li>
   <li>Browse the files panel — <code>/etc/nginx/nginx.conf</code>, nginx's logs under <code>/var/log</code> — as they stood at that instant; click a process to view its paths; type any path of the store into the bar at the top and read it.</li>
   <li>Press <b>pin</b>, move, and every panel says what changed since. Step with <b>−1</b> and <b>+1</b>: every instruction is an addressable instant.</li>
 </ol>

@@ -261,10 +261,27 @@ try {
   // request sent through the edge box.
   await navigate(`http://127.0.0.1:${port}/web/?module=fixture/server.wasm&live=8080`);
   await until(`document.readyState === "complete" && !!window.zaqaruDebug && window.zaqaruDebug.live === true`);
-  await until(`!window.zaqaruDebug.busy && document.getElementById("status").textContent.includes("press play")`);
+  await until(`!window.zaqaruDebug.busy && document.getElementById("status").textContent.includes("send the request")`);
   await evaluate(`document.getElementById("request").value = "ping\\n"; document.getElementById("send").click()`);
   const response = await until(`(() => { const r = document.getElementById("responses").textContent; return /pong|not published|error/.test(r) ? r : ""; })()`, 120000);
   check("a request through the edge is answered by the server in the container", /answered at [\d,]+.*pong/s.test(response), response.slice(0, 200));
+  // The first answer ends the opening state and stands the machine on the
+  // instant the request came in.
+  const wasOpening = await evaluate("window.zaqaruDebug.opening");
+  check("the page opened on the edge box alone and left it at the first answer", wasOpening === false, String(wasOpening));
+  await until(`!window.zaqaruDebug.busy && window.zaqaruDebug.pending === null`);
+  const arrivalRow = await evaluate(`document.querySelector(".event.now")?.textContent ?? ""`);
+  check("the machine stands on the accept that took the connection", /accept/.test(arrivalRow), arrivalRow.slice(0, 120));
+  const spans = await evaluate("window.zaqaruDebug.spans.length");
+  check("the request's span is marked", spans === 1, String(spans));
+  const liveNames = await evaluate("JSON.stringify(window.zaqaruDebug.names)");
+  check("the process is named by what it was started from", /"1":"init"/.test(liveNames), liveNames);
+  const who = await evaluate(`document.querySelector(".event.syscall .who")?.textContent ?? ""`);
+  check("timeline rows carry the process's name", who === "init", JSON.stringify(who));
+  const lanes = await evaluate(`(() => { const c = document.getElementById("lanes"); return c.width > 0 && c.height > 0; })()`);
+  check("the lane strip is drawn", lanes === true, String(lanes));
+  // Then let it run on to its exit.
+  await evaluate(`document.getElementById("status").textContent.includes("exited") || document.getElementById("play").click()`);
   await until(`document.getElementById("status").textContent.includes("exited 0")`, 60000);
   const liveStatus = await evaluate(`document.getElementById("status").textContent`);
   check("the live run finishes", /exited 0/.test(liveStatus), liveStatus);
@@ -282,7 +299,7 @@ try {
   // loads it, its history beginning at the file's instant.
   await navigate(`http://127.0.0.1:${port}/web/?module=fixture/server.wasm&snapshot=fixture/server.snapshot&live=8080`);
   await until(`document.readyState === "complete" && !!window.zaqaruDebug && window.zaqaruDebug.live === true && window.zaqaruDebug.origin > 0`);
-  await until(`!window.zaqaruDebug.busy && document.getElementById("status").textContent.includes("press play")`);
+  await until(`!window.zaqaruDebug.busy && document.getElementById("status").textContent.includes("send the request")`);
   const origin = await evaluate("window.zaqaruDebug.origin");
   const snapshotStatus = await evaluate(`document.getElementById("status").textContent`);
   check("a snapshot loads listening", origin > 100000 && /from a snapshot/.test(snapshotStatus) && /listening on 8080/.test(snapshotStatus), snapshotStatus);
@@ -290,6 +307,8 @@ try {
   check("the boot's console came through the file", bootOutput === "listening on 8080\n", JSON.stringify(bootOutput));
   await evaluate(`window.zaqaruDebug.send(8080, "ping\\n")`);
   const snapshotResponse = await until(`(() => { const r = document.getElementById("responses").textContent; return /pong|not published|error/.test(r) ? r : ""; })()`, 120000);
+  await until(`!window.zaqaruDebug.busy && window.zaqaruDebug.pending === null`);
+  await evaluate(`document.getElementById("status").textContent.includes("exited") || document.getElementById("play").click()`);
   check("the server continued from the file answers", /pong/.test(snapshotResponse), snapshotResponse.slice(0, 200));
   await until(`document.getElementById("status").textContent.includes("exited 0")`, 60000);
   await until(`!window.zaqaruDebug.busy`);
@@ -310,7 +329,7 @@ try {
   if (demo && runs("django")) {
     await navigate(`http://127.0.0.1:${port}/web/?module=demo/hello-django.wasm&snapshot=demo/hello-django.snapshot&live=80`);
     await until(`document.readyState === "complete" && !!window.zaqaruDebug && window.zaqaruDebug.live === true && window.zaqaruDebug.origin > 0`, 180000);
-    await until(`!window.zaqaruDebug.busy && document.getElementById("status").textContent.includes("press play")`, 60000);
+    await until(`!window.zaqaruDebug.busy && document.getElementById("status").textContent.includes("send the request")`, 60000);
     const djangoStatus = await evaluate(`document.getElementById("status").textContent`);
     console.log("     " + djangoStatus);
     check("django loads from its snapshot, listening on 80", /listening on 80/.test(djangoStatus), djangoStatus);
@@ -354,6 +373,23 @@ try {
     await until(`!window.zaqaruDebug.busy && window.zaqaruDebug.context.path === "etc/nginx/nginx.conf"`, 120000);
     const nginxConf = await evaluate(`document.querySelector('[data-pattern="processes/{pid}/files/{path}"] .body').textContent`);
     check("and reads nginx.conf as text", /worker_processes|http \{|server \{/.test(nginxConf), nginxConf.slice(0, 200));
+    const djangoNames = await evaluate("JSON.stringify(Object.values(window.zaqaruDebug.names))");
+    check("the processes are named nginx and gunicorn", /nginx/.test(djangoNames) && /gunicorn/.test(djangoNames), djangoNames);
+    const open = await evaluate(`document.querySelectorAll("#panels .panel").length`);
+    const internals = await evaluate(`document.querySelectorAll("#internals .panel").length`);
+    check("six panels stand in the open and the internals are folded away", open === 6 && internals >= 4, `${open} open, ${internals} internal`);
+    // A path in a syscall row is a link into the files panel.
+    const linked = await evaluate(`(() => { const a = document.querySelector(".event.syscall a.link.file"); if (!a) return null; a.click(); return a.dataset.path; })()`);
+    check("a syscall row's path is a link", typeof linked === "string" && linked.startsWith("/"), String(linked));
+    await until(`!window.zaqaruDebug.busy && window.zaqaruDebug.pending === null && window.zaqaruDebug.context.path === ${JSON.stringify((linked ?? "/").replace(/^\/+/, ""))}`, 120000);
+    const focusedFiles = await evaluate(`document.querySelector('.panel.focused[data-pattern="processes/{pid}/files/{path}"]') !== null`);
+    check("clicking it browses there and lights the files panel", focusedFiles === true, String(focusedFiles));
+    // A descriptor in a syscall row is a link to what it names.
+    const fdLinked = await evaluate(`(() => { const a = Array.from(document.querySelectorAll(".event.syscall a.link.fd")).find((a) => Number(a.dataset.fd) > 2); if (!a) return null; a.click(); return Number(a.dataset.fd); })()`);
+    check("a syscall row's descriptor is a link", typeof fdLinked === "number", String(fdLinked));
+    await until(`!window.zaqaruDebug.busy && window.zaqaruDebug.pending === null`, 120000);
+    const focusedSomething = await evaluate(`document.querySelector(".panel.focused")?.dataset.pattern ?? document.querySelector(".panel.focused")?.id ?? ""`);
+    check("clicking it lights the panel that holds what it names", /files|descriptors|net/.test(focusedSomething), focusedSomething);
   } else if (runs("django")) console.log("     (no web/demo/hello-django.snapshot: the django scenario is skipped; make it with web/demo.sh)");
 } catch (why) {
   console.log("FAIL " + why);

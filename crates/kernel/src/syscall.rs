@@ -590,6 +590,13 @@ pub struct Kernel<'a, S: Store, M: Machine> {
     /// `execve` is what knows the answer — and reading the link before
     /// then is a named fault rather than a plausible path.
     pub executable: String,
+    /// What `/proc/self/comm` and `PR_GET_NAME` report: the basename of
+    /// the path `execve` was given, truncated to fit, until the process
+    /// names itself with `PR_SET_NAME`. Linux sets it from the *filename*
+    /// argument, so a shebang script's process is named for the script —
+    /// `gunicorn` — and not for the interpreter that `/proc/self/exe`
+    /// points at.
+    pub comm: String,
     /// Resolution, and the mount table it walks: what a path *means* is
     /// decided here.
     pub vfs: crate::vfs::Vfs<'a>,
@@ -901,6 +908,7 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             machine,
             random: crate::random::Random::unseeded(),
             executable: String::new(),
+            comm: String::new(),
             vfs: crate::vfs::Vfs::new(image),
             pid: PROCESS_ID as i32,
             identity: Identity::default(),
@@ -1290,6 +1298,7 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             random: self.random.clone(),
             // The same program, until the child execs.
             executable: self.executable.clone(),
+            comm: self.comm.clone(),
             // The working directory and the writable layer both come along,
             // and both are *copies*: what the child writes afterwards is the
             // child's, which is what fork means.
@@ -1425,6 +1434,7 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
             // Overwritten by `exec` with the program it actually loads,
             // which is what `/proc/self/exe` has to answer afterwards.
             executable: String::new(),
+            comm: String::new(),
             // The working directory, the root, and the writable layer: all
             // properties of the process, and the process is the thing that
             // survives.
@@ -2716,7 +2726,7 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
                     return Outcome::Done(Errno::Fault.as_result());
                 }
                 let end = comm.iter().position(|byte| *byte == 0).unwrap_or(comm.len());
-                self.executable = String::from_utf8_lossy(&comm[..end]).into_owned();
+                self.comm = String::from_utf8_lossy(&comm[..end]).into_owned();
                 Outcome::Done(0)
             }
             // A signal when the parent dies, which this kernel does not
@@ -2752,17 +2762,11 @@ impl<'a, S: Store, M: Machine> Kernel<'a, S, M> {
                 _ => Errno::Invalid.as_result(),
             }),
             GET_NAME => {
-                // Linux sets `comm` from the basename of what was exec'd and
-                // truncates it to fit, so that is what this answers. A
-                // container that execs `/init` therefore says `init`, which
-                // is the truth about this process rather than about the file
-                // it was built from — and the way to make it say something
-                // else is to exec the program under its own name.
-                let name = self.executable.as_bytes();
-                let base = name
-                    .iter()
-                    .rposition(|byte| *byte == b'/')
-                    .map_or(name, |slash| &name[slash + 1..]);
+                // `comm`, as `execve` set it from the basename of what it was
+                // asked to run — a container that execs `/init` says `init`,
+                // which is the truth about this process rather than about
+                // the file it was built from — or as `PR_SET_NAME` changed it.
+                let base = self.comm.as_bytes();
                 let mut comm = [0u8; COMM_LEN];
                 let kept = base.len().min(COMM_LEN - 1);
                 comm[..kept].copy_from_slice(&base[..kept]);
